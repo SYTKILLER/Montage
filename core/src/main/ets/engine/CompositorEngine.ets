@@ -1,7 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
-import { EngineStats, LayerDTO, LayerThumb, OpenFileData, PixelProbe, PixelTestData, ViewportData } from '../model/EngineTypes';
+import { EngineStats, LayerDTO, LayerThumb, OpenFileData, PixelProbe, PixelTestData, PsdOpenData, ViewportData } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -196,6 +196,24 @@ export class CompositorEngine {
         reject(new Error(`openFileFromFd: ${e.message}`));
       });
     });
+  }
+
+  async openPsdFile(fd: number): Promise<PsdOpenData> {
+    const value: Object = await (native.openPsdFile(fd) as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok || r.data === null) {
+      throw new Error(r.error !== null ? r.error.message : 'openPsdFile failed');
+    }
+    const notes: string[] = [];
+    const arr: Record<string, Object> = r.data['notes'] as Record<string, Object>;
+    const len = Object.keys(arr).length;
+    for (let i = 0; i < len; i++) {
+      const item = arr[`${i}`];
+      if (item !== undefined && item !== null && typeof item === 'string') {
+        notes.push(item);
+      }
+    }
+    return { width: num(r.data, 'width'), height: num(r.data, 'height'), notes: notes };
   }
 
   setViewport(zoom: number, panX: number, panY: number): ViewportData | null {

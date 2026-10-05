@@ -49,6 +49,13 @@ export interface LayerDTO {
   thumbToken: number;
 }
 
+/** PSD 导入结果（openPsdFile 的 data）。 */
+export interface PsdOpenData {
+  width: number;
+  height: number;
+  notes: string[];
+}
+
 /** 缩略图结果（getLayerThumbnail 的 data；O3 跨桥实测）。 */
 export interface LayerThumb {
   pixelMap: Object | null;

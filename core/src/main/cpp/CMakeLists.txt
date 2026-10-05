@@ -10,6 +10,8 @@ add_library(compositor SHARED
         engine/document.cpp
         engine/engine.cpp
         io/image_import.cpp
+        io/psd/psd_reader.cpp
+        io/psd/psd_import.cpp
         render/render_loop.cpp
         render/tile_renderer.cpp
         tiles/pixel_probe.cpp)

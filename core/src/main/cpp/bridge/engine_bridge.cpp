@@ -12,6 +12,7 @@
 
 #include "engine/engine.h"
 #include "io/image_import.h"
+#include "io/psd/psd_import.h"
 #include "render/render_loop.h"
 #include "tiles/pixel_probe.h"
 
@@ -286,6 +287,104 @@ napi_value OpenFileFromFd(napi_env env, napi_callback_info info) {
     }
     return promise;
 }
+
+// ---------- PSD 导入（04 §1.1 PSD-1） ----------
+
+struct PsdPayload {
+    bool ok = false;
+    int32_t width = 0;
+    int32_t height = 0;
+    std::vector<std::string> notes;
+    std::string error;
+};
+
+void psdDoneJsCallback(napi_env env, napi_value /*jsCb*/, void* context, void* data) {
+    auto* ctx = static_cast<OpenCtx*>(context);
+    auto* p = static_cast<PsdPayload*>(data);
+    napi_value result;
+    if (p != nullptr && p->ok) {
+        napi_value d = nullptr;
+        napi_create_object(env, &d);
+        napi_set_named_property(env, d, "width", makeInt32(env, p->width));
+        napi_set_named_property(env, d, "height", makeInt32(env, p->height));
+        napi_value arr = nullptr;
+        napi_create_array(env, &arr);
+        uint32_t i = 0;
+        for (const std::string& n : p->notes) {
+            napi_set_element(env, arr, i++, makeString(env, n));
+        }
+        napi_set_named_property(env, d, "notes", arr);
+        result = makeOk(env, d);
+    } else {
+        result = makeError(env, kErrInternal, p != nullptr ? p->error : "psd import failed");
+    }
+    delete p;
+    napi_resolve_deferred(env, ctx->deferred, result);
+    napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);
+}
+
+napi_value OpenPsdFile(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "openPsdFile(fd) requires 1 arg");
+    }
+    int32_t fd = -1;
+    if (napi_get_value_int32(env, argv[0], &fd) != napi_ok || fd < 0) {
+        return makeError(env, kErrBadParam, "openPsdFile: invalid fd");
+    }
+    napi_value promise = nullptr;
+    napi_deferred deferred = nullptr;
+    napi_create_promise(env, &deferred, &promise);
+
+    auto* ctx = new OpenCtx();
+    ctx->deferred = deferred;
+    napi_value fn = nullptr;
+    napi_value name = nullptr;
+    napi_create_string_utf8(env, "psdDone", NAPI_AUTO_LENGTH, &name);
+    napi_create_function(env, "onPsdDone", NAPI_AUTO_LENGTH, noopJsCallback, nullptr, &fn);
+    napi_status st = napi_create_threadsafe_function(env, fn, nullptr, name, 4, 1, ctx,
+                                                     finalizeOpenCtx, ctx, psdDoneJsCallback,
+                                                     &ctx->tsfn);
+    if (st != napi_ok) {
+        finalizeOpenCtx(env, ctx, nullptr);
+        napi_resolve_deferred(env, deferred, makeError(env, kErrInternal, "create tsfn failed"));
+        return promise;
+    }
+    // 与图片导入互斥（共用 import 状态）
+    {
+        auto& e = Engine::get();
+        std::lock_guard<std::mutex> lk(e.import.mtx);
+        if (e.import.running) {
+            close(fd);
+            napi_resolve_deferred(env, deferred,
+                                  makeError(env, kErrBusy, "another import is running"));
+            napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);
+            return promise;
+        }
+        e.import.cancel = false;
+        e.import.progress = 0.0;
+        e.import.running = true;
+    }
+    std::thread([fd, tsfn = ctx->tsfn]() {
+        auto* payload = new PsdPayload();
+        std::string err;
+        payload->ok = io::importPsd(fd, &payload->width, &payload->height, &payload->notes, err);
+        if (!payload->ok) {
+            payload->error = err;
+        }
+        auto& e = Engine::get();
+        {
+            std::lock_guard<std::mutex> lk(e.import.mtx);
+            e.import.running = false;
+        }
+        napi_call_threadsafe_function(tsfn, payload, napi_tsfn_nonblocking);
+    }).detach();
+    return promise;
+}
+
+// ---------- 视口 ----------
 
 // ---------- 视口 ----------
 

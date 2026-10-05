@@ -2,7 +2,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
-import { CompositorEngine, LayerDTO, OpenFileData, PixelTestData, ViewportData } from 'core';
+import { CompositorEngine, LayerDTO, OpenFileData, PixelTestData, PsdOpenData, ViewportData } from 'core';
 
 const TAG: string = '[Montage.M2]';
 
@@ -39,7 +39,7 @@ struct Index {
   private engine: CompositorEngine = new CompositorEngine();
   private xcController: XComponentController = new XComponentController();
   private statsTimer: number = -1;
-  private docOpen: boolean = false;
+  @State docOpen: boolean = false;
   private fittedOnce: boolean = false;
   private pinchActive: boolean = false;
   private pinchBaseZoom: number = 1;
@@ -202,7 +202,8 @@ struct Index {
     hilog.info(0x4D30, TAG, 'axis x=%{public}f y=%{public}f raw=%{public}f step=%{public}f',
       e.x, e.y, e.scrollStep, step);
     const k = this.pxPerVp();
-    const factor = Math.pow(1.1, -step);  // 滚轮向前（step<0）= 放大
+    // M2.5 用户实证：-step 时两方向都缩小（OHOS scrollStep 向上为正）→ 翻转为 +step
+    const factor = Math.pow(1.1, step);  // 滚轮向前（step>0）= 放大
     const ax = this.panX + (e.x * k) / this.zoom;
     const ay = this.panY + (e.y * k) / this.zoom;
     const z = this.clampZoom(this.zoom * factor);
@@ -253,15 +254,45 @@ struct Index {
   private onOpenImage(): void {
     const opt = new picker.DocumentSelectOptions();
     opt.maxSelectNumber = 1;
-    opt.fileSuffixFilters = ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'];
+    // M2.5 实测：fileSuffixFilters 传 .psd 时列表异常为空（过滤实现疑似仅认首个图片类后缀），
+    // 改为不过滤 + 扩展名分发
+    // 用户测试文件所在目录（picker 直达）
+    opt.defaultFilePathUri = 'file://docs/storage/Users/currentUser/Download/com.huawei.hmos.browser';
     const dp = new picker.DocumentViewPicker();
     dp.select(opt).then((uris: string[]): void => {
       if (uris.length < 1) {
         return;
       }
-      this.openByUri(uris[0]);
+      const uri = uris[0].toLowerCase();
+      if (uri.endsWith('.psd')) {
+        this.openPsdByUri(uris[0]);
+      } else {
+        this.openByUri(uris[0]);
+      }
     }).catch((e: BusinessError): void => {
       this.log(`选择文件失败: ${e.code} ${e.message}`);
+    });
+  }
+
+  private openPsdByUri(uri: string): void {
+    const f = fs.openSync(uri, fs.OpenMode.READ_ONLY);
+    this.log(`打开 PSD fd=${f.fd}`);
+    this.importing = true;
+    this.engine.openPsdFile(f.fd).then((d: PsdOpenData): void => {
+      this.importing = false;
+      this.docW = d.width;
+      this.docH = d.height;
+      this.docOpen = true;
+      this.fittedOnce = false;
+      this.log(`PSD 打开完成 ${d.width}x${d.height}，${d.notes.length} 条提示，自动适配`);
+      this.refreshLayers();
+      for (let i = 0; i < d.notes.length && i < 8; i++) {
+        this.log(`提示: ${d.notes[i]}`);
+      }
+      this.tryFit();
+    }).catch((e: BusinessError): void => {
+      this.importing = false;
+      this.log(`PSD 打开失败: ${e.message}`);
     });
   }
 

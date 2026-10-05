@@ -9,6 +9,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"newDocument", nullptr, montage::bridge::NewDocument, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"closeDocument", nullptr, montage::bridge::CloseDocument, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"openFileFromFd", nullptr, montage::bridge::OpenFileFromFd, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"openPsdFile", nullptr, montage::bridge::OpenPsdFile, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setViewport", nullptr, montage::bridge::SetViewport, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"fitToWindow", nullptr, montage::bridge::FitToWindow, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"addLayer", nullptr, montage::bridge::AddLayer, nullptr, nullptr, nullptr, napi_default, nullptr},
