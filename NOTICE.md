@@ -6,7 +6,7 @@
 
 **Montage（蒙太奇）**——为鸿蒙平台打造的 Photoshop 级开源替代软件。上游 Compositor（robbietilton/Compositor，macOS 开源图像编辑器）仅作为参考实现与脚手架；文件互换以 **PSD 为中心**。
 
-- GitHub：`github.com/SYTKILLER/montage`（Public，2026-10-05 建仓）
+- GitHub：`github.com/SYTKILLER/Montage`（Public，2026-10-05 建仓并推送）
 - bundleName：`com.sytkiller.montage`；应用名：Montage
 - 自有工程格式：`.montage` 包（manifest.json + 每层 PNG），格式标识 `com.sytkiller.montage.project`
 - 基线：API 24（6.1.1(24)），目标 2in1/鸿蒙 PC（自由窗口），开发环境 = 模拟器 `Huawei_2in1_Foldable`（暂无 PC 真机）
@@ -29,7 +29,9 @@
 
 ## 遗留决策 / 待办
 
-- 05 层四项待确认：chrome 固定深色？图标缺口自绘豁免（套索/渐变/形状，sys.symbol 无对应，需用户豁免红线）？v1 单文档？滚轮直接缩放？
+- ~~05 层四项~~ → **已定案（2026-10-05，D5.1–D5.4）**：主题三态自选（深色/浅色/跟随系统，否决固定深色）；图标缺口自绘豁免；v1 单文档；滚轮直接缩放
+- **图标红线例外登记（2026-10-05 用户批准）**：套索/渐变/通用形状/光标徽标等专业工具图标在 sys.symbol 无对应，允许自绘 SVG（media 资源）；其余图标一律 SymbolGlyph
+- 下一步：06 功能映射矩阵 或直接开工 M0 技术尖刺
 - M0 开工前置：无（模拟器已就绪）
 
 ## 约定
