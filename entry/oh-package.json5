@@ -1,10 +1,11 @@
 {
   "name": "entry",
   "version": "1.0.0",
-  "description": "Please describe the basic information.",
+  "description": "Montage entry HAP (UI shell).",
   "main": "",
   "author": "",
   "license": "",
-  "dependencies": {}
+  "dependencies": {
+    "core": "file:../core"
+  }
 }
-

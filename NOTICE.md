@@ -24,7 +24,7 @@
 
 ## 关键决策索引（截至 2026-10-05）
 
-- **架构**：ArkTS UI + C++ 引擎（compositor HAR）；文档模型住 C++；四线程模型；typed NAPI 命令面 + 版本号事件面；单 HAP + 多 HAR（HAR native 打包 = M0 验证项）
+- **架构**：ArkTS UI + C++ 引擎（compositor HAR）；文档模型住 C++；四线程模型；typed NAPI 命令面 + 版本号事件面；单 HAP + 多 HAR（**HAR native 打包已 M0 实证**）
 - **像素**：全图层 256px 稀疏瓦片（TileGrid，不可变 + shared_ptr 快照共享撤销）；PixelSource 抽象；PixelMap 仅 IO 边界；导入 = 分带区域解码 + RAII Guard
 - **选区**：8-bit 软选区掩码主表示；蚂蚁线 = Marching Squares（命中绝不走轮廓几何）
 - **渲染**：Native XComponent + GLES 3.0；视口空间每层两趟（assemble+blend，ping-pong acc，acc 优先 RGBA16F）；23 混合模式每模式独立 program；覆盖层分工 = GL 像素真相 + ArkTS Canvas 几何交互；CPU 导出合成器必需，实时 CPU 兜底不做；色彩固定 sRGB 非线性
@@ -35,8 +35,15 @@
 
 - ~~05 层四项~~ → **已定案（2026-10-05，D5.1–D5.4）**：主题三态自选（深色/浅色/跟随系统，否决固定深色）；图标缺口自绘豁免；v1 单文档；滚轮直接缩放
 - **图标红线例外登记（2026-10-05 用户批准）**：套索/渐变/通用形状/光标徽标等专业工具图标在 sys.symbol 无对应，允许自绘 SVG（media 资源）；其余图标一律 SymbolGlyph
-- 下一步：06 功能映射矩阵 或直接开工 M0 技术尖刺
-- M0 开工前置：无（模拟器已就绪）
+- **M0 技术尖刺已完成（2026-10-05）**：HAR native 打包 ✅ / XComponent+EGL 清屏 ✅ / NativeVsync 60fps（实测 59.1）✅ / NAPI 双向通路（命令往返 + 版本回调）✅ / 像素指针读写 ✅（DMA+共享内存双通过、PixelMap 跨桥成功）。实证修订见 01 文档 §10 D6
+- 下一步：06 功能映射矩阵 或直接开工 M1（打开浏览）
+- **待用户决策：调试签名材料**——`~/.ohos/config` 现有 profile 均绑定他项目 bundleName，Montage 真机调试/发版前需在 DevEco 里自动生成 com.sytkiller.montage 专属签名（用户登录 AGC 操作；模拟器当前免签名不受影响）
+
+## 项目坑（按日期追加）
+
+- **2026-10-05（M0）模拟器是 x86_64 镜像**：abiFilters 必须含 x86_64（已配 arm64-v8a + x86_64 双 ABI）；只配 arm64 装包报 9568347 ABI 不匹配。
+- **2026-10-05（M0）OH_NativeVSync 回调不在创建线程**（模拟器实证，两线程 id 不同）：GL 上下文在首帧回调线程惰性 makeCurrent（`render_loop.cpp` ensureCurrent），初始化线程不保 current，GL 销毁也在回调线程做。
+- **2026-10-05（M0）模拟器免签名**：调试镜像 `hdc install` 接受未签名 HAP；真机强制 AGC 签名（见上"待用户决策"）。
 
 ## 约定
 

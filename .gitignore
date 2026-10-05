@@ -12,6 +12,8 @@
 /.appanalyzer
 # Montage 立项补充（开发规范 §9.2：原始源工程不入库）
 docs/10-源码仓库/
+# 排障临时产物（模拟器截图等，用完即删）
+/.debug
 /.zcode
 /.claude
 /Backup

@@ -37,6 +37,18 @@
           ]
         }
       ]
+    },
+    {
+      "name": "core",
+      "srcPath": "./core",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
     }
   ]
 }

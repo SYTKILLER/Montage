@@ -1,0 +1,9 @@
+{
+  "name": "core",
+  "version": "1.0.0",
+  "description": "Montage compositor engine: C++ native engine + ArkTS typed bridge.",
+  "main": "Index.ets",
+  "author": "",
+  "license": "",
+  "dependencies": {}
+}
