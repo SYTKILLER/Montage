@@ -11,6 +11,10 @@
 - 自有工程格式：`.montage` 包（manifest.json + 每层 PNG），格式标识 `com.sytkiller.montage.project`
 - 基线：API 24（6.1.1(24)），目标 2in1/鸿蒙 PC（自由窗口），开发环境 = 模拟器 `Huawei_2in1_Foldable`（暂无 PC 真机）
 
+## 新会话开工流程（规定动作）
+
+1. 读本文件（状态快照）→ 2. 读 `docs/README.md` → 3. 写代码前读工作区 `D:\HarmonyOS_Develop\docs\开发规范.md` + `踩坑记录汇总.md` → 4. 方案细节进 `docs/40-方案设计/`（01–05 已定案）→ 5. API 结论一律过本地 SDK 核验（官方助手曾答错两处，见 `docs/30-移植问答/Q&A 1-13 决策整理.md` §2）→ 6. 改完跑 hvigor 门禁、提交推送。
+
 ## 必读文档（编码前）
 
 1. `D:\HarmonyOS_Develop\docs\开发规范.md` + `D:\HarmonyOS_Develop\docs\踩坑记录汇总.md`（工作区强制基线）
