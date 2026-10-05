@@ -7,7 +7,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(compositor SHARED
         bridge/napi_module.cpp
         bridge/engine_bridge.cpp
+        engine/document.cpp
+        engine/engine.cpp
+        io/image_import.cpp
         render/render_loop.cpp
+        render/tile_renderer.cpp
         tiles/pixel_probe.cpp)
 
 target_include_directories(compositor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -18,5 +22,6 @@ target_link_libraries(compositor PUBLIC
         libnative_window.so
         libnative_vsync.so
         libpixelmap.so
+        libimage_source.so
         libEGL.so
         libGLESv3.so)

@@ -10,10 +10,28 @@ export interface EngineStats {
   bufferWidth: number;
   bufferHeight: number;
   docRevision: number;
-  docOpen: boolean;
+  docWidth: number;
+  docHeight: number;
+  zoom: number;
+  panX: number;
+  panY: number;
+  importRunning: boolean;
+  importProgress: number;
   renderRunning: boolean;
   lastError: string;
-  callbackThread: string;
+}
+
+/** 视口（pan = 视口左上角文档坐标，doc px）。 */
+export interface ViewportData {
+  zoom: number;
+  panX: number;
+  panY: number;
+}
+
+/** 导入完成结果（openFileFromFd 的 data）。 */
+export interface OpenFileData {
+  width: number;
+  height: number;
 }
 
 /** 单个分配器探针结果（M0 像素实测）。 */

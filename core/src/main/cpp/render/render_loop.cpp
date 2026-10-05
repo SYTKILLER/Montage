@@ -1,12 +1,13 @@
 #include "render/render_loop.h"
 
-#include <chrono>
 #include <cstring>
 #include <sstream>
 #include <thread>
 
 #include <EGL/eglext.h>
 #include <hilog/log.h>
+
+#include "engine/engine.h"
 
 namespace montage {
 namespace {
@@ -36,6 +37,7 @@ bool RenderLoop::start(uint64_t surfaceId, std::string* errorOut) {
     stop_.store(false);
     running_.store(false);
     glReleased_.store(false);
+    framePending_.store(false);
     {
         std::lock_guard<std::mutex> initLk(initMtx_);
         initDone_ = false;
@@ -84,6 +86,26 @@ RenderLoop::Snapshot RenderLoop::snapshot() const {
     s.lastError = lastError_;
     s.callbackThread = callbackThread_;
     return s;
+}
+
+void RenderLoop::wake() {
+    // M1 实证：跨线程 OH_NativeVSync_RequestFrame 注册会静默丢失（回调不触发，framePending
+    // 卡死吞掉后续请求）。帧循环改为回调线程内自续帧（03 §2 的"空闲停请求"降级为"空闲跳绘"，
+    // LTPO 停帧留真机阶段经 SurfaceHolder 生命周期/降频实现），wake 因此退化为空操作。
+}
+
+void RenderLoop::requestFrameLocked() {
+    if (vsync_ == nullptr || stop_.load()) {
+        return;
+    }
+    if (framePending_.exchange(true)) {
+        return;  // 已有一帧在途
+    }
+    const int rc = OH_NativeVSync_RequestFrame(vsync_, &RenderLoop::frameCallback, this);
+    if (rc != 0) {
+        framePending_.store(false);
+        OH_LOG_Print(kLogType, LOG_ERROR, kDomain, kTag, "RequestFrame rc=%{public}d", rc);
+    }
 }
 
 void RenderLoop::failInit(const std::string& reason) {
@@ -148,10 +170,6 @@ void RenderLoop::threadMain(uint64_t surfaceId) {
         failInit("OH_NativeVSync_Create failed");
         return;
     }
-    if (OH_NativeVSync_RequestFrame(vsync_, &RenderLoop::frameCallback, this) != 0) {
-        failInit("OH_NativeVSync_RequestFrame failed");
-        return;
-    }
 
     {
         std::lock_guard<std::mutex> lk(initMtx_);
@@ -169,20 +187,29 @@ void RenderLoop::threadMain(uint64_t surfaceId) {
         fpsWindowStart_ = std::chrono::steady_clock::now();
         lastError_.clear();
     }
+    requestFrameLocked();  // 拉起首帧（脏驱动，Engine 初值 needsRender=true）
 
     while (true) {
         std::unique_lock<std::mutex> lk(lifecycleMtx_);
-        if (stopCv_.wait_for(lk, std::chrono::milliseconds(500), [this] { return stop_.load(); })) {
+        bool stopNow = stopCv_.wait_for(lk, std::chrono::milliseconds(200),
+                                        [this] { return stop_.load(); });
+        if (stopNow) {
             break;
         }
+        lk.unlock();
+        // 帧调度由回调线程自续（见 wake 注释）；本循环只等待停止信号。
     }
-    // 等 vsync 回调侧完成 GL 清理（其落点线程可能不是本线程）
-    for (int i = 0; i < 200 && !glReleased_.load(); ++i) {
+    // 等 vsync 回调侧完成 GL 清理（其落点线程可能不是本线程）；空闲停帧时回调不再来，由本线程兜底
+    for (int i = 0; i < 20 && !glReleased_.load(); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    if (vsync_ != nullptr) {
-        OH_NativeVSync_Destroy(vsync_);
-        vsync_ = nullptr;
+    releaseGl();
+    {
+        std::lock_guard<std::mutex> lk(vsyncMtx_);
+        if (vsync_ != nullptr) {
+            OH_NativeVSync_Destroy(vsync_);
+            vsync_ = nullptr;
+        }
     }
     if (window_ != nullptr) {
         OH_NativeWindow_DestroyNativeWindow(window_);
@@ -216,27 +243,53 @@ bool RenderLoop::ensureCurrent() {
 }
 
 void RenderLoop::doFrame() {
+    framePending_.store(false);
     if (stop_.load()) {
         releaseGl();
         return;
     }
     if (!ensureCurrent()) {
-        OH_NativeVSync_RequestFrame(vsync_, &RenderLoop::frameCallback, this);
-        return;
+        return;  // 下次命令 wake 重试
     }
+    auto& e = Engine::get();
 
     int32_t h = 0;
     int32_t w = 0;
     if (OH_NativeWindow_NativeWindowHandleOpt(window_, GET_BUFFER_GEOMETRY, &h, &w) == 0 && w > 0 &&
         h > 0) {
-        glViewport(0, 0, w, h);
-        std::lock_guard<std::mutex> lk(statsMtx_);
-        width_ = w;
-        height_ = h;
+        bool sizeChanged = false;
+        {
+            std::lock_guard<std::mutex> lk(statsMtx_);
+            if (width_ != w || height_ != h) {
+                width_ = w;
+                height_ = h;
+                sizeChanged = true;
+            }
+        }
+        if (sizeChanged) {
+            e.needsRender.store(true);  // 尺寸变化强制重绘（视口重建）
+        }
     }
 
-    glClearColor(0.10f, 0.42f, 0.85f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
+    // 03 §2（M1 降级实现）：无脏跳过绘制与 swap；帧循环由回调线程自续（跨线程请求实证不可靠）。
+    // 空闲成本 = vsync 空回调，省电的"停请求"待真机阶段实现。
+    const bool dirty = e.needsRender.exchange(false);
+    if (!dirty) {
+        OH_NativeVSync_RequestFrame(vsync_, &RenderLoop::frameCallback, this);
+        return;
+    }
+
+    Document docSnap;
+    Viewport vp;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        docSnap = e.doc;  // shared_ptr 拷贝（02 §7 帧快照）
+        vp = e.viewport;
+    }
+
+    renderer_.ensureInit();
+    renderer_.drawFrame(docSnap, vp, w, h);
+
     if (eglSwapBuffers(display_, surface_) != EGL_TRUE) {
         std::lock_guard<std::mutex> lk(statsMtx_);
         lastError_ = "eglSwapBuffers failed";
@@ -252,14 +305,16 @@ void RenderLoop::doFrame() {
             fpsWindowStart_ = now;
         }
     }
-    OH_NativeVSync_RequestFrame(vsync_, &RenderLoop::frameCallback, this);
+    OH_NativeVSync_RequestFrame(vsync_, &RenderLoop::frameCallback, this);  // 回调线程内自续
 }
 
 void RenderLoop::releaseGl() {
     if (glReleased_.exchange(true)) {
         return;
     }
+    // 上下文若正被回调线程 current，由该线程调用本函数释放；空闲停帧时由 T2 兜底（未 current 可移动）
     eglMakeCurrent(display_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    renderer_.invalidate();
     if (surface_ != EGL_NO_SURFACE) {
         eglDestroySurface(display_, surface_);
         surface_ = EGL_NO_SURFACE;
@@ -269,7 +324,7 @@ void RenderLoop::releaseGl() {
         context_ = EGL_NO_CONTEXT;
     }
     currentThread_ = std::thread::id();
-    OH_LOG_Print(kLogType, LOG_INFO, kDomain, kTag, "GL released on frame thread");
+    OH_LOG_Print(kLogType, LOG_INFO, kDomain, kTag, "GL released");
 }
 
 }  // namespace montage

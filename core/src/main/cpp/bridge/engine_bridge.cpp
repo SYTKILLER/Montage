@@ -1,13 +1,15 @@
 #include "bridge/engine_bridge.h"
 
-#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unistd.h>
 
 #include <hilog/log.h>
 #include <multimedia/image_framework/image/pixelmap_native.h>
 
+#include "engine/engine.h"
+#include "io/image_import.h"
 #include "render/render_loop.h"
 #include "tiles/pixel_probe.h"
 
@@ -15,7 +17,6 @@ namespace montage {
 namespace bridge {
 namespace {
 
-constexpr LogType kLogType = LOG_APP;
 constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Engine";
 
@@ -24,44 +25,11 @@ enum : int32_t {
     kErrBadParam = 1,
     kErrSurface = 2,
     kErrInternal = 3,
+    kErrBusy = 4,
+    kErrNoDoc = 5,
 };
 
-struct Engine {
-    static Engine& get() {
-        static Engine inst;
-        return inst;
-    }
-
-    std::mutex mtx;
-    int64_t docRevision = 0;
-    bool docOpen = false;
-    int32_t docWidth = 0;
-    int32_t docHeight = 0;
-    napi_threadsafe_function revisionTsfn = nullptr;
-    RenderLoop render;
-
-    void bumpRevisionLocked() {
-        docRevision++;
-        if (revisionTsfn == nullptr) {
-            return;
-        }
-        void* payload = reinterpret_cast<void*>(static_cast<intptr_t>(docRevision));
-        napi_status st = napi_call_threadsafe_function(revisionTsfn, payload, napi_tsfn_nonblocking);
-        if (st != napi_ok) {
-            OH_LOG_Print(kLogType, LOG_WARN, kDomain, kTag, "revision tsfn call st=%{public}d",
-                         static_cast<int>(st));
-        }
-    }
-};
-
-void revisionJsCallback(napi_env env, napi_value jsCb, void* /*context*/, void* data) {
-    const int64_t rev = static_cast<int64_t>(reinterpret_cast<intptr_t>(data));
-    napi_value revValue = nullptr;
-    napi_value undefined = nullptr;
-    napi_create_int64(env, rev, &revValue);
-    napi_get_undefined(env, &undefined);
-    napi_call_function(env, undefined, jsCb, 1, &revValue, nullptr);
-}
+// ---------- Result 对象工具 ----------
 
 napi_value makeOk(napi_env env, napi_value data) {
     napi_value result = nullptr;
@@ -123,6 +91,67 @@ napi_value makeString(napi_env env, const std::string& v) {
     return out;
 }
 
+napi_value makeViewportData(napi_env env, const Viewport& vp) {
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "zoom", makeDouble(env, vp.zoom));
+    napi_set_named_property(env, data, "panX", makeDouble(env, vp.panX));
+    napi_set_named_property(env, data, "panY", makeDouble(env, vp.panY));
+    return data;
+}
+
+// ---------- 事件面 TSFN 回调 ----------
+
+void revisionJsCallback(napi_env env, napi_value jsCb, void* /*context*/, void* data) {
+    const int64_t rev = static_cast<int64_t>(reinterpret_cast<intptr_t>(data));
+    napi_value revValue = nullptr;
+    napi_value undefined = nullptr;
+    napi_create_int64(env, rev, &revValue);
+    napi_get_undefined(env, &undefined);
+    napi_call_function(env, undefined, jsCb, 1, &revValue, nullptr);
+}
+
+void progressJsCallback(napi_env env, napi_value jsCb, void* /*context*/, void* data) {
+    const double progress = static_cast<double>(reinterpret_cast<intptr_t>(data)) / 1000.0;
+    napi_value v = nullptr;
+    napi_value undefined = nullptr;
+    napi_create_double(env, progress, &v);
+    napi_get_undefined(env, &undefined);
+    napi_call_function(env, undefined, jsCb, 1, &v, nullptr);
+}
+
+// 导入完成 → resolve Promise（openFileFromFd 的 deferred 挂在 context 上）
+struct OpenCtx {
+    napi_deferred deferred = nullptr;
+    napi_threadsafe_function tsfn = nullptr;
+};
+
+void importDoneJsCallback(napi_env env, napi_value /*jsCb*/, void* context, void* data) {
+    auto* ctx = static_cast<OpenCtx*>(context);
+    auto* p = static_cast<io::ImportCompletion*>(data);
+    napi_value result;
+    if (p != nullptr && p->ok) {
+        napi_value d = nullptr;
+        napi_create_object(env, &d);
+        napi_set_named_property(env, d, "width", makeUint32(env, p->width));
+        napi_set_named_property(env, d, "height", makeUint32(env, p->height));
+        result = makeOk(env, d);
+    } else {
+        result = makeError(env, kErrInternal, p != nullptr ? std::string(p->error) : "import failed");
+    }
+    napi_resolve_deferred(env, ctx->deferred, result);
+    delete p;
+    napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);  // finalize 删 ctx
+}
+
+void finalizeOpenCtx(napi_env /*env*/, void* data, void* /*hint*/) {
+    delete static_cast<OpenCtx*>(data);
+}
+
+napi_value noopJsCallback(napi_env /*env*/, napi_callback_info /*info*/) {
+  return nullptr;
+}
+
 napi_value makeProbeObject(napi_env env, const tiles::ProbeResult& p) {
     napi_value obj = nullptr;
     napi_create_object(env, &obj);
@@ -149,7 +178,30 @@ struct PixelTestContext {
     tiles::ProbeHandle sample;
 };
 
+// 替换/登记 TSFN 的通用流程：创建 → 换入 Engine（旧的 release）
+napi_status bindTsfn(napi_env env, napi_callback_info info, const char* name, int32_t maxQueue,
+                     napi_threadsafe_function_call_js cb, napi_threadsafe_function* out) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return napi_invalid_arg;
+    }
+    napi_valuetype t = napi_undefined;
+    napi_typeof(env, argv[0], &t);
+    if (t != napi_function) {
+        return napi_invalid_arg;
+    }
+    napi_value resourceName = nullptr;
+    napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &resourceName);
+    napi_status st = napi_create_threadsafe_function(env, argv[0], nullptr, resourceName, maxQueue, 1,
+                                                     nullptr, nullptr, nullptr, cb, out);
+    return st;
+}
+
 }  // namespace
+
+// ---------- 会话 ----------
 
 napi_value NewDocument(napi_env env, napi_callback_info info) {
     size_t argc = 2;
@@ -165,34 +217,133 @@ napi_value NewDocument(napi_env env, napi_callback_info info) {
         return makeError(env, kErrBadParam, "newDocument: invalid size");
     }
     auto& e = Engine::get();
-    int64_t rev = 0;
+    io::cancelImageImport();
     {
-        std::lock_guard<std::mutex> lk(e.mtx);
-        e.docOpen = true;
-        e.docWidth = w;
-        e.docHeight = h;
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        e.doc = Document{};
+        e.doc.width = static_cast<uint32_t>(w);
+        e.doc.height = static_cast<uint32_t>(h);
+        e.doc.name = "Untitled";
+        e.viewport = Viewport{};
         e.bumpRevisionLocked();
-        rev = e.docRevision;
+        e.requestRender();
     }
-    napi_value data = nullptr;
-    napi_create_object(env, &data);
-    napi_set_named_property(env, data, "revision", makeDouble(env, static_cast<double>(rev)));
-    napi_set_named_property(env, data, "width", makeInt32(env, w));
-    napi_set_named_property(env, data, "height", makeInt32(env, h));
-    OH_LOG_Print(kLogType, LOG_INFO, kDomain, kTag, "newDocument %{public}dx%{public}d rev=%{public}lld",
-                 w, h, static_cast<long long>(rev));
-    return makeOk(env, data);
+    OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "newDocument %{public}dx%{public}d", w, h);
+    return makeOk(env, nullptr);
 }
 
 napi_value CloseDocument(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
+    io::cancelImageImport();
     {
-        std::lock_guard<std::mutex> lk(e.mtx);
-        e.docOpen = false;
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        e.doc = Document{};
+        e.viewport = Viewport{};
         e.bumpRevisionLocked();
+        e.requestRender();
     }
     return makeOk(env, nullptr);
 }
+
+// ---------- 导入 ----------
+
+napi_value OpenFileFromFd(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "openFileFromFd(fd) requires 1 arg");
+    }
+    int32_t fd = -1;
+    if (napi_get_value_int32(env, argv[0], &fd) != napi_ok || fd < 0) {
+        return makeError(env, kErrBadParam, "openFileFromFd: invalid fd");
+    }
+    napi_value promise = nullptr;
+    napi_deferred deferred = nullptr;
+    napi_create_promise(env, &deferred, &promise);
+
+    auto* ctx = new OpenCtx();
+    ctx->deferred = deferred;
+    napi_value fn = nullptr;
+    napi_value name = nullptr;
+    napi_create_string_utf8(env, "importDone", NAPI_AUTO_LENGTH, &name);
+    napi_create_function(env, "onImportDone", NAPI_AUTO_LENGTH, noopJsCallback, nullptr, &fn);
+    napi_status st = napi_create_threadsafe_function(env, fn, nullptr, name, 4, 1, ctx,
+                                                     finalizeOpenCtx, ctx, importDoneJsCallback,
+                                                     &ctx->tsfn);
+    if (st != napi_ok) {
+        finalizeOpenCtx(env, ctx, nullptr);
+        napi_resolve_deferred(env, deferred, makeError(env, kErrInternal, "create tsfn failed"));
+        return promise;
+    }
+    if (!io::startImageImport(fd, ctx->tsfn)) {
+        // fd 所有权已被 native 接管并关闭（忙路径）
+        napi_resolve_deferred(env, deferred, makeError(env, kErrBusy, "another import is running"));
+        napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);
+    }
+    return promise;
+}
+
+// ---------- 视口 ----------
+
+napi_value SetViewport(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 3) {
+        return makeError(env, kErrBadParam, "setViewport(zoom, panX, panY) requires 3 args");
+    }
+    double zoom = 0;
+    double panX = 0;
+    double panY = 0;
+    if (napi_get_value_double(env, argv[0], &zoom) != napi_ok ||
+        napi_get_value_double(env, argv[1], &panX) != napi_ok ||
+        napi_get_value_double(env, argv[2], &panY) != napi_ok) {
+        return makeError(env, kErrBadParam, "setViewport: numbers required");
+    }
+    auto& e = Engine::get();
+    Viewport vp;
+    vp.zoom = clampZoom(zoom);
+    vp.panX = panX;
+    vp.panY = panY;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        e.viewport = vp;
+        e.requestRender();
+    }
+    return makeOk(env, makeViewportData(env, vp));
+}
+
+napi_value FitToWindow(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "fitToWindow(canvasW, canvasH) requires 2 args");
+    }
+    double cw = 0;
+    double ch = 0;
+    if (napi_get_value_double(env, argv[0], &cw) != napi_ok ||
+        napi_get_value_double(env, argv[1], &ch) != napi_ok || cw <= 0 || ch <= 0) {
+        return makeError(env, kErrBadParam, "fitToWindow: invalid canvas size");
+    }
+    auto& e = Engine::get();
+    Viewport vp;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "fitToWindow: no document");
+        }
+        vp.zoom = clampZoom(std::min(cw / e.doc.width, ch / e.doc.height));
+        vp.panX = (static_cast<double>(e.doc.width) - cw / vp.zoom) / 2.0;
+        vp.panY = (static_cast<double>(e.doc.height) - ch / vp.zoom) / 2.0;
+        e.viewport = vp;
+        e.requestRender();
+    }
+    return makeOk(env, makeViewportData(env, vp));
+}
+
+// ---------- 渲染表面 ----------
 
 napi_value CreateSurface(napi_env env, napi_callback_info info) {
     size_t argc = 1;
@@ -215,10 +366,12 @@ napi_value CreateSurface(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     std::string err;
     if (!e.render.start(surfaceId, &err)) {
-        OH_LOG_Print(kLogType, LOG_ERROR, kDomain, kTag, "createSurface failed: %{public}s", err.c_str());
+        OH_LOG_Print(LOG_APP, LOG_ERROR, kDomain, kTag, "createSurface failed: %{public}s", err.c_str());
         return makeError(env, kErrSurface, err);
     }
-    OH_LOG_Print(kLogType, LOG_INFO, kDomain, kTag, "createSurface ok: %{public}s", buf);
+    // 表面就绪后按需出首帧
+    e.requestRender();
+    OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "createSurface ok: %{public}s", buf);
     return makeOk(env, nullptr);
 }
 
@@ -227,15 +380,28 @@ napi_value DestroySurface(napi_env env, napi_callback_info /*info*/) {
     return makeOk(env, nullptr);
 }
 
+// ---------- 状态 ----------
+
 napi_value GetStats(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
     const RenderLoop::Snapshot snap = e.render.snapshot();
+    Viewport vp;
     int64_t rev = 0;
-    bool open = false;
+    uint32_t dw = 0;
+    uint32_t dh = 0;
+    double progress = 0.0;
+    bool importing = false;
     {
-        std::lock_guard<std::mutex> lk(e.mtx);
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        vp = e.viewport;
         rev = e.docRevision;
-        open = e.docOpen;
+        dw = e.doc.width;
+        dh = e.doc.height;
+    }
+    {
+        std::lock_guard<std::mutex> lk(e.import.mtx);
+        progress = e.import.progress;
+        importing = e.import.running;
     }
     napi_value data = nullptr;
     napi_create_object(env, &data);
@@ -244,36 +410,28 @@ napi_value GetStats(napi_env env, napi_callback_info /*info*/) {
     napi_set_named_property(env, data, "bufferWidth", makeInt32(env, snap.width));
     napi_set_named_property(env, data, "bufferHeight", makeInt32(env, snap.height));
     napi_set_named_property(env, data, "docRevision", makeDouble(env, static_cast<double>(rev)));
-    napi_set_named_property(env, data, "docOpen", makeBool(env, open));
+    napi_set_named_property(env, data, "docWidth", makeUint32(env, dw));
+    napi_set_named_property(env, data, "docHeight", makeUint32(env, dh));
+    napi_set_named_property(env, data, "zoom", makeDouble(env, vp.zoom));
+    napi_set_named_property(env, data, "panX", makeDouble(env, vp.panX));
+    napi_set_named_property(env, data, "panY", makeDouble(env, vp.panY));
+    napi_set_named_property(env, data, "importRunning", makeBool(env, importing));
+    napi_set_named_property(env, data, "importProgress", makeDouble(env, progress));
     napi_set_named_property(env, data, "renderRunning", makeBool(env, snap.running));
     napi_set_named_property(env, data, "lastError", makeString(env, snap.lastError));
-    napi_set_named_property(env, data, "callbackThread", makeString(env, snap.callbackThread));
     return makeOk(env, data);
 }
 
+// ---------- 事件面 ----------
+
 napi_value OnRevisionChanged(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value argv[1] = {nullptr};
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (argc < 1) {
-        return makeError(env, kErrBadParam, "onRevisionChanged(callback) requires 1 arg");
-    }
-    napi_valuetype t = napi_undefined;
-    napi_typeof(env, argv[0], &t);
-    if (t != napi_function) {
-        return makeError(env, kErrBadParam, "onRevisionChanged: callback must be function");
+    napi_threadsafe_function tsfn = nullptr;
+    if (bindTsfn(env, info, "montageRevision", 32, revisionJsCallback, &tsfn) != napi_ok) {
+        return makeError(env, kErrBadParam, "onRevisionChanged(callback) requires function arg");
     }
     auto& e = Engine::get();
-    napi_threadsafe_function tsfn = nullptr;
-    napi_value resourceName = nullptr;
-    napi_create_string_utf8(env, "montageRevision", NAPI_AUTO_LENGTH, &resourceName);
-    napi_status st = napi_create_threadsafe_function(env, argv[0], nullptr, resourceName, 32, 1, nullptr,
-                                                     nullptr, nullptr, revisionJsCallback, &tsfn);
-    if (st != napi_ok) {
-        return makeError(env, kErrInternal, "create threadsafe function failed");
-    }
     {
-        std::lock_guard<std::mutex> lk(e.mtx);
+        std::lock_guard<std::mutex> lk(e.docMutex);
         if (e.revisionTsfn != nullptr) {
             napi_release_threadsafe_function(e.revisionTsfn, napi_tsfn_release);
         }
@@ -281,6 +439,24 @@ napi_value OnRevisionChanged(napi_env env, napi_callback_info info) {
     }
     return makeOk(env, nullptr);
 }
+
+napi_value OnImportProgress(napi_env env, napi_callback_info info) {
+    napi_threadsafe_function tsfn = nullptr;
+    if (bindTsfn(env, info, "montageImportProgress", 64, progressJsCallback, &tsfn) != napi_ok) {
+        return makeError(env, kErrBadParam, "onImportProgress(callback) requires function arg");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.progressTsfn != nullptr) {
+            napi_release_threadsafe_function(e.progressTsfn, napi_tsfn_release);
+        }
+        e.progressTsfn = tsfn;
+    }
+    return makeOk(env, nullptr);
+}
+
+// ---------- M0 像素测试（保留） ----------
 
 napi_value RunPixelTest(napi_env env, napi_callback_info /*info*/) {
     napi_value promise = nullptr;
@@ -311,9 +487,6 @@ napi_value RunPixelTest(napi_env env, napi_callback_info /*info*/) {
                     env, static_cast<OH_PixelmapNative*>(c->sample.pixelmap), &pmValue);
                 if (crc == IMAGE_SUCCESS && pmValue != nullptr) {
                     napi_set_named_property(env, dataObj, "samplePixelMap", pmValue);
-                } else {
-                    OH_LOG_Print(kLogType, LOG_WARN, kDomain, kTag,
-                                 "ConvertPixelmapNativeToNapi rc=%{public}d", static_cast<int>(crc));
                 }
             }
             tiles::ReleaseProbeHandle(c->sample);
@@ -335,14 +508,21 @@ napi_value RunPixelTest(napi_env env, napi_callback_info /*info*/) {
 
 napi_value Dispose(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
-    napi_threadsafe_function tsfn = nullptr;
+    io::cancelImageImport();
+    napi_threadsafe_function revision = nullptr;
+    napi_threadsafe_function progress = nullptr;
     {
-        std::lock_guard<std::mutex> lk(e.mtx);
-        tsfn = e.revisionTsfn;
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        revision = e.revisionTsfn;
         e.revisionTsfn = nullptr;
+        progress = e.progressTsfn;
+        e.progressTsfn = nullptr;
     }
-    if (tsfn != nullptr) {
-        napi_release_threadsafe_function(tsfn, napi_tsfn_release);
+    if (revision != nullptr) {
+        napi_release_threadsafe_function(revision, napi_tsfn_release);
+    }
+    if (progress != nullptr) {
+        napi_release_threadsafe_function(progress, napi_tsfn_release);
     }
     e.render.stop();
     return makeOk(env, nullptr);

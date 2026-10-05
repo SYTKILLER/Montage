@@ -1,11 +1,13 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
-import { EngineStats, PixelProbe, PixelTestData } from '../model/EngineTypes';
+import { EngineStats, OpenFileData, PixelProbe, PixelTestData, ViewportData } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
 
 type RevisionListener = (revision: number) => void;
+type ImportProgressListener = (progress: number) => void;
 
 interface EngineError {
   code: number;
@@ -53,6 +55,10 @@ function narrowResult(value: Object): EngineResult {
   return { ok: ok, data: data, error: error };
 }
 
+function narrowViewport(r: Record<string, Object>): ViewportData {
+  return { zoom: num(r, 'zoom'), panX: num(r, 'panX'), panY: num(r, 'panY') };
+}
+
 function narrowStats(r: Record<string, Object>): EngineStats {
   return {
     fps: num(r, 'fps'),
@@ -60,10 +66,15 @@ function narrowStats(r: Record<string, Object>): EngineStats {
     bufferWidth: num(r, 'bufferWidth'),
     bufferHeight: num(r, 'bufferHeight'),
     docRevision: num(r, 'docRevision'),
-    docOpen: boolOf(r, 'docOpen'),
+    docWidth: num(r, 'docWidth'),
+    docHeight: num(r, 'docHeight'),
+    zoom: num(r, 'zoom'),
+    panX: num(r, 'panX'),
+    panY: num(r, 'panY'),
+    importRunning: boolOf(r, 'importRunning'),
+    importProgress: num(r, 'importProgress'),
     renderRunning: boolOf(r, 'renderRunning'),
     lastError: str(r, 'lastError'),
-    callbackThread: str(r, 'callbackThread'),
   };
 }
 
@@ -96,11 +107,12 @@ function narrowPixelData(r: Record<string, Object>): PixelTestData {
 }
 
 /**
- * Compositor 引擎 ArkTS 门面：typed 命令面 + AppStorage 版本号事件面。
- * 页面侧通过 @StorageProp('docVersion') 建立刷新依赖（build 内必须真实读取）。
+ * Compositor 引擎 ArkTS 门面：typed 命令面 + AppStorage 事件面（docVersion/importProgress）。
+ * 页面侧通过 @StorageProp 建立刷新依赖（build 内必须真实读取）。
  */
 export class CompositorEngine {
   private revisionBound: boolean = false;
+  private importBound: boolean = false;
 
   bindRevisionListener(listener?: RevisionListener): void {
     if (this.revisionBound) {
@@ -114,6 +126,20 @@ export class CompositorEngine {
     });
     this.revisionBound = true;
     hilog.info(DOMAIN, TAG, 'revision listener bound');
+  }
+
+  bindImportListener(listener?: ImportProgressListener): void {
+    if (this.importBound) {
+      return;
+    }
+    native.onImportProgress((progress: number): void => {
+      AppStorage.setOrCreate<number>('importProgress', progress);
+      if (listener !== undefined) {
+        listener(progress);
+      }
+    });
+    this.importBound = true;
+    hilog.info(DOMAIN, TAG, 'import progress listener bound');
   }
 
   newDocument(width: number, height: number): boolean {
@@ -132,6 +158,41 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
     }
     return r.ok;
+  }
+
+  /**
+   * 导入图片。fd 所有权一律移交 native（含失败路径），调用方不得再 close。
+   */
+  openFileFromFd(fd: number): Promise<OpenFileData> {
+    return new Promise<OpenFileData>((resolve: (d: OpenFileData) => void,
+      reject: (e: Error) => void) => {
+      (native.openFileFromFd(fd) as Promise<Object>).then((value: Object): void => {
+        const r = narrowResult(value);
+        if (r.ok && r.data !== null) {
+          resolve({ width: num(r.data, 'width'), height: num(r.data, 'height') });
+        } else {
+          reject(new Error(r.error !== null ? r.error.message : 'openFileFromFd failed'));
+        }
+      }).catch((e: BusinessError): void => {
+        reject(new Error(`openFileFromFd: ${e.message}`));
+      });
+    });
+  }
+
+  setViewport(zoom: number, panX: number, panY: number): ViewportData | null {
+    const r = narrowResult(native.setViewport(zoom, panX, panY) as Object);
+    if (!r.ok || r.data === null) {
+      return null;
+    }
+    return narrowViewport(r.data);
+  }
+
+  fitToWindow(canvasW: number, canvasH: number): ViewportData | null {
+    const r = narrowResult(native.fitToWindow(canvasW, canvasH) as Object);
+    if (!r.ok || r.data === null) {
+      return null;
+    }
+    return narrowViewport(r.data);
   }
 
   createSurface(surfaceId: string): boolean {
@@ -159,7 +220,9 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return {
         fps: 0, frames: 0, bufferWidth: 0, bufferHeight: 0, docRevision: 0,
-        docOpen: false, renderRunning: false, lastError: 'getStats failed', callbackThread: '',
+        docWidth: 0, docHeight: 0, zoom: 1, panX: 0, panY: 0,
+        importRunning: false, importProgress: 0, renderRunning: false,
+        lastError: 'getStats failed',
       };
     }
     return narrowStats(r.data);
@@ -179,6 +242,7 @@ export class CompositorEngine {
   dispose(): void {
     native.dispose();
     this.revisionBound = false;
+    this.importBound = false;
     hilog.info(DOMAIN, TAG, 'disposed');
   }
 }
