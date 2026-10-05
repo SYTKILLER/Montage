@@ -12,6 +12,11 @@
 /.appanalyzer
 # Montage 立项补充（开发规范 §9.2：原始源工程不入库）
 docs/10-源码仓库/
+# 仓库内容红线（2026-10-05）：只含代码/应用资源/README/LICENSE，开发文档与 AGENTS 一律本地
+/docs/
+/NOTICE.md
+/DEVELOPMENT_LOG.md
+/AGENTS.md
 # 排障临时产物（模拟器截图等，用完即删）
 /.debug
 /.zcode
