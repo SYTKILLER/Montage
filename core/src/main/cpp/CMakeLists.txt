@@ -12,6 +12,7 @@ add_library(compositor SHARED
         engine/engine.cpp
         engine/history.cpp
         io/image_import.cpp
+        io/project_save.cpp
         io/psd/psd_reader.cpp
         io/psd/psd_import.cpp
         render/render_loop.cpp
@@ -28,4 +29,5 @@ target_link_libraries(compositor PUBLIC
         libpixelmap.so
         libimage_source.so
         libEGL.so
-        libGLESv3.so)
+        libGLESv3.so
+        z)

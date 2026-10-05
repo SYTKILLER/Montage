@@ -1,6 +1,7 @@
 #include "bridge/engine_bridge.h"
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -12,6 +13,7 @@
 
 #include "engine/engine.h"
 #include "io/image_import.h"
+#include "io/project_save.h"
 #include "io/psd/psd_import.h"
 #include "render/render_loop.h"
 #include "tiles/pixel_probe.h"
@@ -384,7 +386,83 @@ napi_value OpenPsdFile(napi_env env, napi_callback_info info) {
     return promise;
 }
 
-// ---------- 视口 ----------
+// ---------- 工程保存（04 §1.2 M4b） ----------
+
+struct SavePayload {
+    bool ok = false;
+    size_t layers = 0;
+    uint64_t bytes = 0;
+    char error[192] = {0};
+};
+
+void saveDoneJsCallback(napi_env env, napi_value /*jsCb*/, void* context, void* data) {
+    auto* ctx = static_cast<OpenCtx*>(context);
+    auto* p = static_cast<SavePayload*>(data);
+    napi_value result;
+    if (p != nullptr && p->ok) {
+        napi_value d = nullptr;
+        napi_create_object(env, &d);
+        napi_set_named_property(env, d, "layers", makeUint32(env, static_cast<uint32_t>(p->layers)));
+        napi_set_named_property(env, d, "bytes", makeDouble(env, static_cast<double>(p->bytes)));
+        result = makeOk(env, d);
+    } else {
+        result = makeError(env, kErrInternal, p != nullptr ? std::string(p->error) : "save failed");
+    }
+    delete p;
+    napi_resolve_deferred(env, ctx->deferred, result);
+    napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);
+}
+
+napi_value SaveProject(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "saveProject(fd) requires 1 arg");
+    }
+    int32_t fd = -1;
+    if (napi_get_value_int32(env, argv[0], &fd) != napi_ok || fd < 0) {
+        return makeError(env, kErrBadParam, "saveProject: invalid fd");
+    }
+    {
+        auto& e = Engine::get();
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            close(fd);
+            return makeError(env, kErrNoDoc, "saveProject: no document");
+        }
+    }
+    napi_value promise = nullptr;
+    napi_deferred deferred = nullptr;
+    napi_create_promise(env, &deferred, &promise);
+
+    auto* ctx = new OpenCtx();
+    ctx->deferred = deferred;
+    napi_value fn = nullptr;
+    napi_value name = nullptr;
+    napi_create_string_utf8(env, "saveDone", NAPI_AUTO_LENGTH, &name);
+    napi_create_function(env, "onSaveDone", NAPI_AUTO_LENGTH, noopJsCallback, nullptr, &fn);
+    napi_status st = napi_create_threadsafe_function(env, fn, nullptr, name, 4, 1, ctx,
+                                                     finalizeOpenCtx, ctx, saveDoneJsCallback,
+                                                     &ctx->tsfn);
+    if (st != napi_ok) {
+        close(fd);
+        finalizeOpenCtx(env, ctx, nullptr);
+        napi_resolve_deferred(env, deferred, makeError(env, kErrInternal, "create tsfn failed"));
+        return promise;
+    }
+    // saveProject 全路径接管 fd（成功/失败都关闭）
+    std::thread([fd, tsfn = ctx->tsfn]() {
+        auto* payload = new SavePayload();
+        std::string err;
+        payload->ok = io::saveProject(fd, &payload->layers, &payload->bytes, err);
+        if (!payload->ok) {
+            std::strncpy(payload->error, err.c_str(), sizeof(payload->error) - 1);
+        }
+        napi_call_threadsafe_function(tsfn, payload, napi_tsfn_nonblocking);
+    }).detach();
+    return promise;
+}
 
 // ---------- 视口 ----------
 

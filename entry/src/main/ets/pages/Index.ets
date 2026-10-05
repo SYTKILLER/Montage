@@ -2,7 +2,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
-import { CompositorEngine, LayerDTO, OpenFileData, PixelTestData, PsdOpenData, ViewportData } from 'core';
+import { CompositorEngine, LayerDTO, OpenFileData, PixelTestData, PsdOpenData, SaveProjectData, ViewportData } from 'core';
 
 const TAG: string = '[Montage.M2]';
 
@@ -47,6 +47,8 @@ struct Index {
   @State canUndo: boolean = false;
   @State canRedo: boolean = false;
   @State painting: boolean = false;
+  @State saving: boolean = false;
+  private saveUri: string = '';  // 已关联工程包 URI（保存直达覆写，04 §2）
   @State pixelText: string = '未运行';
   @State statsText: string = '等待渲染…';
   @State logLines: string[] = [];
@@ -172,6 +174,7 @@ struct Index {
     this.docW = 4096;
     this.docH = 4096;
     this.fittedOnce = false;
+    this.saveUri = '';  // 换文档即解除旧包关联
     this.log(`新建空文档 4096x4096: ${ok ? '成功' : '失败'}`);
     this.tryFit();
   }
@@ -295,6 +298,7 @@ struct Index {
       this.docH = d.height;
       this.docOpen = true;
       this.fittedOnce = false;
+      this.saveUri = '';  // 换文档即解除旧包关联
       this.log(`PSD 打开完成 ${d.width}x${d.height}，${d.notes.length} 条提示，自动适配`);
       this.refreshLayers();
       for (let i = 0; i < d.notes.length && i < 8; i++) {
@@ -304,6 +308,48 @@ struct Index {
     }).catch((e: BusinessError): void => {
       this.importing = false;
       this.log(`PSD 打开失败: ${e.message}`);
+    });
+  }
+
+  // ---------- 工程保存（M4b） ----------
+
+  private doSaveProject(): void {
+    if (!this.docOpen) {
+      this.log('无文档可保存');
+      return;
+    }
+    if (this.saving) {
+      return;
+    }
+    if (this.saveUri !== '') {
+      this.writeProjectTo(this.saveUri);
+      return;
+    }
+    const opt = new picker.DocumentSaveOptions();
+    opt.newFileNames = ['未命名.montage'];
+    const dp = new picker.DocumentViewPicker();
+    dp.save(opt).then((uris: string[]): void => {
+      if (uris.length < 1) {
+        return;
+      }
+      this.saveUri = uris[0];
+      this.writeProjectTo(uris[0]);
+    }).catch((e: BusinessError): void => {
+      this.log(`保存选择失败: ${e.code} ${e.message}`);
+    });
+  }
+
+  private writeProjectTo(uri: string): void {
+    this.saving = true;
+    // TRUNC 清空旧包再整包重写（非原子替换，O4-7 登记）；fd 移交 native（全路径关闭）
+    const f = fs.openSync(uri, fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
+    this.log(`保存工程 fd=${f.fd} → ${uri}`);
+    this.engine.saveProject(f.fd).then((d: SaveProjectData): void => {
+      this.saving = false;
+      this.log(`工程已保存：${d.layers} 层，${d.bytes} 字节`);
+    }).catch((e: BusinessError): void => {
+      this.saving = false;
+      this.log(`保存失败: ${e.message}`);
     });
   }
 
@@ -369,23 +415,6 @@ struct Index {
       this.importing = false;
       this.docOpen = true;
       this.log(`测试图层导入完成 ${Date.now() - t0}ms（含透明区，验证混合）`);
-      // M3 链路自检：中心画一笔（begin→continue×20→end）验证 dab/合成/提交/撤销
-      this.log('测试笔画开始');
-      this.pushBrushSettings();
-      const c2: number[] = this.screenToDoc(this.canvasVpW / 2, this.canvasVpH / 2);
-      this.log(`测试笔画 @doc(${c2[0].toFixed(0)},${c2[1].toFixed(0)})`);
-      this.engine.beginStroke(c2[0], c2[1]);
-      this.log('笔画已开始');
-      for (let i = 1; i <= 20; i++) {
-        this.engine.continueStroke(c2[0] + i * 8, c2[1] + i * 5);
-      }
-      this.engine.endStroke();
-      this.log('笔画已提交');
-      // M4a 自动撤销验证：1.5s 后 undo，docVersion 应回退
-      setTimeout((): void => {
-        const ok: boolean = this.engine.undo();
-        this.log(`自动撤销: ${ok ? '执行' : '无可撤销'}`);
-      }, 1500);
       this.tryFit();
     } catch (e) {
       this.importing = false;
@@ -393,18 +422,6 @@ struct Index {
       this.log(`测试图层流程失败: ${err.code} ${err.message}`);
     }
     this.generating = false;
-  }
-
-  // 引擎核心链路自检：doc 中心画一笔（begin→continue→end，不依赖注入 touch 流）
-  private doTestStroke(): void {
-    this.pushBrushSettings();
-    const c: number[] = this.screenToDoc(this.canvasVpW / 2, this.canvasVpH / 2);
-    this.log(`测试笔画 @doc(${c[0].toFixed(0)},${c[1].toFixed(0)})`);
-    this.engine.beginStroke(c[0], c[1]);
-    for (let i = 1; i <= 20; i++) {
-      this.engine.continueStroke(c[0] + i * 8, c[1] + i * 5);
-    }
-    this.engine.endStroke();
   }
 
   private doPixelTest(): void {
@@ -555,6 +572,8 @@ struct Index {
             Button('缩小').onClick((): void => this.doZoomStep(0.8)).margin({ left: 8 })
             Button('撤销').onClick((): void => this.doUndo()).margin({ left: 8 }).opacity(this.canUndo ? 1 : 0.4)
             Button('重做').onClick((): void => this.doRedo()).margin({ left: 8 }).opacity(this.canRedo ? 1 : 0.4)
+            Button('保存').onClick((): void => this.doSaveProject()).margin({ left: 8 })
+              .opacity(this.docOpen ? 1 : 0.4)
           }
           .width('100%')
 

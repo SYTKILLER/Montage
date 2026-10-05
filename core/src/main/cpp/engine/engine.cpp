@@ -68,9 +68,6 @@ void Engine::strokeThreadMain() {
         }
         {
             std::lock_guard<std::mutex> lk(docMutex);
-            OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Brush",
-                         "thread batch n=%{public}zu ending=%{public}d draft=%{public}d",
-                         batch.size(), ending ? 1 : 0, draft != nullptr ? 1 : 0);
             if (draft != nullptr) {
                 for (const StrokePoint& p : batch) {
                     if (p.end) {

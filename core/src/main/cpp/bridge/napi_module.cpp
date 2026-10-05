@@ -10,6 +10,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"closeDocument", nullptr, montage::bridge::CloseDocument, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"openFileFromFd", nullptr, montage::bridge::OpenFileFromFd, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"openPsdFile", nullptr, montage::bridge::OpenPsdFile, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"saveProject", nullptr, montage::bridge::SaveProject, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setBrushSettings", nullptr, montage::bridge::SetBrushSettings, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"beginStroke", nullptr, montage::bridge::BeginStroke, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"continueStroke", nullptr, montage::bridge::ContinueStroke, nullptr, nullptr, nullptr, napi_default, nullptr},

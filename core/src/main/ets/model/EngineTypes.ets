@@ -59,6 +59,12 @@ export interface PsdOpenData {
   notes: string[];
 }
 
+/** 工程保存结果（saveProject 的 data，M4b）。 */
+export interface SaveProjectData {
+  layers: number;
+  bytes: number;
+}
+
 /** 缩略图结果（getLayerThumbnail 的 data；O3 跨桥实测）。 */
 export interface LayerThumb {
   pixelMap: Object | null;

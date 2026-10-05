@@ -45,7 +45,6 @@ void History::beginEdit(const Document& doc, const std::string& label, uint64_t 
     pendingSnap_.revision = revision;
     pendingLabel_ = label;
     pendingFlag_ = true;
-    OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "beginEdit %{public}s", label.c_str());
 }
 
 void History::endEdit(const Document& doc, uint64_t revision) {
@@ -67,7 +66,6 @@ void History::endEdit(const Document& doc, uint64_t revision) {
     undo_.push_back(std::move(entry));
     redo_.clear();
     trim();
-    OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "endEdit depth=%{public}zu", undo_.size());
 }
 
 void History::trim() {

@@ -1,5 +1,6 @@
 #include "io/image_import.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <thread>
@@ -168,6 +169,17 @@ bool decodeBand(OH_ImageSourceNative* source, uint32_t imgW, uint32_t imgY, uint
     // M1 两轮实证：此解码路径的 fmt 报告与实际输出相反（报 RGBA 实出 BGRA，反之亦然）；
     // 请求 BGRA(4) → 实出 RGBA → 不换；报 3 → 实出 BGRA → 换 R/B。JPEG 待复验。
     const bool swapRB = (pixelFormat == 3);
+    // M4b 实证（.montage 保存对拍）：解码带为预乘 alpha（引擎约定直 alpha，对齐 PSD 路径
+    // unpremultiply），DecodingOptions 无 alphaType 请求项（SDK 核验），只能检测后手动还原
+    int32_t alphaType = 0;
+    OH_PixelmapImageInfo_GetAlphaType(info, &alphaType);
+    // 实证（M4b 对拍）：模拟器 PNG 解码带为预乘 alpha 且报告 UNKNOWN(0)；DecodingOptions 无
+    // alphaType 请求项（SDK 核验）。引擎瓦片约定直 alpha（对齐 PSD unpremultiply 路径）：
+    // 显式报 UNPREMULTIPLIED(3) 才信任报告跳过，其余（UNKNOWN/PREMULTIPLIED）按预乘还原；
+    // 无 alpha 格式 a≡255，还原为恒等
+    const bool unpremult = (alphaType != 3 /*PIXELMAP_ALPHA_TYPE_UNPREMULTIPLIED*/);
+    OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "band decode: fmt=%{public}d alphaType=%{public}d swapRB=%{public}d unpremult=%{public}d",
+                 pixelFormat, alphaType, swapRB ? 1 : 0, unpremult ? 1 : 0);
 
     void* addr = nullptr;
     if (OH_PixelmapNative_AccessPixels(pm.get(), &addr) != IMAGE_SUCCESS || addr == nullptr) {
@@ -195,14 +207,25 @@ bool decodeBand(OH_ImageSourceNative* source, uint32_t imgW, uint32_t imgY, uint
                 const uint8_t* srcRow =
                     src + static_cast<size_t>(rowStride) * (inTileY + r) + static_cast<size_t>(tileX0) * 4u;
                 uint8_t* dstRow = dstBase + static_cast<size_t>(buf.rowBytes()) * r;
-                if (!swapRB) {
+                if (!swapRB && !unpremult) {
                     std::memcpy(dstRow, srcRow, static_cast<size_t>(copyW) * 4u);
                 } else {
                     for (uint32_t px = 0; px < copyW; ++px) {
-                        dstRow[px * 4u + 0u] = srcRow[px * 4u + 2u];
-                        dstRow[px * 4u + 1u] = srcRow[px * 4u + 1u];
-                        dstRow[px * 4u + 2u] = srcRow[px * 4u + 0u];
-                        dstRow[px * 4u + 3u] = srcRow[px * 4u + 3u];
+                        uint8_t r8 = srcRow[px * 4u + 0u];
+                        uint8_t g8 = srcRow[px * 4u + 1u];
+                        uint8_t b8 = srcRow[px * 4u + 2u];
+                        uint8_t a8 = srcRow[px * 4u + 3u];
+                        if (unpremult && a8 > 0 && a8 < 255) {
+                            // 预乘还原（四舍五入），引擎瓦片一律直 alpha
+                            const uint32_t a32 = a8;
+                            r8 = static_cast<uint8_t>(std::min(255u, (r8 * 255u + a32 / 2u) / a32));
+                            g8 = static_cast<uint8_t>(std::min(255u, (g8 * 255u + a32 / 2u) / a32));
+                            b8 = static_cast<uint8_t>(std::min(255u, (b8 * 255u + a32 / 2u) / a32));
+                        }
+                        dstRow[px * 4u + 0u] = swapRB ? b8 : r8;
+                        dstRow[px * 4u + 1u] = g8;
+                        dstRow[px * 4u + 2u] = swapRB ? r8 : b8;
+                        dstRow[px * 4u + 3u] = a8;
                     }
                 }
             }

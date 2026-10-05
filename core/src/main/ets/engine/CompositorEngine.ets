@@ -1,7 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
-import { EngineStats, LayerDTO, LayerThumb, OpenFileData, PixelProbe, PixelTestData, PsdOpenData, ViewportData } from '../model/EngineTypes';
+import { EngineStats, LayerDTO, LayerThumb, OpenFileData, PixelProbe, PixelTestData, PsdOpenData, SaveProjectData, ViewportData } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -217,6 +217,18 @@ export class CompositorEngine {
       }
     }
     return { width: num(r.data, 'width'), height: num(r.data, 'height'), notes: notes };
+  }
+
+  /**
+   * 工程保存（M4b）。fd 所有权移交 native（成功/失败都关闭），调用方不得再 close。
+   */
+  async saveProject(fd: number): Promise<SaveProjectData> {
+    const value: Object = await (native.saveProject(fd) as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok || r.data === null) {
+      throw new Error(r.error !== null ? r.error.message : 'saveProject failed');
+    }
+    return { layers: num(r.data, 'layers'), bytes: num(r.data, 'bytes') };
   }
 
   setViewport(zoom: number, panX: number, panY: number): ViewportData | null {
