@@ -7,6 +7,7 @@
 // 所有 GL 调用只在渲染线程（vsync 回调线程）发生。
 
 #include <cstdint>
+#include <map>
 #include <unordered_map>
 
 #include <GLES3/gl3.h>
@@ -19,8 +20,17 @@ class TileRenderer {
   public:
     // GL 线程首帧惰性初始化（编译 program / 建 quad VBO）
     void ensureInit();
+    // 绘制中的笔画瓦片覆盖（直通 RGBA，逐帧直传不进 LRU）
+    struct StrokeOverlay {
+        bool active = false;
+        LayerId layerId = 0;
+        uint32_t gridCols = 0;
+        uint32_t gridRows = 0;
+        const std::map<uint32_t, std::vector<uint8_t>>* tiles = nullptr;
+    };
     // 绘制一帧（背板 + 棋盘格 + 图层栈合成）。vw/vh = 视口 px。
-    void drawFrame(const Document& doc, const Viewport& vp, int32_t vw, int32_t vh);
+    void drawFrame(const Document& doc, const Viewport& vp, int32_t vw, int32_t vh,
+                   const StrokeOverlay* stroke);
     // 上下文销毁/丢失时清空全部 GL 资源（03 R3.9：派生缓存语义）
     void invalidate();
 
@@ -38,12 +48,14 @@ class TileRenderer {
     void destroyFbos();
     void drawQuad(GLuint program, float rx, float ry, float rw, float rh, float zoom, float panX,
                   float panY, float vw, float vh);
-    void drawTiles(const Layer& layer, float zoom, float panX, float panY, float vw, float vh);
+    void drawTiles(const Layer& layer, float zoom, float panX, float panY, float vw, float vh,
+                   const StrokeOverlay* stroke);
+    std::unordered_map<uint64_t, uint32_t> strokeTex_;  // key → 临时纹理（逐帧刷新）
 
     GLuint checkerProg_ = 0;
     GLuint tileProg_ = 0;
     GLuint plainProg_ = 0;
-    GLuint blendProgs_[4] = {0, 0, 0, 0};
+    GLuint blendProgs_[kBlendModeCount] = {0};
     GLuint vbo_ = 0;
     GLuint vao_ = 0;
     bool inited_ = false;

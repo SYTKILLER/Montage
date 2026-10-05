@@ -5,11 +5,17 @@
 // 并发规则（02 §7）：一把粗锁 docMutex；T3 导入线程锁外计算、带边界加锁发布。
 
 #include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <memory>
 #include <mutex>
+#include <thread>
 
 #include <napi/native_api.h>
 
+#include "engine/brush.h"
 #include "engine/document.h"
+#include "engine/history.h"
 #include "render/render_loop.h"
 
 namespace montage {
@@ -33,6 +39,38 @@ class Engine {
     ImportJob import;
 
     RenderLoop render;  // T2 渲染循环（回调线程惰性绑 GL）
+
+    // M3 笔画：命令入队（T1）→ 工作线程消费落 dab → draft 供渲染叠加
+    struct StrokePoint {
+        float x = 0;
+        float y = 0;
+        bool end = false;
+    };
+    std::mutex strokeMtx;
+    std::condition_variable strokeCv;
+    std::deque<StrokePoint> strokeQueue;
+    bool strokeEnding = false;              // end 已入队标记
+    bool strokeQuit = false;                // 常驻线程退出标记（dispose 置位）
+    std::unique_ptr<StrokeDraft> draft;     // 绘制中的笔画（mutex 内访问）
+    BrushSettings brush;                    // 当前笔刷参数（ArkTS setBrushSettings 写入）
+    std::thread strokeThread_;
+    bool strokeThreadStarted_ = false;
+    void ensureStrokeThreadLocked();        // 须持 strokeMtx；幂等，先 join 已退出线程
+    void strokeThreadMain();
+
+    // M4a 撤销
+    History history;
+    std::atomic<uint32_t> historyVersion{0};
+
+    // 渲染帧快照携带的笔画瓦片（docMutex 内拷贝，避免渲染线程跨锁悬挂）
+    struct StrokeSnapshot {
+        LayerId layerId = 0;
+        uint32_t gridCols = 0;
+        uint32_t gridRows = 0;
+        std::map<uint32_t, std::vector<uint8_t>> tiles;
+        bool active = false;
+    };
+    StrokeSnapshot copyStrokeSnapshotLocked();
 
     int64_t docRevision = 0;
     napi_threadsafe_function revisionTsfn = nullptr;   // docVersion 事件

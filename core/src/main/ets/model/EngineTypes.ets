@@ -19,6 +19,9 @@ export interface EngineStats {
   importProgress: number;
   renderRunning: boolean;
   lastError: string;
+  canUndo: boolean;
+  canRedo: boolean;
+  historyVersion: number;
 }
 
 /** 视口（pan = 视口左上角文档坐标，doc px）。 */

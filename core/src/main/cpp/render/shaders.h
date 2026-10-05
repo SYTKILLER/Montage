@@ -1,8 +1,11 @@
 #ifndef MONTAGE_RENDER_SHADERS_H
 #define MONTAGE_RENDER_SHADERS_H
 
-// 着色器清单（03 §9）：M1 用 quad.vert / checker.frag / tile.frag。
+// 着色器清单（03 §9）：quad.vert / checker.frag / tile.frag / plain.frag / blend.frag 族。
 // 视口变换（R3.4）：交互 vp 基准在 ArkTS，GL 内 px 基准；screen = (doc - pan) * zoom，Y 向下。
+// 混合公式（M2.1 全集，对拍源 SeparableBlend→CI 标准语义 = W3C Compositing 可分离公式，
+// sRGB 非线性空间直算）：Cr=(1-αb)Cs+αb·B(Cb,Cs)；αo=αs+αb(1-αs)；直通 alpha 存储回除。
+// 24 模式 = 独立 program（R3.3），frag 由 kBlendCommon（含 %%BODY%% 占位声明）+ kBlend*Body 拼装。
 
 namespace montage {
 namespace shaders {
@@ -33,7 +36,7 @@ void main() {
 }
 )";
 
-// 瓦片采样（M1 无蒙版；半纹素内缩防 LINEAR 跨瓦片接缝；≥200% 由 CPU 侧切 NEAREST，03 §6）
+// 瓦片采样（半纹素内缩防 LINEAR 跨瓦片接缝；≥200% 由 CPU 侧切 NEAREST，03 §6）
 inline const char* kTileFrag = R"(#version 300 es
 precision mediump float;
 uniform sampler2D uTex;
@@ -59,13 +62,7 @@ void main() {
 }
 )";
 
-// ---------- Pass B 混合（03 §4/§5）----------
-// 公式对拍：源 SeparableBlend.swift 委托 Core Image 标准混合滤镜 = W3C Compositing 1.0
-// 可分离混合公式，sRGB 非线性空间直接计算（与本管线存储一致，不做线性化）。
-//   Cr = (1-αb)·Cs + αb·B(Cb,Cs)          （混合步）
-//   αo = αs + αb·(1-αs)                    （source-over）
-//   Co_premult = αs·Cr + (1-αs)·Cb·αb     （直通 alpha 存储，输出前除回）
-// 4 模式 = 独立 program（R3.3），frag 由 kBlendCommon + kBlendB[mode] 拼装。
+// Pass B 混合公共模板：%%BODY%% 占位声明由 buildBlendProgram 按模式替换为完整函数。
 inline const char* kBlendCommon = R"(#version 300 es
 precision mediump float;
 uniform sampler2D uSrc;    // 图层纹理（straight alpha）
@@ -73,9 +70,27 @@ uniform sampler2D uDst;    // acc 纹理（straight alpha）
 uniform float uOpacity;    // 图层不透明度
 uniform vec2 uViewport;
 out vec4 o;
-vec3 blendB(vec3 Cb, vec3 Cs) {   // %%BLEND_B%% 各模式替换
-  return Cs;
+float lum(vec3 c) { return dot(c, vec3(0.3, 0.59, 0.11)); }
+vec3 clipColor(vec3 c) {
+  float l = lum(c);
+  float n = min(c.r, min(c.g, c.b));
+  float x = max(c.r, max(c.g, c.b));
+  if (x > 1.0) c = l + (c - l) * ((1.0 - l) / max(1e-6, x - l));
+  if (n < 0.0) c = l + (c - l) * (l / max(1e-6, l - n));
+  return c;
 }
+vec3 setLum(vec3 c, float l) { return clipColor(c + (l - lum(c))); }
+float sat(vec3 c) { return max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b)); }
+vec3 setSat(vec3 c, float s) {
+  float mn = min(c.r, min(c.g, c.b));
+  float mx = max(c.r, max(c.g, c.b));
+  float md = c.r + c.g + c.b - mn - mx;
+  float nv = mx > mn ? (md - mn) * s / (mx - mn) : 0.0;
+  if (c.r == mx) return vec3(s, nv, 0.0);
+  if (c.g == mx) return vec3(0.0, s, nv);
+  return vec3(nv, 0.0, s);
+}
+vec3 blendB(vec3 Cb, vec3 Cs);   // %%BODY%%
 void main() {
   vec4 src = texture(uSrc, gl_FragCoord.xy / uViewport);
   vec4 dst = texture(uDst, gl_FragCoord.xy / uViewport);
@@ -91,21 +106,30 @@ void main() {
 }
 )";
 
-inline const char* kBlendNormalBody = R"(
-  return Cs;
-)";
-inline const char* kBlendMultiplyBody = R"(
-  return Cb * Cs;
-)";
-inline const char* kBlendScreenBody = R"(
-  return Cb + Cs - Cb * Cs;
-)";
-inline const char* kBlendOverlayBody = R"(
-  // overlay = hard-light 交换参数：Cb<=0.5 → 2·Cb·Cs，否则 1-2·(1-Cb)·(1-Cs)
-  vec3 lo = 2.0 * Cb * Cs;
-  vec3 hi = 1.0 - 2.0 * (1.0 - Cb) * (1.0 - Cs);
-  return mix(lo, hi, step(vec3(0.5), Cb));
-)";
+inline const char* kBlendNormalBody = R"(  return Cs;)";
+inline const char* kBlendDarkenBody = R"(  return min(Cb, Cs);)";
+inline const char* kBlendMultiplyBody = R"(  return Cb * Cs;)";
+inline const char* kBlendColorBurnBody = R"(  return max(vec3(1.0) - min(vec3(1.0), (vec3(1.0) - Cb) / max(vec3(1e-5), Cs)), vec3(0.0));)";
+inline const char* kBlendLinearBurnBody = R"(  return max(Cb + Cs - vec3(1.0), vec3(0.0));)";
+inline const char* kBlendLightenBody = R"(  return max(Cb, Cs);)";
+inline const char* kBlendScreenBody = R"(  return Cb + Cs - Cb * Cs;)";
+inline const char* kBlendColorDodgeBody = R"(  return max(min(vec3(1.0), Cb / max(vec3(1e-5), vec3(1.0) - Cs)), vec3(0.0));)";
+inline const char* kBlendLinearDodgeBody = R"(  return min(Cb + Cs, vec3(1.0));)";
+inline const char* kBlendOverlayBody = R"(  return mix(2.0 * Cb * Cs, 1.0 - 2.0 * (1.0 - Cb) * (1.0 - Cs), step(vec3(0.5), Cb));)";
+inline const char* kBlendSoftLightBody = R"(  return mix(Cb + (2.0 * Cs - 1.0) * (mix((16.0 * Cb - 12.0) * Cb + 4.0, sqrt(Cb), step(vec3(0.25), Cb)) - Cb), Cb - (1.0 - 2.0 * Cs) * Cb * (1.0 - Cb), step(vec3(0.5), Cs));)";
+inline const char* kBlendHardLightBody = R"(  return mix(2.0 * Cs * Cb, 1.0 - 2.0 * (1.0 - Cs) * (1.0 - Cb), step(vec3(0.5), Cs));)";
+inline const char* kBlendVividLightBody = R"(  return max(mix(vec3(1.0) - min(vec3(1.0), (vec3(1.0) - Cb) / max(vec3(1e-5), 2.0 * Cs)), min(vec3(1.0), Cb / max(vec3(1e-5), 2.0 * (vec3(1.0) - Cs))), step(vec3(0.5), Cs)), vec3(0.0));)";
+inline const char* kBlendLinearLightBody = R"(  return clamp(Cb + 2.0 * Cs - vec3(1.0), vec3(0.0), vec3(1.0));)";
+inline const char* kBlendPinLightBody = R"(  return mix(min(Cb, 2.0 * Cs), max(Cb, 2.0 * Cs - vec3(1.0)), step(vec3(0.5), Cs));)";
+inline const char* kBlendHardMixBody = R"(  return step(vec3(0.5), mix(min(Cb, 2.0 * Cs), max(Cb, 2.0 * Cs - vec3(1.0)), step(vec3(0.5), Cs)));)";
+inline const char* kBlendDifferenceBody = R"(  return abs(Cb - Cs);)";
+inline const char* kBlendExclusionBody = R"(  return Cb + Cs - 2.0 * Cb * Cs;)";
+inline const char* kBlendSubtractBody = R"(  return max(Cb - Cs, vec3(0.0));)";
+inline const char* kBlendDivideBody = R"(  return min(vec3(1.0), Cs / max(vec3(1e-5), vec3(1.0) - Cb));)";
+inline const char* kBlendHueBody = R"(  return setLum(setSat(Cs, sat(Cb)), lum(Cb));)";
+inline const char* kBlendSaturationBody = R"(  return setLum(setSat(Cb, sat(Cs)), lum(Cb));)";
+inline const char* kBlendColorBody = R"(  return setLum(Cs, lum(Cb));)";
+inline const char* kBlendLuminosityBody = R"(  return setLum(Cb, lum(Cs));)";
 
 }  // namespace shaders
 }  // namespace montage

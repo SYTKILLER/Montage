@@ -496,22 +496,35 @@ LayerKind kindOf(const RawLayer& layer, bool isGroup) {
 }  // namespace
 
 BlendMode blendFromKey(const std::string& key, bool* exact) {
-    // 完整 25 项映射（对拍 PSDTypes.fromPSD）；引擎 M2 仅 4 模式可渲染，其余 exact=false
+    // 完整映射（对拍 PSDTypes.fromPSD 25 项；Dissolve 等上游即无等价 → Normal+报告）
     *exact = true;
     if (key == "norm") return BlendMode::Normal;
     if (key == "mul ") return BlendMode::Multiply;
     if (key == "scrn") return BlendMode::Screen;
     if (key == "over") return BlendMode::Overlay;
-    *exact = false;
-    if (key == "sLit" || key == "dark" || key == "lite" || key == "diff" || key == "div " ||
-        key == "idiv" || key == "hue " || key == "sat " || key == "colr" || key == "lum " ||
-        key == "lbrn" || key == "lddg" || key == "hLit" || key == "vLit" || key == "lLit" ||
-        key == "pLit" || key == "hMix" || key == "smud" || key == "fsub" || key == "fdiv") {
-        return BlendMode::Normal;  // 上游无等价落 Normal 并报告；引擎 M2 扩 4 外模式同策略
-    }
+    if (key == "dark") return BlendMode::Darken;
+    if (key == "lite") return BlendMode::Lighten;
+    if (key == "diff") return BlendMode::Difference;
+    if (key == "div ") return BlendMode::ColorDodge;
+    if (key == "idiv") return BlendMode::ColorBurn;
+    if (key == "hue ") return BlendMode::Hue;
+    if (key == "sat ") return BlendMode::Saturation;
+    if (key == "colr") return BlendMode::Color;
+    if (key == "lum ") return BlendMode::Luminosity;
+    if (key == "lbrn") return BlendMode::LinearBurn;
+    if (key == "lddg") return BlendMode::LinearDodge;
+    if (key == "hLit") return BlendMode::HardLight;
+    if (key == "vLit") return BlendMode::VividLight;
+    if (key == "lLit") return BlendMode::LinearLight;
+    if (key == "pLit") return BlendMode::PinLight;
+    if (key == "hMix") return BlendMode::HardMix;
+    if (key == "sLit") return BlendMode::SoftLight;
+    if (key == "smud") return BlendMode::Exclusion;
+    if (key == "fsub") return BlendMode::Subtract;
+    if (key == "fdiv") return BlendMode::Divide;
+    *exact = false;  // Dissolve / Darker Color / Lighter Color：上游即落 Normal 并报告
     return BlendMode::Normal;
 }
-
 bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& err) {
     Cursor c(data, length);
     std::string magic;

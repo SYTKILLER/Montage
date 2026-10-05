@@ -62,12 +62,29 @@ double clampZoom(double zoom) {
 
 const char* blendModeName(BlendMode mode) {
     switch (mode) {
-        case BlendMode::Multiply:
-            return "Multiply";
-        case BlendMode::Screen:
-            return "Screen";
-        case BlendMode::Overlay:
-            return "Overlay";
+        case BlendMode::Darken: return "Darken";
+        case BlendMode::Multiply: return "Multiply";
+        case BlendMode::ColorBurn: return "Color Burn";
+        case BlendMode::LinearBurn: return "Linear Burn";
+        case BlendMode::Lighten: return "Lighten";
+        case BlendMode::Screen: return "Screen";
+        case BlendMode::ColorDodge: return "Color Dodge";
+        case BlendMode::LinearDodge: return "Linear Dodge (Add)";
+        case BlendMode::Overlay: return "Overlay";
+        case BlendMode::SoftLight: return "Soft Light";
+        case BlendMode::HardLight: return "Hard Light";
+        case BlendMode::VividLight: return "Vivid Light";
+        case BlendMode::LinearLight: return "Linear Light";
+        case BlendMode::PinLight: return "Pin Light";
+        case BlendMode::HardMix: return "Hard Mix";
+        case BlendMode::Difference: return "Difference";
+        case BlendMode::Exclusion: return "Exclusion";
+        case BlendMode::Subtract: return "Subtract";
+        case BlendMode::Divide: return "Divide";
+        case BlendMode::Hue: return "Hue";
+        case BlendMode::Saturation: return "Saturation";
+        case BlendMode::Color: return "Color";
+        case BlendMode::Luminosity: return "Luminosity";
         case BlendMode::Normal:
         default:
             return "Normal";

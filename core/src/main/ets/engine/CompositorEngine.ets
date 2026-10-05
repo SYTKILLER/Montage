@@ -75,6 +75,9 @@ function narrowStats(r: Record<string, Object>): EngineStats {
     importProgress: num(r, 'importProgress'),
     renderRunning: boolOf(r, 'renderRunning'),
     lastError: str(r, 'lastError'),
+    canUndo: boolOf(r, 'canUndo'),
+    canRedo: boolOf(r, 'canRedo'),
+    historyVersion: num(r, 'historyVersion'),
   };
 }
 
@@ -316,6 +319,35 @@ export class CompositorEngine {
     return r.ok;
   }
 
+  // ---------- 笔刷（M3）/ 撤销（M4a） ----------
+
+  setBrushSettings(diameter: number, hardness: number, opacity: number, red: number,
+    green: number, blue: number, erasing: boolean): void {
+    native.setBrushSettings(diameter, hardness, opacity, red, green, blue, erasing);
+  }
+
+  beginStroke(x: number, y: number): void {
+    native.beginStroke(x, y);
+  }
+
+  continueStroke(x: number, y: number): void {
+    native.continueStroke(x, y);
+  }
+
+  endStroke(): void {
+    native.endStroke();
+  }
+
+  undo(): boolean {
+    const r = narrowResult(native.undo() as Object);
+    return r.ok && r.data !== null && boolOf(r.data, 'performed');
+  }
+
+  redo(): boolean {
+    const r = narrowResult(native.redo() as Object);
+    return r.ok && r.data !== null && boolOf(r.data, 'performed');
+  }
+
   async getLayerThumbnail(id: number): Promise<LayerThumb> {
     const value: Object = await (native.getLayerThumbnail(id) as Promise<Object>);
     const r = narrowResult(value);
@@ -356,7 +388,7 @@ export class CompositorEngine {
         fps: 0, frames: 0, bufferWidth: 0, bufferHeight: 0, docRevision: 0,
         docWidth: 0, docHeight: 0, zoom: 1, panX: 0, panY: 0,
         importRunning: false, importProgress: 0, renderRunning: false,
-        lastError: 'getStats failed',
+        lastError: 'getStats failed', canUndo: false, canRedo: false, historyVersion: 0,
       };
     }
     return narrowStats(r.data);

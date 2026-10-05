@@ -281,14 +281,23 @@ void RenderLoop::doFrame() {
 
     Document docSnap;
     Viewport vp;
+    Engine::StrokeSnapshot strokeSnap;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
         docSnap = e.doc;  // shared_ptr 拷贝（02 §7 帧快照）
         vp = e.viewport;
+        strokeSnap = e.copyStrokeSnapshotLocked();
+    }
+    TileRenderer::StrokeOverlay overlay;
+    if (strokeSnap.active) {
+        overlay.layerId = strokeSnap.layerId;
+        overlay.gridCols = strokeSnap.gridCols;
+        overlay.gridRows = strokeSnap.gridRows;
+        overlay.tiles = &strokeSnap.tiles;
     }
 
     renderer_.ensureInit();
-    renderer_.drawFrame(docSnap, vp, w, h);
+    renderer_.drawFrame(docSnap, vp, w, h, strokeSnap.active ? &overlay : nullptr);
 
     if (eglSwapBuffers(display_, surface_) != EGL_TRUE) {
         std::lock_guard<std::mutex> lk(statsMtx_);

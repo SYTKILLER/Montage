@@ -521,6 +521,10 @@ napi_value GetStats(napi_env env, napi_callback_info /*info*/) {
     napi_set_named_property(env, data, "importProgress", makeDouble(env, progress));
     napi_set_named_property(env, data, "renderRunning", makeBool(env, snap.running));
     napi_set_named_property(env, data, "lastError", makeString(env, snap.lastError));
+    napi_set_named_property(env, data, "canUndo", makeBool(env, e.history.canUndo()));
+    napi_set_named_property(env, data, "canRedo", makeBool(env, e.history.canRedo()));
+    napi_set_named_property(env, data, "historyVersion",
+                            makeDouble(env, static_cast<double>(e.historyVersion.load())));
     return makeOk(env, data);
 }
 
@@ -760,7 +764,7 @@ napi_value SetLayerBlendMode(napi_env env, napi_callback_info info) {
         if (l == nullptr) {
             return makeError(env, kErrBadParam, "setLayerBlendMode: layer not found");
         }
-        l->blendMode = (mode >= 0 && mode <= 3) ? static_cast<BlendMode>(mode) : BlendMode::Normal;
+        l->blendMode = (mode >= 0 && mode < kBlendModeCount) ? static_cast<BlendMode>(mode) : BlendMode::Normal;
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -955,6 +959,176 @@ napi_value GetLayerThumbnail(napi_env env, napi_callback_info info) {
     return promise;
 }
 
+// ---------- 笔刷（M3）/ 撤销（M4a） ----------
+
+// argv[0..6]：diameter, hardness, opacity, red, green, blue, erasing
+bool parseBrush(napi_env env, size_t argc, const napi_value* argv, BrushSettings& out) {
+    if (argc < 7) {
+        return false;
+    }
+    double d = 0, h = 0, o = 0, r = 0, g = 0, b = 0;
+    bool erasing = false;
+    if (napi_get_value_double(env, argv[0], &d) != napi_ok ||
+        napi_get_value_double(env, argv[1], &h) != napi_ok ||
+        napi_get_value_double(env, argv[2], &o) != napi_ok ||
+        napi_get_value_double(env, argv[3], &r) != napi_ok ||
+        napi_get_value_double(env, argv[4], &g) != napi_ok ||
+        napi_get_value_double(env, argv[5], &b) != napi_ok ||
+        napi_get_value_bool(env, argv[6], &erasing) != napi_ok) {
+        return false;
+    }
+    out.diameter = static_cast<float>(d);
+    out.hardness = static_cast<float>(h);
+    out.opacity = static_cast<float>(o);
+    out.red = static_cast<float>(r);
+    out.green = static_cast<float>(g);
+    out.blue = static_cast<float>(b);
+    out.erasing = erasing;
+    return true;
+}
+
+napi_value SetBrushSettings(napi_env env, napi_callback_info info) {
+    size_t argc = 7;
+    napi_value argv[7] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    BrushSettings s;
+    if (!parseBrush(env, argc, argv, s)) {
+        return makeError(env, kErrBadParam,
+                         "setBrushSettings(d,h,o,r,g,b,erasing) requires 7 args");
+    }
+    Engine::get().brush = s;
+    return makeOk(env, nullptr);
+}
+
+napi_value BeginStroke(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "beginStroke(x, y) requires 2 args");
+    }
+    double x = 0, y = 0;
+    if (napi_get_value_double(env, argv[0], &x) != napi_ok ||
+        napi_get_value_double(env, argv[1], &y) != napi_ok) {
+        return makeError(env, kErrBadParam, "beginStroke: invalid coords");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0) {
+            return makeError(env, kErrNoDoc, "beginStroke: no document");
+        }
+        if (e.doc.activeId == 0) {
+            return makeError(env, kErrNoDoc, "beginStroke: no active layer");
+        }
+        e.history.beginEdit(e.doc, e.brush.erasing ? "eraser" : "brush",
+                            static_cast<uint64_t>(e.docRevision));
+        e.draft = std::make_unique<StrokeDraft>();
+        std::string err;
+        if (!e.draft->begin(e.doc, e.doc.activeId, e.brush, err)) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.draft.reset();
+            return makeError(env, kErrBadParam, err);
+        }
+        e.draft->append(static_cast<float>(x), static_cast<float>(y));
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Brush",
+                     "begin stroke at (%{public}f, %{public}f) layer=%{public}llu d=%{public}f erasing=%{public}d",
+                     x, y, static_cast<unsigned long long>(e.doc.activeId),
+                     static_cast<double>(e.brush.diameter), e.brush.erasing ? 1 : 0);
+        {
+            std::lock_guard<std::mutex> sk(e.strokeMtx);
+            e.strokeQueue.clear();
+            e.strokeEnding = false;
+            e.ensureStrokeThreadLocked();
+        }
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value ContinueStroke(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "continueStroke(x, y) requires 2 args");
+    }
+    double x = 0, y = 0;
+    if (napi_get_value_double(env, argv[0], &x) != napi_ok ||
+        napi_get_value_double(env, argv[1], &y) != napi_ok) {
+        return makeError(env, kErrBadParam, "continueStroke: invalid coords");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> sk(e.strokeMtx);
+        if (!e.strokeEnding) {
+            e.strokeQueue.push_back({static_cast<float>(x), static_cast<float>(y), false});
+            e.ensureStrokeThreadLocked();
+        }
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value EndStroke(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Brush", "end stroke");
+    {
+        std::lock_guard<std::mutex> sk(e.strokeMtx);
+        e.strokeEnding = true;
+        e.strokeQueue.push_back({0.0f, 0.0f, true});
+        e.ensureStrokeThreadLocked();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value Undo(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    bool performed = false;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        std::string label;
+        uint64_t rev = static_cast<uint64_t>(e.docRevision);
+        performed = e.history.undo(e.doc, rev, label);
+        if (performed) {
+            e.docRevision = static_cast<int64_t>(rev);
+            e.bumpRevisionLocked();
+            e.requestRender();
+        }
+    }
+    if (performed) {
+        e.historyVersion.fetch_add(1);
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "performed", makeBool(env, performed));
+    return makeOk(env, data);
+}
+
+napi_value Redo(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    bool performed = false;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        std::string label;
+        uint64_t rev = static_cast<uint64_t>(e.docRevision);
+        performed = e.history.redo(e.doc, rev, label);
+        if (performed) {
+            e.docRevision = static_cast<int64_t>(rev);
+            e.bumpRevisionLocked();
+            e.requestRender();
+        }
+    }
+    if (performed) {
+        e.historyVersion.fetch_add(1);
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "performed", makeBool(env, performed));
+    return makeOk(env, data);
+}
+
+// ---------- M0 像素测试（保留） ----------
+
 // ---------- M0 像素测试（保留） ----------
 
 // ---------- M0 像素测试（保留） ----------
@@ -1009,6 +1183,11 @@ napi_value RunPixelTest(napi_env env, napi_callback_info /*info*/) {
 
 napi_value Dispose(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.strokeMtx);
+        e.strokeQuit = true;
+        e.strokeCv.notify_all();
+    }
     io::cancelImageImport();
     napi_threadsafe_function revision = nullptr;
     napi_threadsafe_function progress = nullptr;

@@ -36,6 +36,14 @@ napi_value GetStats(napi_env env, napi_callback_info info);
 // 事件面：docVersion / importProgress
 napi_value OnRevisionChanged(napi_env env, napi_callback_info info);
 napi_value OnImportProgress(napi_env env, napi_callback_info info);
+// 笔刷（01 §6 命令面：M3）
+napi_value SetBrushSettings(napi_env env, napi_callback_info info);
+napi_value BeginStroke(napi_env env, napi_callback_info info);
+napi_value ContinueStroke(napi_env env, napi_callback_info info);
+napi_value EndStroke(napi_env env, napi_callback_info info);
+// 撤销（02 §4 / 01 §6：undo/redo）
+napi_value Undo(napi_env env, napi_callback_info info);
+napi_value Redo(napi_env env, napi_callback_info info);
 // M0 实测遗留：像素指针读写（Promise<{ok, data}>）
 napi_value RunPixelTest(napi_env env, napi_callback_info info);
 // 页面销毁时释放回调与渲染线程

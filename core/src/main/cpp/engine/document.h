@@ -20,13 +20,35 @@ constexpr uint32_t kTileSize = 256;  // 定案 R2：256px（256KB/瓦片 RGBA888
 
 using LayerId = uint64_t;
 
-// M2 混合模式子集（03 §5：M2.1 再扩全集；索引即 UI Select 序号）
+// 混合模式全集（M2.1 定案：对齐源 LayerBlendMode 顺序，24 值 = PS 25 减 Dissolve/Darker/Lighter；
+// 索引即 UI Select 序号；非可分离 4 值 hue/saturation/color/luminosity 走 W3C SetLum/SetSat/ClipColor）
 enum class BlendMode : int32_t {
     Normal = 0,
-    Multiply = 1,
-    Screen = 2,
-    Overlay = 3,
+    Darken = 1,
+    Multiply = 2,
+    ColorBurn = 3,
+    LinearBurn = 4,
+    Lighten = 5,
+    Screen = 6,
+    ColorDodge = 7,
+    LinearDodge = 8,
+    Overlay = 9,
+    SoftLight = 10,
+    HardLight = 11,
+    VividLight = 12,
+    LinearLight = 13,
+    PinLight = 14,
+    HardMix = 15,
+    Difference = 16,
+    Exclusion = 17,
+    Subtract = 18,
+    Divide = 19,
+    Hue = 20,
+    Saturation = 21,
+    Color = 22,
+    Luminosity = 23,
 };
+constexpr int32_t kBlendModeCount = 24;
 
 // D2.4 像素源抽象（DMA 扩展点预留）。
 class PixelSource {

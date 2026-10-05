@@ -6,7 +6,14 @@ import { CompositorEngine, LayerDTO, OpenFileData, PixelTestData, PsdOpenData, V
 
 const TAG: string = '[Montage.M2]';
 
-const BLEND_LABELS: string[] = ['正常', '正片叠底', '滤色', '叠加'];
+const BLEND_LABELS: string[] = [
+  '正常',
+  '变暗', '正片叠底', '颜色加深', '线性加深',
+  '变亮', '滤色', '颜色减淡', '线性减淡(添加)',
+  '叠加', '柔光', '强光', '亮光', '线性光', '点光', '实色混合',
+  '差值', '排除', '减去', '划分',
+  '色相', '饱和度', '颜色', '明度',
+];
 
 /**
  * M2 图层栈合成（临时脚手架，编辑器骨架落地后替换）：
@@ -33,6 +40,13 @@ struct Index {
   @State layers: LayerDTO[] = [];
   @State blendSel: number = 0;
   @State opacityVal: number = 1;
+  @State tool: string = 'brush';       // brush | eraser | none
+  @State brushSize: number = 40;
+  @State brushHardness: number = 80;
+  @State brushColor: string = '#D93025';
+  @State canUndo: boolean = false;
+  @State canRedo: boolean = false;
+  @State painting: boolean = false;
   @State pixelText: string = '未运行';
   @State statsText: string = '等待渲染…';
   @State logLines: string[] = [];
@@ -47,6 +61,7 @@ struct Index {
   private pinchAy: number = 0;
   private panLastX: number = 0;
   private panLastY: number = 0;
+
 
   aboutToAppear(): void {
     this.engine.bindRevisionListener((revision: number): void => {
@@ -354,12 +369,42 @@ struct Index {
       this.importing = false;
       this.docOpen = true;
       this.log(`测试图层导入完成 ${Date.now() - t0}ms（含透明区，验证混合）`);
+      // M3 链路自检：中心画一笔（begin→continue×20→end）验证 dab/合成/提交/撤销
+      this.log('测试笔画开始');
+      this.pushBrushSettings();
+      const c2: number[] = this.screenToDoc(this.canvasVpW / 2, this.canvasVpH / 2);
+      this.log(`测试笔画 @doc(${c2[0].toFixed(0)},${c2[1].toFixed(0)})`);
+      this.engine.beginStroke(c2[0], c2[1]);
+      this.log('笔画已开始');
+      for (let i = 1; i <= 20; i++) {
+        this.engine.continueStroke(c2[0] + i * 8, c2[1] + i * 5);
+      }
+      this.engine.endStroke();
+      this.log('笔画已提交');
+      // M4a 自动撤销验证：1.5s 后 undo，docVersion 应回退
+      setTimeout((): void => {
+        const ok: boolean = this.engine.undo();
+        this.log(`自动撤销: ${ok ? '执行' : '无可撤销'}`);
+      }, 1500);
+      this.tryFit();
     } catch (e) {
       this.importing = false;
       const err: BusinessError = e as BusinessError;
       this.log(`测试图层流程失败: ${err.code} ${err.message}`);
     }
     this.generating = false;
+  }
+
+  // 引擎核心链路自检：doc 中心画一笔（begin→continue→end，不依赖注入 touch 流）
+  private doTestStroke(): void {
+    this.pushBrushSettings();
+    const c: number[] = this.screenToDoc(this.canvasVpW / 2, this.canvasVpH / 2);
+    this.log(`测试笔画 @doc(${c[0].toFixed(0)},${c[1].toFixed(0)})`);
+    this.engine.beginStroke(c[0], c[1]);
+    for (let i = 1; i <= 20; i++) {
+      this.engine.continueStroke(c[0] + i * 8, c[1] + i * 5);
+    }
+    this.engine.endStroke();
   }
 
   private doPixelTest(): void {
@@ -374,8 +419,72 @@ struct Index {
 
   private refreshStats(): void {
     const s = this.engine.getStats();
-    this.statsText = `fps=${s.fps.toFixed(1)} frames=${s.frames} buf=${s.bufferWidth}x${s.bufferHeight} ` +
-      `running=${s.renderRunning}` + (s.lastError === '' ? '' : ` err=${s.lastError}`);
+    this.statsText = `fps=${s.fps.toFixed(1)} frames=${s.frames} running=${s.renderRunning}` +
+      (s.lastError === '' ? '' : ` err=${s.lastError}`);
+    this.canUndo = s.canUndo;
+    this.canRedo = s.canRedo;
+  }
+
+  private hexToRgb(hex: string): number[] {
+    const r = parseInt(hex.slice(1, 3), 16) / 255;
+    const g = parseInt(hex.slice(3, 5), 16) / 255;
+    const b = parseInt(hex.slice(5, 7), 16) / 255;
+    return [r, g, b];
+  }
+
+  private pushBrushSettings(): void {
+    const rgb = this.hexToRgb(this.brushColor);
+    this.engine.setBrushSettings(this.brushSize, this.brushHardness / 100, 1.0,
+      rgb[0], rgb[1], rgb[2], this.tool === 'eraser');
+  }
+
+  private doUndo(): void {
+    if (this.engine.undo()) {
+      this.log('撤销');
+    }
+  }
+
+  private doRedo(): void {
+    if (this.engine.redo()) {
+      this.log('重做');
+    }
+  }
+
+  // 触摸事件流（05 §4：笔画走 onTouch 原始事件，逐事件坐标）
+  private onTouchEvent(e: TouchEvent): void {
+    if (this.tool !== 'brush' && this.tool !== 'eraser') {
+      return;
+    }
+    if (e.touches.length < 1 && e.changedTouches.length < 1) {
+      return;
+    }
+    const t: TouchObject = e.changedTouches.length > 0 ? e.changedTouches[0] : e.touches[0];
+    hilog.info(0x4D30, TAG, 'touch type=%{public}d n=%{public}d (%{public}f,%{public}f)',
+      e.type, e.touches.length, t.x, t.y);
+    const k = this.pxPerVp();
+    const docX = this.panX + (t.x * k) / this.zoom;
+    const docY = this.panY + (t.y * k) / this.zoom;
+    switch (e.type) {
+      case TouchType.Down:
+        this.pushBrushSettings();
+        this.painting = true;
+        this.engine.beginStroke(docX, docY);
+        break;
+      case TouchType.Move:
+        if (this.painting) {
+          this.engine.continueStroke(docX, docY);
+        }
+        break;
+      case TouchType.Up:
+      case TouchType.Cancel:
+        if (this.painting) {
+          this.painting = false;
+          this.engine.endStroke();
+        }
+        break;
+      default:
+        break;
+    }
   }
 
   // ---------- 图层面板动作 ----------
@@ -444,6 +553,55 @@ struct Index {
             Button('100%').onClick((): void => this.doZoom100()).margin({ left: 8 })
             Button('放大').onClick((): void => this.doZoomStep(1.25)).margin({ left: 8 })
             Button('缩小').onClick((): void => this.doZoomStep(0.8)).margin({ left: 8 })
+            Button('撤销').onClick((): void => this.doUndo()).margin({ left: 8 }).opacity(this.canUndo ? 1 : 0.4)
+            Button('重做').onClick((): void => this.doRedo()).margin({ left: 8 }).opacity(this.canRedo ? 1 : 0.4)
+          }
+          .width('100%')
+
+          Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.Start }) {
+            Button('画笔').fontSize(12)
+              .backgroundColor(this.tool === 'brush' ? '#1A6BD9' : '#888888')
+              .onClick((): void => {
+                this.tool = 'brush';
+              })
+            Button('橡皮').fontSize(12).margin({ left: 6 })
+              .backgroundColor(this.tool === 'eraser' ? '#1A6BD9' : '#888888')
+              .onClick((): void => {
+                this.tool = 'eraser';
+              })
+            Button('导航').fontSize(12).margin({ left: 6 })
+              .backgroundColor(this.tool === 'none' ? '#1A6BD9' : '#888888')
+              .onClick((): void => {
+                this.tool = 'none';
+              })
+            Text('直径').fontSize(11).margin({ left: 10 })
+            Slider({ value: this.brushSize, min: 2, max: 200, step: 1 })
+              .width(120).height(26)
+              .onChange((v: number, mode: SliderChangeMode): void => {
+                if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                  this.brushSize = v;
+                }
+              })
+            Text('硬度').fontSize(11).margin({ left: 6 })
+            Slider({ value: this.brushHardness, min: 0, max: 100, step: 1 })
+              .width(100).height(26)
+              .onChange((v: number, mode: SliderChangeMode): void => {
+                if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                  this.brushHardness = v;
+                }
+              })
+            ForEach(['#D93025', '#1A6BD9', '#188038', '#F9AB00', '#111111'], (c: string) => {
+              Column()
+                .width(22).height(22).borderRadius(11)
+                .backgroundColor(c)
+                .border({ width: this.brushColor === c ? 3 : 1, color: this.brushColor === c ? '#111111' : '#CCCCCC' })
+                .margin({ left: 6 })
+                .onClick((): void => {
+                  this.brushColor = c;
+                })
+            }, (c: string): string => c)
+            Text(this.tool === 'eraser' ? '橡皮' : this.tool === 'brush' ? '画笔' : '导航')
+              .fontSize(11).fontColor($r('app.color.text_secondary')).margin({ left: 8 })
           }
           .width('100%')
 
@@ -467,6 +625,9 @@ struct Index {
               .onAxisEvent((e: AxisEvent): void => {
                 this.onWheel(e);
               })
+              .onTouch((e: TouchEvent): void => {
+                this.onTouchEvent(e);
+              })
           }
           .width('100%')
           .layoutWeight(1)
@@ -477,16 +638,18 @@ struct Index {
               this.tryFit();
             }
           })
-          .gesture(GestureGroup(GestureMode.Parallel,
-            PanGesture({ fingers: 1, distance: 2 })
-              .onActionStart((e: GestureEvent): void => this.onPanStart(e))
-              .onActionUpdate((e: GestureEvent): void => this.onPanUpdate(e)),
-            PinchGesture({ fingers: 2, distance: 1 })
-              .onActionStart((e: PinchGestureEvent): void => this.onPinchStart(e))
-              .onActionUpdate((e: PinchGestureEvent): void => this.onPinchUpdate(e))
-              .onActionEnd((): void => this.onPinchEnd())
-              .onActionCancel((): void => this.onPinchEnd())
-          ))
+          .gesture(this.tool === 'none' ?
+            GestureGroup(GestureMode.Parallel,
+              PanGesture({ fingers: 1, distance: 2 })
+                .onActionStart((e: GestureEvent): void => this.onPanStart(e))
+                .onActionUpdate((e: GestureEvent): void => this.onPanUpdate(e)),
+              PinchGesture({ fingers: 2, distance: 1 })
+                .onActionStart((e: PinchGestureEvent): void => this.onPinchStart(e))
+                .onActionUpdate((e: PinchGestureEvent): void => this.onPinchUpdate(e))
+                .onActionEnd((): void => this.onPinchEnd())
+                .onActionCancel((): void => this.onPinchEnd())
+            )
+            : TapGesture())
 
           Text(`${this.statsText} | 像素测试: ${this.pixelText}`)
             .fontSize(11)

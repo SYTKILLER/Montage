@@ -16,9 +16,15 @@ namespace {
 constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Render";
 
-const char* const kBlendBodies[4] = {
-    shaders::kBlendNormalBody, shaders::kBlendMultiplyBody,
-    shaders::kBlendScreenBody, shaders::kBlendOverlayBody,
+const char* const kBlendBodies[kBlendModeCount] = {
+    shaders::kBlendNormalBody, shaders::kBlendDarkenBody, shaders::kBlendMultiplyBody,
+    shaders::kBlendColorBurnBody, shaders::kBlendLinearBurnBody, shaders::kBlendLightenBody,
+    shaders::kBlendScreenBody, shaders::kBlendColorDodgeBody, shaders::kBlendLinearDodgeBody,
+    shaders::kBlendOverlayBody, shaders::kBlendSoftLightBody, shaders::kBlendHardLightBody,
+    shaders::kBlendVividLightBody, shaders::kBlendLinearLightBody, shaders::kBlendPinLightBody,
+    shaders::kBlendHardMixBody, shaders::kBlendDifferenceBody, shaders::kBlendExclusionBody,
+    shaders::kBlendSubtractBody, shaders::kBlendDivideBody, shaders::kBlendHueBody,
+    shaders::kBlendSaturationBody, shaders::kBlendColorBody, shaders::kBlendLuminosityBody,
 };
 }  // namespace
 
@@ -66,7 +72,7 @@ GLuint TileRenderer::buildProgram(const char* vertSrc, const char* fragSrc) {
 GLuint TileRenderer::buildBlendProgram(int mode) {
     // 拼装：common 模板中的占位 blendB 函数体替换为对应模式实现（R3.3 独立 program）
     const std::string placeholder =
-        "vec3 blendB(vec3 Cb, vec3 Cs) {   // %%BLEND_B%% 各模式替换\n  return Cs;\n}";
+        "vec3 blendB(vec3 Cb, vec3 Cs);   // %%BODY%%";
     const std::string fn =
         std::string("vec3 blendB(vec3 Cb, vec3 Cs) {") + kBlendBodies[mode] + "\n}";
     std::string src(shaders::kBlendCommon);
@@ -143,8 +149,11 @@ void TileRenderer::ensureInit() {
     checkerProg_ = buildProgram(shaders::kQuadVert, shaders::kCheckerFrag);
     tileProg_ = buildProgram(shaders::kQuadVert, shaders::kTileFrag);
     plainProg_ = buildProgram(shaders::kQuadVert, shaders::kPlainFrag);
-    for (int m = 0; m < 4; ++m) {
+    for (int m = 0; m < kBlendModeCount; ++m) {
         blendProgs_[m] = buildBlendProgram(m);
+        if (blendProgs_[m] == 0) {
+            OH_LOG_Print(LOG_APP, LOG_ERROR, kDomain, kTag, "blend program %{public}d failed", m);
+        }
     }
     if (checkerProg_ == 0 || tileProg_ == 0 || plainProg_ == 0 || blendProgs_[0] == 0) {
         return;
@@ -174,12 +183,18 @@ void TileRenderer::invalidate() {
             glDeleteTextures(1, &kv.second.tex);
         }
     }
+    for (auto& kv : strokeTex_) {
+        if (kv.second != 0) {
+            glDeleteTextures(1, &kv.second);
+        }
+    }
+    strokeTex_.clear();
     cache_.clear();
     destroyFbos();
     if (checkerProg_ != 0) glDeleteProgram(checkerProg_);
     if (tileProg_ != 0) glDeleteProgram(tileProg_);
     if (plainProg_ != 0) glDeleteProgram(plainProg_);
-    for (int m = 0; m < 4; ++m) {
+    for (int m = 0; m < kBlendModeCount; ++m) {
         if (blendProgs_[m] != 0) glDeleteProgram(blendProgs_[m]);
         blendProgs_[m] = 0;
     }
@@ -205,7 +220,7 @@ void TileRenderer::drawQuad(GLuint program, float rx, float ry, float rw, float 
 }
 
 void TileRenderer::drawTiles(const Layer& layer, float zoom, float panX, float panY, float vw,
-                             float vh) {
+                             float vh, const StrokeOverlay* stroke) {
     const TileGrid& grid = *layer.pixels;
     if (grid.cols == 0 || grid.rows == 0) {
         return;
@@ -233,6 +248,31 @@ void TileRenderer::drawTiles(const Layer& layer, float zoom, float panX, float p
     for (uint32_t ty = ty0; ty <= ty1; ++ty) {
         for (uint32_t tx = tx0; tx <= tx1; ++tx) {
             const uint32_t idx = ty * grid.cols + tx;
+            // 绘制中的笔画瓦片：逐帧直传（独立纹理，不进 LRU）
+            if (stroke != nullptr && stroke->active && stroke->layerId == layer.id &&
+                stroke->gridCols == grid.cols && stroke->gridRows == grid.rows) {
+                auto st = stroke->tiles->find(idx);
+                if (st != stroke->tiles->end()) {
+                    uint64_t skey = (static_cast<uint64_t>(layer.id) << 32) | idx;
+                    uint32_t& tex = strokeTex_[skey];
+                    if (tex == 0) {
+                        glGenTextures(1, &tex);
+                    }
+                    glBindTexture(GL_TEXTURE_2D, tex);
+                    const GLint f0 = wantNearest ? GL_NEAREST : GL_LINEAR;
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f0);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f0);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kTileSize, kTileSize, 0, GL_RGBA,
+                                 GL_UNSIGNED_BYTE, st->second.data());
+                    drawQuad(tileProg_, ox + static_cast<float>(tx * kTileSize),
+                             oy + static_cast<float>(ty * kTileSize),
+                             static_cast<float>(kTileSize), static_cast<float>(kTileSize), zoom,
+                             panX, panY, static_cast<float>(vw), static_cast<float>(vh));
+                    continue;
+                }
+            }
             auto it = grid.tiles.find(idx);
             if (it == grid.tiles.end() || it->second == nullptr) {
                 continue;  // 稀疏：空白瓦片不存在
@@ -282,7 +322,8 @@ void TileRenderer::drawTiles(const Layer& layer, float zoom, float panX, float p
     }
 }
 
-void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw, int32_t vh) {
+void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw, int32_t vh,
+                             const StrokeOverlay* stroke) {
     frame_++;
     glViewport(0, 0, vw, vh);
     // 画布外背板：中性灰（05 §7：与主题解耦，对齐 PS 行为）
@@ -315,16 +356,16 @@ void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw
         }
         composited++;
         const int mode = static_cast<int>(layer.blendMode);
-        GLuint blendProg = (mode >= 0 && mode <= 3) ? blendProgs_[mode] : blendProgs_[0];
-        if (blendProg == 0) {
-            blendProg = blendProgs_[0];
-        }
+        GLuint blendProg = (mode >= 0 && mode < kBlendModeCount && blendProgs_[mode] != 0)
+                               ? blendProgs_[mode]
+                               : blendProgs_[0];
         // Pass A：图层可见瓦片 → layerFBO（直通 alpha）
         glBindFramebuffer(GL_FRAMEBUFFER, layerFbo_);
         glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         glDisable(GL_BLEND);
-        drawTiles(layer, zoom, panX, panY, vw, vh);
+        drawTiles(layer, zoom, panX, panY, vw, vh,
+                  stroke != nullptr && stroke->layerId == layer.id ? stroke : nullptr);
 
         // Pass B：blend(src=layerTex, dst=acc) 全屏 → acc 另一侧（R3.1：视口变仍全帧重绘）
         const int dstIdx = accIdx;
