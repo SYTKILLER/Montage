@@ -199,8 +199,10 @@ struct Index {
     if (Math.abs(step) > 4) {
       step = Math.sign(step);
     }
-    hilog.info(0x4D30, TAG, 'axis x=%{public}f y=%{public}f raw=%{public}f step=%{public}f',
-      e.x, e.y, e.scrollStep, step);
+    // hilog 不支持 %{public}f（实证：格式被吞成 "}f"，值拿不到），浮点转 int 再打
+    hilog.info(0x4D30, TAG, 'axis x=%{public}d y=%{public}d raw100=%{public}d step100=%{public}d action=%{public}d',
+      Math.round(e.x * 10), Math.round(e.y * 10), Math.round(e.scrollStep * 100), Math.round(step * 100),
+      e.action);
     const k = this.pxPerVp();
     // M2.5 用户实证：-step 时两方向都缩小（OHOS scrollStep 向上为正）→ 翻转为 +step
     const factor = Math.pow(1.1, step);  // 滚轮向前（step>0）= 放大
