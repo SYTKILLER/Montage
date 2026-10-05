@@ -18,6 +18,6 @@
 1. 源项目架构已梳理完毕 → `20-架构分析/源项目架构梳理.md`
 2. 移植阻塞问题已向官方开发助手提问（Q1–Q13 + Q7 追问）并收到回答 → `30-移植问答/`
 3. **技术路线已定**：Native XComponent + OpenGL ES 自绘画布，自写 GLSL shader 做图层合成；像素内核走 NAPI + native 异步线程；超大画布必须瓦片化。详见 `30-移植问答/Q&A 1-13 决策整理.md`
-4. **方案设计中**：01 总体架构 / 02 数据模型（v1.1）/ 03 渲染管线 / 04 持久化（v1.1，含 RAW=DNG 裁决、扩展名暂定 .hcpx）均已定案；05 UI 框架已出稿待确认
+4. **方案设计完成（2026-10-05）**：01 总体架构 / 02 数据模型（v1.1）/ 03 渲染管线 / 04 持久化（v1.1，RAW=DNG）/ 05 UI 框架（D5.1–D5.4）**全部定案**；下一层 06 功能映射矩阵；随时可开工 M0 技术尖刺
 5. 开发环境：模拟器 `Huawei_2in1_Foldable`（无 PC 真机）；里程碑 M0 就绪可开工
 6. **已立项 Montage（蒙太奇）**（2026-10-05）：bundleName `com.sytkiller.montage`、应用名 Montage、工程包扩展名 `.montage`、格式标识 `com.sytkiller.montage.project`、仓库 `github.com/SYTKILLER/montage`（Public）
