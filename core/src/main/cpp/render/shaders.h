@@ -48,6 +48,65 @@ void main() {
 }
 )";
 
+// 终合成：acc 纹理（直通 alpha）画到屏幕棋盘格上，按 doc rect 裁剪
+inline const char* kPlainFrag = R"(#version 300 es
+precision mediump float;
+uniform sampler2D uTex;
+uniform vec2 uViewport;
+out vec4 o;
+void main() {
+  o = texture(uTex, gl_FragCoord.xy / uViewport);
+}
+)";
+
+// ---------- Pass B 混合（03 §4/§5）----------
+// 公式对拍：源 SeparableBlend.swift 委托 Core Image 标准混合滤镜 = W3C Compositing 1.0
+// 可分离混合公式，sRGB 非线性空间直接计算（与本管线存储一致，不做线性化）。
+//   Cr = (1-αb)·Cs + αb·B(Cb,Cs)          （混合步）
+//   αo = αs + αb·(1-αs)                    （source-over）
+//   Co_premult = αs·Cr + (1-αs)·Cb·αb     （直通 alpha 存储，输出前除回）
+// 4 模式 = 独立 program（R3.3），frag 由 kBlendCommon + kBlendB[mode] 拼装。
+inline const char* kBlendCommon = R"(#version 300 es
+precision mediump float;
+uniform sampler2D uSrc;    // 图层纹理（straight alpha）
+uniform sampler2D uDst;    // acc 纹理（straight alpha）
+uniform float uOpacity;    // 图层不透明度
+uniform vec2 uViewport;
+out vec4 o;
+vec3 blendB(vec3 Cb, vec3 Cs) {   // %%BLEND_B%% 各模式替换
+  return Cs;
+}
+void main() {
+  vec4 src = texture(uSrc, gl_FragCoord.xy / uViewport);
+  vec4 dst = texture(uDst, gl_FragCoord.xy / uViewport);
+  float as = src.a * uOpacity;
+  float ab = dst.a;
+  vec3 Cs = src.rgb;
+  vec3 Cb = dst.rgb;
+  vec3 B = blendB(Cb, Cs);
+  vec3 Cr = (1.0 - ab) * Cs + ab * B;
+  float ao = as + ab * (1.0 - as);
+  vec3 coP = as * Cr + (1.0 - as) * Cb * ab;
+  o = ao > 0.0001 ? vec4(coP / ao, ao) : vec4(0.0);
+}
+)";
+
+inline const char* kBlendNormalBody = R"(
+  return Cs;
+)";
+inline const char* kBlendMultiplyBody = R"(
+  return Cb * Cs;
+)";
+inline const char* kBlendScreenBody = R"(
+  return Cb + Cs - Cb * Cs;
+)";
+inline const char* kBlendOverlayBody = R"(
+  // overlay = hard-light 交换参数：Cb<=0.5 → 2·Cb·Cs，否则 1-2·(1-Cb)·(1-Cs)
+  vec3 lo = 2.0 * Cb * Cs;
+  vec3 hi = 1.0 - 2.0 * (1.0 - Cb) * (1.0 - Cs);
+  return mix(lo, hi, step(vec3(0.5), Cb));
+)";
+
 }  // namespace shaders
 }  // namespace montage
 

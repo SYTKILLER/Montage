@@ -1,7 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
-import { EngineStats, OpenFileData, PixelProbe, PixelTestData, ViewportData } from '../model/EngineTypes';
+import { EngineStats, LayerDTO, LayerThumb, OpenFileData, PixelProbe, PixelTestData, ViewportData } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -106,6 +106,21 @@ function narrowPixelData(r: Record<string, Object>): PixelTestData {
   };
 }
 
+function narrowLayer(r: Record<string, Object>): LayerDTO {
+  return {
+    id: num(r, 'id'),
+    name: str(r, 'name'),
+    visible: boolOf(r, 'visible'),
+    opacity: num(r, 'opacity'),
+    blendMode: num(r, 'blendMode'),
+    isActive: boolOf(r, 'isActive'),
+    isGroup: boolOf(r, 'isGroup'),
+    parentId: num(r, 'parentId'),
+    hasMask: boolOf(r, 'hasMask'),
+    thumbToken: num(r, 'thumbToken'),
+  };
+}
+
 /**
  * Compositor 引擎 ArkTS 门面：typed 命令面 + AppStorage 事件面（docVersion/importProgress）。
  * 页面侧通过 @StorageProp 建立刷新依赖（build 内必须真实读取）。
@@ -169,7 +184,11 @@ export class CompositorEngine {
       (native.openFileFromFd(fd) as Promise<Object>).then((value: Object): void => {
         const r = narrowResult(value);
         if (r.ok && r.data !== null) {
-          resolve({ width: num(r.data, 'width'), height: num(r.data, 'height') });
+          resolve({
+            width: num(r.data, 'width'),
+            height: num(r.data, 'height'),
+            layerId: num(r.data, 'layerId'),
+          });
         } else {
           reject(new Error(r.error !== null ? r.error.message : 'openFileFromFd failed'));
         }
@@ -193,6 +212,103 @@ export class CompositorEngine {
       return null;
     }
     return narrowViewport(r.data);
+  }
+
+  // ---------- 图层（02 §5 M2 命令面） ----------
+
+  getLayerListSnapshot(): LayerDTO[] {
+    const r = narrowResult(native.getLayerListSnapshot() as Object);
+    const out: LayerDTO[] = [];
+    if (!r.ok || r.data === null) {
+      return out;
+    }
+    // data 是数组：Record 收窄按索引遍历
+    const arr: Record<string, Object> = r.data;
+    const len = Object.keys(arr).length;
+    for (let i = 0; i < len; i++) {
+      const item = arr[`${i}`];
+      if (item !== undefined && item !== null) {
+        out.push(narrowLayer(toRecord(item)));
+      }
+    }
+    return out;
+  }
+
+  addLayer(name?: string): number {
+    const r = narrowResult((name !== undefined ? native.addLayer(name) : native.addLayer()) as Object);
+    if (!r.ok || r.data === null) {
+      hilog.error(DOMAIN, TAG, 'addLayer failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return 0;
+    }
+    return num(r.data, 'id');
+  }
+
+  removeLayer(id: number): boolean {
+    const r = narrowResult(native.removeLayer(id) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'removeLayer failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  selectLayer(id: number): boolean {
+    const r = narrowResult(native.selectLayer(id) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'selectLayer failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  setLayerVisible(id: number, v: boolean): boolean {
+    const r = narrowResult(native.setLayerVisible(id, v) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setLayerVisible failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  setLayerOpacity(id: number, v: number): boolean {
+    const r = narrowResult(native.setLayerOpacity(id, v) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setLayerOpacity failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  setLayerBlendMode(id: number, mode: number): boolean {
+    const r = narrowResult(native.setLayerBlendMode(id, mode) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setLayerBlendMode failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  reorderLayer(id: number, toIndex: number): boolean {
+    const r = narrowResult(native.reorderLayer(id, toIndex) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'reorderLayer failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  async getLayerThumbnail(id: number): Promise<LayerThumb> {
+    const value: Object = await (native.getLayerThumbnail(id) as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok || r.data === null) {
+      throw new Error(r.error !== null ? r.error.message : 'getLayerThumbnail failed');
+    }
+    const pm = r.data['pixelMap'];
+    return {
+      pixelMap: pm !== undefined && pm !== null ? pm : null,
+      ready: boolOf(r.data, 'ready'),
+    };
   }
 
   createSurface(surfaceId: string): boolean {

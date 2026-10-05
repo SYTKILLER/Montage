@@ -1,8 +1,10 @@
 #include "bridge/engine_bridge.h"
 
+#include <algorithm>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 #include <unistd.h>
 
 #include <hilog/log.h>
@@ -135,6 +137,7 @@ void importDoneJsCallback(napi_env env, napi_value /*jsCb*/, void* context, void
         napi_create_object(env, &d);
         napi_set_named_property(env, d, "width", makeUint32(env, p->width));
         napi_set_named_property(env, d, "height", makeUint32(env, p->height));
+        napi_set_named_property(env, d, "layerId", makeDouble(env, static_cast<double>(p->layerId)));
         result = makeOk(env, d);
     } else {
         result = makeError(env, kErrInternal, p != nullptr ? std::string(p->error) : "import failed");
@@ -455,6 +458,405 @@ napi_value OnImportProgress(napi_env env, napi_callback_info info) {
     }
     return makeOk(env, nullptr);
 }
+
+// ---------- 图层（02 §5 M2 命令面）----------
+
+namespace {
+Layer* findLayerLocked(Document& doc, LayerId id) {
+    for (Layer& l : doc.layers) {
+        if (l.id == id) {
+            return &l;
+        }
+    }
+    return nullptr;
+}
+
+napi_value makeLayerDto(napi_env env, const Layer& l, bool isActive) {
+    napi_value obj = nullptr;
+    napi_create_object(env, &obj);
+    napi_set_named_property(env, obj, "id", makeDouble(env, static_cast<double>(l.id)));
+    napi_set_named_property(env, obj, "name", makeString(env, l.name));
+    napi_set_named_property(env, obj, "visible", makeBool(env, l.visible));
+    napi_set_named_property(env, obj, "opacity", makeDouble(env, l.opacity));
+    napi_set_named_property(env, obj, "blendMode", makeInt32(env, static_cast<int32_t>(l.blendMode)));
+    napi_set_named_property(env, obj, "isActive", makeBool(env, isActive));
+    // 02 §5 DTO 形状保真：M2 无组/蒙版，常量占位
+    napi_set_named_property(env, obj, "isGroup", makeBool(env, false));
+    napi_set_named_property(env, obj, "parentId", makeDouble(env, 0.0));
+    napi_set_named_property(env, obj, "hasMask", makeBool(env, false));
+    napi_set_named_property(env, obj, "thumbToken",
+                            makeDouble(env, static_cast<double>(l.pixels != nullptr ? l.pixels->revision : 0)));
+    return obj;
+}
+}  // namespace
+
+napi_value AddLayer(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    char name[96] = {0};
+    if (argc >= 1) {
+        size_t len = 0;
+        napi_get_value_string_utf8(env, argv[0], name, sizeof(name), &len);
+    }
+    auto& e = Engine::get();
+    double newId = 0;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "addLayer: no document");
+        }
+        Layer layer;
+        layer.id = e.nextLayerId();
+        layer.name = name[0] != '\0' ? std::string(name) : ("图层 " + std::to_string(layer.id));
+        // 插到 active 之上（源 addLayer 语义：新图层出现在当前图层上方并激活）
+        size_t at = e.doc.layers.size();
+        for (size_t i = 0; i < e.doc.layers.size(); ++i) {
+            if (e.doc.layers[i].id == e.doc.activeId) {
+                at = i + 1;
+                break;
+            }
+        }
+        e.doc.layers.insert(e.doc.layers.begin() + static_cast<long>(at), std::move(layer));
+        e.doc.activeId = e.doc.layers[at].id;
+        newId = static_cast<double>(e.doc.layers[at].id);
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "id", makeDouble(env, newId));
+    return makeOk(env, data);
+}
+
+napi_value RemoveLayer(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "removeLayer(id) requires 1 arg");
+    }
+    double id = 0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "removeLayer: invalid id");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        size_t at = e.doc.layers.size();
+        for (size_t i = 0; i < e.doc.layers.size(); ++i) {
+            if (e.doc.layers[i].id == static_cast<LayerId>(id)) {
+                at = i;
+                break;
+            }
+        }
+        if (at == e.doc.layers.size()) {
+            return makeError(env, kErrBadParam, "removeLayer: layer not found");
+        }
+        e.doc.layers.erase(e.doc.layers.begin() + static_cast<long>(at));
+        if (e.doc.activeId == static_cast<LayerId>(id)) {
+            e.doc.activeId =
+                e.doc.layers.empty() ? 0 : e.doc.layers[std::min(at, e.doc.layers.size() - 1)].id;
+        }
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value SelectLayer(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "selectLayer(id) requires 1 arg");
+    }
+    double id = 0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "selectLayer: invalid id");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (findLayerLocked(e.doc, static_cast<LayerId>(id)) == nullptr) {
+            return makeError(env, kErrBadParam, "selectLayer: layer not found");
+        }
+        e.doc.activeId = static_cast<LayerId>(id);
+        e.bumpRevisionLocked();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value SetLayerVisible(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "setLayerVisible(id, v) requires 2 args");
+    }
+    double id = 0;
+    bool v = false;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok ||
+        napi_get_value_bool(env, argv[1], &v) != napi_ok) {
+        return makeError(env, kErrBadParam, "setLayerVisible: invalid args");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        if (l == nullptr) {
+            return makeError(env, kErrBadParam, "setLayerVisible: layer not found");
+        }
+        l->visible = v;
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value SetLayerOpacity(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "setLayerOpacity(id, v) requires 2 args");
+    }
+    double id = 0;
+    double v = 0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok ||
+        napi_get_value_double(env, argv[1], &v) != napi_ok) {
+        return makeError(env, kErrBadParam, "setLayerOpacity: invalid args");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        if (l == nullptr) {
+            return makeError(env, kErrBadParam, "setLayerOpacity: layer not found");
+        }
+        l->opacity = std::min(1.0, std::max(0.0, v));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value SetLayerBlendMode(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "setLayerBlendMode(id, mode) requires 2 args");
+    }
+    double id = 0;
+    int32_t mode = 0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok ||
+        napi_get_value_int32(env, argv[1], &mode) != napi_ok) {
+        return makeError(env, kErrBadParam, "setLayerBlendMode: invalid args");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        if (l == nullptr) {
+            return makeError(env, kErrBadParam, "setLayerBlendMode: layer not found");
+        }
+        l->blendMode = (mode >= 0 && mode <= 3) ? static_cast<BlendMode>(mode) : BlendMode::Normal;
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value ReorderLayer(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "reorderLayer(id, toIndex) requires 2 args");
+    }
+    double id = 0;
+    int32_t toIndex = 0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok ||
+        napi_get_value_int32(env, argv[1], &toIndex) != napi_ok) {
+        return makeError(env, kErrBadParam, "reorderLayer: invalid args");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        size_t at = e.doc.layers.size();
+        for (size_t i = 0; i < e.doc.layers.size(); ++i) {
+            if (e.doc.layers[i].id == static_cast<LayerId>(id)) {
+                at = i;
+                break;
+            }
+        }
+        if (at == e.doc.layers.size()) {
+            return makeError(env, kErrBadParam, "reorderLayer: layer not found");
+        }
+        Layer layer = e.doc.layers[at];
+        e.doc.layers.erase(e.doc.layers.begin() + static_cast<long>(at));
+        long dst = std::min(std::max(0L, static_cast<long>(toIndex)),
+                            static_cast<long>(e.doc.layers.size()));
+        e.doc.layers.insert(e.doc.layers.begin() + dst, std::move(layer));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value GetLayerListSnapshot(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    napi_value arr = nullptr;
+    napi_create_array(env, &arr);
+    uint32_t n = 0;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        for (const Layer& l : e.doc.layers) {
+            napi_set_element(env, arr, n++, makeLayerDto(env, l, l.id == e.doc.activeId));
+        }
+    }
+    return makeOk(env, arr);
+}
+
+// 缩略图（02 §5：64px 经 ConvertPixelmapNativeToNapi；O3 生命周期实测项）。
+// execute 在 libuv 线程对瓦片最近邻采样成 64×64 RGBA；complete 回 JS 线程建 PixelMap。
+struct ThumbContext {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    LayerId layerId = 0;
+    std::shared_ptr<const TileGrid> pixels;  // 锁内拷贝，锁外采样
+    uint32_t layerW = 0;
+    uint32_t layerH = 0;
+    std::vector<uint8_t> buf;                // 64×64×4 RGBA
+    bool ok = false;
+};
+
+napi_value GetLayerThumbnail(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "getLayerThumbnail(id) requires 1 arg");
+    }
+    double id = 0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "getLayerThumbnail: invalid id");
+    }
+    napi_value promise = nullptr;
+    napi_deferred deferred = nullptr;
+    napi_create_promise(env, &deferred, &promise);
+
+    auto* ctx = new ThumbContext();
+    ctx->deferred = deferred;
+    ctx->layerId = static_cast<LayerId>(id);
+    {
+        auto& e = Engine::get();
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, ctx->layerId);
+        if (l != nullptr && l->pixels != nullptr) {
+            ctx->pixels = l->pixels;
+        }
+    }
+    napi_value workName = nullptr;
+    napi_create_string_utf8(env, "montageLayerThumb", NAPI_AUTO_LENGTH, &workName);
+    napi_status st = napi_create_async_work(
+        env, nullptr, workName,
+        [](napi_env /*env*/, void* data) {
+            auto* c = static_cast<ThumbContext*>(data);
+            if (c->pixels == nullptr || c->pixels->tiles.empty() || c->pixels->cols == 0) {
+                return;  // 空图层：complete 侧给占位
+            }
+            constexpr uint32_t kThumb = 64;
+            const uint32_t lw = c->pixels->cols * kTileSize;
+            const uint32_t lh = c->pixels->rows * kTileSize;
+            c->layerW = lw;
+            c->layerH = lh;
+            c->buf.assign(static_cast<size_t>(kThumb) * kThumb * 4, 0);
+            const double scale = std::min(static_cast<double>(kThumb) / lw,
+                                          static_cast<double>(kThumb) / lh);
+            const double dw = lw * scale;
+            const double dh = lh * scale;
+            const int offX = static_cast<int>((kThumb - dw) / 2);
+            const int offY = static_cast<int>((kThumb - dh) / 2);
+            const uint32_t stride = lw * 4;  // 瓦片拼装虚拟大图（按整图层坐标采样）
+            (void)stride;
+            for (uint32_t v = 0; v < kThumb; ++v) {
+                for (uint32_t u = 0; u < kThumb; ++u) {
+                    if (u < offX || v < offY || static_cast<double>(u) >= offX + dw ||
+                        static_cast<double>(v) >= offY + dh) {
+                        continue;
+                    }
+                    const uint32_t gx = std::min(
+                        static_cast<uint32_t>((u - offX) / scale), lw - 1);
+                    const uint32_t gy = std::min(
+                        static_cast<uint32_t>((v - offY) / scale), lh - 1);
+                    const uint32_t tIdx =
+                        (gy / kTileSize) * c->pixels->cols + (gx / kTileSize);
+                    auto it = c->pixels->tiles.find(tIdx);
+                    if (it == c->pixels->tiles.end() || it->second == nullptr) {
+                        continue;
+                    }
+                    const PixelSource* ps = it->second->pixels.get();
+                    const uint8_t* tp = ps->mapCpu();
+                    if (tp == nullptr) {
+                        continue;
+                    }
+                    const uint32_t inTileX = gx % kTileSize;
+                    const uint32_t inTileY = gy % kTileSize;
+                    const uint8_t* px = tp + static_cast<size_t>(inTileY) * ps->rowBytes() +
+                                        static_cast<size_t>(inTileX) * 4u;
+                    uint8_t* out =
+                        c->buf.data() + (static_cast<size_t>(v) * kThumb + u) * 4u;
+                    out[0] = px[0];
+                    out[1] = px[1];
+                    out[2] = px[2];
+                    out[3] = px[3];
+                }
+            }
+            c->ok = true;
+        },
+        [](napi_env env, napi_status status, void* data) {
+            auto* c = static_cast<ThumbContext*>(data);
+            napi_value d = nullptr;
+            napi_create_object(env, &d);
+            napi_value pmVal = nullptr;
+            if (status == napi_ok && c->ok) {
+                OH_Pixelmap_InitializationOptions* opts = nullptr;
+                OH_PixelmapInitializationOptions_Create(&opts);
+                if (opts != nullptr) {
+                    OH_PixelmapInitializationOptions_SetWidth(opts, 64);
+                    OH_PixelmapInitializationOptions_SetHeight(opts, 64);
+                    OH_PixelmapInitializationOptions_SetPixelFormat(opts, 3 /*RGBA_8888*/);
+                    OH_PixelmapInitializationOptions_SetSrcPixelFormat(opts, 3 /*RGBA_8888*/);
+                }
+                OH_PixelmapNative* pm = nullptr;
+                const Image_ErrorCode rc = OH_PixelmapNative_CreatePixelmap(
+                    const_cast<uint8_t*>(c->buf.data()), c->buf.size(), opts, &pm);
+                if (opts != nullptr) {
+                    OH_PixelmapInitializationOptions_Release(opts);
+                }
+                if (rc == IMAGE_SUCCESS && pm != nullptr) {
+                    OH_PixelmapNative_ConvertPixelmapNativeToNapi(env, pm, &pmVal);
+                    OH_PixelmapNative_Release(pm);
+                }
+            }
+            napi_set_named_property(env, d, "pixelMap", pmVal);
+            napi_set_named_property(env, d, "ready", makeBool(env, pmVal != nullptr));
+            napi_resolve_deferred(env, c->deferred, makeOk(env, d));
+            napi_delete_async_work(env, c->work);
+            delete c;
+        },
+        ctx, &ctx->work);
+    if (st != napi_ok) {
+        delete ctx;
+        return makeError(env, kErrInternal, "create async work failed");
+    }
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+// ---------- M0 像素测试（保留） ----------
 
 // ---------- M0 像素测试（保留） ----------
 

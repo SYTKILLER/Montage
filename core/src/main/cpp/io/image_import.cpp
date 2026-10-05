@@ -71,11 +71,21 @@ class FdGuard {
     int fd_;
 };
 
-ImportCompletion* makePayload(bool ok, uint32_t w, uint32_t h, const std::string& err) {
+// 完成回调 payload（堆分配，TSFN 送 JS 线程消费后由消费方 delete）
+struct ImportCompletion {
+    bool ok = false;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    LayerId layerId = 0;
+    char error[192] = {0};
+};
+
+ImportCompletion* makePayload(bool ok, uint32_t w, uint32_t h, LayerId layerId, const std::string& err) {
     auto* p = new ImportCompletion();
     p->ok = ok;
     p->width = w;
     p->height = h;
+    p->layerId = layerId;
     std::strncpy(p->error, err.c_str(), sizeof(p->error) - 1);
     return p;
 }
@@ -111,7 +121,7 @@ bool decodeBand(OH_ImageSourceNative* source, uint32_t imgW, uint32_t imgY, uint
         err = "DecodingOptions create failed";
         return false;
     }
-    // R8：直出请求 BGRA_8888（M1 实证：native 解码器实际输出 BGRA，请求 RGBA 会被忽略）；
+    // R8：直出请求 BGRA_8888（M1 实证：native 解码器实际输出与请求相反，见 swapRB 校准注释）；
     // R7：分带区域解码（PNG 实证可能整图回退，actualH 兜底）
     OH_DecodingOptions_SetPixelFormat(opts, 4 /*PIXEL_FORMAT_BGRA_8888*/);
     Image_Region region{};
@@ -156,7 +166,7 @@ bool decodeBand(OH_ImageSourceNative* source, uint32_t imgW, uint32_t imgY, uint
     }
     *actualH = bandH;
     // M1 两轮实证：此解码路径的 fmt 报告与实际输出相反（报 RGBA 实出 BGRA，反之亦然）；
-    // 请求 BGRA(4) → 实出 RGBA → 不换；报 3 → 实出 BGRA → 换 R/B。picker 打开 JPEG 后需复验。
+    // 请求 BGRA(4) → 实出 RGBA → 不换；报 3 → 实出 BGRA → 换 R/B。JPEG 待复验。
     const bool swapRB = (pixelFormat == 3);
 
     void* addr = nullptr;
@@ -196,27 +206,20 @@ bool decodeBand(OH_ImageSourceNative* source, uint32_t imgW, uint32_t imgY, uint
                     }
                 }
             }
-            if (tx == 0 && ty == ty0) {
-                OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag,
-                             "band y=%{public}u fmt=%{public}d stride=%{public}u bandWH=%{public}ux%{public}u "
-                             "tile0 bytes=%{public}02x %{public}02x %{public}02x %{public}02x | %{public}02x %{public}02x %{public}02x %{public}02x",
-                             imgY, pixelFormat, rowStride, bandW, bandH,
-                             dstBase[0], dstBase[1], dstBase[2], dstBase[3],
-                             dstBase[4], dstBase[5], dstBase[6], dstBase[7]);
-            }
         }
     }
     return true;
 }
 
-// 导入主体（fd 归属本函数）。返回 payload（堆）。
+// 导入主体（fd 归属本函数）。导入 = 追加图层：无文档时以图片尺寸建文档；有文档时
+// 新图层居中放置、置于栈顶并激活。返回 payload（堆）。
 ImportCompletion* runImport(int fd) {
     FdGuard fdGuard(fd);
     auto& engine = Engine::get();
 
     OH_ImageSourceNative* rawSource = nullptr;
     if (OH_ImageSourceNative_CreateFromFd(fd, &rawSource) != IMAGE_SUCCESS || rawSource == nullptr) {
-        return makePayload(false, 0, 0, "CreateFromFd failed");
+        return makePayload(false, 0, 0, 0, "CreateFromFd failed");
     }
     SourceGuard source(rawSource);
 
@@ -226,7 +229,7 @@ ImportCompletion* runImport(int fd) {
         OH_ImageSource_Info* info = nullptr;
         OH_ImageSourceInfo_Create(&info);
         if (info == nullptr) {
-            return makePayload(false, 0, 0, "ImageSourceInfo create failed");
+            return makePayload(false, 0, 0, 0, "ImageSourceInfo create failed");
         }
         const Image_ErrorCode rc = OH_ImageSourceNative_GetImageInfo(source.get(), 0, info);
         if (rc == IMAGE_SUCCESS) {
@@ -235,14 +238,34 @@ ImportCompletion* runImport(int fd) {
         }
         OH_ImageSourceInfo_Release(info);
         if (rc != IMAGE_SUCCESS) {
-            return makePayload(false, 0, 0, "GetImageInfo rc=" + std::to_string(rc));
+            return makePayload(false, 0, 0, 0, "GetImageInfo rc=" + std::to_string(rc));
         }
     }
     if (imgW == 0 || imgH == 0 || imgW > kMaxSide || imgH > kMaxSide ||
         static_cast<uint64_t>(imgW) * imgH > kMaxPixels) {
-        return makePayload(false, imgW, imgH, "image size out of limits(16384/100MP)");
+        return makePayload(false, imgW, imgH, 0, "image size out of limits(16384/100MP)");
     }
-    OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "import start %{public}ux%{public}u", imgW, imgH);
+
+    // 图层落位：无文档 → 建文档（尺寸=图片）；有文档 → 居中放置
+    const LayerId layerId = engine.nextLayerId();
+    bool createsDoc = false;
+    Transform transform;
+    {
+        std::lock_guard<std::mutex> lk(engine.docMutex);
+        createsDoc = (engine.doc.width == 0 || engine.doc.height == 0);
+        if (createsDoc) {
+            transform.originX = 0.0;
+            transform.originY = 0.0;
+        } else {
+            transform.originX = std::max(0.0, (static_cast<double>(engine.doc.width) - imgW) / 2.0);
+            transform.originY = std::max(0.0, (static_cast<double>(engine.doc.height) - imgH) / 2.0);
+        }
+        transform.width = imgW;
+        transform.height = imgH;
+    }
+    OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag,
+                 "import start %{public}ux%{public}u layer=%{public}llu createsDoc=%{public}d",
+                 imgW, imgH, static_cast<unsigned long long>(layerId), createsDoc ? 1 : 0);
 
     const uint32_t cols = (imgW + kTileSize - 1u) / kTileSize;
     const uint32_t rows = (imgH + kTileSize - 1u) / kTileSize;
@@ -251,18 +274,19 @@ ImportCompletion* runImport(int fd) {
     const uint32_t bands = (imgH + bandH - 1u) / bandH;
     uint64_t gridRevision = 0;
     bool fullDecoded = false;
+    bool layerAppended = false;
 
     for (uint32_t band = 0; band < bands && !fullDecoded; ++band) {
         if (importCancelled()) {
             OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "import cancelled at band %{public}u", band);
-            return makePayload(false, imgW, imgH, "cancelled");
+            return makePayload(false, imgW, imgH, layerId, "cancelled");
         }
         const uint32_t y0 = band * bandH;
         const uint32_t h = std::min(bandH, imgH - y0);
         std::string err;
         uint32_t actualH = 0;
         if (!decodeBand(source.get(), imgW, y0, h, builder, &actualH, err)) {
-            return makePayload(false, imgW, imgH, err);
+            return makePayload(false, imgW, imgH, layerId, err);
         }
         if (band == 0 && actualH >= imgH) {
             // region 解码不生效（整图回退，M1 实证 PNG 如此）：瓦片已全部就位，发布后结束
@@ -270,15 +294,32 @@ ImportCompletion* runImport(int fd) {
                          "region decode unsupported (got full %{public}u rows), single-pass import", actualH);
             fullDecoded = true;
         }
-        // 带边界发布：新不可变 TileGrid + 渐进渲染（02 §6.1 / R4）
+        // 带边界发布：图层入栈（首个带）+ 图层瓦片快照更新 + 渐进渲染（02 §6.1 / R4）
         {
             auto grid = builder.publish(++gridRevision);
             std::lock_guard<std::mutex> lk(engine.docMutex);
-            engine.doc.width = imgW;
-            engine.doc.height = imgH;
-            engine.doc.pixels = grid;
-            OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "PUBLISHED rev=%{public}d tiles=%{public}d doc=%{public}ux%{public}u",
-                         static_cast<int>(gridRevision), static_cast<int>(grid->tiles.size()), imgW, imgH);
+            if (createsDoc) {
+                engine.doc.width = imgW;
+                engine.doc.height = imgH;
+                engine.doc.name = "Untitled";
+            }
+            if (!layerAppended) {
+                Layer layer;
+                layer.id = layerId;
+                layer.name = "图片 " + std::to_string(layerId);
+                layer.transform = transform;
+                layer.pixels = grid;
+                engine.doc.layers.push_back(std::move(layer));
+                engine.doc.activeId = layerId;
+                layerAppended = true;
+            } else {
+                for (Layer& l : engine.doc.layers) {
+                    if (l.id == layerId) {
+                        l.pixels = grid;
+                        break;
+                    }
+                }
+            }
             engine.requestRender();
         }
         notifyProgress(static_cast<double>(band + 1) / static_cast<double>(bands));
@@ -292,8 +333,10 @@ ImportCompletion* runImport(int fd) {
         std::lock_guard<std::mutex> lk(engine.import.mtx);
         engine.import.running = false;
     }
-    OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "import done: grid %{public}ux%{public}u tiles", cols, rows);
-    return makePayload(true, imgW, imgH, "");
+    OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag,
+                 "import done: grid %{public}ux%{public}u tiles layer=%{public}llu",
+                 cols, rows, static_cast<unsigned long long>(layerId));
+    return makePayload(true, imgW, imgH, layerId, "");
 }
 
 void importThread(int fd, napi_threadsafe_function completionTsfn) {

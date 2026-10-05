@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include <EGL/egl.h>
@@ -14,6 +15,11 @@ namespace montage {
 namespace {
 constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Render";
+
+const char* const kBlendBodies[4] = {
+    shaders::kBlendNormalBody, shaders::kBlendMultiplyBody,
+    shaders::kBlendScreenBody, shaders::kBlendOverlayBody,
+};
 }  // namespace
 
 GLuint TileRenderer::buildProgram(const char* vertSrc, const char* fragSrc) {
@@ -57,13 +63,90 @@ GLuint TileRenderer::buildProgram(const char* vertSrc, const char* fragSrc) {
     return prog;
 }
 
+GLuint TileRenderer::buildBlendProgram(int mode) {
+    // 拼装：common 模板中的占位 blendB 函数体替换为对应模式实现（R3.3 独立 program）
+    const std::string placeholder =
+        "vec3 blendB(vec3 Cb, vec3 Cs) {   // %%BLEND_B%% 各模式替换\n  return Cs;\n}";
+    const std::string fn =
+        std::string("vec3 blendB(vec3 Cb, vec3 Cs) {") + kBlendBodies[mode] + "\n}";
+    std::string src(shaders::kBlendCommon);
+    const size_t at = src.find(placeholder);
+    if (at == std::string::npos) {
+        OH_LOG_Print(LOG_APP, LOG_ERROR, kDomain, kTag, "blend template placeholder missing");
+        return 0;
+    }
+    src.replace(at, placeholder.size(), fn);
+    return buildProgram(shaders::kQuadVert, src.c_str());
+}
+
+bool TileRenderer::ensureFbos(int32_t vw, int32_t vh) {
+    if (fboW_ == vw && fboH_ == vh && layerFbo_ != 0) {
+        return true;
+    }
+    destroyFbos();
+    if (!float16Probed_) {
+        const GLubyte* ext = glGetString(GL_EXTENSIONS);
+        float16_ = ext != nullptr && std::strstr(reinterpret_cast<const char*>(ext),
+                                                 "EXT_color_buffer_float") != nullptr;
+        float16Probed_ = true;
+        OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "acc FBO format: %{public}s",
+                     float16_ ? "RGBA16F" : "RGBA8");
+    }
+    const GLint internal = float16_ ? GL_RGBA16F : GL_RGBA8;
+    const GLenum type = float16_ ? GL_HALF_FLOAT : GL_UNSIGNED_BYTE;
+    auto makeFbo = [&](GLuint* fbo, GLuint* tex) -> bool {
+        glGenFramebuffers(1, fbo);
+        glGenTextures(1, tex);
+        glBindTexture(GL_TEXTURE_2D, *tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, internal, vw, vh, 0, GL_RGBA, type, nullptr);
+        glBindFramebuffer(GL_FRAMEBUFFER, *fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, *tex, 0);
+        const GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        return st == GL_FRAMEBUFFER_COMPLETE;
+    };
+    bool ok = makeFbo(&accFbo_[0], &accTex_[0]);
+    ok = makeFbo(&accFbo_[1], &accTex_[1]) && ok;
+    ok = makeFbo(&layerFbo_, &layerTex_) && ok;
+    if (!ok) {
+        OH_LOG_Print(LOG_APP, LOG_ERROR, kDomain, kTag, "FBO incomplete");
+        destroyFbos();
+        return false;
+    }
+    fboW_ = vw;
+    fboH_ = vh;
+    return true;
+}
+
+void TileRenderer::destroyFbos() {
+    for (int i = 0; i < 2; ++i) {
+        if (accFbo_[i] != 0) glDeleteFramebuffers(1, &accFbo_[i]);
+        if (accTex_[i] != 0) glDeleteTextures(1, &accTex_[i]);
+        accFbo_[i] = 0;
+        accTex_[i] = 0;
+    }
+    if (layerFbo_ != 0) glDeleteFramebuffers(1, &layerFbo_);
+    if (layerTex_ != 0) glDeleteTextures(1, &layerTex_);
+    layerFbo_ = 0;
+    layerTex_ = 0;
+    fboW_ = fboH_ = 0;
+}
+
 void TileRenderer::ensureInit() {
     if (inited_) {
         return;
     }
     checkerProg_ = buildProgram(shaders::kQuadVert, shaders::kCheckerFrag);
     tileProg_ = buildProgram(shaders::kQuadVert, shaders::kTileFrag);
-    if (checkerProg_ == 0 || tileProg_ == 0) {
+    plainProg_ = buildProgram(shaders::kQuadVert, shaders::kPlainFrag);
+    for (int m = 0; m < 4; ++m) {
+        blendProgs_[m] = buildBlendProgram(m);
+    }
+    if (checkerProg_ == 0 || tileProg_ == 0 || plainProg_ == 0 || blendProgs_[0] == 0) {
         return;
     }
     const float quad[8] = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f};
@@ -92,11 +175,17 @@ void TileRenderer::invalidate() {
         }
     }
     cache_.clear();
+    destroyFbos();
     if (checkerProg_ != 0) glDeleteProgram(checkerProg_);
     if (tileProg_ != 0) glDeleteProgram(tileProg_);
+    if (plainProg_ != 0) glDeleteProgram(plainProg_);
+    for (int m = 0; m < 4; ++m) {
+        if (blendProgs_[m] != 0) glDeleteProgram(blendProgs_[m]);
+        blendProgs_[m] = 0;
+    }
+    checkerProg_ = tileProg_ = plainProg_ = 0;
     if (vbo_ != 0) glDeleteBuffers(1, &vbo_);
     if (vao_ != 0) glDeleteVertexArrays(1, &vao_);
-    checkerProg_ = tileProg_ = 0;
     vbo_ = vao_ = 0;
     inited_ = false;
 }
@@ -115,47 +204,30 @@ void TileRenderer::drawQuad(GLuint program, float rx, float ry, float rw, float 
     glBindVertexArray(0);
 }
 
-void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw, int32_t vh) {
-    frame_++;
-    glViewport(0, 0, vw, vh);
-    // 画布外背板：中性灰（05 §7：与主题解耦，对齐 PS 行为）
-    glClearColor(0.27f, 0.27f, 0.27f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    if (!inited_ || doc.pixels == nullptr || doc.width == 0 || doc.height == 0) {
-        return;
-    }
-
-    const float zoom = static_cast<float>(clampZoom(vp.zoom));
-    const float panX = static_cast<float>(vp.panX);
-    const float panY = static_cast<float>(vp.panY);
-
-    // ① 棋盘格透明底（仅文档矩形内）
-    glDisable(GL_BLEND);
-    drawQuad(checkerProg_, 0.0f, 0.0f, static_cast<float>(doc.width), static_cast<float>(doc.height),
-             zoom, panX, panY, static_cast<float>(vw), static_cast<float>(vh));
-
-    // ② 可见瓦片：视口求交（03 §6 瓦片剔除），按需上传
-    const TileGrid& grid = *doc.pixels;
+void TileRenderer::drawTiles(const Layer& layer, float zoom, float panX, float panY, float vw,
+                             float vh) {
+    const TileGrid& grid = *layer.pixels;
     if (grid.cols == 0 || grid.rows == 0) {
         return;
     }
+    const float ox = static_cast<float>(layer.transform.originX);
+    const float oy = static_cast<float>(layer.transform.originY);
+
+    // 视口求交（03 §6 瓦片剔除）：doc 可见范围 ∩ 图层变换范围
     const float docX0 = panX;
     const float docY0 = panY;
-    const float docX1 = panX + static_cast<float>(vw) / zoom;
-    const float docY1 = panY + static_cast<float>(vh) / zoom;
-    const uint32_t tx0 = static_cast<uint32_t>(std::max(0.0f, std::floor(docX0 / kTileSize)));
-    const uint32_t ty0 = static_cast<uint32_t>(std::max(0.0f, std::floor(docY0 / kTileSize)));
-    const uint32_t tx1 = std::min(grid.cols - 1u,
-                                  static_cast<uint32_t>(std::max(0.0f, std::floor(docX1 / kTileSize))));
-    const uint32_t ty1 = std::min(grid.rows - 1u,
-                                  static_cast<uint32_t>(std::max(0.0f, std::floor(docY1 / kTileSize))));
-    const bool wantNearest = zoom >= 2.0f;  // 03 §6：≥200% 切 NEAREST
+    const float docX1 = panX + vw / zoom;
+    const float docY1 = panY + vh / zoom;
+    const uint32_t tx0 = static_cast<uint32_t>(std::max(0.0f, std::floor((docX0 - ox) / kTileSize)));
+    const uint32_t ty0 = static_cast<uint32_t>(std::max(0.0f, std::floor((docY0 - oy) / kTileSize)));
+    const uint32_t tx1 = std::min(grid.cols - 1u, static_cast<uint32_t>(
+        std::max(0.0f, std::floor((docX1 - ox) / kTileSize))));
+    const uint32_t ty1 = std::min(grid.rows - 1u, static_cast<uint32_t>(
+        std::max(0.0f, std::floor((docY1 - oy) / kTileSize))));
+    const bool wantNearest = zoom >= 2.0f;  // 03 §6：≥200% 切 NEAREST（crispZoom）
 
     glUseProgram(tileProg_);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    const GLint texLoc = glGetUniformLocation(tileProg_, "uTex");
-    glUniform1i(texLoc, 0);
+    glUniform1i(glGetUniformLocation(tileProg_, "uTex"), 0);
     glActiveTexture(GL_TEXTURE0);
 
     for (uint32_t ty = ty0; ty <= ty1; ++ty) {
@@ -166,7 +238,8 @@ void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw
                 continue;  // 稀疏：空白瓦片不存在
             }
             const Tile* tile = it->second.get();
-            CacheEntry& entry = cache_[idx];
+            const uint64_t key = (static_cast<uint64_t>(layer.id) << 32) | idx;
+            CacheEntry& entry = cache_[key];
             if (entry.tilePtr != tile || entry.tex == 0) {
                 // （重）上传：数据源一律经 PixelSource::mapCpu()
                 if (entry.tex != 0) {
@@ -201,22 +274,109 @@ void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw
             }
             entry.lastFrame = frame_;
             glBindTexture(GL_TEXTURE_2D, entry.tex);
-            drawQuad(tileProg_, static_cast<float>(tx * kTileSize), static_cast<float>(ty * kTileSize),
+            drawQuad(tileProg_, ox + static_cast<float>(tx * kTileSize),
+                     oy + static_cast<float>(ty * kTileSize),
                      static_cast<float>(kTileSize), static_cast<float>(kTileSize), zoom, panX, panY,
                      static_cast<float>(vw), static_cast<float>(vh));
         }
     }
+}
+
+void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw, int32_t vh) {
+    frame_++;
+    glViewport(0, 0, vw, vh);
+    // 画布外背板：中性灰（05 §7：与主题解耦，对齐 PS 行为）
+    glClearColor(0.27f, 0.27f, 0.27f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (!inited_ || doc.width == 0 || doc.height == 0) {
+        return;
+    }
+    if (!ensureFbos(vw, vh)) {
+        return;
+    }
+
+    const float zoom = static_cast<float>(clampZoom(vp.zoom));
+    const float panX = static_cast<float>(vp.panX);
+    const float panY = static_cast<float>(vp.panY);
+    const float vwF = static_cast<float>(vw);
+    const float vhF = static_cast<float>(vh);
+
+    // ① 自底向上逐层两趟合成（03 §4）：assemble → layerFBO，blend → acc ping-pong
+    for (int i = 0; i < 2; ++i) {
+        glBindFramebuffer(GL_FRAMEBUFFER, accFbo_[i]);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
+    int accIdx = 0;
+    int composited = 0;
+    for (const Layer& layer : doc.layers) {
+        if (!layer.visible || layer.pixels == nullptr) {
+            continue;
+        }
+        composited++;
+        const int mode = static_cast<int>(layer.blendMode);
+        GLuint blendProg = (mode >= 0 && mode <= 3) ? blendProgs_[mode] : blendProgs_[0];
+        if (blendProg == 0) {
+            blendProg = blendProgs_[0];
+        }
+        // Pass A：图层可见瓦片 → layerFBO（直通 alpha）
+        glBindFramebuffer(GL_FRAMEBUFFER, layerFbo_);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDisable(GL_BLEND);
+        drawTiles(layer, zoom, panX, panY, vw, vh);
+
+        // Pass B：blend(src=layerTex, dst=acc) 全屏 → acc 另一侧（R3.1：视口变仍全帧重绘）
+        const int dstIdx = accIdx;
+        const int outIdx = 1 - accIdx;
+        glBindFramebuffer(GL_FRAMEBUFFER, accFbo_[outIdx]);
+        glDisable(GL_BLEND);
+        glUseProgram(blendProg);
+        glUniform1i(glGetUniformLocation(blendProg, "uSrc"), 0);
+        glUniform1i(glGetUniformLocation(blendProg, "uDst"), 1);
+        glUniform1f(glGetUniformLocation(blendProg, "uOpacity"), static_cast<float>(layer.opacity));
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, layerTex_);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, accTex_[dstIdx]);
+        // uRect/uView/uViewport 必须由 drawQuad 设置（缺省 0 → quad 退化不绘制，M2 实测坑）
+        drawQuad(blendProg, 0.0f, 0.0f, vwF, vhF, 1.0f, 0.0f, 0.0f, vwF, vhF);
+        accIdx = outIdx;
+    }
+
+    // ② 屏幕：灰背板 → doc rect 棋盘格 → acc 终合成（按 doc rect 裁剪）
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, vw, vh);
+    glClearColor(0.27f, 0.27f, 0.27f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
     glDisable(GL_BLEND);
+    drawQuad(checkerProg_, 0.0f, 0.0f, static_cast<float>(doc.width), static_cast<float>(doc.height),
+             zoom, panX, panY, vwF, vhF);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, accTex_[accIdx]);
+    drawQuad(plainProg_, 0.0f, 0.0f, static_cast<float>(doc.width), static_cast<float>(doc.height),
+             zoom, panX, panY, vwF, vhF);
+    glDisable(GL_BLEND);
+
+    if (frame_ <= 8) {
+        OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag,
+                     "compose layers=%{public}d composited=%{public}d cache=%{public}d fbo=%{public}dx%{public}d f16=%{public}d",
+                     static_cast<int>(doc.layers.size()), composited, static_cast<int>(cache_.size()),
+                     fboW_, fboH_, float16_ ? 1 : 0);
+    }
 
     // LRU 逐出（超预算时最久未用先走）
     if (cache_.size() > kCacheCap) {
-        std::vector<uint32_t> victims;
+        std::vector<uint64_t> victims;
         for (auto& kv : cache_) {
             if (frame_ - kv.second.lastFrame > 8) {
                 victims.push_back(kv.first);
             }
         }
-        std::sort(victims.begin(), victims.end(), [this](uint32_t a, uint32_t b) {
+        std::sort(victims.begin(), victims.end(), [this](uint64_t a, uint64_t b) {
             return cache_[a].lastFrame < cache_[b].lastFrame;
         });
         const size_t target = kCacheCap / 2;

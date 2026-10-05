@@ -30,6 +30,11 @@ void Engine::bumpRevisionLocked() {
     }
 }
 
+LayerId Engine::nextLayerId() {
+    static std::atomic<LayerId> counter{1};
+    return counter.fetch_add(1);
+}
+
 void Engine::resetDocument() {
     {
         std::lock_guard<std::mutex> lk(import.mtx);

@@ -1,19 +1,32 @@
 #ifndef MONTAGE_ENGINE_DOCUMENT_H
 #define MONTAGE_ENGINE_DOCUMENT_H
 
-// 数据模型（02 文档 §2 定案）：256px 稀疏瓦片 + PixelSource 抽象 + 不可变发布。
+// 数据模型（02 文档 §1/§2 定案）：256px 稀疏瓦片 + PixelSource 抽象 + 不可变发布 + 图层栈。
 // 上层（渲染上传/导入/后续 kernels）一律经 PixelSource 接口取数，禁止摸裸指针。
+// 源对拍：ImageLayer/CanvasDocument（EditorSession.swift）——layers 自底向上、
+// opacity 默认 1、blendMode 默认 normal、空图层画笔开始才分配像素。
 
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <native_buffer/native_buffer.h>
 
 namespace montage {
 
 constexpr uint32_t kTileSize = 256;  // 定案 R2：256px（256KB/瓦片 RGBA8888）
+
+using LayerId = uint64_t;
+
+// M2 混合模式子集（03 §5：M2.1 再扩全集；索引即 UI Select 序号）
+enum class BlendMode : int32_t {
+    Normal = 0,
+    Multiply = 1,
+    Screen = 2,
+    Overlay = 3,
+};
 
 // D2.4 像素源抽象（DMA 扩展点预留）。
 class PixelSource {
@@ -73,7 +86,6 @@ class TileGridBuilder {
     uint32_t rows() const { return rows_; }
     uint32_t tileIndex(uint32_t tx, uint32_t ty) const { return ty * cols_ + tx; }
 
-    // 取或创建瓦片（返回可写 buffer 的像素区）
     EngineBuffer& ensureTile(uint32_t tx, uint32_t ty);
     bool hasTile(uint32_t tx, uint32_t ty) const;
 
@@ -85,12 +97,32 @@ class TileGridBuilder {
     std::unordered_map<uint32_t, std::shared_ptr<const Tile>> tiles_;
 };
 
-// M1：单层文档（完整 Document/Layer 模型 M2 展开）。
+// 图层变换（M2：origin+size；旋转/翻转 M8）。origin 为图层左上角在文档坐标系的落点。
+struct Transform {
+    double originX = 0.0;
+    double originY = 0.0;
+    double width = 0.0;   // 0 = 用像素尺寸
+    double height = 0.0;
+};
+
+// 图层（值语义，对齐源 ImageLayer；M2 子集：蒙版/调整/形状/文字 M5+ 逐步补）。
+struct Layer {
+    LayerId id = 0;
+    std::string name;
+    bool visible = true;
+    double opacity = 1.0;
+    BlendMode blendMode = BlendMode::Normal;
+    Transform transform;
+    std::shared_ptr<const TileGrid> pixels;  // null = 空图层（源：画笔开始才分配）
+};
+
+// M2：图层栈文档（无组/蒙版/选区；History M4）。
 struct Document {
     uint32_t width = 0;
     uint32_t height = 0;
     std::string name;
-    std::shared_ptr<const TileGrid> pixels;  // null = 空文档
+    std::vector<Layer> layers;  // bottom → top（对齐源 CanvasDocument.layers）
+    LayerId activeId = 0;
 };
 
 // 视口：pan = 视口左上角的文档坐标（doc px），screen = (doc - pan) * zoom。
@@ -101,6 +133,8 @@ struct Viewport {
 };
 
 double clampZoom(double zoom);  // [1/32, 32]
+
+const char* blendModeName(BlendMode mode);  // DTO 显示名（对齐源 LayerBlendMode raw 值）
 
 }  // namespace montage
 

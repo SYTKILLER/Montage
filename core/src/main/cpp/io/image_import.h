@@ -8,6 +8,8 @@
 
 #include <napi/native_api.h>
 
+#include "engine/document.h"
+
 namespace montage {
 namespace io {
 
@@ -16,6 +18,7 @@ struct ImportCompletion {
     bool ok = false;
     uint32_t width = 0;
     uint32_t height = 0;
+    LayerId layerId = 0;
     char error[192] = {0};
 };
 

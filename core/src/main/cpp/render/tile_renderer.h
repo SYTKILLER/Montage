@@ -1,8 +1,9 @@
 #ifndef MONTAGE_RENDER_TILE_RENDERER_H
 #define MONTAGE_RENDER_TILE_RENDERER_H
 
-// 瓦片绘制（03 §6 定案）：纹理键=瓦片对象指针（不可变 ⇒ 指针即内容身份）；
-// 只上传视口相交瓦片；LRU 预算（缺省 1024 片 ≈ 256MB）；≥200% 切 NEAREST。
+// 图层合成渲染（03 §4 定案）：每层两趟（assemble 进 layerFBO + blend 进 acc ping-pong），
+// 4 混合模式独立 program（R3.3）；acc 优先 RGBA16F（探测 EXT_color_buffer_float，回退 RGBA8）；
+// 瓦片纹理按需上传 + LRU（缺省 1024 片 ≈ 256MB）；≥200% 切 NEAREST（crispZoom）。
 // 所有 GL 调用只在渲染线程（vsync 回调线程）发生。
 
 #include <cstdint>
@@ -18,7 +19,7 @@ class TileRenderer {
   public:
     // GL 线程首帧惰性初始化（编译 program / 建 quad VBO）
     void ensureInit();
-    // 绘制一帧（背景 + 棋盘格 + 可见瓦片）。vw/vh = 视口 px。
+    // 绘制一帧（背板 + 棋盘格 + 图层栈合成）。vw/vh = 视口 px。
     void drawFrame(const Document& doc, const Viewport& vp, int32_t vw, int32_t vh);
     // 上下文销毁/丢失时清空全部 GL 资源（03 R3.9：派生缓存语义）
     void invalidate();
@@ -32,16 +33,32 @@ class TileRenderer {
     };
 
     static GLuint buildProgram(const char* vertSrc, const char* fragSrc);
+    static GLuint buildBlendProgram(int mode);
+    bool ensureFbos(int32_t vw, int32_t vh);
+    void destroyFbos();
     void drawQuad(GLuint program, float rx, float ry, float rw, float rh, float zoom, float panX,
                   float panY, float vw, float vh);
+    void drawTiles(const Layer& layer, float zoom, float panX, float panY, float vw, float vh);
 
     GLuint checkerProg_ = 0;
     GLuint tileProg_ = 0;
+    GLuint plainProg_ = 0;
+    GLuint blendProgs_[4] = {0, 0, 0, 0};
     GLuint vbo_ = 0;
     GLuint vao_ = 0;
     bool inited_ = false;
 
-    std::unordered_map<uint32_t, CacheEntry> cache_;
+    // 合成 FBO（视口分辨率；acc 双缓冲 ping-pong + 单层 assemble）
+    GLuint accFbo_[2] = {0, 0};
+    GLuint accTex_[2] = {0, 0};
+    GLuint layerFbo_ = 0;
+    GLuint layerTex_ = 0;
+    GLint fboW_ = 0;
+    GLint fboH_ = 0;
+    bool float16_ = false;
+    bool float16Probed_ = false;
+
+    std::unordered_map<uint64_t, CacheEntry> cache_;  // key = layerId<<32 | tileIndex
     uint64_t frame_ = 0;
     static constexpr size_t kCacheCap = 1024;  // 1024×256KB = 256MB，与 02 Limits 缓存预算一致
 };

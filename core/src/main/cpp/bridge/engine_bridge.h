@@ -16,6 +16,16 @@ napi_value OpenFileFromFd(napi_env env, napi_callback_info info);
 // 视口（02 §5；pan = 视口左上角文档坐标，canvasW/H = 画布组件 px 尺寸）
 napi_value SetViewport(napi_env env, napi_callback_info info);
 napi_value FitToWindow(napi_env env, napi_callback_info info);
+// 图层（02 §5 M2 命令面；LayerDTO 见 02 §5，缩略图 = O3 跨桥实测）
+napi_value AddLayer(napi_env env, napi_callback_info info);
+napi_value RemoveLayer(napi_env env, napi_callback_info info);
+napi_value SelectLayer(napi_env env, napi_callback_info info);
+napi_value SetLayerVisible(napi_env env, napi_callback_info info);
+napi_value SetLayerOpacity(napi_env env, napi_callback_info info);
+napi_value SetLayerBlendMode(napi_env env, napi_callback_info info);
+napi_value ReorderLayer(napi_env env, napi_callback_info info);
+napi_value GetLayerListSnapshot(napi_env env, napi_callback_info info);
+napi_value GetLayerThumbnail(napi_env env, napi_callback_info info);
 // 渲染表面
 napi_value CreateSurface(napi_env env, napi_callback_info info);
 napi_value DestroySurface(napi_env env, napi_callback_info info);

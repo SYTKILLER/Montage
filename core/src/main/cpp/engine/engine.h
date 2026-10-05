@@ -38,6 +38,8 @@ class Engine {
     napi_threadsafe_function revisionTsfn = nullptr;   // docVersion 事件
     napi_threadsafe_function progressTsfn = nullptr;   // importProgress 事件（payload=permille intptr）
 
+    LayerId nextLayerId();  // 单调递增不回收（02 §1 ID 策略），锁外调用安全
+
     // 状态变更后调用：置脏 + 唤一帧（可在任意线程）
     void requestRender();
 

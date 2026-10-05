@@ -28,10 +28,31 @@ export interface ViewportData {
   panY: number;
 }
 
-/** 导入完成结果（openFileFromFd 的 data）。 */
+/** 导入完成结果（openFileFromFd 的 data，M2 起=新增图层）。 */
 export interface OpenFileData {
   width: number;
   height: number;
+  layerId: number;
+}
+
+/** 图层 DTO（02 §5；M2 无组/蒙版，字段保真常量占位）。 */
+export interface LayerDTO {
+  id: number;
+  name: string;
+  visible: boolean;
+  opacity: number;
+  blendMode: number;
+  isActive: boolean;
+  isGroup: boolean;
+  parentId: number;
+  hasMask: boolean;
+  thumbToken: number;
+}
+
+/** 缩略图结果（getLayerThumbnail 的 data；O3 跨桥实测）。 */
+export interface LayerThumb {
+  pixelMap: Object | null;
+  ready: boolean;
 }
 
 /** 单个分配器探针结果（M0 像素实测）。 */

@@ -60,4 +60,18 @@ double clampZoom(double zoom) {
     return std::min(32.0, std::max(1.0 / 32.0, zoom));
 }
 
+const char* blendModeName(BlendMode mode) {
+    switch (mode) {
+        case BlendMode::Multiply:
+            return "Multiply";
+        case BlendMode::Screen:
+            return "Screen";
+        case BlendMode::Overlay:
+            return "Overlay";
+        case BlendMode::Normal:
+        default:
+            return "Normal";
+    }
+}
+
 }  // namespace montage
