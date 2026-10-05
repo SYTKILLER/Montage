@@ -194,22 +194,16 @@ struct Index {
     if (e.scrollStep === undefined || e.scrollStep === 0) {
       return;
     }
-    // 诊断留痕：部分驱动送原始增量（远大于 1），钳到单格防暴缩
-    let step = e.scrollStep;
-    if (Math.abs(step) > 4) {
-      step = Math.sign(step);
-    }
-    // hilog 不支持 %{public}f（实证：格式被吞成 "}f"，值拿不到），浮点转 int 再打
-    hilog.info(0x4D30, TAG, 'axis x=%{public}d y=%{public}d raw100=%{public}d step100=%{public}d action=%{public}d',
-      Math.round(e.x * 10), Math.round(e.y * 10), Math.round(e.scrollStep * 100), Math.round(step * 100),
-      e.action);
-    const k = this.pxPerVp();
-    // M2.5 用户实证：-step 时两方向都缩小（OHOS scrollStep 向上为正）→ 翻转为 +step
-    const factor = Math.pow(1.1, step);  // 滚轮向前（step>0）= 放大
-    const ax = this.panX + (e.x * k) / this.zoom;
-    const ay = this.panY + (e.y * k) / this.zoom;
+    // hilog 不支持 %{public}f（实证：格式被吞成 "}f"），浮点转 int 再打
+    hilog.info(0x4D30, TAG, 'axis x=%{public}d y=%{public}d raw100=%{public}d action=%{public}d',
+      Math.round(e.x), Math.round(e.y), Math.round(e.scrollStep * 100), e.action);
+    // M2.5 实证（模拟器）：AxisEvent.x/y 是 px 非 vp（4350 = 1460vp × 密度），锚点直接用 px；
+    // scrollStep 恒 3.0（模拟器转发丢方向，真机待回归）→ 按 3.0 = 一档归一，单步 1.1
+    const factor = Math.pow(1.1, e.scrollStep / 3.0);
+    const ax = this.panX + e.x / this.zoom;
+    const ay = this.panY + e.y / this.zoom;
     const z = this.clampZoom(this.zoom * factor);
-    this.applyViewport(z, ax - (e.x * k) / z, ay - (e.y * k) / z);
+    this.applyViewport(z, ax - e.x / z, ay - e.y / z);
   }
 
   private onPinchStart(e: PinchGestureEvent): void {
