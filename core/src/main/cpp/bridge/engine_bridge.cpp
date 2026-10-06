@@ -1196,6 +1196,82 @@ napi_value SetBrushSettings(napi_env env, napi_callback_info info) {
     return makeOk(env, nullptr);
 }
 
+napi_value SetBrushTarget(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "setBrushTarget(mask) requires 1 arg");
+    }
+    bool mask = false;
+    if (napi_get_value_bool(env, argv[0], &mask) != napi_ok) {
+        return makeError(env, kErrBadParam, "setBrushTarget: invalid arg");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        e.brushOnMask = mask;
+    }
+    return makeOk(env, nullptr);
+}
+
+// M5b：添加显示全部图层蒙版（patch = 图层像素网格同维全 255）；撤销粒度 = 单次添加
+napi_value AddLayerMask(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "addLayerMask(id) requires 1 arg");
+    }
+    double id = 0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "addLayerMask: invalid id");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        if (l == nullptr) {
+            return makeError(env, kErrBadParam, "addLayerMask: layer not found");
+        }
+        if (l->mask != nullptr) {
+            return makeError(env, kErrBadParam, "addLayerMask: layer already has mask");
+        }
+        if (l->pixels == nullptr) {
+            return makeError(env, kErrBadParam, "addLayerMask: empty layer");
+        }
+        e.history.beginEdit(e.doc, "add mask", static_cast<uint64_t>(e.docRevision));
+        auto m = std::make_shared<LayerMask>();
+        const uint32_t cols = l->pixels->cols;
+        const uint32_t rows = l->pixels->rows;
+        TileGridBuilder builder(cols, rows);
+        for (uint32_t ty = 0; ty < rows; ++ty) {
+            for (uint32_t tx = 0; tx < cols; ++tx) {
+                EngineBuffer& buf = builder.ensureTile(tx, ty);
+                uint8_t* p = buf.mapCpuWrite();
+                for (size_t i = 0; i < static_cast<size_t>(kTileSize) * kTileSize * 4u; i += 4) {
+                    p[i] = p[i + 1] = p[i + 2] = 255;
+                    p[i + 3] = 255;
+                }
+            }
+        }
+        m->pixels = builder.publish(1);
+        m->width = cols * kTileSize;
+        m->height = rows * kTileSize;
+        m->offsetX = 0;
+        m->offsetY = 0;
+        m->outside = 255;
+        m->enabled = true;
+        m->linked = true;
+        l->mask = std::move(m);
+        l->render = composeMasked(l->pixels, *l->mask);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
 napi_value BeginStroke(napi_env env, napi_callback_info info) {
     size_t argc = 3;
     napi_value argv[3] = {nullptr, nullptr, nullptr};

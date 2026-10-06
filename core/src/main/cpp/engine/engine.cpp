@@ -94,11 +94,12 @@ void Engine::strokeThreadMain() {
                     if (draft != nullptr) {
                         continue;  // 上一笔未提交（异常序列）：丢弃新 begin 防串笔
                     }
-                    history.beginEdit(doc, brush.erasing ? "eraser" : "brush",
+                    history.beginEdit(doc, brushOnMask ? "mask brush"
+                                        : (brush.erasing ? "eraser" : "brush"),
                                       static_cast<uint64_t>(docRevision));
                     draft = std::make_unique<StrokeDraft>();
                     std::string err;
-                    if (!draft->begin(doc, doc.activeId, brush, err)) {
+                    if (!draft->begin(doc, doc.activeId, brush, brushOnMask, err)) {
                         OH_LOG_Print(LOG_APP, LOG_WARN, 0x4D30, "Montage.Brush",
                                      "draft begin failed: %{public}s", err.c_str());
                         history.endEdit(doc, static_cast<uint64_t>(docRevision));
@@ -111,21 +112,37 @@ void Engine::strokeThreadMain() {
                         continue;  // 陈旧 end 标记（背靠背笔画残留）
                     }
                     draft->end();
-                    // 提交（对拍 commit：工作瓦片合并入图层 grid）
-                    const LayerId lid = draft->layerId();
-                    auto grid = draft->commitGrid(nullptr);
-                    for (Layer& l : doc.layers) {
-                        if (l.id == lid && grid != nullptr) {
-                            auto merged = draft->commitGrid(l.pixels.get());
-                            l.pixels = merged;
-                            // M5a：蒙版启用图层提交后重合成派生网格
-                            if (l.mask != nullptr && l.mask->enabled) {
-                                l.render = composeMasked(l.pixels, *l.mask);
+                    if (draft->maskTarget()) {
+                        // M5b：提交到蒙版 patch 网格（COW 换 LayerMask）+ 重合成
+                        const LayerId lid = draft->layerId();
+                        auto merged = draft->commitGrid(nullptr);
+                        for (Layer& l : doc.layers) {
+                            if (l.id == lid && l.mask != nullptr && merged != nullptr) {
+                                auto m = std::make_shared<LayerMask>(*l.mask);
+                                m->pixels = merged;
+                                l.mask = std::move(m);
+                                l.render = (l.mask->enabled && l.pixels != nullptr)
+                                               ? composeMasked(l.pixels, *l.mask)
+                                               : nullptr;
+                                break;
                             }
-                            break;
+                        }
+                    } else {
+                        // 提交（对拍 commit：工作瓦片合并入图层 grid）
+                        const LayerId lid = draft->layerId();
+                        auto grid = draft->commitGrid(nullptr);
+                        for (Layer& l : doc.layers) {
+                            if (l.id == lid && grid != nullptr) {
+                                auto merged = draft->commitGrid(l.pixels.get());
+                                l.pixels = merged;
+                                // M5a：蒙版启用图层提交后重合成派生网格
+                                if (l.mask != nullptr && l.mask->enabled) {
+                                    l.render = composeMasked(l.pixels, *l.mask);
+                                }
+                                break;
+                            }
                         }
                     }
-                    (void)grid;
                     const int64_t rev = docRevision + 1;
                     history.endEdit(doc, static_cast<uint64_t>(rev));
                     bumpRevisionLocked();
@@ -142,31 +159,101 @@ void Engine::strokeThreadMain() {
 
 Engine::StrokeSnapshot Engine::copyStrokeSnapshotLocked() {
     StrokeSnapshot snap;
-    if (draft != nullptr && draft->active()) {
-        snap.layerId = draft->layerId();
-        snap.gridCols = draft->gridCols();
-        snap.gridRows = draft->gridRows();
-        snap.active = true;
-        // 蒙版启用的图层：草稿叠加同样乘蒙版（否则新笔画在蒙版外"画时可见、提交即消失"）
-        const Layer* maskLayer = nullptr;
-        for (const Layer& l : doc.layers) {
-            if (l.id == snap.layerId) {
-                maskLayer = &l;
-                break;
+    if (draft == nullptr || !draft->active()) {
+        return snap;
+    }
+    snap.layerId = draft->layerId();
+    snap.active = true;
+    const Layer* layer = nullptr;
+    for (const Layer& l : doc.layers) {
+        if (l.id == snap.layerId) {
+            layer = &l;
+            break;
+        }
+    }
+    if (layer == nullptr) {
+        return snap;
+    }
+    if (draft->maskTarget()) {
+        // M5b 蒙版落笔：草稿瓦片在 patch 网格空间；显示需按像素网格合成
+        // （display = pixelTile × draftMask）。蒙版停用或空像素层 → 无叠加。
+        if (layer->pixels == nullptr || layer->mask == nullptr || !layer->mask->enabled) {
+            snap.active = false;
+            return snap;
+        }
+        snap.gridCols = layer->pixels->cols;
+        snap.gridRows = layer->pixels->rows;
+        constexpr uint32_t kTile = 256;
+        for (const uint32_t key : draft->touchedTiles()) {
+            const uint32_t ptx = key % draft->gridCols();
+            const uint32_t pty = key / draft->gridCols();
+            std::vector<uint8_t> maskWork;
+            if (!draft->tileFor(ptx, pty, maskWork)) {
+                continue;
+            }
+            // patch 瓦片覆盖的图层局部矩形
+            const int rx0 = layer->mask->offsetX + static_cast<int>(ptx * kTile);
+            const int ry0 = layer->mask->offsetY + static_cast<int>(pty * kTile);
+            const uint32_t ltx0 = std::max(0, rx0) / kTile;
+            const uint32_t lty0 = std::max(0, ry0) / kTile;
+            const uint32_t ltx1 = std::max(0, rx0 + static_cast<int>(kTile) - 1) / kTile;
+            const uint32_t lty1 = std::max(0, ry0 + static_cast<int>(kTile) - 1) / kTile;
+            for (uint32_t lty = lty0; lty <= lty1 && lty < snap.gridRows; ++lty) {
+                for (uint32_t ltx = ltx0; ltx <= ltx1 && ltx < snap.gridCols; ++ltx) {
+                    auto pit = layer->pixels->tiles.find(lty * snap.gridCols + ltx);
+                    if (pit == layer->pixels->tiles.end()) {
+                        continue;  // 像素空瓦片 × 蒙版 = 透明
+                    }
+                    const uint8_t* pxs = pit->second->pixels->mapCpu();
+                    const uint32_t pstride = pit->second->pixels->rowBytes();
+                    std::vector<uint8_t> out(static_cast<size_t>(kTile) * kTile * 4u);
+                    for (uint32_t r = 0; r < kTile; ++r) {
+                        const int gy = static_cast<int>(lty * kTile) + static_cast<int>(r);
+                        const uint8_t* srow = pxs + static_cast<size_t>(r) * pstride;
+                        uint8_t* orow = out.data() + static_cast<size_t>(r) * kTile * 4u;
+                        for (uint32_t c = 0; c < kTile; ++c) {
+                            const int gx = static_cast<int>(ltx * kTile) + static_cast<int>(c);
+                            // patch 域坐标 → work 瓦片内坐标；内容矩形外走旧蒙版语义
+                            // （256 对齐瓦片在 content 外的样本是 0，直采会误隐 outside 区）
+                            const int pxg = gx - layer->mask->offsetX;
+                            const int pyg = gy - layer->mask->offsetY;
+                            const int mx = pxg - static_cast<int>(ptx * kTile);
+                            const int my = pyg - static_cast<int>(pty * kTile);
+                            uint8_t m;
+                            if (pxg >= 0 && pyg >= 0 &&
+                                pxg < static_cast<int>(layer->mask->width) &&
+                                pyg < static_cast<int>(layer->mask->height) && mx >= 0 &&
+                                my >= 0 && mx < static_cast<int>(kTile) && my < static_cast<int>(kTile)) {
+                                m = maskWork[(static_cast<size_t>(my) * kTile) + static_cast<size_t>(mx)];
+                            } else {
+                                m = layerMaskGrayAt(*layer->mask, gx, gy);
+                            }
+                            const uint8_t* s = srow + static_cast<size_t>(c) * 4u;
+                            uint8_t* d = orow + static_cast<size_t>(c) * 4u;
+                            d[0] = s[0];
+                            d[1] = s[1];
+                            d[2] = s[2];
+                            d[3] = static_cast<uint8_t>((s[3] * m + 127) / 255);
+                        }
+                    }
+                    snap.tiles[lty * snap.gridCols + ltx] = std::move(out);
+                }
             }
         }
-        const LayerMask* mask =
-            (maskLayer != nullptr && maskLayer->mask != nullptr && maskLayer->mask->enabled)
-                ? maskLayer->mask.get()
-                : nullptr;
-        for (const uint32_t key : draft->touchedTiles()) {
-            std::vector<uint8_t> px;
-            if (draft->tileFor(key % draft->gridCols(), key / draft->gridCols(), px)) {
-                if (mask != nullptr) {
-                    applyMaskToTile(*mask, px, key % draft->gridCols(), key / draft->gridCols());
-                }
-                snap.tiles[key] = std::move(px);
+        return snap;
+    }
+    // 像素落笔：草稿瓦片即显示瓦片；蒙版启用则乘蒙版（否则新笔画在蒙版外"画时可见、提交即消失"）
+    snap.gridCols = draft->gridCols();
+    snap.gridRows = draft->gridRows();
+    const LayerMask* mask =
+        (layer->mask != nullptr && layer->mask->enabled) ? layer->mask.get() : nullptr;
+    for (const uint32_t key : draft->touchedTiles()) {
+        std::vector<uint8_t> px;
+        if (draft->tileFor(key % draft->gridCols(), key / draft->gridCols(), px)) {
+            if (mask != nullptr) {
+                applyMaskToTile(*mask, px, key % draft->gridCols(), key / draft->gridCols());
             }
+            snap.tiles[key] = std::move(px);
         }
     }
     return snap;

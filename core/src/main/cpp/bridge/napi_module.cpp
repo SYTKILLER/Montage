@@ -13,6 +13,8 @@ napi_value Init(napi_env env, napi_value exports) {
         {"saveProject", nullptr, montage::bridge::SaveProject, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"openProject", nullptr, montage::bridge::OpenProject, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setBrushSettings", nullptr, montage::bridge::SetBrushSettings, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setBrushTarget", nullptr, montage::bridge::SetBrushTarget, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"addLayerMask", nullptr, montage::bridge::AddLayerMask, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"beginStroke", nullptr, montage::bridge::BeginStroke, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"continueStroke", nullptr, montage::bridge::ContinueStroke, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"endStroke", nullptr, montage::bridge::EndStroke, nullptr, nullptr, nullptr, napi_default, nullptr},

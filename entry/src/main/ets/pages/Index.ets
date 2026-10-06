@@ -41,6 +41,7 @@ struct Index {
   @State blendSel: number = 0;
   @State opacityVal: number = 1;
   @State tool: string = 'brush';       // brush | eraser | none
+  @State maskTarget: boolean = false;  // M5b：落笔目标 = 活动图层蒙版
   @State brushSize: number = 40;
   @State brushHardness: number = 80;
   @State brushColor: string = '#D93025';
@@ -375,6 +376,25 @@ struct Index {
     });
   }
 
+  // M5b 验证用（临时）：蒙版上画三短黑笔（渐变区）
+  private onMaskStrokeTest(): void {
+    this.pushBrushSettings();
+    const c: number[] = this.screenToDoc(this.canvasVpW / 2, this.canvasVpH / 2);
+    for (let s = 0; s < 3; s++) {
+      const yy = c[1] - 80 + s * 80;
+      for (let i = 0; i <= 16; i++) {
+        const x = c[0] + i * 10;
+        if (i === 0) {
+          this.engine.beginStroke(x, yy, 1.0);
+        } else {
+          this.engine.continueStroke(x, yy, 1.0);
+        }
+      }
+      this.engine.endStroke();
+    }
+    this.log('蒙版笔测试已提交（三条黑笔）');
+  }
+
   private openByUri(uri: string): void {
     const f = fs.openSync(uri, fs.OpenMode.READ_ONLY);
     this.log(`导入图层 fd=${f.fd}`);
@@ -531,6 +551,39 @@ struct Index {
 
   // ---------- 图层面板动作 ----------
 
+  // M5b：蒙版落笔目标切换（无蒙版图层不可开；开启时强制画笔工具）
+  private activeLayerHasMask(): boolean {
+    for (const l of this.layers) {
+      if (l.isActive) {
+        return l.hasMask;
+      }
+    }
+    return false;
+  }
+
+  private onToggleMaskTarget(): void {
+    if (!this.activeLayerHasMask()) {
+      this.log('当前图层无蒙版');
+      return;
+    }
+    this.maskTarget = !this.maskTarget;
+    if (this.maskTarget && this.tool === 'eraser') {
+      this.tool = 'brush';
+    }
+    this.engine.setBrushTarget(this.maskTarget);
+    this.log(`落笔目标: ${this.maskTarget ? '蒙版' : '像素'}`);
+  }
+
+  private onAddMask(): void {
+    const active = this.layers.find((l: LayerDTO): boolean => l.isActive);
+    if (active === undefined) {
+      return;
+    }
+    if (this.engine.addLayerMask(active.id)) {
+      this.log(`已为图层 ${active.name} 添加蒙版`);
+    }
+  }
+
   private onToggleVisible(l: LayerDTO): void {
     this.engine.setLayerVisible(l.id, !l.visible);
   }
@@ -608,6 +661,7 @@ struct Index {
             Button('重做').onClick((): void => this.doRedo()).margin({ left: 8 }).opacity(this.canRedo ? 1 : 0.4)
             Button('保存').onClick((): void => this.doSaveProject()).margin({ left: 8 })
               .opacity(this.docOpen ? 1 : 0.4)
+            Button('蒙版笔测试').fontSize(12).onClick((): void => this.onMaskStrokeTest()).margin({ left: 8 })
           }
           .width('100%')
 
@@ -627,6 +681,10 @@ struct Index {
               .onClick((): void => {
                 this.tool = 'none';
               })
+            Button('蒙版笔').fontSize(12).margin({ left: 6 })
+              .backgroundColor(this.maskTarget ? '#D93025' : '#888888')
+              .opacity(this.activeLayerHasMask() ? 1 : 0.4)
+              .onClick((): void => this.onToggleMaskTarget())
             Text('直径').fontSize(11).margin({ left: 10 })
             Slider({ value: this.brushSize, min: 2, max: 200, step: 1 })
               .width(120).height(26)
@@ -791,6 +849,7 @@ struct Index {
             Button('新建').fontSize(12).onClick((): void => {
               this.engine.addLayer();
             })
+            Button('加蒙版').fontSize(12).onClick((): void => this.onAddMask())
             Button('删除').fontSize(12).onClick((): void => {
               const a = this.activeLayer();
               if (a !== undefined) {

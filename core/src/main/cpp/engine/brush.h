@@ -36,7 +36,10 @@ struct BrushSettings {
 class StrokeDraft {
   public:
     // 绑定图层开始笔画。grid = 图层像素网格（origin 平移，1:1）；空图层从触笔区域动态扩展。
-    bool begin(const Document& doc, LayerId layerId, const BrushSettings& settings, std::string& err);
+    // onMask = true 时绑定图层蒙版 patch 网格（灰度落笔：L×covA + base×(1-covA)；
+    // 要求蒙版已有 patch 网格，erasing 标志被忽略）。
+    bool begin(const Document& doc, LayerId layerId, const BrushSettings& settings, bool onMask,
+               std::string& err);
     // 文档坐标追加样本（Catmull-Rom 落 dab；pressure ∈ [0,1]，调制 dab 直径）
     void append(float docX, float docY, float pressure);
     void end();
@@ -44,6 +47,7 @@ class StrokeDraft {
 
     bool active() const { return active_; }
     LayerId layerId() const { return layerId_; }
+    bool maskTarget() const { return maskTarget_; }
     // 渲染取数：draft 中该瓦片的合成像素（直通 RGBA，256×256）；无则返回 false
     bool tileFor(uint32_t tx, uint32_t ty, std::vector<uint8_t>& out) const;
     const std::set<uint32_t>& touchedTiles() const { return touched_; }
@@ -84,6 +88,8 @@ class StrokeDraft {
     BrushSettings settings_{};
     LayerId layerId_ = 0;
     bool active_ = false;
+    bool maskTarget_ = false;  // M5b：落笔目标 = 图层蒙版（灰度）
+    float maskLum_ = 0.0f;     // 蒙版笔刷亮度（settings 颜色均值）
     bool layerHadPixels_ = false;
     int originX_ = 0;   // 网格原点 doc 坐标（= 图层 origin；空层 = 首触点整瓦片对齐）
     int originY_ = 0;

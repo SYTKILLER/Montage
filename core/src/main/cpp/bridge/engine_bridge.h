@@ -44,6 +44,10 @@ napi_value OnRevisionChanged(napi_env env, napi_callback_info info);
 napi_value OnImportProgress(napi_env env, napi_callback_info info);
 // 笔刷（01 §6 命令面：M3）
 napi_value SetBrushSettings(napi_env env, napi_callback_info info);
+// 笔画落笔目标（M5b）：true = 活动图层蒙版
+napi_value SetBrushTarget(napi_env env, napi_callback_info info);
+// 添加图层蒙版（M5b：显示全部，全 255 patch）
+napi_value AddLayerMask(napi_env env, napi_callback_info info);
 napi_value BeginStroke(napi_env env, napi_callback_info info);
 napi_value ContinueStroke(napi_env env, napi_callback_info info);
 napi_value EndStroke(napi_env env, napi_callback_info info);

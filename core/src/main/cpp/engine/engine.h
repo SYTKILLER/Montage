@@ -55,6 +55,7 @@ class Engine {
     std::mutex strokeCycleMtx;              // 生命周期互斥：begin/end 处理段与 dispose 清理串行
     std::unique_ptr<StrokeDraft> draft;     // 绘制中的笔画（mutex 内访问）
     BrushSettings brush;                    // 当前笔刷参数（ArkTS setBrushSettings 写入）
+    bool brushOnMask = false;               // M5b：落笔目标 = 活动图层蒙版（setBrushTarget 写入）
     std::thread strokeThread_;
     bool strokeThreadStarted_ = false;
     void ensureStrokeThreadLocked();        // 须持 strokeMtx；幂等，先 join 已退出线程

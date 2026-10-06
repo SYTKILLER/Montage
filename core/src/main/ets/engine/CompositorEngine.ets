@@ -365,6 +365,22 @@ export class CompositorEngine {
     native.setBrushSettings(diameter, hardness, opacity, red, green, blue, erasing);
   }
 
+  // M5b：笔画落笔目标（true = 活动图层蒙版）
+  setBrushTarget(mask: boolean): boolean {
+    const r = narrowResult(native.setBrushTarget(mask) as Object);
+    return r.ok;
+  }
+
+  // M5b：添加显示全部图层蒙版
+  addLayerMask(id: number): boolean {
+    const r = narrowResult(native.addLayerMask(id) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'addLayerMask failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
   // M3.1：pressure ∈[0,1] 调制 dab 直径；缺省/无压感设备传 1
   beginStroke(x: number, y: number, pressure?: number): void {
     if (pressure !== undefined) {

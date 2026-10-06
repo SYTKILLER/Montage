@@ -17,7 +17,7 @@ constexpr float kSpacingSoft = 0.025f;
 }  // namespace
 
 bool StrokeDraft::begin(const Document& doc, LayerId layerId, const BrushSettings& settings,
-                        std::string& err) {
+                        bool onMask, std::string& err) {
     const Layer* layer = nullptr;
     for (const Layer& l : doc.layers) {
         if (l.id == layerId) {
@@ -37,23 +37,42 @@ bool StrokeDraft::begin(const Document& doc, LayerId layerId, const BrushSetting
     }
     settings_ = settings;
     layerId_ = layerId;
-    base_ = layer->pixels;
-    originX_ = static_cast<int>(std::lround(layer->transform.originX));
-    originY_ = static_cast<int>(std::lround(layer->transform.originY));
-    if (base_ != nullptr) {
-        // 网格 = 图层像素网格（1:1，origin 仅平移）
-        imgW_ = base_->cols * kTileSize;
-        imgH_ = base_->rows * kTileSize;
+    maskTarget_ = false;
+    if (onMask) {
+        // M5b 蒙版模式：绑定 patch 网格（灰度落笔）；网格原点 = 图层 origin + patch offset
+        if (layer->mask == nullptr || layer->mask->pixels == nullptr) {
+            err = "brush: layer has no editable mask";
+            return false;
+        }
+        maskTarget_ = true;
+        maskLum_ = std::min(1.0f, std::max(0.0f, (settings.red + settings.green + settings.blue) / 3.0f));
+        base_ = layer->mask->pixels;
+        originX_ = static_cast<int>(std::lround(layer->transform.originX)) + layer->mask->offsetX;
+        originY_ = static_cast<int>(std::lround(layer->transform.originY)) + layer->mask->offsetY;
+        imgW_ = layer->mask->width;
+        imgH_ = layer->mask->height;
         gridCols_ = base_->cols;
         gridRows_ = base_->rows;
+        layerHadPixels_ = true;
     } else {
-        // 空图层：网格 = 画布（对齐源 extent = pixelBounds ∪ canvas）
-        imgW_ = imgH_ = 0;
-        gridCols_ = (doc.width + kTileSize - 1u) / kTileSize;
-        gridRows_ = (doc.height + kTileSize - 1u) / kTileSize;
-        // 空图层 origin 通常 (0,0)（画布域）；防御非零 origin
-        originX_ = std::min(0, originX_);
-        originY_ = std::min(0, originY_);
+        base_ = layer->pixels;
+        originX_ = static_cast<int>(std::lround(layer->transform.originX));
+        originY_ = static_cast<int>(std::lround(layer->transform.originY));
+        if (base_ != nullptr) {
+            // 网格 = 图层像素网格（1:1，origin 仅平移）
+            imgW_ = base_->cols * kTileSize;
+            imgH_ = base_->rows * kTileSize;
+            gridCols_ = base_->cols;
+            gridRows_ = base_->rows;
+        } else {
+            // 空图层：网格 = 画布（对齐源 extent = pixelBounds ∪ canvas）
+            imgW_ = imgH_ = 0;
+            gridCols_ = (doc.width + kTileSize - 1u) / kTileSize;
+            gridRows_ = (doc.height + kTileSize - 1u) / kTileSize;
+            // 空图层 origin 通常 (0,0)（画布域）；防御非零 origin
+            originX_ = std::min(0, originX_);
+            originY_ = std::min(0, originY_);
+        }
     }
     coverage_.clear();
     work_.clear();
@@ -384,6 +403,18 @@ void StrokeDraft::paintTile(uint32_t key) {
     const uint8_t* cov = covIt->second.data();
     uint8_t* px = workIt->second.data();
     const float op = settings_.opacity;
+    if (maskTarget_) {
+        // 蒙版灰度落笔：out = L×covA + base×(1-covA)（base 恒灰，RGB 同值）；erasing 忽略
+        for (size_t i = 0; i < static_cast<size_t>(kTileSize) * kTileSize; ++i) {
+            const float covA = (cov[i] / 255.0f) * op;
+            uint8_t* p = px + i * 4;
+            const float outg = maskLum_ * covA + (p[0] / 255.0f) * (1.0f - covA);
+            const uint8_t g = static_cast<uint8_t>(std::lround(outg * 255.0f));
+            p[0] = p[1] = p[2] = g;
+            p[3] = 255;
+        }
+        return;
+    }
     for (size_t i = 0; i < static_cast<size_t>(kTileSize) * kTileSize; ++i) {
         const float cv = cov[i] / 255.0f;
         const float covA = cv * op;  // 笔画级 opacity 上限（覆盖层语义）
