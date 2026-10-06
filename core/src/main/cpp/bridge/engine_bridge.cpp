@@ -13,6 +13,7 @@
 
 #include "engine/engine.h"
 #include "io/image_import.h"
+#include "io/project_open.h"
 #include "io/project_save.h"
 #include "io/psd/psd_import.h"
 #include "render/render_loop.h"
@@ -465,6 +466,83 @@ napi_value SaveProject(napi_env env, napi_callback_info info) {
 }
 
 // ---------- 视口 ----------
+
+// ---------- 工程打开（04 §1.2 M4c） ----------
+
+struct OpenProjectPayload {
+    bool ok = false;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    size_t layers = 0;
+    char error[192] = {0};
+};
+
+void openProjectDoneJsCallback(napi_env env, napi_value /*jsCb*/, void* context, void* data) {
+    auto* ctx = static_cast<OpenCtx*>(context);
+    auto* p = static_cast<OpenProjectPayload*>(data);
+    napi_value result;
+    if (p != nullptr && p->ok) {
+        napi_value d = nullptr;
+        napi_create_object(env, &d);
+        napi_set_named_property(env, d, "width", makeUint32(env, p->width));
+        napi_set_named_property(env, d, "height", makeUint32(env, p->height));
+        napi_set_named_property(env, d, "layers", makeUint32(env, static_cast<uint32_t>(p->layers)));
+        result = makeOk(env, d);
+    } else {
+        result = makeError(env, kErrInternal, p != nullptr ? std::string(p->error) : "open project failed");
+    }
+    delete p;
+    napi_resolve_deferred(env, ctx->deferred, result);
+    napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);
+}
+
+napi_value OpenProject(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "openProject(fd) requires 1 arg");
+    }
+    int32_t fd = -1;
+    if (napi_get_value_int32(env, argv[0], &fd) != napi_ok || fd < 0) {
+        return makeError(env, kErrBadParam, "openProject: invalid fd");
+    }
+    napi_value promise = nullptr;
+    napi_deferred deferred = nullptr;
+    napi_create_promise(env, &deferred, &promise);
+
+    auto* ctx = new OpenCtx();
+    ctx->deferred = deferred;
+    napi_value fn = nullptr;
+    napi_value name = nullptr;
+    napi_create_string_utf8(env, "openProjectDone", NAPI_AUTO_LENGTH, &name);
+    napi_create_function(env, "onOpenProjectDone", NAPI_AUTO_LENGTH, noopJsCallback, nullptr, &fn);
+    napi_status st = napi_create_threadsafe_function(env, fn, nullptr, name, 4, 1, ctx,
+                                                     finalizeOpenCtx, ctx, openProjectDoneJsCallback,
+                                                     &ctx->tsfn);
+    if (st != napi_ok) {
+        close(fd);
+        finalizeOpenCtx(env, ctx, nullptr);
+        napi_resolve_deferred(env, deferred, makeError(env, kErrInternal, "create tsfn failed"));
+        return promise;
+    }
+    // openProject 全路径接管 fd（成功/失败都关闭）
+    std::thread([fd, tsfn = ctx->tsfn]() {
+        auto* payload = new OpenProjectPayload();
+        std::string err;
+        io::ProjectOpenResult res;
+        payload->ok = io::openProject(fd, &res, err);
+        if (payload->ok) {
+            payload->width = res.width;
+            payload->height = res.height;
+            payload->layers = res.layers;
+        } else {
+            std::strncpy(payload->error, err.c_str(), sizeof(payload->error) - 1);
+        }
+        napi_call_threadsafe_function(tsfn, payload, napi_tsfn_nonblocking);
+    }).detach();
+    return promise;
+}
 
 napi_value SetViewport(napi_env env, napi_callback_info info) {
     size_t argc = 3;

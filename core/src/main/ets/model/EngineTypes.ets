@@ -65,6 +65,13 @@ export interface SaveProjectData {
   bytes: number;
 }
 
+/** 工程打开结果（openProject 的 data，M4c）。 */
+export interface OpenProjectData {
+  width: number;
+  height: number;
+  layers: number;
+}
+
 /** 缩略图结果（getLayerThumbnail 的 data；O3 跨桥实测）。 */
 export interface LayerThumb {
   pixelMap: Object | null;

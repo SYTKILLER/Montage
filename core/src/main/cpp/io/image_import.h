@@ -5,8 +5,11 @@
 // 带边界发布 TileGrid + 进度事件 → 完成后 bump docVersion。T3 引擎工作线程执行。
 
 #include <cstdint>
+#include <string>
 
 #include <napi/native_api.h>
+
+#include <multimedia/image_framework/image/image_source_native.h>
 
 #include "engine/document.h"
 

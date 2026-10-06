@@ -2,7 +2,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
-import { CompositorEngine, LayerDTO, OpenFileData, PixelTestData, PsdOpenData, SaveProjectData, ViewportData } from 'core';
+import { CompositorEngine, LayerDTO, OpenFileData, OpenProjectData, PixelTestData, PsdOpenData, SaveProjectData, ViewportData } from 'core';
 
 const TAG: string = '[Montage.M2]';
 
@@ -280,6 +280,8 @@ struct Index {
       const uri = uris[0].toLowerCase();
       if (uri.endsWith('.psd')) {
         this.openPsdByUri(uris[0]);
+      } else if (uri.endsWith('.montage')) {
+        this.openProjectByUri(uris[0]);
       } else {
         this.openByUri(uris[0]);
       }
@@ -350,6 +352,26 @@ struct Index {
     }).catch((e: BusinessError): void => {
       this.saving = false;
       this.log(`保存失败: ${e.message}`);
+    });
+  }
+
+  private openProjectByUri(uri: string): void {
+    const f = fs.openSync(uri, fs.OpenMode.READ_ONLY);
+    this.log(`打开工程 fd=${f.fd}`);
+    this.importing = true;
+    this.engine.openProject(f.fd).then((d: OpenProjectData): void => {
+      this.importing = false;
+      this.docW = d.width;
+      this.docH = d.height;
+      this.docOpen = true;
+      this.fittedOnce = false;
+      this.saveUri = uri;  // 已关联包：后续保存直接覆写（04 §2）
+      this.log(`工程已打开 ${d.width}x${d.height}，${d.layers} 层`);
+      this.refreshLayers();
+      this.tryFit();
+    }).catch((e: BusinessError): void => {
+      this.importing = false;
+      this.log(`工程打开失败: ${e.message}`);
     });
   }
 

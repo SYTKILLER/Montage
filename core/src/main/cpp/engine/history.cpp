@@ -127,6 +127,13 @@ bool History::canUndo() const {
     return !undo_.empty();
 }
 
+void History::clear() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    undo_.clear();
+    redo_.clear();
+    pendingFlag_ = false;
+}
+
 bool History::canRedo() const {
     std::lock_guard<std::mutex> lk(mtx_);
     return !redo_.empty();

@@ -12,6 +12,8 @@ add_library(compositor SHARED
         engine/engine.cpp
         engine/history.cpp
         io/image_import.cpp
+        io/png_decode.cpp
+        io/project_open.cpp
         io/project_save.cpp
         io/psd/psd_reader.cpp
         io/psd/psd_import.cpp

@@ -24,6 +24,8 @@ class History {
     bool redo(Document& doc, uint64_t& revision, std::string& label);
     bool canUndo() const;
     bool canRedo() const;
+    // 整档替换（打开工程/PSD）时清空：撤销不许跨文档回退
+    void clear();
 
   private:
     struct Snapshot {

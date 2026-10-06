@@ -157,6 +157,7 @@ struct Viewport {
 double clampZoom(double zoom);  // [1/32, 32]
 
 const char* blendModeName(BlendMode mode);  // DTO 显示名（对齐源 LayerBlendMode raw 值）
+bool blendModeFromName(const std::string& name, BlendMode& out);  // 逆映射（.montage 读取，M4c）
 
 }  // namespace montage
 

@@ -91,4 +91,40 @@ const char* blendModeName(BlendMode mode) {
     }
 }
 
+bool blendModeFromName(const std::string& name, BlendMode& out) {
+    static const std::pair<const char*, BlendMode> kTable[] = {
+        {"Normal", BlendMode::Normal},
+        {"Darken", BlendMode::Darken},
+        {"Multiply", BlendMode::Multiply},
+        {"Color Burn", BlendMode::ColorBurn},
+        {"Linear Burn", BlendMode::LinearBurn},
+        {"Lighten", BlendMode::Lighten},
+        {"Screen", BlendMode::Screen},
+        {"Color Dodge", BlendMode::ColorDodge},
+        {"Linear Dodge (Add)", BlendMode::LinearDodge},
+        {"Overlay", BlendMode::Overlay},
+        {"Soft Light", BlendMode::SoftLight},
+        {"Hard Light", BlendMode::HardLight},
+        {"Vivid Light", BlendMode::VividLight},
+        {"Linear Light", BlendMode::LinearLight},
+        {"Pin Light", BlendMode::PinLight},
+        {"Hard Mix", BlendMode::HardMix},
+        {"Difference", BlendMode::Difference},
+        {"Exclusion", BlendMode::Exclusion},
+        {"Subtract", BlendMode::Subtract},
+        {"Divide", BlendMode::Divide},
+        {"Hue", BlendMode::Hue},
+        {"Saturation", BlendMode::Saturation},
+        {"Color", BlendMode::Color},
+        {"Luminosity", BlendMode::Luminosity},
+    };
+    for (const auto& [key, mode] : kTable) {
+        if (name == key) {
+            out = mode;
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace montage

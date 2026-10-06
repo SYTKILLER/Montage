@@ -236,6 +236,7 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
         engine.doc.activeId = engine.doc.layers.empty()
                                   ? 0
                                   : engine.doc.layers[engine.doc.layers.size() - 1].id;
+        engine.history.clear();  // 整档替换：撤销不跨文档
         engine.bumpRevisionLocked();
         engine.requestRender();
     }
