@@ -62,6 +62,21 @@ void main() {
 }
 )";
 
+// 剪贴蒙版（M5b-2）：剪贴层 assemble 纹理 × 基底层 alpha（两者均在视口空间，straight alpha）
+inline const char* kClipFrag = R"(#version 300 es
+precision mediump float;
+uniform sampler2D uSrc;
+uniform sampler2D uClip;
+uniform vec2 uViewport;
+out vec4 o;
+void main() {
+  vec2 uv = gl_FragCoord.xy / uViewport;
+  vec4 s = texture(uSrc, uv);
+  float ca = texture(uClip, uv).a;
+  o = vec4(s.rgb, s.a * ca);
+}
+)";
+
 // Pass B 混合公共模板：%%BODY%% 占位声明由 buildBlendProgram 按模式替换为完整函数。
 inline const char* kBlendCommon = R"(#version 300 es
 precision mediump float;

@@ -29,6 +29,8 @@ napi_value SelectLayer(napi_env env, napi_callback_info info);
 napi_value SetLayerVisible(napi_env env, napi_callback_info info);
 // 蒙版（04 §1.2 / 02 §3 M5a）：启用/停用图层蒙版
 napi_value SetLayerMaskEnabled(napi_env env, napi_callback_info info);
+// 剪贴蒙版（M5b-2）：创建/释放剪贴（剪贴到下方最近非剪贴层）
+napi_value SetLayerClipping(napi_env env, napi_callback_info info);
 napi_value SetLayerOpacity(napi_env env, napi_callback_info info);
 napi_value SetLayerBlendMode(napi_env env, napi_callback_info info);
 napi_value ReorderLayer(napi_env env, napi_callback_info info);

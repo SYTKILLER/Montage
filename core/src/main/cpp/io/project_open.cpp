@@ -507,6 +507,7 @@ struct LayerRecord {
     int maskOutside = 255;
     uint32_t maskWidth = 0;
     uint32_t maskHeight = 0;
+    bool clipping = false;  // v2
 };
 
 bool getU64(const JValue& v, uint64_t& out) {
@@ -625,6 +626,14 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
                 err = "bad layer opacity";
                 return false;
             }
+        }
+        const JValue* jcl = item.find("clipping");
+        if (jcl != nullptr) {
+            if (jcl->type != JValue::Bool) {
+                err = "bad clipping";
+                return false;
+            }
+            l.clipping = jcl->b;
         }
         const JValue* jbm = item.find("blendMode");
         if (jbm == nullptr || jbm->type != JValue::Str ||
@@ -779,6 +788,7 @@ bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
         l.visible = rec.visible;
         l.opacity = rec.opacity;
         l.blendMode = rec.blendMode;
+        l.clipping = rec.clipping;
         l.transform.originX = rec.originX;
         l.transform.originY = rec.originY;
         if (rec.hasImage) {

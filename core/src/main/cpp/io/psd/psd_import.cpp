@@ -89,34 +89,6 @@ std::shared_ptr<LayerMask> buildMask(const psd::Record& rec) {
 }
 
 // 剪贴烘焙：clip 像素 × base alpha（文档坐标对齐，预乘域等比缩放）
-void bakeClipping(psd::Record& rec, const psd::Record& base) {
-    if (base.width <= 0 || base.height <= 0 || rec.width <= 0 || rec.height <= 0) {
-        return;
-    }
-    for (int y = 0; y < rec.height; ++y) {
-        const int by = rec.top + y - base.top;
-        if (by < 0 || by >= base.height) {
-            continue;
-        }
-        for (int x = 0; x < rec.width; ++x) {
-            const int bx = rec.left + x - base.left;
-            if (bx < 0 || bx >= base.width) {
-                continue;
-            }
-            const size_t baseAt = (static_cast<size_t>(by) * base.width + bx) * 4 + 3;
-            const uint16_t k = base.rgba[baseAt];
-            if (k == 255) {
-                continue;
-            }
-            uint8_t* px = rec.rgba.data() + (static_cast<size_t>(y) * rec.width + x) * 4;
-            for (int c = 0; c < 4; ++c) {
-                px[c] = static_cast<uint8_t>((px[c] * k + 127) / 255);
-            }
-        }
-    }
-    rec.notes.push_back("Clipping applied by baking into pixels (layer stack editing arrives later).");
-}
-
 }  // namespace
 
 bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* notes,
@@ -150,14 +122,9 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
         return false;
     }
 
-    // 烘焙：蒙版 → 剪贴 → 直通 alpha；逐层切瓦片
-    std::map<uint64_t, psd::Record*> baked;  // id → 已烘焙记录（剪贴 base 引用）
-    struct Built {
-        Layer layer;
-    };
+    // 烘焙：蒙版 → 剪贴 → 直通 alpha；逐层切瓦片（M5b-2 起蒙版/剪贴均非破坏）
     std::vector<Layer> layers;
     layers.reserve(doc.layers.size());
-    std::map<uint64_t, uint64_t> baseForParent;  // parentId(0=根) → base layerId
     int done = 0;
     for (psd::Record& rec : doc.layers) {
         done++;
@@ -173,27 +140,17 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
         layer.visible = rec.visible;
         layer.opacity = std::min(1.0, std::max(0.0, rec.opacity));
         layer.blendMode = rec.blendMode;
+        layer.clipping = rec.clipping;
         layer.transform.originX = rec.left;
         layer.transform.originY = rec.top;
         layer.transform.width = rec.width;
         layer.transform.height = rec.height;
 
         if (!rec.isGroup && rec.width > 0 && rec.height > 0 && !rec.rgba.empty()) {
-            if (rec.clipping) {
-                auto baseIt = baseForParent.find(parent);
-                if (baseIt != baseForParent.end()) {
-                    auto b = baked.find(baseIt->second);
-                    if (b != baked.end()) {
-                        bakeClipping(rec, *b->second);
-                    } else {
-                        rec.notes.push_back("This clipping mask's base isn't supported, so clipping was skipped.");
-                    }
-                } else {
-                    rec.notes.push_back("This clipping mask's base isn't supported, so clipping was skipped.");
-                }
+            // M5b-2：剪贴非破坏——保留标志渲染期生效；栈底剪贴（无基）给提示
+            if (rec.clipping && layers.empty()) {
+                rec.notes.push_back("This clipping mask has no base below it, so clipping was skipped.");
             }
-            baked[layer.id] = &rec;
-            baseForParent[parent] = layer.id;
             unpremultiply(rec.rgba);
 
             const uint32_t cols =
@@ -225,9 +182,8 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
             if (layer.mask != nullptr && layer.mask->enabled) {
                 layer.render = composeMasked(layer.pixels, *layer.mask);
             }
-        } else if (rec.clipping) {
-            rec.notes.push_back("This clipping mask's base isn't supported, so clipping was skipped.");
         }
+        // 空像素剪贴层：无内容不渲染，无需提示（M5b-2 剪贴已非破坏）
 
         for (const std::string& n : rec.notes) {
             if (notes != nullptr) {

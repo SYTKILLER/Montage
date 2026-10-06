@@ -50,6 +50,7 @@ export interface LayerDTO {
   parentId: number;
   hasMask: boolean;
   maskEnabled: boolean;
+  clipping: boolean;
   thumbToken: number;
 }
 

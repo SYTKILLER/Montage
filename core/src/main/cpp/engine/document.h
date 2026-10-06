@@ -142,7 +142,7 @@ struct LayerMask {
     bool linked = true;  // v1 恒 true（独立 placement 随 M8 变换引入）
 };
 
-// 图层（值语义，对齐源 ImageLayer；M2 子集：蒙版 M5a、调整/形状/文字后续补）。
+// 图层（值语义，对齐源 ImageLayer；M2 子集：蒙版/剪贴 M5、调整/形状/文字后续补）。
 struct Layer {
     LayerId id = 0;
     std::string name;
@@ -154,6 +154,7 @@ struct Layer {
     std::shared_ptr<LayerMask> mask = nullptr;         // null = 无蒙版
     std::shared_ptr<const TileGrid> render = nullptr;  // 蒙版启用时的合成结果（派生缓存，
                                                        // 变更点主动维护、随 History 快照走）
+    bool clipping = false;  // M5b-2：剪贴蒙版——剪贴到下方最近非剪贴层（渲染期生效，PS 语义）
     // 渲染/缩略图取数：蒙版启用取合成结果，否则原像素
     std::shared_ptr<const TileGrid> effectivePixels() const {
         return (mask != nullptr && mask->enabled && render != nullptr) ? render : pixels;

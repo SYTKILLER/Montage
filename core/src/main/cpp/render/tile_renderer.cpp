@@ -118,6 +118,8 @@ bool TileRenderer::ensureFbos(int32_t vw, int32_t vh) {
     bool ok = makeFbo(&accFbo_[0], &accTex_[0]);
     ok = makeFbo(&accFbo_[1], &accTex_[1]) && ok;
     ok = makeFbo(&layerFbo_, &layerTex_) && ok;
+    ok = makeFbo(&clipFbo_, &clipTex_) && ok;
+    ok = makeFbo(&baseFbo_, &baseTex_) && ok;
     if (!ok) {
         OH_LOG_Print(LOG_APP, LOG_ERROR, kDomain, kTag, "FBO incomplete");
         destroyFbos();
@@ -139,6 +141,14 @@ void TileRenderer::destroyFbos() {
     if (layerTex_ != 0) glDeleteTextures(1, &layerTex_);
     layerFbo_ = 0;
     layerTex_ = 0;
+    if (clipFbo_ != 0) glDeleteFramebuffers(1, &clipFbo_);
+    if (clipTex_ != 0) glDeleteTextures(1, &clipTex_);
+    clipFbo_ = 0;
+    clipTex_ = 0;
+    if (baseFbo_ != 0) glDeleteFramebuffers(1, &baseFbo_);
+    if (baseTex_ != 0) glDeleteTextures(1, &baseTex_);
+    baseFbo_ = 0;
+    baseTex_ = 0;
     fboW_ = fboH_ = 0;
 }
 
@@ -149,13 +159,15 @@ void TileRenderer::ensureInit() {
     checkerProg_ = buildProgram(shaders::kQuadVert, shaders::kCheckerFrag);
     tileProg_ = buildProgram(shaders::kQuadVert, shaders::kTileFrag);
     plainProg_ = buildProgram(shaders::kQuadVert, shaders::kPlainFrag);
+    clipProg_ = buildProgram(shaders::kQuadVert, shaders::kClipFrag);
     for (int m = 0; m < kBlendModeCount; ++m) {
         blendProgs_[m] = buildBlendProgram(m);
         if (blendProgs_[m] == 0) {
             OH_LOG_Print(LOG_APP, LOG_ERROR, kDomain, kTag, "blend program %{public}d failed", m);
         }
     }
-    if (checkerProg_ == 0 || tileProg_ == 0 || plainProg_ == 0 || blendProgs_[0] == 0) {
+    if (checkerProg_ == 0 || tileProg_ == 0 || plainProg_ == 0 || clipProg_ == 0 ||
+        blendProgs_[0] == 0) {
         return;
     }
     const float quad[8] = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f};
@@ -194,11 +206,12 @@ void TileRenderer::invalidate() {
     if (checkerProg_ != 0) glDeleteProgram(checkerProg_);
     if (tileProg_ != 0) glDeleteProgram(tileProg_);
     if (plainProg_ != 0) glDeleteProgram(plainProg_);
+    if (clipProg_ != 0) glDeleteProgram(clipProg_);
     for (int m = 0; m < kBlendModeCount; ++m) {
         if (blendProgs_[m] != 0) glDeleteProgram(blendProgs_[m]);
         blendProgs_[m] = 0;
     }
-    checkerProg_ = tileProg_ = plainProg_ = 0;
+    checkerProg_ = tileProg_ = plainProg_ = clipProg_ = 0;
     if (vbo_ != 0) glDeleteBuffers(1, &vbo_);
     if (vao_ != 0) glDeleteVertexArrays(1, &vao_);
     vbo_ = vao_ = 0;
@@ -354,9 +367,18 @@ void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw
     }
     int accIdx = 0;
     int composited = 0;
-    for (const Layer& layer : doc.layers) {
+    bool baseTexValid = false;  // M5b-2：baseTex_ 是否持有当前剪贴组的基 alpha
+    for (size_t li = 0; li < doc.layers.size(); ++li) {
+        const Layer& layer = doc.layers[li];
         if (!layer.visible || layer.effectivePixels() == nullptr) {
+            // 非剪贴层缺席 → 其上剪贴组无有效基（PS：基隐藏则剪贴组隐藏）
+            if (!layer.clipping) {
+                baseTexValid = false;
+            }
             continue;
+        }
+        if (layer.clipping && !baseTexValid) {
+            continue;  // 无有效基（基隐藏/空/栈底剪贴）→ 整层不渲染（PS 语义）
         }
         composited++;
         const int mode = static_cast<int>(layer.blendMode);
@@ -371,7 +393,35 @@ void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw
         drawTiles(layer, zoom, panX, panY, vw, vh,
                   stroke != nullptr && stroke->layerId == layer.id ? stroke : nullptr);
 
-        // Pass B：blend(src=layerTex, dst=acc) 全屏 → acc 另一侧（R3.1：视口变仍全帧重绘）
+        GLuint srcTex = layerTex_;
+        if (!layer.clipping) {
+            // 剪贴基快照：紧随其后的剪贴层组以本层 assemble alpha 为蒙（M5b-2）
+            baseTexValid = false;
+            if (li + 1 < doc.layers.size() && doc.layers[li + 1].clipping) {
+                glBindFramebuffer(GL_FRAMEBUFFER, baseFbo_);
+                glDisable(GL_BLEND);
+                glUseProgram(plainProg_);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, layerTex_);
+                drawQuad(plainProg_, 0.0f, 0.0f, vwF, vhF, 1.0f, 0.0f, 0.0f, vwF, vhF);
+                baseTexValid = true;
+            }
+        } else {
+            // 剪贴层：alpha × 基 alpha（中间趟，Pass B 用乘积纹理）
+            glBindFramebuffer(GL_FRAMEBUFFER, clipFbo_);
+            glDisable(GL_BLEND);
+            glUseProgram(clipProg_);
+            glUniform1i(glGetUniformLocation(clipProg_, "uSrc"), 0);
+            glUniform1i(glGetUniformLocation(clipProg_, "uClip"), 1);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, layerTex_);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, baseTex_);
+            drawQuad(clipProg_, 0.0f, 0.0f, vwF, vhF, 1.0f, 0.0f, 0.0f, vwF, vhF);
+            srcTex = clipTex_;
+        }
+
+        // Pass B：blend(src=layerTex/clipTex, dst=acc) 全屏 → acc 另一侧（R3.1：视口变仍全帧重绘）
         const int dstIdx = accIdx;
         const int outIdx = 1 - accIdx;
         glBindFramebuffer(GL_FRAMEBUFFER, accFbo_[outIdx]);
@@ -381,7 +431,7 @@ void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw
         glUniform1i(glGetUniformLocation(blendProg, "uDst"), 1);
         glUniform1f(glGetUniformLocation(blendProg, "uOpacity"), static_cast<float>(layer.opacity));
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, layerTex_);
+        glBindTexture(GL_TEXTURE_2D, srcTex);
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, accTex_[dstIdx]);
         // uRect/uView/uViewport 必须由 drawQuad 设置（缺省 0 → quad 退化不绘制，M2 实测坑）

@@ -565,6 +565,17 @@ struct Index {
     }
   }
 
+  // M5b-2：创建/释放剪贴蒙版
+  private onToggleClipping(): void {
+    const active = this.activeLayer();
+    if (active === undefined) {
+      return;
+    }
+    if (this.engine.setLayerClipping(active.id, !active.clipping)) {
+      this.log(`剪贴蒙版: ${!active.clipping ? '创建' : '释放'}（${active.name}）`);
+    }
+  }
+
   private onToggleVisible(l: LayerDTO): void {
     this.engine.setLayerVisible(l.id, !l.visible);
   }
@@ -830,6 +841,9 @@ struct Index {
               this.engine.addLayer();
             })
             Button('加蒙版').fontSize(12).onClick((): void => this.onAddMask())
+            Button('剪贴').fontSize(12)
+              .backgroundColor(this.activeLayer()?.clipping ? '#D93025' : '#888888')
+              .onClick((): void => this.onToggleClipping())
             Button('删除').fontSize(12).onClick((): void => {
               const a = this.activeLayer();
               if (a !== undefined) {

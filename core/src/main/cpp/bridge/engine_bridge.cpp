@@ -744,6 +744,7 @@ napi_value makeLayerDto(napi_env env, const Layer& l, bool isActive) {
     napi_set_named_property(env, obj, "parentId", makeDouble(env, 0.0));
     napi_set_named_property(env, obj, "hasMask", makeBool(env, l.mask != nullptr));
     napi_set_named_property(env, obj, "maskEnabled", makeBool(env, l.mask != nullptr && l.mask->enabled));
+    napi_set_named_property(env, obj, "clipping", makeBool(env, l.clipping));
     napi_set_named_property(env, obj, "thumbToken",
                             makeDouble(env, static_cast<double>(l.pixels != nullptr ? l.pixels->revision : 0)));
     return obj;
@@ -876,6 +877,39 @@ napi_value SetLayerMaskEnabled(napi_env env, napi_callback_info info) {
         m->enabled = v;
         l->mask = std::move(m);
         l->render = (v && l->pixels != nullptr) ? composeMasked(l->pixels, *l->mask) : nullptr;
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// M5b-2：创建/释放剪贴蒙版（渲染期生效，无需派生网格重算；撤销粒度 = 单次切换）
+napi_value SetLayerClipping(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "setLayerClipping(id, v) requires 2 args");
+    }
+    double id = 0;
+    bool v = false;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok ||
+        napi_get_value_bool(env, argv[1], &v) != napi_ok) {
+        return makeError(env, kErrBadParam, "setLayerClipping: invalid args");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        if (l == nullptr) {
+            return makeError(env, kErrBadParam, "setLayerClipping: layer not found");
+        }
+        if (l->clipping == v) {
+            return makeOk(env, nullptr);
+        }
+        e.history.beginEdit(e.doc, "clipping", static_cast<uint64_t>(e.docRevision));
+        l->clipping = v;
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();
         e.requestRender();

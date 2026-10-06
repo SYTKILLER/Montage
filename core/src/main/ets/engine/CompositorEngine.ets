@@ -121,6 +121,7 @@ function narrowLayer(r: Record<string, Object>): LayerDTO {
     parentId: num(r, 'parentId'),
     hasMask: boolOf(r, 'hasMask'),
     maskEnabled: boolOf(r, 'maskEnabled'),
+    clipping: boolOf(r, 'clipping'),
     thumbToken: num(r, 'thumbToken'),
   };
 }
@@ -344,6 +345,16 @@ export class CompositorEngine {
     const r = narrowResult(native.setLayerMaskEnabled(id, v) as Object);
     if (!r.ok) {
       hilog.error(DOMAIN, TAG, 'setLayerMaskEnabled failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  // M5b-2：创建/释放剪贴蒙版
+  setLayerClipping(id: number, v: boolean): boolean {
+    const r = narrowResult(native.setLayerClipping(id, v) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setLayerClipping failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
     return r.ok;

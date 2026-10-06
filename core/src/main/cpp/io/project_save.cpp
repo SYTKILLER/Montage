@@ -436,6 +436,7 @@ struct LayerSnapshot {
     int maskOffsetY = 0;
     int maskOutside = 255;
     bool maskEnabled = true;
+    bool clipping = false;  // M5b-2
 };
 
 struct DocSnapshot {
@@ -517,6 +518,9 @@ std::string buildManifest(const DocSnapshot& doc) {
         std::snprintf(num, sizeof(num), "%.6g", l.opacity);
         fields.push_back("      \"opacity\": " + std::string(num));
         fields.push_back("      \"blendMode\": " + jsonEscape(blendModeName(l.blendMode)));
+        if (l.clipping) {
+            fields.push_back("      \"clipping\": true");
+        }
         if (l.pixels != nullptr) {
             // 图像以内容包围盒存出；originX/Y = 包围盒左上角在文档坐标系的落点（load 据此重建 Transform）
             fields.push_back("      \"originX\": " + std::to_string(static_cast<int64_t>(l.originX)));
@@ -586,6 +590,7 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
                 s.maskOutside = l.mask->outside;
                 s.maskEnabled = l.mask->enabled;
             }
+            s.clipping = l.clipping;
             snap.layers.push_back(std::move(s));
         }
     }

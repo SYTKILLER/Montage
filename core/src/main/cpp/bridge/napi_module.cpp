@@ -27,6 +27,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"selectLayer", nullptr, montage::bridge::SelectLayer, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setLayerVisible", nullptr, montage::bridge::SetLayerVisible, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setLayerMaskEnabled", nullptr, montage::bridge::SetLayerMaskEnabled, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setLayerClipping", nullptr, montage::bridge::SetLayerClipping, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setLayerOpacity", nullptr, montage::bridge::SetLayerOpacity, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setLayerBlendMode", nullptr, montage::bridge::SetLayerBlendMode, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"reorderLayer", nullptr, montage::bridge::ReorderLayer, nullptr, nullptr, nullptr, napi_default, nullptr},

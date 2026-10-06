@@ -55,6 +55,7 @@ class TileRenderer {
     GLuint checkerProg_ = 0;
     GLuint tileProg_ = 0;
     GLuint plainProg_ = 0;
+    GLuint clipProg_ = 0;  // M5b-2：剪贴 alpha 乘法
     GLuint blendProgs_[kBlendModeCount] = {0};
     GLuint vbo_ = 0;
     GLuint vao_ = 0;
@@ -65,6 +66,10 @@ class TileRenderer {
     GLuint accTex_[2] = {0, 0};
     GLuint layerFbo_ = 0;
     GLuint layerTex_ = 0;
+    GLuint clipFbo_ = 0;  // 剪贴层 × 基 alpha 乘积
+    GLuint clipTex_ = 0;
+    GLuint baseFbo_ = 0;  // 剪贴基的 assemble alpha 快照
+    GLuint baseTex_ = 0;
     GLint fboW_ = 0;
     GLint fboH_ = 0;
     bool float16_ = false;
