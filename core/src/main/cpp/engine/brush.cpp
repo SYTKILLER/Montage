@@ -74,6 +74,7 @@ bool StrokeDraft::begin(const Document& doc, LayerId layerId, const BrushSetting
             originY_ = std::min(0, originY_);
         }
     }
+    selMask_ = doc.selection != nullptr ? doc.selection.get() : nullptr;
     coverage_.clear();
     work_.clear();
     touched_.clear();
@@ -185,6 +186,16 @@ void StrokeDraft::dab(float gx, float gy) {
                         if (f <= 0.0f) {
                             continue;
                         }
+                    }
+                    if (selMask_ != nullptr) {
+                        // M7a：笔画约束在选区内（文档域采样；cx/r 为图层局部像素坐标）
+                        const uint8_t sg = selectionGrayAt(*selMask_,
+                                                           static_cast<int>(cx) + originX_,
+                                                           static_cast<int>(r) + originY_);
+                        if (sg == 0) {
+                            continue;
+                        }
+                        f *= static_cast<float>(sg) / 255.0f;
                     }
                     uint8_t& c = covRow[static_cast<size_t>(cx - tx * kTile)];
                     if (settings_.hardness >= 1.0f) {

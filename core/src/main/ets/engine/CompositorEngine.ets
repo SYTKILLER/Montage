@@ -385,6 +385,21 @@ export class CompositorEngine {
     return r.ok;
   }
 
+  // M7a：矩形选框（文档坐标）/ 取消选区
+  setRectSelection(x: number, y: number, w: number, h: number): boolean {
+    const r = narrowResult(native.setRectSelection(x, y, w, h) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setRectSelection failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  clearSelection(): boolean {
+    const r = narrowResult(native.clearSelection() as Object);
+    return r.ok;
+  }
+
   reorderLayer(id: number, toIndex: number): boolean {
     const r = narrowResult(native.reorderLayer(id, toIndex) as Object);
     if (!r.ok) {

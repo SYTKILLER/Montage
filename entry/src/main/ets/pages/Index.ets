@@ -593,6 +593,23 @@ struct Index {
     this.engine.setAdjustmentParams(active.id, inBlack, inWhite, gamma);
   }
 
+  // M7a：矩形选区（画布中心 50%）/ 取消
+  private onRectSelect(): void {
+    if (!this.docOpen) {
+      return;
+    }
+    const ok: boolean = this.engine.setRectSelection(this.docW * 0.25, this.docH * 0.25,
+      this.docW * 0.5, this.docH * 0.5);
+    if (ok) {
+      this.log('矩形选区已设置（中心 50%）');
+    }
+  }
+
+  private onClearSelect(): void {
+    this.engine.clearSelection();
+    this.log('选区已取消');
+  }
+
   private onToggleVisible(l: LayerDTO): void {
     this.engine.setLayerVisible(l.id, !l.visible);
   }
@@ -669,6 +686,10 @@ struct Index {
             Button('撤销').onClick((): void => this.doUndo()).margin({ left: 8 }).opacity(this.canUndo ? 1 : 0.4)
             Button('重做').onClick((): void => this.doRedo()).margin({ left: 8 }).opacity(this.canRedo ? 1 : 0.4)
             Button('保存').onClick((): void => this.doSaveProject()).margin({ left: 8 })
+              .opacity(this.docOpen ? 1 : 0.4)
+            Button('矩形选区').fontSize(12).onClick((): void => this.onRectSelect()).margin({ left: 8 })
+              .opacity(this.docOpen ? 1 : 0.4)
+            Button('取消选区').fontSize(12).onClick((): void => this.onClearSelect()).margin({ left: 8 })
               .opacity(this.docOpen ? 1 : 0.4)
           }
           .width('100%')

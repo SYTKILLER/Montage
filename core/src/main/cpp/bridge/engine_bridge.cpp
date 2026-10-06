@@ -1388,6 +1388,85 @@ napi_value AddLayerMask(napi_env env, napi_callback_info info) {
     return makeOk(env, nullptr);
 }
 
+// M7a：矩形选框（文档坐标；硬边 v1）。掩码 = 文档域网格，255 在框内。
+napi_value SetRectSelection(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 4) {
+        return makeError(env, kErrBadParam, "setRectSelection(x, y, w, h) requires 4 args");
+    }
+    double x = 0, y = 0, w = 0, h = 0;
+    if (napi_get_value_double(env, argv[0], &x) != napi_ok ||
+        napi_get_value_double(env, argv[1], &y) != napi_ok ||
+        napi_get_value_double(env, argv[2], &w) != napi_ok ||
+        napi_get_value_double(env, argv[3], &h) != napi_ok) {
+        return makeError(env, kErrBadParam, "setRectSelection: invalid args");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "setRectSelection: no document");
+        }
+        if (w <= 0 || h <= 0) {
+            return makeError(env, kErrBadParam, "setRectSelection: empty rect");
+        }
+        e.history.beginEdit(e.doc, "rect select", static_cast<uint64_t>(e.docRevision));
+        const uint32_t cols = (e.doc.width + kTileSize - 1u) / kTileSize;
+        const uint32_t rows = (e.doc.height + kTileSize - 1u) / kTileSize;
+        TileGridBuilder builder(cols, rows);
+        for (uint32_t ty = 0; ty < rows; ++ty) {
+            for (uint32_t tx = 0; tx < cols; ++tx) {
+                EngineBuffer& buf = builder.ensureTile(tx, ty);
+                uint8_t* px = buf.mapCpuWrite();
+                const int32_t y0 = static_cast<int32_t>(ty * kTileSize);
+                const int32_t x0 = static_cast<int32_t>(tx * kTileSize);
+                for (uint32_t r = 0; r < kTileSize; ++r) {
+                    uint8_t* row = px + static_cast<size_t>(r) * kTileSize * 4u;
+                    const int32_t dy = y0 + static_cast<int32_t>(r);
+                    const bool inY = dy >= static_cast<int32_t>(y) &&
+                                     dy < static_cast<int32_t>(y + h);
+                    for (uint32_t c = 0; c < kTileSize; ++c) {
+                        const int32_t dx = x0 + static_cast<int32_t>(c);
+                        const uint8_t v = (inY && dx >= static_cast<int32_t>(x) &&
+                                           dx < static_cast<int32_t>(x + w))
+                                              ? 255
+                                              : 0;
+                        // 选区掩码灰度存 R 通道（约定与蒙版 patch 一致）
+                        row[c * 4u] = v;
+                        row[c * 4u + 1u] = v;
+                        row[c * 4u + 2u] = v;
+                        row[c * 4u + 3u] = 255;
+                    }
+                }
+            }
+        }
+        e.doc.selection = builder.publish(1);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// M7a：取消选区
+napi_value ClearSelection(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.selection == nullptr) {
+            return makeOk(env, nullptr);
+        }
+        e.history.beginEdit(e.doc, "deselect", static_cast<uint64_t>(e.docRevision));
+        e.doc.selection = nullptr;
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
 napi_value BeginStroke(napi_env env, napi_callback_info info) {
     size_t argc = 3;
     napi_value argv[3] = {nullptr, nullptr, nullptr};

@@ -180,16 +180,19 @@ struct Layer {
     }
 };
 
-// M2：图层栈文档（无组/蒙版/选区；History M4）。
+// M2：图层栈文档（无组；蒙版/剪贴/调整层 M5/M6；选区 M7a）。
 struct Document {
     uint32_t width = 0;
     uint32_t height = 0;
     std::string name;
     std::vector<Layer> layers;  // bottom → top（对齐源 CanvasDocument.layers）
     LayerId activeId = 0;
+    // M7a 选区：文档域 8-bit 覆盖掩码（null = 无选区，全图可编辑）；随 Document 快照走撤销
+    std::shared_ptr<const TileGrid> selection;
 };
 
 // 视口：pan = 视口左上角的文档坐标（doc px），screen = (doc - pan) * zoom。
+// 视图：pan = 视口左上角的文档坐标（doc px），screen = (doc - pan) * zoom。
 struct Viewport {
     double zoom = 1.0;
     double panX = 0.0;
@@ -197,6 +200,9 @@ struct Viewport {
 };
 
 double clampZoom(double zoom);  // [1/32, 32]
+
+// 选区灰度采样（02 D2.3：8-bit 覆盖掩码主表示；mask = 文档域网格，null = 无选区全图可编辑）
+uint8_t selectionGrayAt(const TileGrid& mask, int docX, int docY);
 
 const char* blendModeName(BlendMode mode);  // DTO 显示名（对齐源 LayerBlendMode raw 值）
 bool blendModeFromName(const std::string& name, BlendMode& out);  // 逆映射（.montage 读取，M4c）

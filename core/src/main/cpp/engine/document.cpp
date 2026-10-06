@@ -127,6 +127,25 @@ bool blendModeFromName(const std::string& name, BlendMode& out) {
     return false;
 }
 
+uint8_t selectionGrayAt(const TileGrid& mask, int docX, int docY) {
+    if (docX < 0 || docY < 0) {
+        return 0;
+    }
+    const uint32_t ux = static_cast<uint32_t>(docX);
+    const uint32_t uy = static_cast<uint32_t>(docY);
+    const uint32_t tx = ux / kTileSize;
+    const uint32_t ty = uy / kTileSize;
+    if (tx >= mask.cols || ty >= mask.rows) {
+        return 0;
+    }
+    auto it = mask.tiles.find(ty * mask.cols + tx);
+    if (it == mask.tiles.end()) {
+        return 0;  // 稀疏网格缺瓦片 = 未选中
+    }
+    const uint8_t* px = it->second->pixels->mapCpu();
+    return px[(static_cast<size_t>(uy % kTileSize) * kTileSize) + static_cast<size_t>(ux % kTileSize)];
+}
+
 uint8_t layerMaskGrayAt(const LayerMask& mask, int gx, int gy) {
     const int px0 = mask.offsetX;
     const int py0 = mask.offsetY;
