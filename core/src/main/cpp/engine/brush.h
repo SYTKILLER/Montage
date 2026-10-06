@@ -103,6 +103,9 @@ class StrokeDraft {
     std::set<uint32_t> touched_;
     // provisional tail 备份：key → 尾段前整瓦 coverage（空 vector = 尾段前无 coverage）
     std::map<uint32_t, std::vector<uint8_t>> tailBackup_;
+    // M7a：选区约束（文档域掩码；null = 无选区）。dab coverage × 选区灰度
+    const TileGrid* selMask_ = nullptr;
+
     // dab 步进状态
     bool hasPrev_ = false;
     float prevX_ = 0;
