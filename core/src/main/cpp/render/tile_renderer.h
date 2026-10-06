@@ -51,6 +51,8 @@ class TileRenderer {
     void drawTiles(const Layer& layer, float zoom, float panX, float panY, float vw, float vh,
                    const StrokeOverlay* stroke);
     void uploadLut(const float* lut256);  // M6a：调整层 LUT 上传
+    void rebuildAnts(const Document& doc);  // M7b：selection 变更时重建蚂蚁线缓冲
+    void drawAnts(float phase);
     std::unordered_map<uint64_t, uint32_t> strokeTex_;  // key → 临时纹理（逐帧刷新）
 
     GLuint checkerProg_ = 0;
@@ -58,6 +60,11 @@ class TileRenderer {
     GLuint plainProg_ = 0;
     GLuint clipProg_ = 0;  // M5b-2：剪贴 alpha 乘法
     GLuint adjustProg_ = 0;  // M6a：调整层 LUT
+    GLuint antsProg_ = 0;    // M7b：蚂蚁线
+    GLuint antsVbo_ = 0;
+    GLuint antsVao_ = 0;
+    GLsizei antsVerts_ = 0;              // 顶点数（= 段数×6）
+    const TileGrid* antsBuiltFor_ = nullptr;  // 惰性重建键（selection 指针身份）
     GLuint blendProgs_[kBlendModeCount] = {0};
     GLuint vbo_ = 0;
     GLuint vao_ = 0;

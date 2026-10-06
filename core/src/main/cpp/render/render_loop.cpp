@@ -273,7 +273,12 @@ void RenderLoop::doFrame() {
 
     // 03 §2（M1 降级实现）：无脏跳过绘制与 swap；帧循环由回调线程自续（跨线程请求实证不可靠）。
     // 空闲成本 = vsync 空回调，省电的"停请求"待真机阶段实现。
-    const bool dirty = e.needsRender.exchange(false);
+    // M7b：选区存在时蚂蚁线持续动画 → 视作常脏（LTPO 分档留真机阶段）
+    bool dirty = e.needsRender.exchange(false);
+    if (!dirty) {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        dirty = e.doc.selection != nullptr;
+    }
     if (!dirty) {
         OH_NativeVSync_RequestFrame(vsync_, &RenderLoop::frameCallback, this);
         return;

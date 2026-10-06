@@ -1,5 +1,7 @@
 #include "render/tile_renderer.h"
 
+#include "tiles/selection_outline.h"
+
 #include <algorithm>
 #include <cstring>
 #include <string>
@@ -171,6 +173,7 @@ void TileRenderer::ensureInit() {
     plainProg_ = buildProgram(shaders::kQuadVert, shaders::kPlainFrag);
     clipProg_ = buildProgram(shaders::kQuadVert, shaders::kClipFrag);
     adjustProg_ = buildProgram(shaders::kQuadVert, shaders::kAdjustFrag);
+    antsProg_ = buildProgram(shaders::kAntsVert, shaders::kAntsFrag);
     for (int m = 0; m < kBlendModeCount; ++m) {
         blendProgs_[m] = buildBlendProgram(m);
         if (blendProgs_[m] == 0) {
@@ -178,8 +181,12 @@ void TileRenderer::ensureInit() {
         }
     }
     if (checkerProg_ == 0 || tileProg_ == 0 || plainProg_ == 0 || clipProg_ == 0 ||
-        adjustProg_ == 0 || blendProgs_[0] == 0) {
+        adjustProg_ == 0 || antsProg_ == 0 || blendProgs_[0] == 0) {
         return;
+    }
+    if (antsVao_ == 0) {
+        glGenBuffers(1, &antsVbo_);
+        glGenVertexArrays(1, &antsVao_);
     }
     const float quad[8] = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f};
     glGenVertexArrays(1, &vao_);
@@ -219,11 +226,17 @@ void TileRenderer::invalidate() {
     if (plainProg_ != 0) glDeleteProgram(plainProg_);
     if (clipProg_ != 0) glDeleteProgram(clipProg_);
     if (adjustProg_ != 0) glDeleteProgram(adjustProg_);
+    if (antsProg_ != 0) glDeleteProgram(antsProg_);
     for (int m = 0; m < kBlendModeCount; ++m) {
         if (blendProgs_[m] != 0) glDeleteProgram(blendProgs_[m]);
         blendProgs_[m] = 0;
     }
-    checkerProg_ = tileProg_ = plainProg_ = clipProg_ = adjustProg_ = 0;
+    checkerProg_ = tileProg_ = plainProg_ = clipProg_ = adjustProg_ = antsProg_ = 0;
+    if (antsVbo_ != 0) glDeleteBuffers(1, &antsVbo_);
+    if (antsVao_ != 0) glDeleteVertexArrays(1, &antsVao_);
+    antsVbo_ = antsVao_ = 0;
+    antsVerts_ = 0;
+    antsBuiltFor_ = nullptr;
     if (vbo_ != 0) glDeleteBuffers(1, &vbo_);
     if (vao_ != 0) glDeleteVertexArrays(1, &vao_);
     vbo_ = vao_ = 0;
@@ -407,6 +420,81 @@ void buildAdjustmentLut(const LayerAdjustment& adj, float* lut256) {
     }
 }
 
+void TileRenderer::rebuildAnts(const Document& doc) {
+    antsVerts_ = 0;
+    antsBuiltFor_ = doc.selection.get();
+    if (doc.selection == nullptr || antsProg_ == 0 || antsVao_ == 0) {
+        return;
+    }
+    std::vector<tiles::OutlinePolyline> loops;
+    if (!tiles::extractSelectionOutline(*doc.selection, loops)) {
+        return;
+    }
+    // 每段展开 6 顶点（两三角形）：p1, p2, t, side
+    std::vector<float> verts;
+    verts.reserve(loops.size() * 4 * 36);
+    for (const tiles::OutlinePolyline& poly : loops) {
+        const size_t n = poly.x.size();
+        for (size_t i = 0; i < n; ++i) {
+            const float x1 = poly.x[i];
+            const float y1 = poly.y[i];
+            const size_t j = (i + 1) % n;
+            const float x2 = poly.x[j];
+            const float y2 = poly.y[j];
+            // strip 顺序：(-1,0)(+1,0)(-1,1) / (+1,0)(+1,1)(-1,1)
+            const float data[6][6] = {
+                {x1, y1, x2, y2, 0.0f, -1.0f},
+                {x1, y1, x2, y2, 0.0f, +1.0f},
+                {x1, y1, x2, y2, 1.0f, -1.0f},
+                {x1, y1, x2, y2, 0.0f, +1.0f},
+                {x1, y1, x2, y2, 1.0f, +1.0f},
+                {x1, y1, x2, y2, 1.0f, -1.0f},
+            };
+            for (const auto& v : data) {
+                verts.insert(verts.end(), v, v + 6);
+            }
+        }
+    }
+    antsVerts_ = static_cast<GLsizei>(verts.size() / 6);
+    if (antsVerts_ == 0) {
+        return;
+    }
+    glBindVertexArray(antsVao_);
+    glBindBuffer(GL_ARRAY_BUFFER, antsVbo_);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(verts.size() * sizeof(float)),
+                 verts.data(), GL_STATIC_DRAW);
+    // aP1
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float),
+                          reinterpret_cast<void*>(0));
+    // aP2
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float),
+                          reinterpret_cast<void*>(2 * sizeof(float)));
+    // aT
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 6 * sizeof(float),
+                          reinterpret_cast<void*>(4 * sizeof(float)));
+    // aSide
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 6 * sizeof(float),
+                          reinterpret_cast<void*>(5 * sizeof(float)));
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+void TileRenderer::drawAnts(float phase) {
+    if (antsVerts_ == 0 || antsProg_ == 0 || antsVao_ == 0) {
+        return;
+    }
+    glDisable(GL_BLEND);
+    glUseProgram(antsProg_);
+    glUniform1f(glGetUniformLocation(antsProg_, "uPhase"), phase);
+    glBindVertexArray(antsVao_);
+    glDrawArrays(GL_TRIANGLES, 0, antsVerts_);
+    glBindVertexArray(0);
+}
+
 void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw, int32_t vh,
                              const StrokeOverlay* stroke) {
     frame_++;
@@ -551,6 +639,17 @@ void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw
     drawQuad(plainProg_, 0.0f, 0.0f, static_cast<float>(doc.width), static_cast<float>(doc.height),
              zoom, panX, panY, vwF, vhF);
     glDisable(GL_BLEND);
+
+    // M7b 蚂蚁线：selection 指针身份变化时惰性重建，相位随帧推进
+    if (doc.selection.get() != antsBuiltFor_) {
+        rebuildAnts(doc);
+    }
+    if (antsVerts_ > 0) {
+        glUseProgram(antsProg_);
+        glUniform4f(glGetUniformLocation(antsProg_, "uView"), zoom, panX, panY, 0.0f);
+        glUniform2f(glGetUniformLocation(antsProg_, "uViewport"), vwF, vhF);
+        drawAnts(static_cast<float>(frame_ % 64) * 0.25f);
+    }
 
     if (frame_ <= 8) {
         OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag,

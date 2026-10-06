@@ -96,6 +96,40 @@ void main() {
 }
 )";
 
+// 蚂蚁线（M7b）：段带状 ribbon（CPU 展开三角形，屏幕恒宽），aT = 沿段距离，
+// uPhase 随帧推进 → 黑白 dash 行进动画
+inline const char* kAntsVert = R"(#version 300 es
+layout(location=0) in vec2 aP1;               // 段起点（doc px）
+layout(location=1) in vec2 aP2;               // 段终点
+layout(location=2) in float aT;               // 0..1 沿段参数
+layout(location=3) in float aSide;            // -1/+1 法向侧
+uniform vec4 uView;                           // zoom, panX, panY, -
+uniform vec2 uViewport;
+out float vT;
+void main() {
+  vec2 dir = aP2 - aP1;
+  float len = max(1e-6, length(dir));
+  vec2 perp = vec2(-dir.y, dir.x) / len;
+  vec2 pos = mix(aP1, aP2, aT) + perp * (aSide * 1.6 / uView.x);
+  vec2 screen = (pos - uView.yz) * uView.x;
+  vec2 clip = vec2(screen.x / uViewport.x * 2.0 - 1.0, 1.0 - screen.y / uViewport.y * 2.0);
+  gl_Position = vec4(clip, 0.0, 1.0);
+  vT = aT * len;
+}
+)";
+
+inline const char* kAntsFrag = R"(#version 300 es
+precision mediump float;
+in float vT;
+uniform float uPhase;
+out vec4 o;
+void main() {
+  float dash = fract(vT / 16.0 + uPhase);
+  vec3 c = dash < 0.5 ? vec3(0.05) : vec3(1.0);
+  o = vec4(c, 1.0);
+}
+)";
+
 // Pass B 混合公共模板：%%BODY%% 占位声明由 buildBlendProgram 按模式替换为完整函数。
 inline const char* kBlendCommon = R"(#version 300 es
 precision mediump float;
