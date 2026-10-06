@@ -5,6 +5,7 @@
 #include <cstring>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 #include <hilog/log.h>
 #include <multimedia/image_framework/image/image_common.h>
@@ -12,6 +13,7 @@
 #include <multimedia/image_framework/image/pixelmap_native.h>
 
 #include "engine/engine.h"
+#include "io/png_decode.h"
 
 namespace montage {
 namespace io {
@@ -248,6 +250,7 @@ ImportCompletion* runImport(int fd) {
 
     uint32_t imgW = 0;
     uint32_t imgH = 0;
+    std::string mimeType;
     {
         OH_ImageSource_Info* info = nullptr;
         OH_ImageSourceInfo_Create(&info);
@@ -258,6 +261,10 @@ ImportCompletion* runImport(int fd) {
         if (rc == IMAGE_SUCCESS) {
             OH_ImageSourceInfo_GetWidth(info, &imgW);
             OH_ImageSourceInfo_GetHeight(info, &imgH);
+            Image_MimeType mt {nullptr, 0};
+            if (OH_ImageSourceInfo_GetMimeType(info, &mt) == IMAGE_SUCCESS && mt.data != nullptr) {
+                mimeType.assign(mt.data, mt.size);
+            }
         }
         OH_ImageSourceInfo_Release(info);
         if (rc != IMAGE_SUCCESS) {
@@ -267,6 +274,34 @@ ImportCompletion* runImport(int fd) {
     if (imgW == 0 || imgH == 0 || imgW > kMaxSide || imgH > kMaxSide ||
         static_cast<uint64_t>(imgW) * imgH > kMaxPixels) {
         return makePayload(false, imgW, imgH, 0, "image size out of limits(16384/100MP)");
+    }
+
+    // PNG 走自研确定性解码（直 RGBA，零预乘舍入/字节序猜谜，M4c 实证系统解码器不可信）；
+    // 其余格式维持系统分带解码（swapRB 校准按 M1 实证）
+    std::shared_ptr<const TileGrid> nativeGrid;
+    if (mimeType == "image/png") {
+        lseek(fd, 0, SEEK_SET);
+        off_t sz = lseek(fd, 0, SEEK_END);
+        lseek(fd, 0, SEEK_SET);
+        std::string err;
+        if (sz > 0) {
+            std::vector<uint8_t> bytes(static_cast<size_t>(sz));
+            size_t got = 0;
+            while (got < bytes.size()) {
+                ssize_t n = read(fd, bytes.data() + got, bytes.size() - got);
+                if (n <= 0) {
+                    break;
+                }
+                got += static_cast<size_t>(n);
+            }
+            if (got == bytes.size()) {
+                nativeGrid = decodePngToGrid(bytes.data(), bytes.size(), err);
+            }
+        }
+        if (nativeGrid == nullptr) {
+            return makePayload(false, imgW, imgH, 0, "png decode failed: " + err);
+        }
+        OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "png native decode path %{public}ux%{public}u", imgW, imgH);
     }
 
     // 图层落位：无文档 → 建文档（尺寸=图片）；有文档 → 居中放置
@@ -292,60 +327,67 @@ ImportCompletion* runImport(int fd) {
 
     const uint32_t cols = (imgW + kTileSize - 1u) / kTileSize;
     const uint32_t rows = (imgH + kTileSize - 1u) / kTileSize;
-    TileGridBuilder builder(cols, rows);
-    const uint32_t bandH = kBandTileRows * kTileSize;
-    const uint32_t bands = (imgH + bandH - 1u) / bandH;
-    uint64_t gridRevision = 0;
-    bool fullDecoded = false;
+    // 图层入栈/瓦片快照更新（PNG native 单趟与分带路径共用）
     bool layerAppended = false;
-
-    for (uint32_t band = 0; band < bands && !fullDecoded; ++band) {
-        if (importCancelled()) {
-            OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "import cancelled at band %{public}u", band);
-            return makePayload(false, imgW, imgH, layerId, "cancelled");
+    auto publishGrid = [&](std::shared_ptr<const TileGrid> grid) {
+        std::lock_guard<std::mutex> lk(engine.docMutex);
+        if (createsDoc) {
+            engine.doc.width = imgW;
+            engine.doc.height = imgH;
+            engine.doc.name = "Untitled";
         }
-        const uint32_t y0 = band * bandH;
-        const uint32_t h = std::min(bandH, imgH - y0);
-        std::string err;
-        uint32_t actualH = 0;
-        if (!decodeBand(source.get(), imgW, y0, h, builder, &actualH, err)) {
-            return makePayload(false, imgW, imgH, layerId, err);
-        }
-        if (band == 0 && actualH >= imgH) {
-            // region 解码不生效（整图回退，M1 实证 PNG 如此）：瓦片已全部就位，发布后结束
-            OH_LOG_Print(LOG_APP, LOG_WARN, kDomain, kTag,
-                         "region decode unsupported (got full %{public}u rows), single-pass import", actualH);
-            fullDecoded = true;
-        }
-        // 带边界发布：图层入栈（首个带）+ 图层瓦片快照更新 + 渐进渲染（02 §6.1 / R4）
-        {
-            auto grid = builder.publish(++gridRevision);
-            std::lock_guard<std::mutex> lk(engine.docMutex);
-            if (createsDoc) {
-                engine.doc.width = imgW;
-                engine.doc.height = imgH;
-                engine.doc.name = "Untitled";
-            }
-            if (!layerAppended) {
-                Layer layer;
-                layer.id = layerId;
-                layer.name = "图片 " + std::to_string(layerId);
-                layer.transform = transform;
-                layer.pixels = grid;
-                engine.doc.layers.push_back(std::move(layer));
-                engine.doc.activeId = layerId;
-                layerAppended = true;
-            } else {
-                for (Layer& l : engine.doc.layers) {
-                    if (l.id == layerId) {
-                        l.pixels = grid;
-                        break;
-                    }
+        if (!layerAppended) {
+            Layer layer;
+            layer.id = layerId;
+            layer.name = "图片 " + std::to_string(layerId);
+            layer.transform = transform;
+            layer.pixels = grid;
+            engine.doc.layers.push_back(std::move(layer));
+            engine.doc.activeId = layerId;
+            layerAppended = true;
+        } else {
+            for (Layer& l : engine.doc.layers) {
+                if (l.id == layerId) {
+                    l.pixels = grid;
+                    break;
                 }
             }
-            engine.requestRender();
         }
-        notifyProgress(static_cast<double>(band + 1) / static_cast<double>(bands));
+        engine.requestRender();
+    };
+
+    if (nativeGrid != nullptr) {
+        publishGrid(nativeGrid);
+        notifyProgress(1.0);
+    } else {
+        TileGridBuilder builder(cols, rows);
+        const uint32_t bandH = kBandTileRows * kTileSize;
+        const uint32_t bands = (imgH + bandH - 1u) / bandH;
+        uint64_t gridRevision = 0;
+        bool fullDecoded = false;
+
+        for (uint32_t band = 0; band < bands && !fullDecoded; ++band) {
+            if (importCancelled()) {
+                OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "import cancelled at band %{public}u", band);
+                return makePayload(false, imgW, imgH, layerId, "cancelled");
+            }
+            const uint32_t y0 = band * bandH;
+            const uint32_t h = std::min(bandH, imgH - y0);
+            std::string err;
+            uint32_t actualH = 0;
+            if (!decodeBand(source.get(), imgW, y0, h, builder, &actualH, err)) {
+                return makePayload(false, imgW, imgH, layerId, err);
+            }
+            if (band == 0 && actualH >= imgH) {
+                // region 解码不生效（整图回退，M1 实证 PNG 如此）：瓦片已全部就位，发布后结束
+                OH_LOG_Print(LOG_APP, LOG_WARN, kDomain, kTag,
+                             "region decode unsupported (got full %{public}u rows), single-pass import", actualH);
+                fullDecoded = true;
+            }
+            // 带边界发布：图层入栈（首个带）+ 图层瓦片快照更新 + 渐进渲染（02 §6.1 / R4）
+            publishGrid(builder.publish(++gridRevision));
+            notifyProgress(static_cast<double>(band + 1) / static_cast<double>(bands));
+        }
     }
 
     {
