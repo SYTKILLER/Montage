@@ -354,12 +354,21 @@ export class CompositorEngine {
     native.setBrushSettings(diameter, hardness, opacity, red, green, blue, erasing);
   }
 
-  beginStroke(x: number, y: number): void {
-    native.beginStroke(x, y);
+  // M3.1：pressure ∈[0,1] 调制 dab 直径；缺省/无压感设备传 1
+  beginStroke(x: number, y: number, pressure?: number): void {
+    if (pressure !== undefined) {
+      native.beginStroke(x, y, pressure);
+    } else {
+      native.beginStroke(x, y);
+    }
   }
 
-  continueStroke(x: number, y: number): void {
-    native.continueStroke(x, y);
+  continueStroke(x: number, y: number, pressure?: number): void {
+    if (pressure !== undefined) {
+      native.continueStroke(x, y, pressure);
+    } else {
+      native.continueStroke(x, y);
+    }
   }
 
   endStroke(): void {

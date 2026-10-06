@@ -1152,21 +1152,28 @@ napi_value SetBrushSettings(napi_env env, napi_callback_info info) {
         return makeError(env, kErrBadParam,
                          "setBrushSettings(d,h,o,r,g,b,erasing) requires 7 args");
     }
-    Engine::get().brush = s;
+    {
+        std::lock_guard<std::mutex> lk(Engine::get().docMutex);
+        Engine::get().brush = s;
+    }
     return makeOk(env, nullptr);
 }
 
 napi_value BeginStroke(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value argv[2] = {nullptr, nullptr};
+    size_t argc = 3;
+    napi_value argv[3] = {nullptr, nullptr, nullptr};
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 2) {
-        return makeError(env, kErrBadParam, "beginStroke(x, y) requires 2 args");
+        return makeError(env, kErrBadParam, "beginStroke(x, y, pressure?) requires 2+ args");
     }
     double x = 0, y = 0;
     if (napi_get_value_double(env, argv[0], &x) != napi_ok ||
         napi_get_value_double(env, argv[1], &y) != napi_ok) {
         return makeError(env, kErrBadParam, "beginStroke: invalid coords");
+    }
+    double pressure = 1.0;
+    if (argc >= 3 && napi_get_value_double(env, argv[2], &pressure) != napi_ok) {
+        return makeError(env, kErrBadParam, "beginStroke: invalid pressure");
     }
     auto& e = Engine::get();
     {
@@ -1177,61 +1184,53 @@ napi_value BeginStroke(napi_env env, napi_callback_info info) {
         if (e.doc.activeId == 0) {
             return makeError(env, kErrNoDoc, "beginStroke: no active layer");
         }
-        e.history.beginEdit(e.doc, e.brush.erasing ? "eraser" : "brush",
-                            static_cast<uint64_t>(e.docRevision));
-        e.draft = std::make_unique<StrokeDraft>();
-        std::string err;
-        if (!e.draft->begin(e.doc, e.doc.activeId, e.brush, err)) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
-            e.draft.reset();
-            return makeError(env, kErrBadParam, err);
-        }
-        e.draft->append(static_cast<float>(x), static_cast<float>(y));
         OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Brush",
                      "begin stroke at (%{public}f, %{public}f) layer=%{public}llu d=%{public}f erasing=%{public}d",
                      x, y, static_cast<unsigned long long>(e.doc.activeId),
                      static_cast<double>(e.brush.diameter), e.brush.erasing ? 1 : 0);
-        {
-            std::lock_guard<std::mutex> sk(e.strokeMtx);
-            e.strokeQueue.clear();
-            e.strokeEnding = false;
-            e.ensureStrokeThreadLocked();
-        }
-        e.requestRender();
     }
+    {
+        // begin 标记入队（draft 创建在笔画线程按序进行；陈旧点由 draft==null 丢弃）
+        std::lock_guard<std::mutex> sk(e.strokeMtx);
+        e.strokeQueue.push_back({static_cast<float>(x), static_cast<float>(y),
+                                 static_cast<float>(pressure), true, false});
+        e.ensureStrokeThreadLocked();
+    }
+    e.requestRender();
     return makeOk(env, nullptr);
 }
 
 napi_value ContinueStroke(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value argv[2] = {nullptr, nullptr};
+    size_t argc = 3;
+    napi_value argv[3] = {nullptr, nullptr, nullptr};
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 2) {
-        return makeError(env, kErrBadParam, "continueStroke(x, y) requires 2 args");
+        return makeError(env, kErrBadParam, "continueStroke(x, y, pressure?) requires 2+ args");
     }
     double x = 0, y = 0;
     if (napi_get_value_double(env, argv[0], &x) != napi_ok ||
         napi_get_value_double(env, argv[1], &y) != napi_ok) {
         return makeError(env, kErrBadParam, "continueStroke: invalid coords");
     }
+    double pressure = 1.0;
+    if (argc >= 3 && napi_get_value_double(env, argv[2], &pressure) != napi_ok) {
+        return makeError(env, kErrBadParam, "continueStroke: invalid pressure");
+    }
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> sk(e.strokeMtx);
-        if (!e.strokeEnding) {
-            e.strokeQueue.push_back({static_cast<float>(x), static_cast<float>(y), false});
-            e.ensureStrokeThreadLocked();
-        }
+        e.strokeQueue.push_back({static_cast<float>(x), static_cast<float>(y),
+                                 static_cast<float>(pressure), false, false});
+        e.ensureStrokeThreadLocked();
     }
     return makeOk(env, nullptr);
 }
 
 napi_value EndStroke(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
-    OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Brush", "end stroke");
     {
         std::lock_guard<std::mutex> sk(e.strokeMtx);
-        e.strokeEnding = true;
-        e.strokeQueue.push_back({0.0f, 0.0f, true});
+        e.strokeQueue.push_back({0.0f, 0.0f, 1.0f, false, true});
         e.ensureStrokeThreadLocked();
     }
     return makeOk(env, nullptr);

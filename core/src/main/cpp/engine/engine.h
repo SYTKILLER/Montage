@@ -40,17 +40,19 @@ class Engine {
 
     RenderLoop render;  // T2 渲染循环（回调线程惰性绑 GL）
 
-    // M3 笔画：命令入队（T1）→ 工作线程消费落 dab → draft 供渲染叠加
+    // M3 笔画：命令入队（T1）→ 工作线程按序消费（begin 落 draft / append / end 提交）
     struct StrokePoint {
         float x = 0;
         float y = 0;
-        bool end = false;
+        float pressure = 1.0f;  // M3.1：∈[0,1]，调制 dab 直径（无压感设备传 1）
+        bool begin = false;     // 开始标记：创建 draft + history.beginEdit（线程内，保证与提交同序）
+        bool end = false;       // 结束标记：收尾曲线段 + 提交 + history.endEdit
     };
     std::mutex strokeMtx;
     std::condition_variable strokeCv;
     std::deque<StrokePoint> strokeQueue;
-    bool strokeEnding = false;              // end 已入队标记
     bool strokeQuit = false;                // 常驻线程退出标记（dispose 置位）
+    std::mutex strokeCycleMtx;              // 生命周期互斥：begin/end 处理段与 dispose 清理串行
     std::unique_ptr<StrokeDraft> draft;     // 绘制中的笔画（mutex 内访问）
     BrushSettings brush;                    // 当前笔刷参数（ArkTS setBrushSettings 写入）
     std::thread strokeThread_;

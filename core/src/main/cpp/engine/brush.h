@@ -7,8 +7,10 @@
 // - Catmull-Rom 样本曲线（向心式，过每个样本）+ dab 均匀步进（spacing = d × 0.015/0.025）。
 // - 软刷 falloff：归一化高斯 exp(-2.5u²) 跨整个半径衰减（BrushRaster.falloff）。
 // - 橡皮：coverage 乘掉图层 alpha（destinationOut 语义）。
-// - 简化（相对源，登记 M3.1）：无 provisional tail（末段随样本即时落 dab）、无 GPU 路径、
-//   无压感（模拟器无压感）、无 clone/heal/blur（后续里程碑）。
+// - M3.1 补全：provisional tail（最新样本先以直线尾段连到光标 + 整瓦 coverage 备份，
+//   下一样本/收尾时还原再落最终曲线段——笔画不滞后于光标）；压感调制 dab 直径
+//   （几何安全：不透明度压感会破坏 coverage max/screen 笔画级模型，登记后续）。
+// - 简化（相对源，登记后续里程碑）：无 GPU 路径、无 clone/heal/blur。
 
 #include <cstdint>
 #include <map>
@@ -35,8 +37,8 @@ class StrokeDraft {
   public:
     // 绑定图层开始笔画。grid = 图层像素网格（origin 平移，1:1）；空图层从触笔区域动态扩展。
     bool begin(const Document& doc, LayerId layerId, const BrushSettings& settings, std::string& err);
-    // 文档坐标追加样本（Catmull-Rom 落 dab）
-    void append(float docX, float docY);
+    // 文档坐标追加样本（Catmull-Rom 落 dab；pressure ∈ [0,1]，调制 dab 直径）
+    void append(float docX, float docY, float pressure);
     void end();
     void cancel();
 
@@ -55,10 +57,17 @@ class StrokeDraft {
   private:
     struct Pt {
         float x = 0, y = 0;
+        float pressure = 1.0f;
     };
     void dab(float gx, float gy);
+    float effRadius() const;  // 压感调制后的 dab 半径
     void walkTo(float gx, float gy);
-    void curveTo(float gx, float gy);
+    // 向心 Catmull-Rom 曲线段（显式四控制点；压感取 to 点）
+    void curvePiece(const Pt& from, const Pt& to, const Pt& before, const Pt& after);
+    // provisional tail：备份可能触及的整瓦 coverage + dab 步进状态，直线走到光标后还原状态
+    void drawTail(const Pt& from, const Pt& to);
+    // 还原尾段（coverage/工作瓦片/触达集），下一样本或收尾前调用
+    void removeTail();
     void ensureWorking(uint32_t key);
     void allocWorking(uint32_t key, uint32_t tx, uint32_t ty);
     void paintTile(uint32_t key);
@@ -70,7 +79,7 @@ class StrokeDraft {
     }
 
     std::shared_ptr<const TileGrid> base_;  // 图层原瓦片（工作瓦片 base 拷贝源）
-    std::vector<float> radial_;             // 软刷 1D 径向 falloff 表
+    std::vector<float> radial_;             // 软刷 1D 径向 falloff 表（归一化索引，尺度不变）
 
     BrushSettings settings_{};
     LayerId layerId_ = 0;
@@ -86,11 +95,14 @@ class StrokeDraft {
     std::map<uint32_t, std::vector<uint8_t>> coverage_;
     std::map<uint32_t, std::vector<uint8_t>> work_;
     std::set<uint32_t> touched_;
+    // provisional tail 备份：key → 尾段前整瓦 coverage（空 vector = 尾段前无 coverage）
+    std::map<uint32_t, std::vector<uint8_t>> tailBackup_;
     // dab 步进状态
     bool hasPrev_ = false;
     float prevX_ = 0;
     float prevY_ = 0;
     float distToNext_ = 0;
+    float pressure_ = 1.0f;  // 当前段压感（dab 直径调制）
     // Catmull-Rom 样本（≤4）
     std::vector<Pt> samples_;
 

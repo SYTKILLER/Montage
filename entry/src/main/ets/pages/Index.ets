@@ -498,8 +498,11 @@ struct Index {
       return;
     }
     const t: TouchObject = e.changedTouches.length > 0 ? e.changedTouches[0] : e.touches[0];
-    hilog.info(0x4D30, TAG, 'touch type=%{public}d n=%{public}d (%{public}f,%{public}f)',
-      e.type, e.touches.length, t.x, t.y);
+    // M3.1 压感：SDK 约定 0.0/undefined = 设备不支持 → 归一为 1（行为同无压感）
+    const pressure: number = (t.pressure !== undefined && t.pressure > 0) ? t.pressure : 1.0;
+    if (e.type === TouchType.Down) {
+      hilog.info(0x4D30, TAG, 'stroke down (%{public}f,%{public}f) p=%{public}f', t.x, t.y, pressure);
+    }
     const k = this.pxPerVp();
     const docX = this.panX + (t.x * k) / this.zoom;
     const docY = this.panY + (t.y * k) / this.zoom;
@@ -507,11 +510,11 @@ struct Index {
       case TouchType.Down:
         this.pushBrushSettings();
         this.painting = true;
-        this.engine.beginStroke(docX, docY);
+        this.engine.beginStroke(docX, docY, pressure);
         break;
       case TouchType.Move:
         if (this.painting) {
-          this.engine.continueStroke(docX, docY);
+          this.engine.continueStroke(docX, docY, pressure);
         }
         break;
       case TouchType.Up:

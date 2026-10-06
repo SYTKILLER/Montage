@@ -58,9 +58,11 @@ bool StrokeDraft::begin(const Document& doc, LayerId layerId, const BrushSetting
     coverage_.clear();
     work_.clear();
     touched_.clear();
+    tailBackup_.clear();
     samples_.clear();
     hasPrev_ = false;
     distToNext_ = 0;
+    pressure_ = 1.0f;
     active_ = true;
 
     // 软刷 1D 径向 falloff 表（对拍 falloff(): 归一化高斯跨半径衰减，rim 归零）
@@ -102,8 +104,15 @@ void StrokeDraft::ensureWorking(uint32_t key) {
     work_[key] = std::move(px);
 }
 
+// 当前段有效 dab 半径：压感线性调制直径（clamp 到微小下限，pressure=0 仍留针尖）
+float StrokeDraft::effRadius() const {
+    constexpr float kMinPressure = 0.02f;
+    const float p = std::min(1.0f, std::max(kMinPressure, pressure_));
+    return settings_.diameter / 2.0f * p;
+}
+
 void StrokeDraft::dab(float gx, float gy) {
-    const float radius = settings_.diameter / 2.0f;
+    const float radius = effRadius();
     const float maxX = layerHadPixels_ ? static_cast<float>(imgW_) : static_cast<float>(gridCols_ * kTileSize);
     const float maxY = layerHadPixels_ ? static_cast<float>(imgH_) : static_cast<float>(gridRows_ * kTileSize);
     const float x0 = std::max(0.0f, gx - radius);
@@ -197,69 +206,150 @@ void StrokeDraft::walkTo(float gx, float gy) {
     hasPrev_ = true;
 }
 
-// 向心 Catmull-Rom（对拍 curve()：过每个样本、步长 ≤2px）
-void StrokeDraft::curveTo(float gx, float gy) {
-    const size_t n = samples_.size();
-    if (n < 2) {
-        return;
-    }
-    const Pt start = samples_[n - 2];
-    const Pt end{gx, gy};
-    const Pt before = n >= 3 ? samples_[n - 3] : start;
-    const Pt after = end;
+// 向心 Catmull-Rom 曲线段（对拍 curve()：过每个样本、步长 ≤2px；显式四控制点）
+void StrokeDraft::curvePiece(const Pt& from, const Pt& to, const Pt& before, const Pt& after) {
+    pressure_ = to.pressure;
     auto knot = [](float t, const Pt& a, const Pt& b) {
         return t + std::max(0.0001f, std::sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y)));
     };
     auto mix = [](const Pt& a, const Pt& b, float ta, float tb, float t) {
         const float wa = (tb - t) / (tb - ta);
         const float wb = (t - ta) / (tb - ta);
-        return Pt{a.x * wa + b.x * wb, a.y * wa + b.y * wb};
+        return Pt{a.x * wa + b.x * wb, a.y * wa + b.y * wb, a.pressure * wa + b.pressure * wb};
     };
     const float t0 = 0.0f;
-    const float t1 = knot(t0, before, start);
-    const float t2 = knot(t1, start, end);
-    const float t3 = knot(t2, end, after);
-    const float dist = std::sqrt((end.x - start.x) * (end.x - start.x) +
-                                 (end.y - start.y) * (end.y - start.y));
+    const float t1 = knot(t0, before, from);
+    const float t2 = knot(t1, from, to);
+    const float t3 = knot(t2, to, after);
+    const float dist = std::sqrt((to.x - from.x) * (to.x - from.x) +
+                                 (to.y - from.y) * (to.y - from.y));
     const int pieces = std::max(1, static_cast<int>(std::ceil(dist / 2.0f)));
     for (int i = 1; i <= pieces; ++i) {
         const float t = t1 + (t2 - t1) * static_cast<float>(i) / static_cast<float>(pieces);
-        const Pt a1 = mix(before, start, t0, t1, t);
-        const Pt a2 = mix(start, end, t1, t2, t);
-        const Pt a3 = mix(end, after, t2, t3, t);
+        const Pt a1 = mix(before, from, t0, t1, t);
+        const Pt a2 = mix(from, to, t1, t2, t);
+        const Pt a3 = mix(to, after, t2, t3, t);
         const Pt b1 = mix(a1, a2, t0, t2, t);
         const Pt b2 = mix(a2, a3, t1, t3, t);
-        const Pt p = i == pieces ? end : mix(b1, b2, t1, t2, t);
+        const Pt p = i == pieces ? to : mix(b1, b2, t1, t2, t);
+        pressure_ = p.pressure;
         walkTo(p.x, p.y);
     }
 }
 
-void StrokeDraft::append(float docX, float docY) {
+// provisional tail（对拍 drawTail）：备份可能触及瓦片的整份 coverage + dab 步进状态，
+// 直线走到光标（笔画不滞后），随后还原步进状态——下一样本/收尾时 removeTail 还原 coverage
+// 再落最终曲线段
+void StrokeDraft::drawTail(const Pt& from, const Pt& to) {
+    const float reach = settings_.diameter / 2.0f + 2.0f;
+    const float maxX = layerHadPixels_ ? static_cast<float>(imgW_) : static_cast<float>(gridCols_ * kTileSize);
+    const float maxY = layerHadPixels_ ? static_cast<float>(imgH_) : static_cast<float>(gridRows_ * kTileSize);
+    const float x0 = std::max(0.0f, std::min(from.x, to.x) - reach);
+    const float y0 = std::max(0.0f, std::min(from.y, to.y) - reach);
+    const float x1 = std::min(maxX, std::max(from.x, to.x) + reach);
+    const float y1 = std::min(maxY, std::max(from.y, to.y) + reach);
+    if (x1 > x0 && y1 > y0) {
+        constexpr int kTile = static_cast<int>(kTileSize);
+        const int tx0 = std::max(0, static_cast<int>(x0) / kTile);
+        const int ty0 = std::max(0, static_cast<int>(y0) / kTile);
+        const int tx1 = std::max(static_cast<int>(x1) - 1, static_cast<int>(x0)) / kTile;
+        const int ty1 = std::max(static_cast<int>(y1) - 1, static_cast<int>(y0)) / kTile;
+        for (int ty = ty0; ty <= ty1; ++ty) {
+            for (int tx = tx0; tx <= tx1; ++tx) {
+                if (tx >= static_cast<int>(gridCols_) || ty >= static_cast<int>(gridRows_)) {
+                    continue;
+                }
+                const uint32_t key = static_cast<uint32_t>(ty) * gridCols_ + static_cast<uint32_t>(tx);
+                auto covIt = coverage_.find(key);
+                if (covIt != coverage_.end()) {
+                    tailBackup_[key] = covIt->second;
+                } else if (tailBackup_.find(key) == tailBackup_.end()) {
+                    tailBackup_[key] = std::vector<uint8_t>();  // 空标记：尾段前无 coverage
+                }
+            }
+        }
+    }
+    // 直线走到光标；步进状态还原（落盘状态不指向光标，最终曲线段从 from 续 spacing）
+    const bool savedHasPrev = hasPrev_;
+    const float savedX = prevX_;
+    const float savedY = prevY_;
+    const float savedDist = distToNext_;
+    pressure_ = to.pressure;
+    walkTo(to.x, to.y);
+    hasPrev_ = savedHasPrev;
+    prevX_ = savedX;
+    prevY_ = savedY;
+    distToNext_ = savedDist;
+}
+
+// 还原尾段（对拍 removeTail）：coverage 按备份还原（空标记 = 清零并撤出工作集），
+// 工作瓦片重合成；返回无——渲染叠加按 touched_ 逐帧取数
+void StrokeDraft::removeTail() {
+    for (auto& [key, backup] : tailBackup_) {
+        auto covIt = coverage_.find(key);
+        if (covIt == coverage_.end()) {
+            continue;
+        }
+        if (backup.empty()) {
+            // 尾段前无 coverage：现值全为尾段所画 → 整瓦撤出（提交/渲染均忽略）
+            coverage_.erase(covIt);
+            work_.erase(key);
+            touched_.erase(key);
+        } else {
+            covIt->second = backup;
+            paintTile(key);
+        }
+    }
+    tailBackup_.clear();
+}
+
+void StrokeDraft::append(float docX, float docY, float pressure) {
     if (!active_) {
         return;
     }
     const float gx = docX - static_cast<float>(originX_);
     const float gy = docY - static_cast<float>(originY_);
-    if (!std::isfinite(gx) || !std::isfinite(gy)) {
+    const float pr = std::min(1.0f, std::max(0.0f, pressure));
+    if (!std::isfinite(gx) || !std::isfinite(gy) || !std::isfinite(pr)) {
         return;
     }
     if (!samples_.empty() && samples_.back().x == gx && samples_.back().y == gy) {
         return;
     }
-    samples_.push_back(Pt{gx, gy});
+    removeTail();
+    samples_.push_back(Pt{gx, gy, pr});
     if (samples_.size() > 4) {
         samples_.erase(samples_.begin());
     }
     const size_t n = samples_.size();
     if (n == 1) {
+        pressure_ = pr;
         walkTo(gx, gy);
-    } else if (n >= 3) {
-        curveTo(gx, gy);
+    } else {
+        if (n >= 3) {
+            // 上一段现已拿到真实后置样本 → 落最终曲线段
+            curvePiece(samples_[n - 3], samples_[n - 2],
+                       samples_[n >= 4 ? n - 4 : n - 3], samples_[n - 1]);
+        }
+        if (n >= 2) {
+            drawTail(samples_[n - 2], samples_[n - 1]);
+        }
     }
 }
 
 void StrokeDraft::end() {
-    // 简化（M3.1）：无 provisional tail，末段随样本即时落 dab
+    // 收尾（对拍 flush()）：还原尾段，末段以真实端点为后置样本落最终曲线段
+    if (!active_) {
+        return;
+    }
+    removeTail();
+    const size_t n = samples_.size();
+    if (n >= 2) {
+        curvePiece(samples_[n - 2], samples_[n - 1],
+                   samples_[n >= 3 ? n - 3 : n - 2], samples_[n - 1]);
+    }
+    samples_.clear();
+    hasPrev_ = false;
     active_ = false;
 }
 
@@ -268,6 +358,7 @@ void StrokeDraft::cancel() {
     coverage_.clear();
     work_.clear();
     touched_.clear();
+    tailBackup_.clear();
 }
 
 bool StrokeDraft::tileFor(uint32_t tx, uint32_t ty, std::vector<uint8_t>& out) const {

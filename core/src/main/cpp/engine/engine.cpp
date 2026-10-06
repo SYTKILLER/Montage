@@ -49,12 +49,12 @@ void Engine::ensureStrokeThreadLocked() {
     strokeThread_ = std::thread(&Engine::strokeThreadMain, this);
 }
 
-// T3 笔画工作线程（常驻，条件变量等待）：消费命令队列落 dab；end 时提交瓦片入栈
-// （beginEdit 于 begin 命令时已记快照，M4a 撤销粒度 = 单笔画）。
+// T3 笔画工作线程（常驻，条件变量等待）：按序消费命令队列——begin 落 draft（含
+// history.beginEdit）、点坐标落 dab、end 收尾提交（M4a 撤销粒度 = 单笔画）。
+// 陈旧点（上一笔 end 之后、下一笔 begin 之前残留）因 draft 为空自然丢弃。
 void Engine::strokeThreadMain() {
     while (true) {
         std::deque<StrokePoint> batch;
-        bool ending = false;
         {
             std::unique_lock<std::mutex> lk(strokeMtx);
             strokeCv.wait(lk, [this] { return strokeQuit || !strokeQueue.empty(); });
@@ -63,20 +63,33 @@ void Engine::strokeThreadMain() {
                 return;
             }
             batch.swap(strokeQueue);
-            ending = strokeEnding;
-            strokeEnding = false;
         }
         {
+            // 生命周期互斥：与 dispose 清理串行（锁序：cycle → doc）
+            std::lock_guard<std::mutex> cycle(strokeCycleMtx);
             std::lock_guard<std::mutex> lk(docMutex);
-            if (draft != nullptr) {
-                for (const StrokePoint& p : batch) {
-                    if (p.end) {
-                        draft->end();
-                    } else {
-                        draft->append(p.x, p.y);
+            for (const StrokePoint& p : batch) {
+                if (p.begin) {
+                    if (draft != nullptr) {
+                        continue;  // 上一笔未提交（异常序列）：丢弃新 begin 防串笔
                     }
-                }
-                if (ending) {
+                    history.beginEdit(doc, brush.erasing ? "eraser" : "brush",
+                                      static_cast<uint64_t>(docRevision));
+                    draft = std::make_unique<StrokeDraft>();
+                    std::string err;
+                    if (!draft->begin(doc, doc.activeId, brush, err)) {
+                        OH_LOG_Print(LOG_APP, LOG_WARN, 0x4D30, "Montage.Brush",
+                                     "draft begin failed: %{public}s", err.c_str());
+                        history.endEdit(doc, static_cast<uint64_t>(docRevision));
+                        draft.reset();
+                        continue;
+                    }
+                    draft->append(p.x, p.y, p.pressure);
+                } else if (p.end) {
+                    if (draft == nullptr) {
+                        continue;  // 陈旧 end 标记（背靠背笔画残留）
+                    }
+                    draft->end();
                     // 提交（对拍 commit：工作瓦片合并入图层 grid）
                     const LayerId lid = draft->layerId();
                     auto grid = draft->commitGrid(nullptr);
@@ -93,9 +106,11 @@ void Engine::strokeThreadMain() {
                     bumpRevisionLocked();
                     draft.reset();
                     historyVersion.fetch_add(1);
+                } else if (draft != nullptr) {
+                    draft->append(p.x, p.y, p.pressure);
                 }
-                requestRender();
             }
+            requestRender();
         }
     }
 }
