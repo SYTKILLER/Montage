@@ -12,6 +12,7 @@
 #include <multimedia/image_framework/image/pixelmap_native.h>
 
 #include "engine/engine.h"
+#include "tiles/magic_wand.h"
 #include "io/image_import.h"
 #include "io/project_open.h"
 #include "io/project_save.h"
@@ -1460,6 +1461,47 @@ napi_value ClearSelection(napi_env env, napi_callback_info /*info*/) {
         }
         e.history.beginEdit(e.doc, "deselect", static_cast<uint64_t>(e.docRevision));
         e.doc.selection = nullptr;
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// M7c：魔棒选区（活动图层有效像素；点击文档坐标 + 容差 + 连通性；history 事务）
+napi_value SetWandSelection(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 4) {
+        return makeError(env, kErrBadParam, "setWandSelection(x, y, tolerance, contiguous) requires 4 args");
+    }
+    double x = 0, y = 0, tol = 32;
+    bool contiguous = true;
+    if (napi_get_value_double(env, argv[0], &x) != napi_ok ||
+        napi_get_value_double(env, argv[1], &y) != napi_ok ||
+        napi_get_value_double(env, argv[2], &tol) != napi_ok ||
+        napi_get_value_bool(env, argv[3], &contiguous) != napi_ok) {
+        return makeError(env, kErrBadParam, "setWandSelection: invalid args");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "setWandSelection: no document");
+        }
+        Layer* l = findLayerLocked(e.doc, e.doc.activeId);
+        if (l == nullptr || l->effectivePixels() == nullptr) {
+            return makeError(env, kErrBadParam, "setWandSelection: no pixels to sample");
+        }
+        auto mask = tiles::wandMask(*l->effectivePixels(), e.doc.width, e.doc.height,
+                                    static_cast<int>(x), static_cast<int>(y),
+                                    static_cast<int>(tol), contiguous);
+        if (mask == nullptr) {
+            return makeError(env, kErrBadParam, "setWandSelection: nothing matched");
+        }
+        e.history.beginEdit(e.doc, "magic wand", static_cast<uint64_t>(e.docRevision));
+        e.doc.selection = std::move(mask);
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();
         e.requestRender();

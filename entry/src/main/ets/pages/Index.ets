@@ -605,6 +605,17 @@ struct Index {
     }
   }
 
+  // M7c：魔棒（画布中心采样，容差 32 连通）
+  private onWandSelect(): void {
+    if (!this.docOpen) {
+      return;
+    }
+    const ok: boolean = this.engine.setWandSelection(this.docW / 2, this.docH / 2, 32, true);
+    if (ok) {
+      this.log('魔棒选区已设置（中心采样 tol=32 连通）');
+    }
+  }
+
   private onClearSelect(): void {
     this.engine.clearSelection();
     this.log('选区已取消');
@@ -690,6 +701,8 @@ struct Index {
             Button('矩形选区').fontSize(12).onClick((): void => this.onRectSelect()).margin({ left: 8 })
               .opacity(this.docOpen ? 1 : 0.4)
             Button('取消选区').fontSize(12).onClick((): void => this.onClearSelect()).margin({ left: 8 })
+              .opacity(this.docOpen ? 1 : 0.4)
+            Button('魔棒').fontSize(12).onClick((): void => this.onWandSelect()).margin({ left: 8 })
               .opacity(this.docOpen ? 1 : 0.4)
           }
           .width('100%')

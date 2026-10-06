@@ -385,6 +385,16 @@ export class CompositorEngine {
     return r.ok;
   }
 
+  // M7c：魔棒选区（活动图层采样）
+  setWandSelection(x: number, y: number, tolerance: number, contiguous: boolean): boolean {
+    const r = narrowResult(native.setWandSelection(x, y, tolerance, contiguous) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setWandSelection failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
   // M7a：矩形选框（文档坐标）/ 取消选区
   setRectSelection(x: number, y: number, w: number, h: number): boolean {
     const r = narrowResult(native.setRectSelection(x, y, w, h) as Object);

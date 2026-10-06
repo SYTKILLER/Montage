@@ -30,6 +30,8 @@ napi_value SetAdjustmentParams(napi_env env, napi_callback_info info);
 // 选区（02 D2.3 M7a）：矩形选框（文档坐标）+ 取消选区
 napi_value SetRectSelection(napi_env env, napi_callback_info info);
 napi_value ClearSelection(napi_env env, napi_callback_info info);
+// 魔棒（M7c）：点击容差选区
+napi_value SetWandSelection(napi_env env, napi_callback_info info);
 napi_value RemoveLayer(napi_env env, napi_callback_info info);
 napi_value SelectLayer(napi_env env, napi_callback_info info);
 napi_value SetLayerVisible(napi_env env, napi_callback_info info);
