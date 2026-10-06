@@ -376,25 +376,6 @@ struct Index {
     });
   }
 
-  // M5b 验证用（临时）：蒙版上画三短黑笔（渐变区）
-  private onMaskStrokeTest(): void {
-    this.pushBrushSettings();
-    const c: number[] = this.screenToDoc(this.canvasVpW / 2, this.canvasVpH / 2);
-    for (let s = 0; s < 3; s++) {
-      const yy = c[1] - 80 + s * 80;
-      for (let i = 0; i <= 16; i++) {
-        const x = c[0] + i * 10;
-        if (i === 0) {
-          this.engine.beginStroke(x, yy, 1.0);
-        } else {
-          this.engine.continueStroke(x, yy, 1.0);
-        }
-      }
-      this.engine.endStroke();
-    }
-    this.log('蒙版笔测试已提交（三条黑笔）');
-  }
-
   private openByUri(uri: string): void {
     const f = fs.openSync(uri, fs.OpenMode.READ_ONLY);
     this.log(`导入图层 fd=${f.fd}`);
@@ -661,7 +642,6 @@ struct Index {
             Button('重做').onClick((): void => this.doRedo()).margin({ left: 8 }).opacity(this.canRedo ? 1 : 0.4)
             Button('保存').onClick((): void => this.doSaveProject()).margin({ left: 8 })
               .opacity(this.docOpen ? 1 : 0.4)
-            Button('蒙版笔测试').fontSize(12).onClick((): void => this.onMaskStrokeTest()).margin({ left: 8 })
           }
           .width('100%')
 

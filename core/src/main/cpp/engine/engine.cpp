@@ -114,16 +114,19 @@ void Engine::strokeThreadMain() {
                     draft->end();
                     if (draft->maskTarget()) {
                         // M5b：提交到蒙版 patch 网格（COW 换 LayerMask）+ 重合成
+                        // 必须以原 patch 网格为合并基底（nullptr 会丢未触碰瓦片 → patch 缺行）
                         const LayerId lid = draft->layerId();
-                        auto merged = draft->commitGrid(nullptr);
                         for (Layer& l : doc.layers) {
-                            if (l.id == lid && l.mask != nullptr && merged != nullptr) {
-                                auto m = std::make_shared<LayerMask>(*l.mask);
-                                m->pixels = merged;
-                                l.mask = std::move(m);
-                                l.render = (l.mask->enabled && l.pixels != nullptr)
-                                               ? composeMasked(l.pixels, *l.mask)
-                                               : nullptr;
+                            if (l.id == lid && l.mask != nullptr && l.mask->pixels != nullptr) {
+                                auto merged = draft->commitGrid(l.mask->pixels.get());
+                                if (merged != nullptr) {
+                                    auto m = std::make_shared<LayerMask>(*l.mask);
+                                    m->pixels = merged;
+                                    l.mask = std::move(m);
+                                    l.render = (l.mask->enabled && l.pixels != nullptr)
+                                                   ? composeMasked(l.pixels, *l.mask)
+                                                   : nullptr;
+                                }
                                 break;
                             }
                         }
