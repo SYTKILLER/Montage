@@ -745,11 +745,93 @@ napi_value makeLayerDto(napi_env env, const Layer& l, bool isActive) {
     napi_set_named_property(env, obj, "hasMask", makeBool(env, l.mask != nullptr));
     napi_set_named_property(env, obj, "maskEnabled", makeBool(env, l.mask != nullptr && l.mask->enabled));
     napi_set_named_property(env, obj, "clipping", makeBool(env, l.clipping));
+    napi_set_named_property(env, obj, "isAdjustment", makeBool(env, l.adjustment != nullptr));
+    if (l.adjustment != nullptr) {
+        napi_set_named_property(env, obj, "adjBlack", makeDouble(env, l.adjustment->inBlack));
+        napi_set_named_property(env, obj, "adjWhite", makeDouble(env, l.adjustment->inWhite));
+        napi_set_named_property(env, obj, "adjGamma", makeDouble(env, l.adjustment->gamma));
+    }
     napi_set_named_property(env, obj, "thumbToken",
                             makeDouble(env, static_cast<double>(l.pixels != nullptr ? l.pixels->revision : 0)));
     return obj;
 }
 }  // namespace
+
+// M6a：添加 Levels 调整层（插到活动层之上并激活，history 事务）
+napi_value AddAdjustmentLayer(napi_env env, napi_callback_info info) {
+    auto& e = Engine::get();
+    double newId = 0;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "addAdjustmentLayer: no document");
+        }
+        e.history.beginEdit(e.doc, "add adjustment", static_cast<uint64_t>(e.docRevision));
+        Layer layer;
+        layer.id = e.nextLayerId();
+        layer.name = "Levels";
+        auto adj = std::make_shared<LayerAdjustment>();
+        adj->kind = AdjustmentKind::Levels;
+        layer.adjustment = std::move(adj);
+        size_t at = e.doc.layers.size();
+        for (size_t i = 0; i < e.doc.layers.size(); ++i) {
+            if (e.doc.layers[i].id == e.doc.activeId) {
+                at = i + 1;
+                break;
+            }
+        }
+        e.doc.layers.insert(e.doc.layers.begin() + static_cast<long>(at), std::move(layer));
+        e.doc.activeId = e.doc.layers[at].id;
+        newId = static_cast<double>(e.doc.layers[at].id);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "id", makeDouble(env, newId));
+    return makeOk(env, data);
+}
+
+// M6a：设置调整层参数（COW + history 事务；滑条拖动结束调用）
+napi_value SetAdjustmentParams(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 4) {
+        return makeError(env, kErrBadParam, "setAdjustmentParams(id, inBlack, inWhite, gamma) requires 4 args");
+    }
+    double id = 0, inBlack = 0, inWhite = 1, gamma = 1;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok ||
+        napi_get_value_double(env, argv[1], &inBlack) != napi_ok ||
+        napi_get_value_double(env, argv[2], &inWhite) != napi_ok ||
+        napi_get_value_double(env, argv[3], &gamma) != napi_ok) {
+        return makeError(env, kErrBadParam, "setAdjustmentParams: invalid args");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        if (l == nullptr || l->adjustment == nullptr) {
+            return makeError(env, kErrBadParam, "setAdjustmentParams: adjustment layer not found");
+        }
+        if (l->adjustment->inBlack == static_cast<float>(inBlack) &&
+            l->adjustment->inWhite == static_cast<float>(inWhite) &&
+            l->adjustment->gamma == static_cast<float>(gamma)) {
+            return makeOk(env, nullptr);
+        }
+        e.history.beginEdit(e.doc, "adjust params", static_cast<uint64_t>(e.docRevision));
+        auto adj = std::make_shared<LayerAdjustment>(*l->adjustment);  // COW
+        adj->inBlack = static_cast<float>(std::min(0.98, std::max(0.0, inBlack)));
+        adj->inWhite = static_cast<float>(std::min(1.0, std::max(0.02, inWhite)));
+        adj->gamma = static_cast<float>(std::min(10.0, std::max(0.1, gamma)));
+        l->adjustment = std::move(adj);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
 
 napi_value AddLayer(napi_env env, napi_callback_info info) {
     size_t argc = 1;

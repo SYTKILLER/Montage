@@ -24,6 +24,9 @@ napi_value SetViewport(napi_env env, napi_callback_info info);
 napi_value FitToWindow(napi_env env, napi_callback_info info);
 // 图层（02 §5 M2 命令面；LayerDTO 见 02 §5，缩略图 = O3 跨桥实测）
 napi_value AddLayer(napi_env env, napi_callback_info info);
+// 调整层（02 §3 M6a）：添加 Levels 调整层 / 设置参数
+napi_value AddAdjustmentLayer(napi_env env, napi_callback_info info);
+napi_value SetAdjustmentParams(napi_env env, napi_callback_info info);
 napi_value RemoveLayer(napi_env env, napi_callback_info info);
 napi_value SelectLayer(napi_env env, napi_callback_info info);
 napi_value SetLayerVisible(napi_env env, napi_callback_info info);

@@ -120,6 +120,14 @@ bool TileRenderer::ensureFbos(int32_t vw, int32_t vh) {
     ok = makeFbo(&layerFbo_, &layerTex_) && ok;
     ok = makeFbo(&clipFbo_, &clipTex_) && ok;
     ok = makeFbo(&baseFbo_, &baseTex_) && ok;
+    // 256×1 LUT 纹理（RGBA8；三通道同表，LINEAR 平滑插值）
+    glGenTextures(1, &lutTex_);
+    glBindTexture(GL_TEXTURE_2D, lutTex_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     if (!ok) {
         OH_LOG_Print(LOG_APP, LOG_ERROR, kDomain, kTag, "FBO incomplete");
         destroyFbos();
@@ -149,6 +157,8 @@ void TileRenderer::destroyFbos() {
     if (baseTex_ != 0) glDeleteTextures(1, &baseTex_);
     baseFbo_ = 0;
     baseTex_ = 0;
+    if (lutTex_ != 0) glDeleteTextures(1, &lutTex_);
+    lutTex_ = 0;
     fboW_ = fboH_ = 0;
 }
 
@@ -160,6 +170,7 @@ void TileRenderer::ensureInit() {
     tileProg_ = buildProgram(shaders::kQuadVert, shaders::kTileFrag);
     plainProg_ = buildProgram(shaders::kQuadVert, shaders::kPlainFrag);
     clipProg_ = buildProgram(shaders::kQuadVert, shaders::kClipFrag);
+    adjustProg_ = buildProgram(shaders::kQuadVert, shaders::kAdjustFrag);
     for (int m = 0; m < kBlendModeCount; ++m) {
         blendProgs_[m] = buildBlendProgram(m);
         if (blendProgs_[m] == 0) {
@@ -167,7 +178,7 @@ void TileRenderer::ensureInit() {
         }
     }
     if (checkerProg_ == 0 || tileProg_ == 0 || plainProg_ == 0 || clipProg_ == 0 ||
-        blendProgs_[0] == 0) {
+        adjustProg_ == 0 || blendProgs_[0] == 0) {
         return;
     }
     const float quad[8] = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f};
@@ -207,11 +218,12 @@ void TileRenderer::invalidate() {
     if (tileProg_ != 0) glDeleteProgram(tileProg_);
     if (plainProg_ != 0) glDeleteProgram(plainProg_);
     if (clipProg_ != 0) glDeleteProgram(clipProg_);
+    if (adjustProg_ != 0) glDeleteProgram(adjustProg_);
     for (int m = 0; m < kBlendModeCount; ++m) {
         if (blendProgs_[m] != 0) glDeleteProgram(blendProgs_[m]);
         blendProgs_[m] = 0;
     }
-    checkerProg_ = tileProg_ = plainProg_ = clipProg_ = 0;
+    checkerProg_ = tileProg_ = plainProg_ = clipProg_ = adjustProg_ = 0;
     if (vbo_ != 0) glDeleteBuffers(1, &vbo_);
     if (vao_ != 0) glDeleteVertexArrays(1, &vao_);
     vbo_ = vao_ = 0;
@@ -339,6 +351,62 @@ void TileRenderer::drawTiles(const Layer& layer, float zoom, float panX, float p
     }
 }
 
+void TileRenderer::uploadLut(const float* lut256) {
+    // lut256: 256 个 0..1 值 → RGBA8 三通道同表
+    uint8_t px[256 * 4];
+    for (int i = 0; i < 256; ++i) {
+        const uint8_t v = static_cast<uint8_t>(std::lround(
+            std::min(1.0f, std::max(0.0f, lut256[i])) * 255.0f));
+        px[i * 4] = v;
+        px[i * 4 + 1] = v;
+        px[i * 4 + 2] = v;
+        px[i * 4 + 3] = 255;
+    }
+    glBindTexture(GL_TEXTURE_2D, lutTex_);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+}
+
+// Levels/Curves → 256 LUT（v1：Curves 控制点线性插值）
+void buildAdjustmentLut(const LayerAdjustment& adj, float* lut256) {
+    if (adj.kind == AdjustmentKind::Levels) {
+        const float lo = std::min(adj.inBlack, adj.inWhite - 0.001f);
+        const float hi = std::max(adj.inWhite, lo + 0.001f);
+        const float g = std::min(10.0f, std::max(0.1f, adj.gamma));
+        for (int i = 0; i < 256; ++i) {
+            float t = (static_cast<float>(i) / 255.0f - lo) / (hi - lo);
+            t = std::min(1.0f, std::max(0.0f, t));
+            lut256[i] = std::pow(t, 1.0f / g);
+        }
+        return;
+    }
+    // Curves：控制点线性插值 + 端点延伸
+    const auto& xs = adj.curveX;
+    const auto& ys = adj.curveY;
+    if (xs.size() < 2 || xs.size() != ys.size()) {
+        for (int i = 0; i < 256; ++i) {
+            lut256[i] = static_cast<float>(i) / 255.0f;
+        }
+        return;
+    }
+    for (int i = 0; i < 256; ++i) {
+        const float x = static_cast<float>(i) / 255.0f;
+        if (x <= xs.front()) {
+            lut256[i] = ys.front();
+            continue;
+        }
+        if (x >= xs.back()) {
+            lut256[i] = ys.back();
+            continue;
+        }
+        size_t k = 1;
+        while (k < xs.size() && xs[k] < x) {
+            ++k;
+        }
+        const float t = (x - xs[k - 1]) / std::max(1e-6f, xs[k] - xs[k - 1]);
+        lut256[i] = ys[k - 1] + (ys[k] - ys[k - 1]) * t;
+    }
+}
+
 void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw, int32_t vh,
                              const StrokeOverlay* stroke) {
     frame_++;
@@ -370,6 +438,34 @@ void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw
     bool baseTexValid = false;  // M5b-2：baseTex_ 是否持有当前剪贴组的基 alpha
     for (size_t li = 0; li < doc.layers.size(); ++li) {
         const Layer& layer = doc.layers[li];
+        if (layer.adjustment != nullptr) {
+            // M6a：调整层——acc 全帧经 LUT 调色（ping-pong），opacity lerp；忽略剪贴/混合模式（v1）
+            if (!layer.visible) {
+                continue;
+            }
+            composited++;
+            float lut[256];
+            buildAdjustmentLut(*layer.adjustment, lut);
+            uploadLut(lut);
+            const int dstIdx = accIdx;
+            const int outIdx = 1 - accIdx;
+            glBindFramebuffer(GL_FRAMEBUFFER, accFbo_[outIdx]);
+            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glDisable(GL_BLEND);
+            glUseProgram(adjustProg_);
+            glUniform1i(glGetUniformLocation(adjustProg_, "uDst"), 0);
+            glUniform1i(glGetUniformLocation(adjustProg_, "uLut"), 1);
+            glUniform1f(glGetUniformLocation(adjustProg_, "uOpacity"),
+                        static_cast<float>(layer.opacity));
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, accTex_[dstIdx]);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, lutTex_);
+            drawQuad(adjustProg_, 0.0f, 0.0f, vwF, vhF, 1.0f, 0.0f, 0.0f, vwF, vhF);
+            accIdx = outIdx;
+            continue;
+        }
         if (!layer.visible || layer.effectivePixels() == nullptr) {
             // 非剪贴层缺席 → 其上剪贴组无有效基（PS：基隐藏则剪贴组隐藏）
             if (!layer.clipping) {

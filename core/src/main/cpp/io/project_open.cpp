@@ -26,7 +26,7 @@ constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Open";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
 constexpr int kMinVersion = 1;
-constexpr int kMaxVersion = 2;  // v2：+图层蒙版（读取方按字段存在性兼容 v1）
+constexpr int kMaxVersion = 3;  // v3：+调整层；v2：+图层蒙版（按字段存在性兼容 v1/v2）
 constexpr uint32_t kMaxSide = 30000;
 constexpr uint64_t kMaxTotalPixels = 100ull * 1000 * 1000;
 constexpr size_t kMaxLayers = 10000;
@@ -508,6 +508,7 @@ struct LayerRecord {
     uint32_t maskWidth = 0;
     uint32_t maskHeight = 0;
     bool clipping = false;  // v2
+    std::shared_ptr<LayerAdjustment> adjustment;  // v3
 };
 
 bool getU64(const JValue& v, uint64_t& out) {
@@ -713,6 +714,50 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
             }
             totalPixels += static_cast<uint64_t>(l.maskWidth) * l.maskHeight;
         }
+        // v3 调整层（v1/v2 无此字段 → 普通层）
+        const JValue* jadj = item.find("adjustment");
+        if (jadj != nullptr && jadj->type == JValue::Obj) {
+            auto adj = std::make_shared<LayerAdjustment>();
+            const JValue* jkind = jadj->find("kind");
+            if (jkind != nullptr && jkind->type == JValue::Str && jkind->str == "curves") {
+                adj->kind = AdjustmentKind::Curves;
+                const JValue* jcx = jadj->find("curveX");
+                const JValue* jcy = jadj->find("curveY");
+                if (jcx != nullptr && jcy != nullptr && jcx->type == JValue::Arr &&
+                    jcy->type == JValue::Arr && jcx->arr.size() == jcy->arr.size() &&
+                    jcx->arr.size() >= 2 && jcx->arr.size() <= 64) {
+                    for (size_t c = 0; c < jcx->arr.size(); ++c) {
+                        double vx = 0, vy = 0;
+                        if (!getDouble(jcx->arr[c], vx) || !getDouble(jcy->arr[c], vy) ||
+                            !std::isfinite(vx) || !std::isfinite(vy) || vx < 0 || vx > 1 ||
+                            vy < -4 || vy > 4) {
+                            err = "bad curve point";
+                            return false;
+                        }
+                        adj->curveX.push_back(static_cast<float>(vx));
+                        adj->curveY.push_back(static_cast<float>(vy));
+                    }
+                }
+            } else if (jkind == nullptr || jkind->type != JValue::Str || jkind->str != "levels") {
+                err = "unknown adjustment kind";
+                return false;
+            }
+            const JValue* jbl = jadj->find("inBlack");
+            const JValue* jwl = jadj->find("inWhite");
+            const JValue* jgm = jadj->find("gamma");
+            double bl = 0, wl = 1, gm = 1;
+            if (jbl == nullptr || jwl == nullptr || jgm == nullptr ||
+                !getDouble(*jbl, bl) || !getDouble(*jwl, wl) || !getDouble(*jgm, gm) ||
+                !std::isfinite(bl) || !std::isfinite(wl) || !std::isfinite(gm) || bl < 0 ||
+                bl > 1 || wl < 0 || wl > 1 || gm < 0.1 || gm > 10) {
+                err = "bad adjustment params";
+                return false;
+            }
+            adj->inBlack = static_cast<float>(bl);
+            adj->inWhite = static_cast<float>(wl);
+            adj->gamma = static_cast<float>(gm);
+            l.adjustment = std::move(adj);
+        }
         layers.push_back(l);
     }
     if (totalPixels > kMaxTotalPixels) {
@@ -789,6 +834,7 @@ bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
         l.opacity = rec.opacity;
         l.blendMode = rec.blendMode;
         l.clipping = rec.clipping;
+        l.adjustment = rec.adjustment;
         l.transform.originX = rec.originX;
         l.transform.originY = rec.originY;
         if (rec.hasImage) {

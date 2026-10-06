@@ -51,6 +51,10 @@ export interface LayerDTO {
   hasMask: boolean;
   maskEnabled: boolean;
   clipping: boolean;
+  isAdjustment: boolean;
+  adjBlack: number;
+  adjWhite: number;
+  adjGamma: number;
   thumbToken: number;
 }
 

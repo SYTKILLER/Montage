@@ -576,6 +576,23 @@ struct Index {
     }
   }
 
+  // M6a：添加 Levels 调整层
+  private onAddAdjustment(): void {
+    const id: number = this.engine.addAdjustmentLayer();
+    if (id !== 0) {
+      this.log(`已添加 Levels 调整层 (id=${id})`);
+    }
+  }
+
+  // M6a：调整层参数（滑条拖动结束）
+  private onAdjustParamChange(inBlack: number, inWhite: number, gamma: number): void {
+    const active = this.activeLayer();
+    if (active === undefined || !active.isAdjustment) {
+      return;
+    }
+    this.engine.setAdjustmentParams(active.id, inBlack, inWhite, gamma);
+  }
+
   private onToggleVisible(l: LayerDTO): void {
     this.engine.setLayerVisible(l.id, !l.visible);
   }
@@ -788,6 +805,40 @@ struct Index {
           }
           .width('100%')
 
+          // M6a：调整层参数（活动层为 Levels 时显示）
+          if (this.activeLayer()?.isAdjustment === true) {
+            Row({ space: 6 }) {
+              Text('黑').fontSize(11).fontColor($r('app.color.text_secondary'))
+              Slider({ value: this.activeLayer()!.adjBlack * 255, min: 0, max: 250, step: 1 })
+                .width(90).height(24)
+                .onChange((v: number, mode: SliderChangeMode): void => {
+                  if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                    const a = this.activeLayer()!;
+                    this.onAdjustParamChange(v / 255, a.adjWhite, a.adjGamma);
+                  }
+                })
+              Text('白').fontSize(11).fontColor($r('app.color.text_secondary'))
+              Slider({ value: this.activeLayer()!.adjWhite * 255, min: 5, max: 255, step: 1 })
+                .width(90).height(24)
+                .onChange((v: number, mode: SliderChangeMode): void => {
+                  if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                    const a = this.activeLayer()!;
+                    this.onAdjustParamChange(a.adjBlack, v / 255, a.adjGamma);
+                  }
+                })
+              Text('γ').fontSize(11).fontColor($r('app.color.text_secondary'))
+              Slider({ value: this.activeLayer()!.adjGamma, min: 0.1, max: 10, step: 0.05 })
+                .width(90).height(24)
+                .onChange((v: number, mode: SliderChangeMode): void => {
+                  if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                    const a = this.activeLayer()!;
+                    this.onAdjustParamChange(a.adjBlack, a.adjWhite, v);
+                  }
+                })
+            }
+            .width('100%')
+          }
+
           List({ space: 4 }) {
             ForEach(this.reversedLayers(), (l: LayerDTO) => {
               ListItem() {
@@ -844,6 +895,7 @@ struct Index {
             Button('剪贴').fontSize(12)
               .backgroundColor(this.activeLayer()?.clipping ? '#D93025' : '#888888')
               .onClick((): void => this.onToggleClipping())
+            Button('调整层').fontSize(12).onClick((): void => this.onAddAdjustment())
             Button('删除').fontSize(12).onClick((): void => {
               const a = this.activeLayer();
               if (a !== undefined) {

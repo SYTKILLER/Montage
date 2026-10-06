@@ -122,6 +122,10 @@ function narrowLayer(r: Record<string, Object>): LayerDTO {
     hasMask: boolOf(r, 'hasMask'),
     maskEnabled: boolOf(r, 'maskEnabled'),
     clipping: boolOf(r, 'clipping'),
+    isAdjustment: boolOf(r, 'isAdjustment'),
+    adjBlack: num(r, 'adjBlack'),
+    adjWhite: num(r, 'adjWhite'),
+    adjGamma: num(r, 'adjGamma'),
     thumbToken: num(r, 'thumbToken'),
   };
 }
@@ -355,6 +359,27 @@ export class CompositorEngine {
     const r = narrowResult(native.setLayerClipping(id, v) as Object);
     if (!r.ok) {
       hilog.error(DOMAIN, TAG, 'setLayerClipping failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  // M6a：添加 Levels 调整层，返回新图层 id（0 = 失败）
+  addAdjustmentLayer(): number {
+    const r = narrowResult(native.addAdjustmentLayer() as Object);
+    if (!r.ok || r.data === null) {
+      hilog.error(DOMAIN, TAG, 'addAdjustmentLayer failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return 0;
+    }
+    return num(r.data, 'id');
+  }
+
+  // M6a：设置调整层 Levels 参数（滑条拖动结束调用）
+  setAdjustmentParams(id: number, inBlack: number, inWhite: number, gamma: number): boolean {
+    const r = narrowResult(native.setAdjustmentParams(id, inBlack, inWhite, gamma) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setAdjustmentParams failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
     return r.ok;

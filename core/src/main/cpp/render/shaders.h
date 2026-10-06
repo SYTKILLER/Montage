@@ -77,6 +77,25 @@ void main() {
 }
 )";
 
+// 调整层（M6a）：acc 全帧经 256 LUT 调色（CPU 建表，RGBA 三通道同表），opacity 与原值 lerp
+inline const char* kAdjustFrag = R"(#version 300 es
+precision mediump float;
+uniform sampler2D uDst;
+uniform sampler2D uLut;
+uniform float uOpacity;
+uniform vec2 uViewport;
+out vec4 o;
+void main() {
+  vec2 uv = gl_FragCoord.xy / uViewport;
+  vec4 d = texture(uDst, uv);
+  vec3 adj = vec3(
+    texture(uLut, vec2(clamp(d.r, 0.004, 0.996), 0.5)).r,
+    texture(uLut, vec2(clamp(d.g, 0.004, 0.996), 0.5)).g,
+    texture(uLut, vec2(clamp(d.b, 0.004, 0.996), 0.5)).b);
+  o = vec4(mix(d.rgb, adj, uOpacity), d.a);
+}
+)";
+
 // Pass B 混合公共模板：%%BODY%% 占位声明由 buildBlendProgram 按模式替换为完整函数。
 inline const char* kBlendCommon = R"(#version 300 es
 precision mediump float;

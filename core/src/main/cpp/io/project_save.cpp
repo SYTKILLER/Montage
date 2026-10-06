@@ -22,7 +22,7 @@ namespace {
 constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Save";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
-constexpr int kFormatVersion = 2;  // v2：+图层蒙版（maskFile/maskEnabled/maskOffset/maskOutside）
+constexpr int kFormatVersion = 3;  // v3：+调整层（adjustment）；v2：+图层蒙版
 constexpr int kDeflateLevel = 6;
 // 04 §1.3 格式上限（沿用上游档位，与引擎运行预算分立）
 constexpr uint32_t kMaxSide = 30000;
@@ -437,6 +437,7 @@ struct LayerSnapshot {
     int maskOutside = 255;
     bool maskEnabled = true;
     bool clipping = false;  // M5b-2
+    std::shared_ptr<LayerAdjustment> adjustment;  // M6a：null = 普通层
 };
 
 struct DocSnapshot {
@@ -521,6 +522,32 @@ std::string buildManifest(const DocSnapshot& doc) {
         if (l.clipping) {
             fields.push_back("      \"clipping\": true");
         }
+        if (l.adjustment != nullptr) {
+            const LayerAdjustment& adj = *l.adjustment;
+            std::string fields2;
+            char num[32];
+            const char* nl = "\n";
+            std::snprintf(num, sizeof(num), "%.6g", adj.inBlack);
+            fields2 += std::string("      \"inBlack\": ") + num + "," + nl;
+            std::snprintf(num, sizeof(num), "%.6g", adj.inWhite);
+            fields2 += std::string("      \"inWhite\": ") + num + "," + nl;
+            std::snprintf(num, sizeof(num), "%.6g", adj.gamma);
+            fields2 += std::string("      \"gamma\": ") + num;
+            if (adj.kind == AdjustmentKind::Curves && adj.curveX.size() >= 2) {
+                fields2 += std::string(",") + nl + "      \"curveX\": [";
+                for (size_t c = 0; c < adj.curveX.size(); ++c) {
+                    std::snprintf(num, sizeof(num), "%.6g", adj.curveX[c]);
+                    fields2 += std::string(num) + (c + 1 < adj.curveX.size() ? ", " : "");
+                }
+                fields2 += std::string("],") + nl + "      \"curveY\": [";
+                for (size_t c = 0; c < adj.curveY.size(); ++c) {
+                    std::snprintf(num, sizeof(num), "%.6g", adj.curveY[c]);
+                    fields2 += std::string(num) + (c + 1 < adj.curveY.size() ? ", " : "");
+                }
+                fields2 += "]";
+            }
+            fields.push_back(std::string("      \"adjustment\": {") + nl + fields2 + nl + "      }");
+        }
         if (l.pixels != nullptr) {
             // 图像以内容包围盒存出；originX/Y = 包围盒左上角在文档坐标系的落点（load 据此重建 Transform）
             fields.push_back("      \"originX\": " + std::to_string(static_cast<int64_t>(l.originX)));
@@ -591,6 +618,7 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
                 s.maskEnabled = l.mask->enabled;
             }
             s.clipping = l.clipping;
+            s.adjustment = l.adjustment;
             snap.layers.push_back(std::move(s));
         }
     }

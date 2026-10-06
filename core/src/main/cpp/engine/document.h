@@ -142,7 +142,25 @@ struct LayerMask {
     bool linked = true;  // v1 恒 true（独立 placement 随 M8 变换引入）
 };
 
-// 图层（值语义，对齐源 ImageLayer；M2 子集：蒙版/剪贴 M5、调整/形状/文字后续补）。
+// 调整层（M6a，对齐源 LayerAdjustment 的 v1 子集）： Levels/Curves 统一为 256 LUT 渲染；
+// 对下方全部合成结果生效（acc 全帧），v1 忽略剪贴/混合模式（仅 opacity lerp，登记 M6b）。
+enum class AdjustmentKind : int32_t {
+    Levels = 0,
+    Curves = 1,
+};
+
+struct LayerAdjustment {
+    AdjustmentKind kind = AdjustmentKind::Levels;
+    // Levels：主通道输入黑/白点 + gamma（0..1、0..1、0.1..10）
+    float inBlack = 0.0f;
+    float inWhite = 1.0f;
+    float gamma = 1.0f;
+    // Curves：控制点（x/y 各 0..1，x 单调；v1 线性插值）
+    std::vector<float> curveX;
+    std::vector<float> curveY;
+};
+
+// 图层（值语义，对齐源 ImageLayer；M2 子集：蒙版/剪贴 M5、调整层 M6a、形状/文字后续补）。
 struct Layer {
     LayerId id = 0;
     std::string name;
@@ -155,6 +173,7 @@ struct Layer {
     std::shared_ptr<const TileGrid> render = nullptr;  // 蒙版启用时的合成结果（派生缓存，
                                                        // 变更点主动维护、随 History 快照走）
     bool clipping = false;  // M5b-2：剪贴蒙版——剪贴到下方最近非剪贴层（渲染期生效，PS 语义）
+    std::shared_ptr<LayerAdjustment> adjustment = nullptr;  // M6a：非空 = 调整层（无像素）
     // 渲染/缩略图取数：蒙版启用取合成结果，否则原像素
     std::shared_ptr<const TileGrid> effectivePixels() const {
         return (mask != nullptr && mask->enabled && render != nullptr) ? render : pixels;
