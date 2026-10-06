@@ -26,7 +26,7 @@ constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Open";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
 constexpr int kMinVersion = 1;
-constexpr int kMaxVersion = 1;  // 本版只认 v1（04 §1.2：版本线自持，向上兼容随版本演进）
+constexpr int kMaxVersion = 2;  // v2：+图层蒙版（读取方按字段存在性兼容 v1）
 constexpr uint32_t kMaxSide = 30000;
 constexpr uint64_t kMaxTotalPixels = 100ull * 1000 * 1000;
 constexpr size_t kMaxLayers = 10000;
@@ -499,6 +499,14 @@ struct LayerRecord {
     uint32_t width = 0;
     uint32_t height = 0;
     bool hasImage = false;
+    // v2 蒙版
+    bool hasMask = false;
+    bool maskEnabled = true;
+    int maskOffsetX = 0;
+    int maskOffsetY = 0;
+    int maskOutside = 255;
+    uint32_t maskWidth = 0;
+    uint32_t maskHeight = 0;
 };
 
 bool getU64(const JValue& v, uint64_t& out) {
@@ -649,6 +657,53 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
                 return false;
             }
         }
+        // v2 蒙版字段（v1 无 → 无蒙版）
+        const JValue* jmf = item.find("maskFile");
+        if (jmf != nullptr && jmf->type == JValue::Str) {
+            const std::string expect = "images/" + std::to_string(l.id) + ".mask.png";
+            if (jmf->str != expect) {
+                err = "maskFile mismatch";
+                return false;
+            }
+            l.hasMask = true;
+            const JValue* jme = item.find("maskEnabled");
+            if (jme != nullptr) {
+                if (jme->type != JValue::Bool) {
+                    err = "bad maskEnabled";
+                    return false;
+                }
+                l.maskEnabled = jme->b;
+            }
+            const JValue* jmo = item.find("maskOutside");
+            if (jmo != nullptr) {
+                uint32_t mo = 255;
+                if (!getU32(*jmo, mo) || mo > 255) {
+                    err = "bad maskOutside";
+                    return false;
+                }
+                l.maskOutside = static_cast<int>(mo);
+            }
+            const JValue* jmox = item.find("maskOffsetX");
+            const JValue* jmoy = item.find("maskOffsetY");
+            double ox = 0, oy = 0;
+            if (jmox == nullptr || jmoy == nullptr || !getDouble(*jmox, ox) || !getDouble(*jmoy, oy) ||
+                !std::isfinite(ox) || !std::isfinite(oy) || ox < -1e9 || ox > 1e9 || oy < -1e9 ||
+                oy > 1e9) {
+                err = "bad mask offset";
+                return false;
+            }
+            l.maskOffsetX = static_cast<int>(ox);
+            l.maskOffsetY = static_cast<int>(oy);
+            const JValue* jmw = item.find("maskWidth");
+            const JValue* jmh = item.find("maskHeight");
+            if (jmw == nullptr || jmh == nullptr || !getU32(*jmw, l.maskWidth) ||
+                !getU32(*jmh, l.maskHeight) || l.maskWidth == 0 || l.maskHeight == 0 ||
+                l.maskWidth > kMaxSide || l.maskHeight > kMaxSide) {
+                err = "bad mask size";
+                return false;
+            }
+            totalPixels += static_cast<uint64_t>(l.maskWidth) * l.maskHeight;
+        }
         layers.push_back(l);
     }
     if (totalPixels > kMaxTotalPixels) {
@@ -749,6 +804,43 @@ bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
                 return false;
             }
             l.pixels = std::move(grid);
+        }
+        if (rec.hasMask) {
+            // v2 蒙版：patch PNG → LayerMask → 合成派生网格
+            const ZipReader::CdEntry* mpng =
+                zip.find("images/" + std::to_string(rec.id) + ".mask.png");
+            if (mpng == nullptr) {
+                err = "layer mask missing: " + std::to_string(rec.id);
+                return false;
+            }
+            std::vector<uint8_t> maskBytes;
+            if (!zip.extract(*mpng, maskBytes, err)) {
+                return false;
+            }
+            std::shared_ptr<const TileGrid> mgrid =
+                decodePngToGrid(maskBytes.data(), maskBytes.size(), err);
+            if (mgrid == nullptr) {
+                return false;
+            }
+            const uint32_t mCols = (rec.maskWidth + kTileSize - 1u) / kTileSize;
+            const uint32_t mRows = (rec.maskHeight + kTileSize - 1u) / kTileSize;
+            if (mgrid->cols != mCols || mgrid->rows != mRows) {
+                err = "layer mask size mismatch: " + std::to_string(rec.id);
+                return false;
+            }
+            auto m = std::make_shared<LayerMask>();
+            m->pixels = std::move(mgrid);
+            m->width = rec.maskWidth;
+            m->height = rec.maskHeight;
+            m->offsetX = rec.maskOffsetX;
+            m->offsetY = rec.maskOffsetY;
+            m->outside = static_cast<uint8_t>(rec.maskOutside);
+            m->enabled = rec.maskEnabled;
+            m->linked = true;
+            l.mask = std::move(m);
+            if (l.mask->enabled && l.pixels != nullptr) {
+                l.render = composeMasked(l.pixels, *l.mask);
+            }
         }
         layers.push_back(std::move(l));
     }

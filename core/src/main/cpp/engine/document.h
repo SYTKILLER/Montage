@@ -127,7 +127,22 @@ struct Transform {
     double height = 0.0;
 };
 
-// 图层（值语义，对齐源 ImageLayer；M2 子集：蒙版/调整/形状/文字 M5+ 逐步补）。
+// 图层蒙版（M5a，对拍上游 LayerMask 语义）：8-bit 灰度（白显黑隐），网格恒 RGBA8888
+// （R=G=B=gray、A=255）。patch 网格 = PSD maskRect 原始范围，在图层局部坐标系由
+// offsetX/Y 定位；patch 之外的区域取 outside（PSD 语义 = maskDefault，通常 255 全显）。
+// 不可变共享（改 = 整份 COW 换新，撤销快照才不会被原地改写）。
+struct LayerMask {
+    std::shared_ptr<const TileGrid> pixels;  // patch 网格；null = 无 patch（整层取 outside）
+    uint32_t width = 0;                      // patch 像素尺寸（网格可能 256 对齐略大）
+    uint32_t height = 0;
+    int offsetX = 0;
+    int offsetY = 0;
+    uint8_t outside = 255;
+    bool enabled = true;
+    bool linked = true;  // v1 恒 true（独立 placement 随 M8 变换引入）
+};
+
+// 图层（值语义，对齐源 ImageLayer；M2 子集：蒙版 M5a、调整/形状/文字后续补）。
 struct Layer {
     LayerId id = 0;
     std::string name;
@@ -136,6 +151,13 @@ struct Layer {
     BlendMode blendMode = BlendMode::Normal;
     Transform transform;
     std::shared_ptr<const TileGrid> pixels;  // null = 空图层（源：画笔开始才分配）
+    std::shared_ptr<LayerMask> mask = nullptr;         // null = 无蒙版
+    std::shared_ptr<const TileGrid> render = nullptr;  // 蒙版启用时的合成结果（派生缓存，
+                                                       // 变更点主动维护、随 History 快照走）
+    // 渲染/缩略图取数：蒙版启用取合成结果，否则原像素
+    std::shared_ptr<const TileGrid> effectivePixels() const {
+        return (mask != nullptr && mask->enabled && render != nullptr) ? render : pixels;
+    }
 };
 
 // M2：图层栈文档（无组/蒙版/选区；History M4）。
@@ -158,6 +180,14 @@ double clampZoom(double zoom);  // [1/32, 32]
 
 const char* blendModeName(BlendMode mode);  // DTO 显示名（对齐源 LayerBlendMode raw 值）
 bool blendModeFromName(const std::string& name, BlendMode& out);  // 逆映射（.montage 读取，M4c）
+
+// 蒙版合成（M5a）：out.a = a × gray/255（直 alpha 域，rgb 不变）；patch 外取 mask.outside。
+// 无蒙版像素/网格外按语义共享或丢弃；返回的网格与 src 同维度。mask.pixels == null 时
+// 整层取 outside（255 → 原样共享指针；0 → 空网格）。
+std::shared_ptr<const TileGrid> composeMasked(std::shared_ptr<const TileGrid> src, const LayerMask& mask);
+
+// 图层局部坐标 (gx,gy) 处的蒙版灰度（patch 内查网格，patch 外取 outside）
+uint8_t layerMaskGrayAt(const LayerMask& mask, int gx, int gy);
 
 }  // namespace montage
 

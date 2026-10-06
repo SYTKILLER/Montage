@@ -535,6 +535,15 @@ struct Index {
     this.engine.setLayerVisible(l.id, !l.visible);
   }
 
+  // M5a：蒙版启用/停用
+  private maskEnabled(l: LayerDTO): boolean {
+    return l.maskEnabled;
+  }
+
+  private onToggleMask(l: LayerDTO): void {
+    this.engine.setLayerMaskEnabled(l.id, !l.maskEnabled);
+  }
+
   private onSelectLayer(l: LayerDTO): void {
     if (!l.isActive) {
       this.engine.selectLayer(l.id);
@@ -739,6 +748,16 @@ struct Index {
                     .fontColor([l.visible ? '#1A6BD9' : '#999999'])
                     .opacity(l.visible ? 1 : 0.5)
                     .onClick((): void => this.onToggleVisible(l))
+                  if (l.hasMask) {
+                    // M5a 蒙版开关：实心 = 启用（渲染走合成结果），灰 = 停用
+                    Text('蒙')
+                      .fontSize(10)
+                      .width(20).height(20).borderRadius(4)
+                      .textAlign(TextAlign.Center)
+                      .fontColor('#FFFFFF')
+                      .backgroundColor(this.maskEnabled(l) ? '#1A6BD9' : '#999999')
+                      .onClick((): void => this.onToggleMask(l))
+                  }
                   Column({ space: 2 }) {
                     Text(l.name)
                       .fontSize(12)
@@ -763,7 +782,7 @@ struct Index {
                 .border({ width: 1, color: l.isActive ? '#1A6BD9' : '#00000000' })
               }
             }, (l: LayerDTO): string =>
-              `${l.id}|${l.visible}|${l.isActive}|${l.blendMode}|${Math.round(l.opacity * 100)}|${l.thumbToken}`)
+              `${l.id}|${l.visible}|${l.isActive}|${l.blendMode}|${Math.round(l.opacity * 100)}|${l.thumbToken}|${l.hasMask}|${l.maskEnabled}`)
           }
           .layoutWeight(1)
           .scrollBar(BarState.Off)

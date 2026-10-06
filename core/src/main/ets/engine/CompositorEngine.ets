@@ -120,6 +120,7 @@ function narrowLayer(r: Record<string, Object>): LayerDTO {
     isGroup: boolOf(r, 'isGroup'),
     parentId: num(r, 'parentId'),
     hasMask: boolOf(r, 'hasMask'),
+    maskEnabled: boolOf(r, 'maskEnabled'),
     thumbToken: num(r, 'thumbToken'),
   };
 }
@@ -333,6 +334,16 @@ export class CompositorEngine {
     const r = narrowResult(native.setLayerBlendMode(id, mode) as Object);
     if (!r.ok) {
       hilog.error(DOMAIN, TAG, 'setLayerBlendMode failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  // M5a：蒙版启用/停用
+  setLayerMaskEnabled(id: number, v: boolean): boolean {
+    const r = narrowResult(native.setLayerMaskEnabled(id, v) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setLayerMaskEnabled failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
     return r.ok;

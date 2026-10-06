@@ -127,4 +127,93 @@ bool blendModeFromName(const std::string& name, BlendMode& out) {
     return false;
 }
 
+uint8_t layerMaskGrayAt(const LayerMask& mask, int gx, int gy) {
+    const int px0 = mask.offsetX;
+    const int py0 = mask.offsetY;
+    if (gx < px0 || gy < py0 || gx >= px0 + static_cast<int>(mask.width) ||
+        gy >= py0 + static_cast<int>(mask.height)) {
+        return mask.outside;
+    }
+    if (mask.pixels == nullptr) {
+        return mask.outside;
+    }
+    const TileGrid& patch = *mask.pixels;
+    constexpr int kTile = static_cast<int>(kTileSize);
+    const int mx = gx - px0;
+    const int my = gy - py0;
+    const uint32_t mtx = static_cast<uint32_t>(mx) / kTileSize;
+    const uint32_t mty = static_cast<uint32_t>(my) / kTileSize;
+    auto it = patch.tiles.find(mty * patch.cols + mtx);
+    if (it == patch.tiles.end()) {
+        return 0;  // 网格内缺瓦片 = 透明（构建方保证不缺，防御）
+    }
+    const uint8_t* mPx = it->second->pixels->mapCpu();
+    return mPx[(static_cast<size_t>(my % kTileSize) * kTileSize) + static_cast<size_t>(mx % kTileSize)];
+}
+
+std::shared_ptr<const TileGrid> composeMasked(std::shared_ptr<const TileGrid> src,
+                                              const LayerMask& mask) {
+    if (src == nullptr) {
+        return nullptr;
+    }
+    const TileGrid& shared = *src;
+    auto out = std::make_shared<TileGrid>();
+    out->cols = shared.cols;
+    out->rows = shared.rows;
+    out->revision = shared.revision;
+    // 无 patch：整层取 outside（255 = 全显 → 原样返回；0 = 全隐 → 空网格）
+    if (mask.pixels == nullptr) {
+        if (mask.outside >= 128) {
+            return src;
+        }
+        return out;
+    }
+    constexpr int kTile = static_cast<int>(kTileSize);
+    // patch 在图层局部坐标的包围盒
+    const int px0 = mask.offsetX;
+    const int py0 = mask.offsetY;
+    const int px1 = px0 + static_cast<int>(mask.width);
+    const int py1 = py0 + static_cast<int>(mask.height);
+    const bool outsideReveal = mask.outside >= 128;
+
+    for (const auto& [key, tile] : shared.tiles) {
+        const uint32_t tx = key % shared.cols;
+        const uint32_t ty = key / shared.cols;
+        const int x0 = static_cast<int>(tx * kTileSize);
+        const int y0 = static_cast<int>(ty * kTileSize);
+        const int x1 = x0 + kTile;
+        const int y1 = y0 + kTile;
+        // 与 patch 不相交：outside 语义决定共享/丢弃
+        if (x1 <= px0 || x0 >= px1 || y1 <= py0 || y0 >= py1) {
+            if (outsideReveal) {
+                out->tiles[key] = tile;
+            }
+            continue;
+        }
+        auto buf = std::make_unique<EngineBuffer>(kTileSize, kTileSize);
+        uint8_t* dst = buf->mapCpuWrite();
+        const uint8_t* srcPx = tile->pixels->mapCpu();
+        const uint32_t srcStride = tile->pixels->rowBytes();
+        for (int ry = 0; ry < kTile; ++ry) {
+            const int gy = y0 + ry;  // 图层局部 y
+            const uint8_t* srcRow = srcPx + static_cast<size_t>(ry) * srcStride;
+            uint8_t* dstRow = dst + static_cast<size_t>(ry) * kTileSize * 4u;
+            for (int rx = 0; rx < kTile; ++rx) {
+                const int gx = x0 + rx;
+                const uint8_t m = layerMaskGrayAt(mask, gx, gy);
+                const uint8_t* s = srcRow + static_cast<size_t>(rx) * 4u;
+                uint8_t* d = dstRow + static_cast<size_t>(rx) * 4u;
+                d[0] = s[0];
+                d[1] = s[1];
+                d[2] = s[2];
+                d[3] = static_cast<uint8_t>((s[3] * m + 127) / 255);
+            }
+        }
+        auto t = std::make_shared<Tile>();
+        t->pixels = std::move(buf);
+        out->tiles[key] = std::move(t);
+    }
+    return out;
+}
+
 }  // namespace montage

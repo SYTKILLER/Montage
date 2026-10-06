@@ -221,7 +221,11 @@ void TileRenderer::drawQuad(GLuint program, float rx, float ry, float rw, float 
 
 void TileRenderer::drawTiles(const Layer& layer, float zoom, float panX, float panY, float vw,
                              float vh, const StrokeOverlay* stroke) {
-    const TileGrid& grid = *layer.pixels;
+    const std::shared_ptr<const TileGrid> effective = layer.effectivePixels();
+    if (effective == nullptr) {
+        return;
+    }
+    const TileGrid& grid = *effective;
     if (grid.cols == 0 || grid.rows == 0) {
         return;
     }
@@ -351,7 +355,7 @@ void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw
     int accIdx = 0;
     int composited = 0;
     for (const Layer& layer : doc.layers) {
-        if (!layer.visible || layer.pixels == nullptr) {
+        if (!layer.visible || layer.effectivePixels() == nullptr) {
             continue;
         }
         composited++;

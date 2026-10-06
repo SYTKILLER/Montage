@@ -45,40 +45,47 @@ void unpremultiply(std::vector<uint8_t>& rgba) {
     }
 }
 
-// 蒙版烘焙（对拍 maskOnLayerGrid 语义）：图层网格全图填 maskDefault，patch 贴到文档位置，
-// 然后乘进预乘像素。返回 false = 无可烘焙蒙版。
-bool bakeMask(psd::Record& rec) {
-    if (!rec.hasMask || rec.mask.empty() || rec.maskW <= 0 || rec.maskH <= 0 || rec.width <= 0 ||
-        rec.height <= 0) {
-        return false;
+// 蒙版网格构建（M5a 非破坏，对拍 bakeMask 的 maskOnLayerGrid 语义）：patch 原样入网格
+// （RGBA 灰度），offset = maskRect - layerRect，patch 外取 maskDefault。返回 null = 无蒙版。
+std::shared_ptr<LayerMask> buildMask(const psd::Record& rec) {
+    if (!rec.hasMask || rec.mask.empty() || rec.maskW <= 0 || rec.maskH <= 0) {
+        return nullptr;
     }
-    std::vector<uint8_t> full(static_cast<size_t>(rec.width) * rec.height, rec.maskDefault);
-    const int px = rec.maskLeft - rec.left;
-    const int py = rec.maskTop - rec.top;
-    for (int y = 0; y < rec.maskH; ++y) {
-        const int dy = py + y;
-        if (dy < 0 || dy >= rec.height) {
-            continue;
-        }
-        for (int x = 0; x < rec.maskW; ++x) {
-            const int dx = px + x;
-            if (dx < 0 || dx >= rec.width) {
-                continue;
+    const uint32_t cols = (static_cast<uint32_t>(rec.maskW) + kTileSize - 1u) / kTileSize;
+    const uint32_t rows = (static_cast<uint32_t>(rec.maskH) + kTileSize - 1u) / kTileSize;
+    TileGridBuilder builder(cols, rows);
+    for (uint32_t ty = 0; ty < rows; ++ty) {
+        const uint32_t y0 = ty * kTileSize;
+        const uint32_t copyH = std::min(kTileSize, static_cast<uint32_t>(rec.maskH) - y0);
+        for (uint32_t tx = 0; tx < cols; ++tx) {
+            const uint32_t x0 = tx * kTileSize;
+            const uint32_t copyW = std::min(kTileSize, static_cast<uint32_t>(rec.maskW) - x0);
+            EngineBuffer& buf = builder.ensureTile(tx, ty);
+            uint8_t* dst = buf.mapCpuWrite();
+            for (uint32_t r = 0; r < copyH; ++r) {
+                uint8_t* dstRow = dst + static_cast<size_t>(buf.rowBytes()) * r;
+                const uint8_t* srcRow =
+                    rec.mask.data() + static_cast<size_t>(y0 + r) * static_cast<uint32_t>(rec.maskW) + x0;
+                for (uint32_t x = 0; x < copyW; ++x) {
+                    const uint8_t g = srcRow[x];
+                    dstRow[x * 4u + 0u] = g;
+                    dstRow[x * 4u + 1u] = g;
+                    dstRow[x * 4u + 2u] = g;
+                    dstRow[x * 4u + 3u] = 255;
+                }
             }
-            full[static_cast<size_t>(dy) * rec.width + dx] =
-                rec.mask[static_cast<size_t>(y) * rec.maskW + x];
         }
     }
-    const size_t count = static_cast<size_t>(rec.width) * rec.height;
-    for (size_t i = 0; i < count; ++i) {
-        const uint16_t m = full[i];
-        for (int c = 0; c < 4; ++c) {
-            const size_t at = i * 4 + static_cast<size_t>(c);
-            rec.rgba[at] = static_cast<uint8_t>((rec.rgba[at] * m + 127) / 255);
-        }
-    }
-    rec.notes.push_back("Layer mask was baked into pixels (non-destructive editing arrives in M5).");
-    return true;
+    auto m = std::make_shared<LayerMask>();
+    m->pixels = builder.publish(1);
+    m->width = static_cast<uint32_t>(rec.maskW);
+    m->height = static_cast<uint32_t>(rec.maskH);
+    m->offsetX = rec.maskLeft - rec.left;
+    m->offsetY = rec.maskTop - rec.top;
+    m->outside = rec.maskDefault;
+    m->enabled = rec.maskEnabled;
+    m->linked = true;
+    return m;
 }
 
 // 剪贴烘焙：clip 像素 × base alpha（文档坐标对齐，预乘域等比缩放）
@@ -172,7 +179,6 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
         layer.transform.height = rec.height;
 
         if (!rec.isGroup && rec.width > 0 && rec.height > 0 && !rec.rgba.empty()) {
-            bakeMask(rec);
             if (rec.clipping) {
                 auto baseIt = baseForParent.find(parent);
                 if (baseIt != baseForParent.end()) {
@@ -214,6 +220,11 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
                 }
             }
             layer.pixels = builder.publish(1);
+            // M5a 非破坏蒙版：patch 独立成网格 + 合成派生网格（原 bakeMask 改为不改像素）
+            layer.mask = buildMask(rec);
+            if (layer.mask != nullptr && layer.mask->enabled) {
+                layer.render = composeMasked(layer.pixels, *layer.mask);
+            }
         } else if (rec.clipping) {
             rec.notes.push_back("This clipping mask's base isn't supported, so clipping was skipped.");
         }

@@ -27,6 +27,8 @@ napi_value AddLayer(napi_env env, napi_callback_info info);
 napi_value RemoveLayer(napi_env env, napi_callback_info info);
 napi_value SelectLayer(napi_env env, napi_callback_info info);
 napi_value SetLayerVisible(napi_env env, napi_callback_info info);
+// 蒙版（04 §1.2 / 02 §3 M5a）：启用/停用图层蒙版
+napi_value SetLayerMaskEnabled(napi_env env, napi_callback_info info);
 napi_value SetLayerOpacity(napi_env env, napi_callback_info info);
 napi_value SetLayerBlendMode(napi_env env, napi_callback_info info);
 napi_value ReorderLayer(napi_env env, napi_callback_info info);

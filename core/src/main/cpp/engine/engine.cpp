@@ -1,8 +1,29 @@
 #include "engine/engine.h"
 
+#include <algorithm>
+
 #include <hilog/log.h>
 
 namespace montage {
+
+namespace {
+
+// 单瓦片蒙版调制（草稿叠加用；瓦片位于图层局部坐标 tx/ty）
+void applyMaskToTile(const LayerMask& mask, std::vector<uint8_t>& px, uint32_t tx, uint32_t ty) {
+    constexpr uint32_t kTile = 256;
+    const int x0 = static_cast<int>(tx * kTile);
+    const int y0 = static_cast<int>(ty * kTile);
+    for (uint32_t r = 0; r < kTile; ++r) {
+        uint8_t* row = px.data() + static_cast<size_t>(r) * kTile * 4u;
+        for (uint32_t c = 0; c < kTile; ++c) {
+            const uint8_t m = layerMaskGrayAt(mask, x0 + static_cast<int>(c), y0 + static_cast<int>(r));
+            row[c * 4u + 3u] = static_cast<uint8_t>((row[c * 4u + 3u] * m + 127) / 255);
+        }
+    }
+}
+
+}  // namespace
+
 namespace {
 constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Engine";
@@ -97,6 +118,10 @@ void Engine::strokeThreadMain() {
                         if (l.id == lid && grid != nullptr) {
                             auto merged = draft->commitGrid(l.pixels.get());
                             l.pixels = merged;
+                            // M5a：蒙版启用图层提交后重合成派生网格
+                            if (l.mask != nullptr && l.mask->enabled) {
+                                l.render = composeMasked(l.pixels, *l.mask);
+                            }
                             break;
                         }
                     }
@@ -122,9 +147,24 @@ Engine::StrokeSnapshot Engine::copyStrokeSnapshotLocked() {
         snap.gridCols = draft->gridCols();
         snap.gridRows = draft->gridRows();
         snap.active = true;
+        // 蒙版启用的图层：草稿叠加同样乘蒙版（否则新笔画在蒙版外"画时可见、提交即消失"）
+        const Layer* maskLayer = nullptr;
+        for (const Layer& l : doc.layers) {
+            if (l.id == snap.layerId) {
+                maskLayer = &l;
+                break;
+            }
+        }
+        const LayerMask* mask =
+            (maskLayer != nullptr && maskLayer->mask != nullptr && maskLayer->mask->enabled)
+                ? maskLayer->mask.get()
+                : nullptr;
         for (const uint32_t key : draft->touchedTiles()) {
             std::vector<uint8_t> px;
             if (draft->tileFor(key % draft->gridCols(), key / draft->gridCols(), px)) {
+                if (mask != nullptr) {
+                    applyMaskToTile(*mask, px, key % draft->gridCols(), key / draft->gridCols());
+                }
                 snap.tiles[key] = std::move(px);
             }
         }

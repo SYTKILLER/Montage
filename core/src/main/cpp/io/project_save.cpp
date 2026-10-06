@@ -22,7 +22,7 @@ namespace {
 constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Save";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
-constexpr int kFormatVersion = 1;
+constexpr int kFormatVersion = 2;  // v2：+图层蒙版（maskFile/maskEnabled/maskOffset/maskOutside）
 constexpr int kDeflateLevel = 6;
 // 04 §1.3 格式上限（沿用上游档位，与引擎运行预算分立）
 constexpr uint32_t kMaxSide = 30000;
@@ -428,6 +428,14 @@ struct LayerSnapshot {
     uint32_t py = 0;
     uint32_t pw = 0;
     uint32_t ph = 0;
+    // M5a 蒙版
+    std::shared_ptr<const TileGrid> maskGrid;  // patch 网格（R=G=B=gray）
+    uint32_t maskW = 0;
+    uint32_t maskH = 0;
+    int maskOffsetX = 0;
+    int maskOffsetY = 0;
+    int maskOutside = 255;
+    bool maskEnabled = true;
 };
 
 struct DocSnapshot {
@@ -501,23 +509,38 @@ std::string buildManifest(const DocSnapshot& doc) {
     j += "  \"layers\": [\n";
     for (size_t i = 0; i < doc.layers.size(); ++i) {
         const LayerSnapshot& l = doc.layers[i];
-        j += "    {\n";
-        j += "      \"id\": " + std::to_string(l.id) + ",\n";
-        j += "      \"name\": " + jsonEscape(l.name) + ",\n";
-        j += std::string("      \"visible\": ") + (l.visible ? "true" : "false") + ",\n";
+        std::vector<std::string> fields;
+        fields.push_back("      \"id\": " + std::to_string(l.id));
+        fields.push_back("      \"name\": " + jsonEscape(l.name));
+        fields.push_back(std::string("      \"visible\": ") + (l.visible ? "true" : "false"));
         char num[32];
         std::snprintf(num, sizeof(num), "%.6g", l.opacity);
-        j += "      \"opacity\": " + std::string(num) + ",\n";
-        j += "      \"blendMode\": " + jsonEscape(blendModeName(l.blendMode)) + ",\n";
+        fields.push_back("      \"opacity\": " + std::string(num));
+        fields.push_back("      \"blendMode\": " + jsonEscape(blendModeName(l.blendMode)));
         if (l.pixels != nullptr) {
             // 图像以内容包围盒存出；originX/Y = 包围盒左上角在文档坐标系的落点（load 据此重建 Transform）
-            j += "      \"originX\": " + std::to_string(static_cast<int64_t>(l.originX)) + ",\n";
-            j += "      \"originY\": " + std::to_string(static_cast<int64_t>(l.originY)) + ",\n";
-            j += "      \"width\": " + std::to_string(l.pw) + ",\n";
-            j += "      \"height\": " + std::to_string(l.ph) + ",\n";
-            j += "      \"imageFile\": \"images/" + std::to_string(l.id) + ".png\"\n";
+            fields.push_back("      \"originX\": " + std::to_string(static_cast<int64_t>(l.originX)));
+            fields.push_back("      \"originY\": " + std::to_string(static_cast<int64_t>(l.originY)));
+            fields.push_back("      \"width\": " + std::to_string(l.pw));
+            fields.push_back("      \"height\": " + std::to_string(l.ph));
+            fields.push_back("      \"imageFile\": \"images/" + std::to_string(l.id) + ".png\"");
         } else {
-            j += "      \"imageFile\": null\n";
+            fields.push_back("      \"imageFile\": null");
+        }
+        if (l.maskGrid != nullptr) {
+            // v2 蒙版字段（v1 读取方按未知字段忽略）
+            fields.push_back("      \"maskFile\": \"images/" + std::to_string(l.id) + ".mask.png\"");
+            fields.push_back("      \"maskWidth\": " + std::to_string(l.maskW));
+            fields.push_back("      \"maskHeight\": " + std::to_string(l.maskH));
+            fields.push_back(std::string("      \"maskEnabled\": ") + (l.maskEnabled ? "true" : "false"));
+            fields.push_back("      \"maskOffsetX\": " + std::to_string(l.maskOffsetX));
+            fields.push_back("      \"maskOffsetY\": " + std::to_string(l.maskOffsetY));
+            fields.push_back("      \"maskOutside\": " + std::to_string(l.maskOutside));
+        }
+        j += "    {\n";
+        for (size_t f = 0; f < fields.size(); ++f) {
+            j += fields[f];
+            j += (f + 1 < fields.size()) ? ",\n" : "\n";
         }
         j += "    }";
         j += (i + 1 < doc.layers.size()) ? ",\n" : "\n";
@@ -554,6 +577,15 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
             s.pixels = l.pixels;
             s.originX = l.transform.originX;
             s.originY = l.transform.originY;
+            if (l.mask != nullptr) {
+                s.maskGrid = l.mask->pixels;
+                s.maskW = l.mask->width;
+                s.maskH = l.mask->height;
+                s.maskOffsetX = l.mask->offsetX;
+                s.maskOffsetY = l.mask->offsetY;
+                s.maskOutside = l.mask->outside;
+                s.maskEnabled = l.mask->enabled;
+            }
             snap.layers.push_back(std::move(s));
         }
     }
@@ -576,6 +608,9 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
         } else {
             l.pixels = nullptr;
         }
+        if (l.maskGrid != nullptr) {
+            totalPixels += static_cast<uint64_t>(l.maskW) * l.maskH;
+        }
     }
     if (totalPixels > kMaxTotalPixels) {
         close(fd);
@@ -583,8 +618,51 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
         return false;
     }
 
-    // 3) 包体：逐层 PNG（内容包围盒）→ manifest.json → central directory
+    // 3) 包体：逐层 PNG（内容包围盒）+ 蒙版 PNG → manifest.json → central directory
     ZipWriter zip(fd);
+    // 网格 → 全幅 PNG 条目（蒙版 patch 用；图层走 bbox 拼装分支）
+    auto encodeGridPng = [&](const TileGrid& grid, uint32_t w, uint32_t h,
+                             const std::string& name) -> bool {
+        if (!zip.beginEntry(name, 0)) {
+            err = "zip init failed";
+            return false;
+        }
+        PngRowEncoder png(zip, w, h);
+        if (!png.begin()) {
+            err = "png init failed";
+            return false;
+        }
+        std::vector<uint8_t> row(static_cast<size_t>(w) * 4u);
+        for (uint32_t ry = 0; ry < h; ++ry) {
+            const uint32_t ty = ry / kTileSize;
+            const uint32_t inTileY = ry % kTileSize;
+            for (uint32_t rx = 0; rx < w; rx += kTileSize) {
+                const uint32_t tx = rx / kTileSize;
+                const uint32_t copyW = std::min(kTileSize, w - rx);
+                auto it = grid.tiles.find(ty * grid.cols + tx);
+                if (it == grid.tiles.end()) {
+                    std::memset(row.data() + static_cast<size_t>(rx) * 4u, 0,
+                                static_cast<size_t>(copyW) * 4u);
+                    continue;
+                }
+                const uint8_t* src = it->second->pixels->mapCpu();
+                const uint32_t stride = it->second->pixels->rowBytes();
+                std::memcpy(row.data() + static_cast<size_t>(rx) * 4u,
+                            src + static_cast<size_t>(inTileY) * stride,
+                            static_cast<size_t>(copyW) * 4u);
+            }
+            if (!png.addRow(row.data())) {
+                err = "png encode failed";
+                return false;
+            }
+        }
+        if (!png.finish() || !zip.endEntry()) {
+            err = "png finalize failed";
+            return false;
+        }
+        return true;
+    };
+
     for (const LayerSnapshot& l : snap.layers) {
         if (l.pixels == nullptr) {
             continue;
@@ -630,6 +708,13 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
         }
         if (!png.finish() || !zip.endEntry()) {
             err = "png finalize failed";
+            close(fd);
+            return false;
+        }
+        // M5a：蒙版 patch 原样存出（整幅，无 bbox 裁剪）
+        if (l.maskGrid != nullptr &&
+            !encodeGridPng(*l.maskGrid, l.maskW, l.maskH,
+                           "images/" + std::to_string(l.id) + ".mask.png")) {
             close(fd);
             return false;
         }

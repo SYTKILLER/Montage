@@ -38,7 +38,7 @@ export interface OpenFileData {
   layerId: number;
 }
 
-/** 图层 DTO（02 §5；M2 无组/蒙版，字段保真常量占位）。 */
+/** 图层 DTO（02 §5；M2 无组，字段保真常量占位；M5a 起蒙版字段为真值）。 */
 export interface LayerDTO {
   id: number;
   name: string;
@@ -49,6 +49,7 @@ export interface LayerDTO {
   isGroup: boolean;
   parentId: number;
   hasMask: boolean;
+  maskEnabled: boolean;
   thumbToken: number;
 }
 
