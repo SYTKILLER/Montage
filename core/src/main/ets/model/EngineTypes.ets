@@ -106,3 +106,26 @@ export interface PixelTestData {
   /** ConvertPixelmapNativeToNapi 转换出的 PixelMap 样本（仅验证跨桥通路，M0 不解包使用）。 */
   samplePixelMap: Object | null;
 }
+
+/** 取色结果（samplePixel 的 data，M7.5 吸管；RGBA 0-255，合成结果采样）。 */
+export interface SamplePixelData {
+  ok: boolean;
+  red: number;
+  green: number;
+  blue: number;
+  alpha: number;
+}
+
+/** PNG 导出结果（exportPng 的 data，M7.5；PngRowEncoder 直写 fd）。 */
+export interface ExportPngData {
+  width: number;
+  height: number;
+  bytes: number;
+}
+
+/** 扁平化结果（flattenToPixelMap 的 data，M7.5 JPEG 导出；RGBA_8888 PixelMap）。 */
+export interface FlattenData {
+  width: number;
+  height: number;
+  pixelMap: Object | null;
+}

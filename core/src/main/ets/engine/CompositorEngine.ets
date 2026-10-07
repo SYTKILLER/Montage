@@ -1,7 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
-import { EngineStats, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, PixelProbe, PixelTestData, PsdOpenData, SaveProjectData, ViewportData } from '../model/EngineTypes';
+import { EngineStats, ExportPngData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -444,10 +444,13 @@ export class CompositorEngine {
 
   // M3.1：pressure ∈[0,1] 调制 dab 直径；缺省/无压感设备传 1
   beginStroke(x: number, y: number, pressure?: number): void {
-    if (pressure !== undefined) {
-      native.beginStroke(x, y, pressure);
-    } else {
-      native.beginStroke(x, y);
+    // native 命令是同步返回 Result 对象（非 Promise）；拒绝要留日志（验证期：静默拒绝=无声丢笔画）
+    const v: Object = pressure !== undefined
+      ? (native.beginStroke(x, y, pressure) as Object)
+      : (native.beginStroke(x, y) as Object);
+    const r = narrowResult(v);
+    if (!r.ok && r.error !== null) {
+      hilog.error(DOMAIN, TAG, 'beginStroke rejected: %{public}s', r.error.message);
     }
   }
 
@@ -483,6 +486,61 @@ export class CompositorEngine {
     return {
       pixelMap: pm !== undefined && pm !== null ? pm : null,
       ready: boolOf(r.data, 'ready'),
+    };
+  }
+
+  /** 图层重命名（M7.5 图层面板；直接改元数据，不入撤销）。 */
+  renameLayer(id: number, name: string): boolean {
+    const r = narrowResult(native.renameLayer(id, name) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'renameLayer failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  /** 取色（M7.5 吸管；合成结果区域采样，异步扁平化单区域）。 */
+  async samplePixel(x: number, y: number): Promise<SamplePixelData> {
+    const value: Object = await (native.samplePixel(x, y) as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok || r.data === null) {
+      throw new Error(r.error !== null ? r.error.message : 'samplePixel failed');
+    }
+    return {
+      ok: boolOf(r.data, 'ok'),
+      red: num(r.data, 'red'),
+      green: num(r.data, 'green'),
+      blue: num(r.data, 'blue'),
+      alpha: num(r.data, 'alpha'),
+    };
+  }
+
+  /** PNG 导出（M7.5：CPU 扁平化 → PngRowEncoder 流式直写 fd）。 */
+  async exportPng(fd: number): Promise<ExportPngData> {
+    const value: Object = await (native.exportPng(fd) as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok || r.data === null) {
+      throw new Error(r.error !== null ? r.error.message : 'exportPng failed');
+    }
+    return {
+      width: num(r.data, 'width'),
+      height: num(r.data, 'height'),
+      bytes: num(r.data, 'bytes'),
+    };
+  }
+
+  /** 扁平化为 PixelMap（M7.5：JPEG 导出走 ImagePacker；RGBA_8888 直 alpha）。 */
+  async flattenToPixelMap(): Promise<FlattenData> {
+    const value: Object = await (native.flattenToPixelMap() as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok || r.data === null) {
+      throw new Error(r.error !== null ? r.error.message : 'flattenToPixelMap failed');
+    }
+    const pm = r.data['pixelMap'];
+    return {
+      width: num(r.data, 'width'),
+      height: num(r.data, 'height'),
+      pixelMap: pm !== undefined && pm !== null ? pm : null,
     };
   }
 

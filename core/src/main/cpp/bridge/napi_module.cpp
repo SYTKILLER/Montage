@@ -44,6 +44,10 @@ napi_value Init(napi_env env, napi_value exports) {
         {"onRevisionChanged", nullptr, montage::bridge::OnRevisionChanged, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"onImportProgress", nullptr, montage::bridge::OnImportProgress, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"runPixelTest", nullptr, montage::bridge::RunPixelTest, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"renameLayer", nullptr, montage::bridge::RenameLayer, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"samplePixel", nullptr, montage::bridge::SamplePixel, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"exportPng", nullptr, montage::bridge::ExportPng, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"flattenToPixelMap", nullptr, montage::bridge::FlattenToPixelMap, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"dispose", nullptr, montage::bridge::Dispose, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props);

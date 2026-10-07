@@ -66,6 +66,11 @@ napi_value Undo(napi_env env, napi_callback_info info);
 napi_value Redo(napi_env env, napi_callback_info info);
 // M0 实测遗留：像素指针读写（Promise<{ok, data}>）
 napi_value RunPixelTest(napi_env env, napi_callback_info info);
+// M7.5 导出管线：重命名（同步，不入撤销）/ 取色（合成结果 1×1）/ PNG 直写 fd / 扁平化 PixelMap
+napi_value RenameLayer(napi_env env, napi_callback_info info);
+napi_value SamplePixel(napi_env env, napi_callback_info info);
+napi_value ExportPng(napi_env env, napi_callback_info info);
+napi_value FlattenToPixelMap(napi_env env, napi_callback_info info);
 // 页面销毁时释放回调与渲染线程
 napi_value Dispose(napi_env env, napi_callback_info info);
 

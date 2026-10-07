@@ -42,6 +42,13 @@ void Engine::requestRender() {
 void Engine::bumpRevisionLocked() {
     // 须持有 docMutex；版本经 TSFN 送 JS 线程（AppStorage docVersion，01 §6 事件面）
     docRevision++;
+    fireRevisionLocked();
+}
+
+void Engine::fireRevisionLocked() {
+    // 撤销/重做：docRevision 被恢复为快照版本（非自增），只广播不递增。
+    // 此前 undo 复用 bump 的自增会让 AppStorage 值恰好不变 → @Watch 不触发 →
+    // 图层面板/缩略图在撤销后不刷新（M7.5 模拟器实证修复）。
     if (revisionTsfn == nullptr) {
         return;
     }

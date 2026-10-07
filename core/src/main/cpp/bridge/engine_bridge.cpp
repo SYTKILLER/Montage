@@ -1,6 +1,7 @@
 #include "bridge/engine_bridge.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -13,6 +14,7 @@
 
 #include "engine/engine.h"
 #include "tiles/magic_wand.h"
+#include "io/image_export.h"
 #include "io/image_import.h"
 #include "io/project_open.h"
 #include "io/project_save.h"
@@ -233,6 +235,12 @@ napi_value NewDocument(napi_env env, napi_callback_info info) {
         e.doc.height = static_cast<uint32_t>(h);
         e.doc.name = "Untitled";
         e.viewport = Viewport{};
+        // M7.5：PS 语义——新建文档自带初始图层（此前零图层，首笔直接画会 no active layer）
+        Layer initial;
+        initial.id = e.nextLayerId();
+        initial.name = "图层 " + std::to_string(initial.id);
+        e.doc.layers.push_back(std::move(initial));
+        e.doc.activeId = e.doc.layers.back().id;
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -1545,6 +1553,7 @@ napi_value BeginStroke(napi_env env, napi_callback_info info) {
         e.strokeQueue.push_back({static_cast<float>(x), static_cast<float>(y),
                                  static_cast<float>(pressure), true, false});
         e.ensureStrokeThreadLocked();
+        e.strokeCv.notify_all();  // 唤醒笔画线程（此前缺失：线程 cv.wait 睡死、笔画不提交，M7.5 实证修复）
     }
     e.requestRender();
     return makeOk(env, nullptr);
@@ -1572,6 +1581,7 @@ napi_value ContinueStroke(napi_env env, napi_callback_info info) {
         e.strokeQueue.push_back({static_cast<float>(x), static_cast<float>(y),
                                  static_cast<float>(pressure), false, false});
         e.ensureStrokeThreadLocked();
+        e.strokeCv.notify_all();
     }
     return makeOk(env, nullptr);
 }
@@ -1582,6 +1592,7 @@ napi_value EndStroke(napi_env env, napi_callback_info /*info*/) {
         std::lock_guard<std::mutex> sk(e.strokeMtx);
         e.strokeQueue.push_back({0.0f, 0.0f, 1.0f, false, true});
         e.ensureStrokeThreadLocked();
+        e.strokeCv.notify_all();
     }
     return makeOk(env, nullptr);
 }
@@ -1596,7 +1607,7 @@ napi_value Undo(napi_env env, napi_callback_info /*info*/) {
         performed = e.history.undo(e.doc, rev, label);
         if (performed) {
             e.docRevision = static_cast<int64_t>(rev);
-            e.bumpRevisionLocked();
+            e.fireRevisionLocked();  // 恢复快照版本只广播（bump 的自增会让值恰好不变、@Watch 不触发）
             e.requestRender();
         }
     }
@@ -1619,7 +1630,7 @@ napi_value Redo(napi_env env, napi_callback_info /*info*/) {
         performed = e.history.redo(e.doc, rev, label);
         if (performed) {
             e.docRevision = static_cast<int64_t>(rev);
-            e.bumpRevisionLocked();
+            e.fireRevisionLocked();  // 同 undo：恢复快照版本只广播
             e.requestRender();
         }
     }
@@ -1711,6 +1722,281 @@ napi_value Dispose(napi_env env, napi_callback_info /*info*/) {
     }
     e.render.stop();
     return makeOk(env, nullptr);
+}
+
+// ---------- M7.5 导出管线（06 规划 §4）：renameLayer / samplePixel / exportPng / flattenToPixelMap ----------
+
+napi_value RenameLayer(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "renameLayer(id, name) requires 2 args");
+    }
+    double id = 0;
+    char buf[256] = {0};
+    size_t len = 0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok ||
+        napi_get_value_string_utf8(env, argv[1], buf, sizeof(buf), &len) != napi_ok) {
+        return makeError(env, kErrBadParam, "renameLayer: invalid args");
+    }
+    auto& e = Engine::get();
+    bool ok = false;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        if (l != nullptr) {
+            l->name = std::string(buf, len);
+            e.bumpRevisionLocked();
+            e.requestRender();
+            ok = true;
+        }
+    }
+    if (!ok) {
+        return makeError(env, kErrBadParam, "renameLayer: layer not found");
+    }
+    return makeOk(env, nullptr);
+}
+
+// 扁平化异步任务上下文（锁内建快照 → libuv 线程锁外计算 → JS 线程 resolve）
+struct ExportCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    io::FlattenJob job;
+    io::FlattenResult result;
+    double sampleX = 0;          // samplePixel 用
+    double sampleY = 0;
+    int fd = -1;                 // exportPng：fd 全路径接管（execute 内关闭）
+    uint64_t pngBytes = 0;
+};
+
+void finalizeExportCtx(napi_env /*env*/, void* data, void* /*hint*/) {
+    delete static_cast<ExportCtx*>(data);
+}
+
+napi_value SamplePixel(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "samplePixel(x, y) requires 2 args");
+    }
+    double x = 0;
+    double y = 0;
+    if (napi_get_value_double(env, argv[0], &x) != napi_ok ||
+        napi_get_value_double(env, argv[1], &y) != napi_ok) {
+        return makeError(env, kErrBadParam, "samplePixel: invalid args");
+    }
+    auto& e = Engine::get();
+    auto* ctx = new ExportCtx();
+    ctx->sampleX = x;
+    ctx->sampleY = y;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            delete ctx;
+            return makeError(env, kErrNoDoc, "samplePixel: no document");
+        }
+        ctx->job = io::BuildFlattenJob(e.doc, 0, 0, 0, 0);
+    }
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value workName = nullptr;
+    napi_create_string_utf8(env, "montageSamplePixel", NAPI_AUTO_LENGTH, &workName);
+    napi_status st = napi_create_async_work(
+        env, nullptr, workName,
+        [](napi_env /*env*/, void* data) {
+            auto* c = static_cast<ExportCtx*>(data);
+            const int px = static_cast<int>(std::floor(c->sampleX));
+            const int py = static_cast<int>(std::floor(c->sampleY));
+            c->result = io::FlattenVisible(c->job, px, py, 1, 1);
+        },
+        [](napi_env env, napi_status status, void* data) {
+            auto* c = static_cast<ExportCtx*>(data);
+            napi_value dataObj = nullptr;
+            napi_create_object(env, &dataObj);
+            if (status == napi_ok && c->result.ok && c->result.rgba.size() >= 4) {
+                napi_set_named_property(env, dataObj, "ok", makeBool(env, true));
+                napi_set_named_property(env, dataObj, "red", makeUint32(env, c->result.rgba[0]));
+                napi_set_named_property(env, dataObj, "green", makeUint32(env, c->result.rgba[1]));
+                napi_set_named_property(env, dataObj, "blue", makeUint32(env, c->result.rgba[2]));
+                napi_set_named_property(env, dataObj, "alpha", makeUint32(env, c->result.rgba[3]));
+            } else {
+                napi_set_named_property(env, dataObj, "ok", makeBool(env, false));
+                napi_set_named_property(env, dataObj, "red", makeUint32(env, 0));
+                napi_set_named_property(env, dataObj, "green", makeUint32(env, 0));
+                napi_set_named_property(env, dataObj, "blue", makeUint32(env, 0));
+                napi_set_named_property(env, dataObj, "alpha", makeUint32(env, 0));
+            }
+            napi_resolve_deferred(env, c->deferred, makeOk(env, dataObj));
+            napi_delete_async_work(env, c->work);
+            delete c;
+        },
+        ctx, &ctx->work);
+    if (st != napi_ok) {
+        delete ctx;
+        return makeError(env, kErrInternal, "create async work failed");
+    }
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+napi_value ExportPng(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "exportPng(fd) requires 1 arg");
+    }
+    int32_t fd = -1;
+    if (napi_get_value_int32(env, argv[0], &fd) != napi_ok || fd < 0) {
+        return makeError(env, kErrBadParam, "exportPng: invalid fd");
+    }
+    auto& e = Engine::get();
+    auto* ctx = new ExportCtx();
+    ctx->fd = fd;  // 全路径接管：execute 关闭（成功/失败都关）
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            delete ctx;
+            close(fd);
+            return makeError(env, kErrNoDoc, "exportPng: no document");
+        }
+        ctx->job = io::BuildFlattenJob(e.doc, 0, 0, 0, 0);
+    }
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value workName = nullptr;
+    napi_create_string_utf8(env, "montageExportPng", NAPI_AUTO_LENGTH, &workName);
+    napi_status st = napi_create_async_work(
+        env, nullptr, workName,
+        [](napi_env /*env*/, void* data) {
+            auto* c = static_cast<ExportCtx*>(data);
+            io::FlattenResult r = io::FlattenVisible(c->job, 0, 0, 0, 0);
+            c->result = std::move(r);
+            if (c->result.ok) {
+                std::string err;
+                if (!io::WritePngToFd(c->fd, c->result.width, c->result.height, c->result.rgba,
+                                      &c->pngBytes, &err)) {
+                    c->result.ok = false;
+                    c->result.error = err;
+                }
+            }
+            close(c->fd);
+            c->fd = -1;
+        },
+        [](napi_env env, napi_status status, void* data) {
+            auto* c = static_cast<ExportCtx*>(data);
+            if (c->fd >= 0) {
+                close(c->fd);  // 兜底（create 失败路径不会到这，但防御）
+                c->fd = -1;
+            }
+            if (status == napi_ok && c->result.ok) {
+                napi_value dataObj = nullptr;
+                napi_create_object(env, &dataObj);
+                napi_set_named_property(env, dataObj, "width", makeUint32(env, c->result.width));
+                napi_set_named_property(env, dataObj, "height", makeUint32(env, c->result.height));
+                napi_set_named_property(env, dataObj, "bytes", makeDouble(env, static_cast<double>(c->pngBytes)));
+                napi_resolve_deferred(env, c->deferred, makeOk(env, dataObj));
+            } else {
+                napi_resolve_deferred(env, c->deferred,
+                                      makeError(env, kErrInternal, c->result.error.empty()
+                                          ? "exportPng failed" : c->result.error));
+            }
+            napi_delete_async_work(env, c->work);
+            delete c;
+        },
+        ctx, &ctx->work);
+    if (st != napi_ok) {
+        close(fd);
+        delete ctx;
+        return makeError(env, kErrInternal, "create async work failed");
+    }
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+napi_value FlattenToPixelMap(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    auto* ctx = new ExportCtx();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            delete ctx;
+            return makeError(env, kErrNoDoc, "flattenToPixelMap: no document");
+        }
+        ctx->job = io::BuildFlattenJob(e.doc, 0, 0, 0, 0);
+    }
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value workName = nullptr;
+    napi_create_string_utf8(env, "montageFlatten", NAPI_AUTO_LENGTH, &workName);
+    napi_status st = napi_create_async_work(
+        env, nullptr, workName,
+        [](napi_env /*env*/, void* data) {
+            auto* c = static_cast<ExportCtx*>(data);
+            c->result = io::FlattenVisible(c->job, 0, 0, 0, 0);
+        },
+        [](napi_env env, napi_status status, void* data) {
+            auto* c = static_cast<ExportCtx*>(data);
+            if (status != napi_ok || !c->result.ok || c->result.rgba.empty()) {
+                napi_resolve_deferred(env, c->deferred,
+                                      makeError(env, kErrInternal, c->result.error.empty()
+                                          ? "flatten failed" : c->result.error));
+                napi_delete_async_work(env, c->work);
+                delete c;
+                return;
+            }
+            // RGBA_8888 直 alpha → PixelMap（显式声明格式与 alphaType，M4b 教训）
+            OH_Pixelmap_InitializationOptions* opts = nullptr;
+            OH_PixelmapInitializationOptions_Create(&opts);
+            if (opts != nullptr) {
+                OH_PixelmapInitializationOptions_SetWidth(opts, c->result.width);
+                OH_PixelmapInitializationOptions_SetHeight(opts, c->result.height);
+                OH_PixelmapInitializationOptions_SetPixelFormat(opts, PIXEL_FORMAT_RGBA_8888);
+                OH_PixelmapInitializationOptions_SetAlphaType(opts, PIXELMAP_ALPHA_TYPE_UNPREMULTIPLIED);
+            }
+            OH_PixelmapNative* pm = nullptr;
+            Image_ErrorCode crc = OH_PixelmapNative_CreatePixelmap(
+                const_cast<uint8_t*>(c->result.rgba.data()), c->result.rgba.size(), opts, &pm);
+            if (opts != nullptr) {
+                OH_PixelmapInitializationOptions_Release(opts);
+            }
+            if (crc != IMAGE_SUCCESS || pm == nullptr) {
+                napi_resolve_deferred(env, c->deferred,
+                                      makeError(env, kErrInternal, "createPixelmap rc=" +
+                                          std::to_string(static_cast<int>(crc))));
+                napi_delete_async_work(env, c->work);
+                delete c;
+                return;
+            }
+            napi_value pmValue = nullptr;
+            crc = OH_PixelmapNative_ConvertPixelmapNativeToNapi(env, pm, &pmValue);
+            OH_PixelmapNative_Release(pm);  // napi 值持独立引用（M0 runPixelTest 同款）
+            if (crc != IMAGE_SUCCESS || pmValue == nullptr) {
+                napi_resolve_deferred(env, c->deferred,
+                                      makeError(env, kErrInternal, "convert napi rc=" +
+                                          std::to_string(static_cast<int>(crc))));
+                napi_delete_async_work(env, c->work);
+                delete c;
+                return;
+            }
+            napi_value dataObj = nullptr;
+            napi_create_object(env, &dataObj);
+            napi_set_named_property(env, dataObj, "width", makeUint32(env, c->result.width));
+            napi_set_named_property(env, dataObj, "height", makeUint32(env, c->result.height));
+            napi_set_named_property(env, dataObj, "pixelMap", pmValue);
+            napi_resolve_deferred(env, c->deferred, makeOk(env, dataObj));
+            napi_delete_async_work(env, c->work);
+            delete c;
+        },
+        ctx, &ctx->work);
+    if (st != napi_ok) {
+        delete ctx;
+        return makeError(env, kErrInternal, "create async work failed");
+    }
+    napi_queue_async_work(env, ctx->work);
+    return promise;
 }
 
 }  // namespace bridge

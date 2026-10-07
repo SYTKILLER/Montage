@@ -9,12 +9,56 @@
       "value": "#0A0A0A"
     },
     {
+      "name": "surface",
+      "value": "#1F1F21"
+    },
+    {
+      "name": "panel_background",
+      "value": "#141416"
+    },
+    {
+      "name": "bar_background",
+      "value": "#1A1A1C"
+    },
+    {
+      "name": "canvas_backdrop",
+      "value": "#202022"
+    },
+    {
       "name": "text_primary",
       "value": "#E5E5E5"
     },
     {
       "name": "text_secondary",
       "value": "#999999"
+    },
+    {
+      "name": "accent",
+      "value": "#4C8DF0"
+    },
+    {
+      "name": "on_accent",
+      "value": "#0B1B2B"
+    },
+    {
+      "name": "accent_container",
+      "value": "#334C8DF0"
+    },
+    {
+      "name": "border",
+      "value": "#2E2E30"
+    },
+    {
+      "name": "divider",
+      "value": "#262628"
+    },
+    {
+      "name": "icon_muted",
+      "value": "#6E7276"
+    },
+    {
+      "name": "danger",
+      "value": "#FF6B5E"
     }
   ]
 }

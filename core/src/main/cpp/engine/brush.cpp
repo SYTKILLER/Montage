@@ -441,13 +441,12 @@ void StrokeDraft::paintTile(uint32_t key) {
             p[0] = p[1] = p[2] = p[3] = 0;
             continue;
         }
-        const float cr = settings_.red;
-        const float cg = settings_.green;
-        const float cb = settings_.blue;
+        const float srcRgb[3] = {settings_.red, settings_.green, settings_.blue};
         // premult 合成后转回直通：out_rgb = (src_rgb·covA + dst_rgb·as·(1-covA)) / ao
+        // （M7.5 验证期修复：原实现三通道全用 cr，任何笔色都画成灰白）
         for (int c = 0; c < 3; ++c) {
             const float d = p[static_cast<size_t>(c)] / 255.0f;
-            const float outP = cr * covA + d * as * (1.0f - covA);
+            const float outP = srcRgb[c] * covA + d * as * (1.0f - covA);
             p[static_cast<size_t>(c)] =
                 static_cast<uint8_t>(std::lround(std::min(1.0f, outP / ao) * 255.0f));
         }

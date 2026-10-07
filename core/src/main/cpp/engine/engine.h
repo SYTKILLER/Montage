@@ -86,6 +86,8 @@ class Engine {
 
     // 锁内 bump 文档版本并经 TSFN 通知（须持有 docMutex）
     void bumpRevisionLocked();
+    // 锁内只广播当前 docRevision（不递增）——撤销/重做恢复快照版本后用（M7.5）
+    void fireRevisionLocked();
 
     void resetDocument();  // 关闭文档：取消导入、清空、请求渲染
 
