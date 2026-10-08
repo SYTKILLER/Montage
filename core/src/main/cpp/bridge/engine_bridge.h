@@ -70,6 +70,8 @@ napi_value RunPixelTest(napi_env env, napi_callback_info info);
 napi_value RenameLayer(napi_env env, napi_callback_info info);
 napi_value SamplePixel(napi_env env, napi_callback_info info);
 napi_value ExportPng(napi_env env, napi_callback_info info);
+// M8b：PSD 导出（8-bit RGB，层/蒙版/剪贴/混合键/luni 中文名）
+napi_value ExportPsd(napi_env env, napi_callback_info info);
 napi_value FlattenToPixelMap(napi_env env, napi_callback_info info);
 // M8a 无损文档操作：画布重设（裁剪/画布大小）/ 裁切 / 显示全部 / 90°旋转 / 翻转 /
 // 移动图层（三段事务）/ 选区平移

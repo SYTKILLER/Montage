@@ -1,7 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
-import { EngineStats, ExportPngData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData } from '../model/EngineTypes';
+import { EngineStats, ExportPngData, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -571,6 +571,30 @@ export class CompositorEngine {
       width: num(r.data, 'width'),
       height: num(r.data, 'height'),
       bytes: num(r.data, 'bytes'),
+    };
+  }
+
+  /** PSD 导出（M8b：层/蒙版/剪贴/混合键/luni 中文名；调整层跳过+提示）。 */
+  async exportPsd(fd: number): Promise<ExportPsdData> {
+    const value: Object = await (native.exportPsd(fd) as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok || r.data === null) {
+      throw new Error(r.error !== null ? r.error.message : 'exportPsd failed');
+    }
+    const notesRaw = r.data['notes'];
+    const notes: string[] = [];
+    if (notesRaw !== undefined && notesRaw !== null) {
+      const arr = notesRaw as Array<Object>;
+      for (const item of arr) {
+        if (typeof item === 'string') {
+          notes.push(item);
+        }
+      }
+    }
+    return {
+      layers: num(r.data, 'layers'),
+      bytes: num(r.data, 'bytes'),
+      notes: notes,
     };
   }
 

@@ -737,7 +737,7 @@ struct Index {
       this.toast('无文档可导出');
       return;
     }
-    const ext = format === 'png' ? 'png' : 'jpg';
+    const ext = format === 'png' ? 'png' : (format === 'psd' ? 'psd' : 'jpg');
     const opt = new picker.DocumentSaveOptions();
     opt.newFileNames = [`${this.docName().replace(/\.(montage|png|jpg|jpeg)$/i, '') || '未命名'}.${ext}`];
     const dp = new picker.DocumentViewPicker();
@@ -756,6 +756,22 @@ struct Index {
     this.busyText = '扁平合成中…';
     const t0 = Date.now();
     const f = fs.openSync(uri, fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
+    if (format === 'psd') {
+      // PSD：层/蒙版/剪贴非破坏导出（M8b）
+      this.engine.exportPsd(f.fd).then((d): void => {
+        this.busyText = '';
+        this.log(`PSD 导出 ${d.layers} 层 ${d.bytes} 字节（${Date.now() - t0}ms）→ ${uri}`);
+        for (let i = 0; i < d.notes.length && i < 5; i++) {
+          this.log(`PSD 提示: ${d.notes[i]}`);
+        }
+        this.toast(`PSD 已导出（${d.layers} 层）`);
+      }).catch((e: BusinessError): void => {
+        this.busyText = '';
+        this.log(`PSD 导出失败: ${e.message}`);
+        this.toast('PSD 导出失败');
+      });
+      return;
+    }
     if (format === 'png') {
       // PNG：引擎 PngRowEncoder 流式直写 fd（绕系统编解码器，M4c 教训）
       this.engine.exportPng(f.fd).then((d): void => {

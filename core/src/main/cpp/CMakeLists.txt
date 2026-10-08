@@ -14,6 +14,7 @@ add_library(compositor SHARED
         engine/transform_ops.cpp
         io/image_import.cpp
         io/image_export.cpp
+        io/psd_export.cpp
         io/png_decode.cpp
         io/project_open.cpp
         io/project_save.cpp

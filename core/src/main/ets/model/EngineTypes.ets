@@ -135,3 +135,10 @@ export interface OpResultData {
   changed: boolean;
   moved: boolean;
 }
+
+/** PSD 导出结果（exportPsd 的 data，M8b；notes = 跳过/降级提示）。 */
+export interface ExportPsdData {
+  layers: number;
+  bytes: number;
+  notes: string[];
+}

@@ -20,6 +20,7 @@
 #include "io/project_open.h"
 #include "io/project_save.h"
 #include "io/psd/psd_import.h"
+#include "io/psd_export.h"
 #include "render/render_loop.h"
 #include "tiles/pixel_probe.h"
 
@@ -2009,6 +2010,8 @@ struct ExportCtx {
     double sampleY = 0;
     int fd = -1;                 // exportPng：fd 全路径接管（execute 内关闭）
     uint64_t pngBytes = 0;
+    io::PsdDocSnap psdSnap;      // exportPsd 用
+    io::PsdExportResult psdResult;
 };
 
 void finalizeExportCtx(napi_env /*env*/, void* data, void* /*hint*/) {
@@ -2143,6 +2146,110 @@ napi_value ExportPng(napi_env env, napi_callback_info info) {
                 napi_resolve_deferred(env, c->deferred,
                                       makeError(env, kErrInternal, c->result.error.empty()
                                           ? "exportPng failed" : c->result.error));
+            }
+            napi_delete_async_work(env, c->work);
+            delete c;
+        },
+        ctx, &ctx->work);
+    if (st != napi_ok) {
+        close(fd);
+        delete ctx;
+        return makeError(env, kErrInternal, "create async work failed");
+    }
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+// M8b：PSD 导出（锁内拍快照 + 扁平化任务，锁外编码写出；fd 全路径接管）
+napi_value ExportPsd(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "exportPsd(fd) requires 1 arg");
+    }
+    int32_t fd = -1;
+    if (napi_get_value_int32(env, argv[0], &fd) != napi_ok || fd < 0) {
+        return makeError(env, kErrBadParam, "exportPsd: invalid fd");
+    }
+    auto& e = Engine::get();
+    auto* ctx = new ExportCtx();
+    ctx->fd = fd;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            delete ctx;
+            close(fd);
+            return makeError(env, kErrNoDoc, "exportPsd: no document");
+        }
+        io::PsdDocSnap snap;
+        snap.width = e.doc.width;
+        snap.height = e.doc.height;
+        snap.name = e.doc.name;
+        for (const Layer& l : e.doc.layers) {
+            io::PsdLayerSnap pl;
+            pl.name = l.name;
+            pl.visible = l.visible;
+            pl.opacity = l.opacity;
+            pl.blendMode = l.blendMode;
+            pl.clipping = l.clipping;
+            pl.pixels = l.effectivePixels();
+            pl.originX = l.transform.originX;
+            pl.originY = l.transform.originY;
+            if (l.mask != nullptr) {
+                pl.maskGrid = l.mask->pixels;
+                pl.maskW = l.mask->width;
+                pl.maskH = l.mask->height;
+                pl.maskOffsetX = l.mask->offsetX;
+                pl.maskOffsetY = l.mask->offsetY;
+                pl.maskOutside = l.mask->outside;
+                pl.maskEnabled = l.mask->enabled;
+            }
+            pl.isAdjustment = l.adjustment != nullptr;
+            snap.layers.push_back(std::move(pl));
+        }
+        ctx->psdSnap = std::move(snap);
+        ctx->job = io::BuildFlattenJob(e.doc, 0, 0, 0, 0);
+    }
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value workName = nullptr;
+    napi_create_string_utf8(env, "montageExportPsd", NAPI_AUTO_LENGTH, &workName);
+    napi_status st = napi_create_async_work(
+        env, nullptr, workName,
+        [](napi_env /*env*/, void* data) {
+            auto* c = static_cast<ExportCtx*>(data);
+            io::FlattenResult r = io::FlattenVisible(c->job, 0, 0, 0, 0);
+            if (r.ok && !r.rgba.empty()) {
+                c->psdSnap.flattenedRgba = std::make_shared<std::vector<uint8_t>>(std::move(r.rgba));
+            }
+            io::PsdExportResult pr = io::exportPsd(c->fd, c->psdSnap);
+            c->fd = -1;
+            c->psdResult = std::move(pr);
+        },
+        [](napi_env env, napi_status status, void* data) {
+            auto* c = static_cast<ExportCtx*>(data);
+            if (c->fd >= 0) {
+                close(c->fd);
+                c->fd = -1;
+            }
+            if (status == napi_ok && c->psdResult.ok) {
+                napi_value dataObj = nullptr;
+                napi_create_object(env, &dataObj);
+                napi_set_named_property(env, dataObj, "layers", makeUint32(env, c->psdResult.layers));
+                napi_set_named_property(env, dataObj, "bytes", makeDouble(env, static_cast<double>(c->psdResult.bytes)));
+                napi_value arr = nullptr;
+                napi_create_array(env, &arr);
+                uint32_t n = 0;
+                for (const std::string& note : c->psdResult.notes) {
+                    napi_set_element(env, arr, n++, makeString(env, note));
+                }
+                napi_set_named_property(env, dataObj, "notes", arr);
+                napi_resolve_deferred(env, c->deferred, makeOk(env, dataObj));
+            } else {
+                napi_resolve_deferred(env, c->deferred,
+                                      makeError(env, kErrInternal, c->psdResult.error.empty()
+                                          ? "exportPsd failed" : c->psdResult.error));
             }
             napi_delete_async_work(env, c->work);
             delete c;

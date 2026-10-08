@@ -49,6 +49,16 @@ export struct ExportDialog {
               })
             Text('JPEG').fontSize(13).fontColor($r('app.color.text_primary'))
           }
+          Row({ space: 6 }) {
+            Radio({ value: 'PSD', group: 'exportFmt' })
+              .checked(this.formatIdx === 2)
+              .onChange((on: boolean): void => {
+                if (on) {
+                  this.formatIdx = 2;
+                }
+              })
+            Text('PSD（保留图层）').fontSize(13).fontColor($r('app.color.text_primary'))
+          }
         }
 
         if (this.formatIdx === 1) {
@@ -81,7 +91,7 @@ export struct ExportDialog {
             .width(96)
             .backgroundColor($r('app.color.accent'))
             .fontColor($r('app.color.on_accent'))
-            .onClick((): void => this.onConfirm(this.formatIdx === 0 ? 'png' : 'jpeg', this.quality))
+            .onClick((): void => this.onConfirm(this.formatIdx === 0 ? 'png' : (this.formatIdx === 1 ? 'jpeg' : 'psd'), this.quality))
         }
         .justifyContent(FlexAlign.End)
         .width('100%')

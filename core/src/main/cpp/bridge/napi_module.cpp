@@ -47,6 +47,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"renameLayer", nullptr, montage::bridge::RenameLayer, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"samplePixel", nullptr, montage::bridge::SamplePixel, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"exportPng", nullptr, montage::bridge::ExportPng, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"exportPsd", nullptr, montage::bridge::ExportPsd, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"flattenToPixelMap", nullptr, montage::bridge::FlattenToPixelMap, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"resizeCanvas", nullptr, montage::bridge::ResizeCanvas, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"trimCanvas", nullptr, montage::bridge::TrimCanvas, nullptr, nullptr, nullptr, napi_default, nullptr},

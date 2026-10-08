@@ -1,6 +1,7 @@
 #include "io/psd/psd_reader.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <map>
 
