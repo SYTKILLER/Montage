@@ -287,11 +287,13 @@ void RenderLoop::doFrame() {
     Document docSnap;
     Viewport vp;
     Engine::StrokeSnapshot strokeSnap;
+    Engine::TransformPreview transformPreview;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
         docSnap = e.doc;  // shared_ptr 拷贝（02 §7 帧快照）
         vp = e.viewport;
         strokeSnap = e.copyStrokeSnapshotLocked();
+        transformPreview = e.transformPreview;
     }
     TileRenderer::StrokeOverlay overlay;
     if (strokeSnap.active) {
@@ -302,7 +304,16 @@ void RenderLoop::doFrame() {
     }
 
     renderer_.ensureInit();
-    renderer_.drawFrame(docSnap, vp, w, h, strokeSnap.active ? &overlay : nullptr);
+    TileRenderer::LayerXformPreview xformPreview;
+    if (transformPreview.active) {
+        xformPreview.layerId = transformPreview.layerId;
+        xformPreview.active = true;
+        for (int i = 0; i < 6; ++i) {
+            xformPreview.m[i] = transformPreview.m[i];
+        }
+    }
+    renderer_.drawFrame(docSnap, vp, w, h, strokeSnap.active ? &overlay : nullptr,
+                        transformPreview.active ? &xformPreview : nullptr);
 
     if (eglSwapBuffers(display_, surface_) != EGL_TRUE) {
         std::lock_guard<std::mutex> lk(statsMtx_);

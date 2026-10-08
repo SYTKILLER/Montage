@@ -1,7 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
-import { EngineStats, ExportPngData, HistogramData, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData } from '../model/EngineTypes';
+import { EngineStats, ExportPngData, HistogramData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -575,6 +575,39 @@ export class CompositorEngine {
   resampleDocument(w: number, h: number): boolean {
     const r = narrowResult(native.resampleDocument(w, h) as Object);
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
+  }
+
+  /** 变换 overlay bbox（M8.1；进入 overlay 态）。 */
+  beginTransformOverlay(): TransformOverlayBox | null {
+    const r = narrowResult(native.beginTransformOverlay() as Object);
+    if (!r.ok || r.data === null) {
+      return null;
+    }
+    return {
+      left: num(r.data, 'left'), top: num(r.data, 'top'),
+      width: num(r.data, 'width'), height: num(r.data, 'height'),
+    };
+  }
+
+  /** 拖拽实时预览矩阵（M8.1）。 */
+  setTransformPreview(active: boolean, m: number[]): void {
+    if (active && m.length >= 6) {
+      native.setTransformPreview(active, m[0], m[1], m[2], m[3], m[4], m[5]);
+    } else {
+      native.setTransformPreview(active);
+    }
+  }
+
+  /** 矩阵烘焙（M8.1；overlay 确认；异步 warp 防主线程 freeze）。 */
+  async bakeLayerMatrix(id: number, m: number[]): Promise<boolean> {
+    const value: Object = await (native.bakeLayerMatrix(id, m[0], m[1], m[2], m[3], m[4], m[5]) as Promise<Object>);
+    const r = narrowResult(value);
+    return r.ok && r.data !== null && boolOf(r.data, 'changed');
+  }
+
+  /** 取消 overlay（M8.1）。 */
+  cancelTransformOverlay(): void {
+    native.cancelTransformOverlay();
   }
 
   /** 自由变换烘焙（M8d；围绕枢轴 缩放/旋转/斜切，提交式）。 */

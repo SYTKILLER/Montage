@@ -61,6 +61,14 @@ class Engine {
     void ensureStrokeThreadLocked();        // 须持 strokeMtx；幂等，先 join 已退出线程
     void strokeThreadMain();
 
+    // M8.1 自由变换预览（overlay 拖拽实时预览；docMutex 保护）
+    struct TransformPreview {
+        LayerId layerId = 0;
+        bool active = false;
+        double m[6] = {1.0, 0.0, 0.0, 0.0, 1.0, 0.0};  // doc→doc 行主序
+    };
+    TransformPreview transformPreview;
+
     // M4a 撤销
     History history;
     std::atomic<uint32_t> historyVersion{0};

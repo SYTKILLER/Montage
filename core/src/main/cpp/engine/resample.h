@@ -26,6 +26,9 @@ bool rotateDocumentArbitrary(Document& doc, double degreesCw);
 bool bakeLayerTransform(Document& doc, LayerId id, double scaleX, double scaleY,
                         double rotDegCw, double skewDeg, double pivotX, double pivotY);
 
+// M8.1 矩阵版烘焙（overlay 状态机的任意 2x3 仿射；行主序 x'=m0·x+m1·y+m2）。
+bool bakeLayerMatrix(Document& doc, LayerId id, const double m[6]);
+
 }  // namespace montage
 
 #endif  // MONTAGE_ENGINE_RESAMPLE_H

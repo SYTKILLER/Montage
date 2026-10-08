@@ -244,7 +244,7 @@ void TileRenderer::invalidate() {
 }
 
 void TileRenderer::drawQuad(GLuint program, float rx, float ry, float rw, float rh, float zoom,
-                            float panX, float panY, float vw, float vh) {
+                            float panX, float panY, float vw, float vh, const double* xform) {
     glUseProgram(program);
     const GLint rectLoc = glGetUniformLocation(program, "uRect");
     const GLint viewLoc = glGetUniformLocation(program, "uView");
@@ -252,13 +252,37 @@ void TileRenderer::drawQuad(GLuint program, float rx, float ry, float rw, float 
     glUniform4f(rectLoc, rx, ry, rw, rh);
     glUniform4f(viewLoc, zoom, panX, panY, 0.0f);
     glUniform2f(vpLoc, vw, vh);
+    // uXform：行主序 [a,b,c, d,e,f]（x'=a·x+b·y+c）→ GL 列主序 mat3
+    float m[9];
+    if (xform != nullptr) {
+        m[0] = static_cast<float>(xform[0]);
+        m[1] = static_cast<float>(xform[3]);
+        m[2] = 0.0f;
+        m[3] = static_cast<float>(xform[1]);
+        m[4] = static_cast<float>(xform[4]);
+        m[5] = 0.0f;
+        m[6] = static_cast<float>(xform[2]);
+        m[7] = static_cast<float>(xform[5]);
+        m[8] = 1.0f;
+    } else {
+        m[0] = 1.0f;
+        m[1] = 0.0f;
+        m[2] = 0.0f;
+        m[3] = 0.0f;
+        m[4] = 1.0f;
+        m[5] = 0.0f;
+        m[6] = 0.0f;
+        m[7] = 0.0f;
+        m[8] = 1.0f;
+    }
+    glUniformMatrix3fv(glGetUniformLocation(program, "uXform"), 1, GL_FALSE, m);
     glBindVertexArray(vao_);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glBindVertexArray(0);
 }
 
 void TileRenderer::drawTiles(const Layer& layer, float zoom, float panX, float panY, float vw,
-                             float vh, const StrokeOverlay* stroke) {
+                             float vh, const StrokeOverlay* stroke, const double* xform) {
     const std::shared_ptr<const TileGrid> effective = layer.effectivePixels();
     if (effective == nullptr) {
         return;
@@ -275,13 +299,21 @@ void TileRenderer::drawTiles(const Layer& layer, float zoom, float panX, float p
     const float docY0 = panY;
     const float docX1 = panX + vw / zoom;
     const float docY1 = panY + vh / zoom;
-    const uint32_t tx0 = static_cast<uint32_t>(std::max(0.0f, std::floor((docX0 - ox) / kTileSize)));
-    const uint32_t ty0 = static_cast<uint32_t>(std::max(0.0f, std::floor((docY0 - oy) / kTileSize)));
-    const uint32_t tx1 = std::min(grid.cols - 1u, static_cast<uint32_t>(
+    uint32_t tx0 = static_cast<uint32_t>(std::max(0.0f, std::floor((docX0 - ox) / kTileSize)));
+    uint32_t ty0 = static_cast<uint32_t>(std::max(0.0f, std::floor((docY0 - oy) / kTileSize)));
+    uint32_t tx1 = std::min(grid.cols - 1u, static_cast<uint32_t>(
         std::max(0.0f, std::floor((docX1 - ox) / kTileSize))));
-    const uint32_t ty1 = std::min(grid.rows - 1u, static_cast<uint32_t>(
+    uint32_t ty1 = std::min(grid.rows - 1u, static_cast<uint32_t>(
         std::max(0.0f, std::floor((docY1 - oy) / kTileSize))));
     const bool wantNearest = zoom >= 2.0f;  // 03 §6：≥200% 切 NEAREST（crispZoom）
+    // M8.1 变换预览：xform 层不做视口剔除（变换后 bbox 计算复杂且预览层瓦片有限），
+    // 稀疏网格空白瓦片循环内天然跳过
+    if (xform != nullptr) {
+        tx0 = 0;
+        ty0 = 0;
+        tx1 = grid.cols - 1u;
+        ty1 = grid.rows - 1u;
+    }
 
     glUseProgram(tileProg_);
     glUniform1i(glGetUniformLocation(tileProg_, "uTex"), 0);
@@ -311,7 +343,7 @@ void TileRenderer::drawTiles(const Layer& layer, float zoom, float panX, float p
                     drawQuad(tileProg_, ox + static_cast<float>(tx * kTileSize),
                              oy + static_cast<float>(ty * kTileSize),
                              static_cast<float>(kTileSize), static_cast<float>(kTileSize), zoom,
-                             panX, panY, static_cast<float>(vw), static_cast<float>(vh));
+                             panX, panY, static_cast<float>(vw), static_cast<float>(vh), xform);
                     continue;
                 }
             }
@@ -359,7 +391,7 @@ void TileRenderer::drawTiles(const Layer& layer, float zoom, float panX, float p
             drawQuad(tileProg_, ox + static_cast<float>(tx * kTileSize),
                      oy + static_cast<float>(ty * kTileSize),
                      static_cast<float>(kTileSize), static_cast<float>(kTileSize), zoom, panX, panY,
-                     static_cast<float>(vw), static_cast<float>(vh));
+                     static_cast<float>(vw), static_cast<float>(vh), xform);
         }
     }
 }
@@ -473,7 +505,7 @@ void TileRenderer::drawAnts(float phase) {
 }
 
 void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw, int32_t vh,
-                             const StrokeOverlay* stroke) {
+                             const StrokeOverlay* stroke, const LayerXformPreview* preview) {
     frame_++;
     glViewport(0, 0, vw, vh);
     // 画布外背板：中性灰（05 §7：与主题解耦，对齐 PS 行为）
@@ -552,7 +584,9 @@ void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw
         glClear(GL_COLOR_BUFFER_BIT);
         glDisable(GL_BLEND);
         drawTiles(layer, zoom, panX, panY, vw, vh,
-                  stroke != nullptr && stroke->layerId == layer.id ? stroke : nullptr);
+                  stroke != nullptr && stroke->layerId == layer.id ? stroke : nullptr,
+                  preview != nullptr && preview->active && preview->layerId == layer.id
+                      ? preview->m : nullptr);
 
         GLuint srcTex = layerTex_;
         if (!layer.clipping) {

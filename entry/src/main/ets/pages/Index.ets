@@ -3,7 +3,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
 import { window } from '@kit.ArkUI';
-import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, PsdOpenData, SaveProjectData, ViewportData } from 'core';
+import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, SaveProjectData, ViewportData } from 'core';
 import { AppPrefs, RecentProject, ThemeMode } from '../editor/AppPrefs';
 import { leafItem, MenuGroupVM, MenuItemVM, subItem, ToolVM } from '../editor/MenuModel';
 import { Toolbox } from '../editor/components/Toolbox';
@@ -12,6 +12,7 @@ import { StatusBar } from '../editor/components/StatusBar';
 import { WelcomeView } from '../editor/components/WelcomeView';
 import { LayersPanel, ThumbEntry } from '../editor/components/LayersPanel';
 import { ExportDialog } from '../editor/components/ExportDialog';
+import { TransformOverlay } from '../editor/components/TransformOverlay';
 import { ABOUT_TEXT, InfoDialog, SHORTCUT_ROWS } from '../editor/components/InfoDialog';
 
 const TAG: string = 'Montage.Shell';
@@ -106,6 +107,8 @@ struct Index {
   @State showRotateAny: boolean = false;
   @State angleText: string = '';
   @State showTransform: boolean = false;
+  @State overlayBox: TransformOverlayBox | null = null;  // M8.1 手柄 overlay 态
+  @State overlayMat: number[] = [1, 0, 0, 0, 1, 0];
   @State tfScale: number = 100;   // %
   @State tfRotate: number = 0;    // 度
   @State tfSkew: number = 0;      // 度
@@ -1034,6 +1037,9 @@ struct Index {
         }
         break;
       case 'layer.transform':
+        this.enterTransformOverlay();
+        break;
+      case 'layer.transformNumeric':
         if (this.docOpen && this.activeLayer() !== undefined) {
           this.tfScale = 100;
           this.tfRotate = 0;
@@ -1085,6 +1091,59 @@ struct Index {
     this.docOp((): boolean => this.engine.bakeLayerTransform(id, scale, scale,
       this.tfRotate, this.tfSkew, this.docW / 2, this.docH / 2),
       `自由变换 ${Math.round(this.tfScale)}%/${this.tfRotate}°`);
+  }
+  private enterTransformOverlay(): void {
+    if (!this.docOpen || this.activeLayer() === undefined) {
+      return;
+    }
+    const box = this.engine.beginTransformOverlay();
+    if (box === null) {
+      this.toast('活动图层无内容');
+      return;
+    }
+    this.overlayBox = box;
+    this.overlayMat = [1, 0, 0, 0, 1, 0];
+    this.maskTarget = false;
+    this.log(`变换 overlay 进入 (${box.left},${box.top} ${box.width}x${box.height})`);
+  }
+
+  private async commitTransformOverlay(): Promise<void> {
+    const a = this.activeLayer();
+    const box = this.overlayBox;
+    if (a === undefined || box === null) {
+      return;
+    }
+    const id = a.id;
+    const mat = this.overlayMat;
+    this.overlayBox = null;  // 先撤 overlay（烘焙异步进行，渲染即回未变换态）
+    const changed = await this.engine.bakeLayerMatrix(id, mat);
+    if (changed) {
+      this.hasSelectionFlag = false;
+      this.refreshDocMeta();
+      this.toast('变换已应用');
+      this.log('自由变换烘焙完成');
+    }
+  }
+
+  private cancelTransformOverlayUi(): void {
+    this.engine.cancelTransformOverlay();
+    this.overlayBox = null;
+  }
+  private composeOverlayMat(tx: number, ty: number, sx: number, sy: number): number[] {
+    const box = this.overlayBox;
+    if (box === null) {
+      return [1, 0, 0, 0, 1, 0];
+    }
+    const cx = box.left + box.width / 2;
+    const cy = box.top + box.height / 2;
+    // M = T(tx,ty) - T(C) - S - T(-C)（围绕框中心缩放 + 平移）
+    const m0 = sx;
+    const m1 = 0;
+    const m2 = tx + cx - sx * cx;
+    const m3 = 0;
+    const m4 = sy;
+    const m5 = ty + cy - sy * cy;
+    return [m0, m1, m2, m3, m4, m5];
   }
   private applyTheme(mode: ThemeMode): void {
     this.themeMode = mode;
@@ -1163,7 +1222,8 @@ struct Index {
       leafItem('image.revealAll', '显示全部', '', d),
     ];
     const layer: MenuItemVM[] = [
-      leafItem('layer.transform', '自由变换（数值）…', 'Ctrl+T', d),
+      leafItem('layer.transform', '自由变换', 'Ctrl+T', d),
+      leafItem('layer.transformNumeric', '数值变换…', '', d),
       leafItem('layer.new', '新建图层', '', d),
       leafItem('layer.rename', '重命名…', '', this.activeLayer() !== undefined),
       leafItem('layer.delete', '删除图层', '', this.activeLayer() !== undefined),
@@ -1276,6 +1336,15 @@ struct Index {
         this.showShortcuts = false;
         this.showAbout = false;
         this.showTheme = false;
+      }
+      return;
+    }
+    // 变换 overlay：Enter 确认 / Esc 取消
+    if (this.overlayBox !== null) {
+      if (e.keyCode === KC_ENTER) {
+        this.commitTransformOverlay();
+      } else if (e.keyCode === KC_ESC) {
+        this.cancelTransformOverlayUi();
       }
       return;
     }
@@ -1518,7 +1587,24 @@ struct Index {
               .onTouch((e: TouchEvent): void => {
                 this.onTouchEvent(e);
               })
-            // 矩形选区拖拽预览（GL 蚂蚁线在提交后接管）
+            // M8.1 自由变换手柄 overlay
+            if (this.overlayBox !== null) {
+              TransformOverlay({
+                ovLeft: this.overlayBox.left,
+                ovTop: this.overlayBox.top,
+                ovWidth: this.overlayBox.width,
+                ovHeight: this.overlayBox.height,
+                zoom: this.zoom,
+                panX: this.panX,
+                panY: this.panY,
+                pxPerVp: this.pxPerVp(),
+                onMatrix: (tx: number, ty: number, sx: number, sy: number): void => {
+                  this.overlayMat = this.composeOverlayMat(tx, ty, sx, sy);
+                  this.engine.setTransformPreview(true, this.overlayMat);  // GL 实时预览
+                }
+              })
+            }
+                        // 矩形选区拖拽预览（GL 蚂蚁线在提交后接管）
             if (this.rectDrag) {
               Column()
                 .position({

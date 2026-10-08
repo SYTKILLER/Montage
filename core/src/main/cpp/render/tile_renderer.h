@@ -28,9 +28,15 @@ class TileRenderer {
         uint32_t gridRows = 0;
         const std::map<uint32_t, std::vector<uint8_t>>* tiles = nullptr;
     };
+    // M8.1：自由变换预览（layerId 匹配的层经 doc→doc 仿射实时绘制）
+    struct LayerXformPreview {
+        LayerId layerId = 0;
+        bool active = false;
+        double m[6] = {1.0, 0.0, 0.0, 0.0, 1.0, 0.0};  // 行主序 x'=m0·x+m1·y+m2
+    };
     // 绘制一帧（背板 + 棋盘格 + 图层栈合成）。vw/vh = 视口 px。
     void drawFrame(const Document& doc, const Viewport& vp, int32_t vw, int32_t vh,
-                   const StrokeOverlay* stroke);
+                   const StrokeOverlay* stroke, const LayerXformPreview* preview = nullptr);
     // 上下文销毁/丢失时清空全部 GL 资源（03 R3.9：派生缓存语义）
     void invalidate();
 
@@ -47,9 +53,9 @@ class TileRenderer {
     bool ensureFbos(int32_t vw, int32_t vh);
     void destroyFbos();
     void drawQuad(GLuint program, float rx, float ry, float rw, float rh, float zoom, float panX,
-                  float panY, float vw, float vh);
+                  float panY, float vw, float vh, const double* xform = nullptr);
     void drawTiles(const Layer& layer, float zoom, float panX, float panY, float vw, float vh,
-                   const StrokeOverlay* stroke);
+                   const StrokeOverlay* stroke, const double* xform = nullptr);  // M8.1：doc→doc 仿射预览
     void uploadLut(const float* lut256);
     void uploadLutRgba(const float r[256], const float g[256], const float b[256]);  // M9a  // M6a：调整层 LUT 上传
     void rebuildAnts(const Document& doc);  // M7b：selection 变更时重建蚂蚁线缓冲

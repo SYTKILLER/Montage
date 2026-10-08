@@ -90,6 +90,11 @@ napi_value ResampleDocument(napi_env env, napi_callback_info info);
 napi_value RotateDocumentArbitrary(napi_env env, napi_callback_info info);
 // M8d：自由变换烘焙（id, scaleX, scaleY, rotDeg, skewDeg, pivotX, pivotY）
 napi_value BakeLayerTransform(napi_env env, napi_callback_info info);
+// M8.1：overlay 进入（返回内容 bbox）/ 实时预览矩阵 / 矩阵烘焙 / 取消
+napi_value BeginTransformOverlay(napi_env env, napi_callback_info info);
+napi_value SetTransformPreview(napi_env env, napi_callback_info info);
+napi_value BakeLayerMatrix(napi_env env, napi_callback_info info);
+napi_value CancelTransformOverlay(napi_env env, napi_callback_info info);
 // 页面销毁时释放回调与渲染线程
 napi_value Dispose(napi_env env, napi_callback_info info);
 

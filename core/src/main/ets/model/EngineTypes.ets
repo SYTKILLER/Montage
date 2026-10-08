@@ -155,3 +155,11 @@ export interface HistogramData {
   g: number[];
   b: number[];
 }
+
+/** 变换 overlay 初始框（beginTransformOverlay 的 data，M8.1；doc 坐标）。 */
+export interface TransformOverlayBox {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}

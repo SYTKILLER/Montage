@@ -15,13 +15,15 @@ layout(location=0) in vec2 aPos;              // 单位 quad 0..1
 uniform vec4 uRect;                           // 文档空间 x,y,w,h
 uniform vec4 uView;                           // zoom, panX, panY, -
 uniform vec2 uViewport;                       // 视口 px
+uniform mat3 uXform;                          // M8.1：doc→doc 仿射（单位阵=直通）
 out vec2 vDoc;
 void main() {
   vec2 doc = uRect.xy + aPos * uRect.zw;
-  vec2 screen = (doc - uView.yz) * uView.x;
+  vDoc = doc;  // 纹理采样坐标 = 原始 doc（M8.1：几何变换不改变瓦片采样）
+  vec2 xdoc = (uXform * vec3(doc, 1.0)).xy;
+  vec2 screen = (xdoc - uView.yz) * uView.x;
   vec2 clip = vec2(screen.x / uViewport.x * 2.0 - 1.0, 1.0 - screen.y / uViewport.y * 2.0);
   gl_Position = vec4(clip, 0.0, 1.0);
-  vDoc = doc;
 }
 )";
 

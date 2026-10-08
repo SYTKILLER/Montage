@@ -61,6 +61,10 @@ napi_value Init(napi_env env, napi_value exports) {
         {"resampleDocument", nullptr, montage::bridge::ResampleDocument, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"rotateDocumentArbitrary", nullptr, montage::bridge::RotateDocumentArbitrary, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"bakeLayerTransform", nullptr, montage::bridge::BakeLayerTransform, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"beginTransformOverlay", nullptr, montage::bridge::BeginTransformOverlay, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setTransformPreview", nullptr, montage::bridge::SetTransformPreview, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"bakeLayerMatrix", nullptr, montage::bridge::BakeLayerMatrix, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"cancelTransformOverlay", nullptr, montage::bridge::CancelTransformOverlay, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"dispose", nullptr, montage::bridge::Dispose, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props);

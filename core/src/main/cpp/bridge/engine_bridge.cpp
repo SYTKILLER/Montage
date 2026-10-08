@@ -2208,6 +2208,167 @@ napi_value BakeLayerTransform(napi_env env, napi_callback_info info) {
     return makeOk(env, data);
 }
 
+// M8.1：自由变换 overlay——进入（返回活动层内容 bbox；返回后 overlay 显示框）
+napi_value BeginTransformOverlay(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    int bx = 0, by = 0, bw = 0, bh = 0;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "beginTransformOverlay: no document");
+        }
+        const Layer* active = nullptr;
+        for (const Layer& l : e.doc.layers) {
+            if (l.id == e.doc.activeId) {
+                active = &l;
+                break;
+            }
+        }
+        if (active == nullptr || active->effectivePixels() == nullptr) {
+            return makeError(env, kErrBadParam, "beginTransformOverlay: empty active layer");
+        }
+        if (!visibleContentBBox(e.doc, bx, by, bw, bh)) {
+            return makeError(env, kErrBadParam, "beginTransformOverlay: no content");
+        }
+        Engine::TransformPreview tp;
+        tp.layerId = active->id;
+        tp.active = true;  // 单位阵（无变换）
+        e.transformPreview = tp;
+        e.requestRender();
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "left", makeInt32(env, bx));
+    napi_set_named_property(env, data, "top", makeInt32(env, by));
+    napi_set_named_property(env, data, "width", makeInt32(env, bw));
+    napi_set_named_property(env, data, "height", makeInt32(env, bh));
+    return makeOk(env, data);
+}
+
+// M8.1：拖拽实时预览矩阵（active=false 取消预览）
+napi_value SetTransformPreview(napi_env env, napi_callback_info info) {
+    size_t argc = 8;
+    napi_value argv[8] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "setTransformPreview requires args");
+    }
+    bool active = false;
+    if (napi_get_value_bool(env, argv[0], &active) != napi_ok) {
+        return makeError(env, kErrBadParam, "setTransformPreview: invalid active");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        e.transformPreview.active = active;
+        if (active && argc >= 7) {
+            for (int i = 0; i < 6; ++i) {
+                double v = 0;
+                if (napi_get_value_double(env, argv[i + 1], &v) == napi_ok) {
+                    e.transformPreview.m[i] = v;
+                }
+            }
+        }
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// M8.1：矩阵烘焙（overlay 确认；异步 warp 防主线程 freeze；一步撤销；清除预览态）
+struct BakeCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    Document docSnap;   // 锁内整档拷贝（shared_ptr 共享瓦片，O(层数)）
+    double id = 0;
+    double m[6] = {1, 0, 0, 0, 1, 0};
+    bool ok = false;
+};
+
+napi_value BakeLayerMatrix(napi_env env, napi_callback_info info) {
+    size_t argc = 7;
+    napi_value argv[7] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 7) {
+        return makeError(env, kErrBadParam, "bakeLayerMatrix(id,m0..m5) requires 7 args");
+    }
+    auto* ctx = new BakeCtx();
+    for (int i = 0; i < 7; ++i) {
+        if (napi_get_value_double(env, argv[i], &ctx->id) != napi_ok && i > 0) {
+            // id 用 argv[0]；m 用 argv[1..6]，逐个回填
+        }
+    }
+    {
+        double m6[6] = {0};
+        for (int i = 1; i < 7; ++i) {
+            if (napi_get_value_double(env, argv[i], &m6[i - 1]) != napi_ok) {
+                delete ctx;
+                return makeError(env, kErrBadParam, "bakeLayerMatrix: invalid args");
+            }
+            ctx->m[i - 1] = m6[i - 1];
+        }
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            delete ctx;
+            return makeError(env, kErrNoDoc, "bakeLayerMatrix: no document");
+        }
+        ctx->docSnap = e.doc;
+        // 预览态即清（渲染回到未变换；烘焙结果异步发布）
+        e.transformPreview.active = false;
+        e.requestRender();
+    }
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value workName = nullptr;
+    napi_create_string_utf8(env, "montageBakeXform", NAPI_AUTO_LENGTH, &workName);
+    napi_status st = napi_create_async_work(
+        env, nullptr, workName,
+        [](napi_env /*env*/, void* data) {
+            auto* c = static_cast<BakeCtx*>(data);
+            // 锁内替换整档（bake 结果 + history 事务）
+            auto& e = Engine::get();
+            std::lock_guard<std::mutex> lk(e.docMutex);
+            e.history.beginEdit(c->docSnap, "free transform",
+                                static_cast<uint64_t>(e.docRevision));
+            c->ok = bakeLayerMatrix(c->docSnap, static_cast<LayerId>(c->id), c->m);
+            e.history.endEdit(c->docSnap, static_cast<uint64_t>(e.docRevision));
+            if (c->ok) {
+                e.doc = c->docSnap;
+                e.bumpRevisionLocked();
+                e.requestRender();
+            }
+        },
+        [](napi_env env, napi_status status, void* data) {
+            auto* c = static_cast<BakeCtx*>(data);
+            napi_value dataObj = nullptr;
+            napi_create_object(env, &dataObj);
+            napi_set_named_property(env, dataObj, "changed", makeBool(env, status == napi_ok && c->ok));
+            napi_resolve_deferred(env, c->deferred, makeOk(env, dataObj));
+            napi_delete_async_work(env, c->work);
+            delete c;
+        },
+        ctx, &ctx->work);
+    if (st != napi_ok) {
+        delete ctx;
+        return makeError(env, kErrInternal, "create async work failed");
+    }
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+// M8.1 取消（清预览态）
+napi_value CancelTransformOverlay(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        e.transformPreview.active = false;
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
 // M9a：调整层 kind 切换 + 通用参数（id, kind, p0..p3；kind 对齐 AdjustmentKind 枚举）
 napi_value SetAdjustmentKind(napi_env env, napi_callback_info info) {
     size_t argc = 6;
