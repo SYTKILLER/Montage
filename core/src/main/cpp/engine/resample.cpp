@@ -280,4 +280,90 @@ bool rotateDocumentArbitrary(Document& doc, double degreesCw) {
     return true;
 }
 
+
+bool bakeLayerTransform(Document& doc, LayerId id, double scaleX, double scaleY,
+                        double rotDegCw, double skewDeg, double pivotX, double pivotY) {
+    if (doc.width == 0 || doc.height == 0) {
+        return false;
+    }
+    Layer* target = nullptr;
+    for (Layer& l : doc.layers) {
+        if (l.id == id) {
+            target = &l;
+            break;
+        }
+    }
+    if (target == nullptr || target->pixels == nullptr) {
+        return false;
+    }
+    Layer& l = *target;
+    const double rad = rotDegCw * 3.14159265358979323846 / 180.0;
+    const double cr = std::cos(rad);
+    const double sr = std::sin(rad);
+    const double k = std::tan(skewDeg * 3.14159265358979323846 / 180.0);
+    // 行主序 x' = m0·x + m1·y + m2：M = T(p) · R · SkewX · S · T(-p)
+    const double m0 = cr * scaleX + (-sr) * k * scaleY;
+    const double m1 = -sr * scaleY;
+    const double m2 = pivotX - m0 * pivotX - m1 * pivotY;
+    const double m3 = sr * scaleX + cr * k * scaleY;
+    const double m4 = cr * scaleY;
+    const double m5 = pivotY - m3 * pivotX - m4 * pivotY;
+    const double mm[6] = {m0, m1, m2, m3, m4, m5};
+    const double gw = static_cast<double>(l.pixels->cols * kTile);
+    const double gh = static_cast<double>(l.pixels->rows * kTile);
+    const double gx[4] = {0.0, gw, 0.0, gw};
+    const double gy[4] = {0.0, 0.0, gh, gh};
+    double nx0 = 1e18, ny0 = 1e18, nx1 = -1e18, ny1 = -1e18;
+    for (int i = 0; i < 4; ++i) {
+        const double nx = m0 * gx[i] + m1 * gy[i] + m2;
+        const double ny = m3 * gx[i] + m4 * gy[i] + m5;
+        nx0 = std::min(nx0, nx);
+        ny0 = std::min(ny0, ny);
+        nx1 = std::max(nx1, nx);
+        ny1 = std::max(ny1, ny);
+    }
+    const uint32_t newCols = std::max(1u, static_cast<uint32_t>(std::ceil(nx1 - nx0)));
+    const uint32_t newRows = std::max(1u, static_cast<uint32_t>(std::ceil(ny1 - ny0)));
+    const double lm[6] = {m0, m1, m2 - nx0, m3, m4, m5 - ny0};
+    l.pixels = warpGridAffine(*l.pixels, lm, newCols, newRows);
+    // origin_new = M(origin_old) + (nx0, ny0)（内容 doc 位置守恒，T7 单测推导）
+    const double tox = m0 * l.transform.originX + m1 * l.transform.originY + m2;
+    const double toy = m3 * l.transform.originX + m4 * l.transform.originY + m5;
+    l.transform.originX = tox + nx0;
+    l.transform.originY = toy + ny0;
+    if (l.mask != nullptr) {
+        auto m2m = std::make_shared<LayerMask>(*l.mask);
+        if (m2m->pixels != nullptr) {
+            const double mgw = static_cast<double>(m2m->pixels->cols * kTile);
+            const double mgh = static_cast<double>(m2m->pixels->rows * kTile);
+            const double mgx[4] = {0.0, mgw, 0.0, mgw};
+            const double mgy[4] = {0.0, 0.0, mgh, mgh};
+            double mnx0 = 1e18, mny0 = 1e18, mnx1 = -1e18, mny1 = -1e18;
+            for (int i = 0; i < 4; ++i) {
+                const double nx = m0 * mgx[i] + m1 * mgy[i] + m2;
+                const double ny = m3 * mgx[i] + m4 * mgy[i] + m5;
+                mnx0 = std::min(mnx0, nx);
+                mny0 = std::min(mny0, ny);
+                mnx1 = std::max(mnx1, nx);
+                mny1 = std::max(mny1, ny);
+            }
+            const uint32_t mCols = std::max(1u, static_cast<uint32_t>(std::ceil(mnx1 - mnx0)));
+            const uint32_t mRows = std::max(1u, static_cast<uint32_t>(std::ceil(mny1 - mny0)));
+            const double mlm[6] = {m0, m1, m2 - mnx0, m3, m4, m5 - mny0};
+            m2m->pixels = warpGridAffine(*m2m->pixels, mlm, mCols, mRows);
+            m2m->width = mCols;
+            m2m->height = mRows;
+            const double mox = static_cast<double>(m2m->offsetX);
+            const double moy = static_cast<double>(m2m->offsetY);
+            m2m->offsetX = static_cast<int>(std::lround(m0 * mox + m1 * moy + m2 + mnx0));
+            m2m->offsetY = static_cast<int>(std::lround(m3 * mox + m4 * moy + m5 + mny0));
+        }
+        l.mask = std::move(m2m);
+    }
+    if (l.mask != nullptr && l.mask->enabled && l.pixels != nullptr) {
+        l.render = composeMasked(l.pixels, *l.mask);
+    }
+    return true;
+}
+
 }  // namespace montage

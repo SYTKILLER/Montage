@@ -47,6 +47,7 @@ const KC_CTRL_R: number = 2073;
 const KC_NUM0: number = 2000;
 const KC_NUM1: number = 2001;
 const KC_ESC: number = 2070;
+const KC_T_KEY: number = 2036;
 const KC_ENTER: number = 2054;
 const KC_UP: number = 2012;
 const KC_DOWN: number = 2013;
@@ -104,6 +105,10 @@ struct Index {
   @State imgHText: string = '';
   @State showRotateAny: boolean = false;
   @State angleText: string = '';
+  @State showTransform: boolean = false;
+  @State tfScale: number = 100;   // %
+  @State tfRotate: number = 0;    // 度
+  @State tfSkew: number = 0;      // 度
   @State thumbVersion: number = 0;
 
   private engine: CompositorEngine = new CompositorEngine();
@@ -1028,6 +1033,14 @@ struct Index {
           this.showRotateAny = true;
         }
         break;
+      case 'layer.transform':
+        if (this.docOpen && this.activeLayer() !== undefined) {
+          this.tfScale = 100;
+          this.tfRotate = 0;
+          this.tfSkew = 0;
+          this.showTransform = true;
+        }
+        break;
       case 'theme.system':
       case 'theme.light':
       case 'theme.dark':
@@ -1060,6 +1073,18 @@ struct Index {
     }
     this.showRotateAny = false;
     this.docOp((): boolean => this.engine.rotateDocumentArbitrary(deg), `旋转 ${deg} 度`);
+  }
+  private commitTransform(): void {
+    const a = this.activeLayer();
+    if (a === undefined || !this.docOpen) {
+      return;
+    }
+    this.showTransform = false;
+    const scale = this.tfScale / 100;
+    const id = a.id;
+    this.docOp((): boolean => this.engine.bakeLayerTransform(id, scale, scale,
+      this.tfRotate, this.tfSkew, this.docW / 2, this.docH / 2),
+      `自由变换 ${Math.round(this.tfScale)}%/${this.tfRotate}°`);
   }
   private applyTheme(mode: ThemeMode): void {
     this.themeMode = mode;
@@ -1138,6 +1163,7 @@ struct Index {
       leafItem('image.revealAll', '显示全部', '', d),
     ];
     const layer: MenuItemVM[] = [
+      leafItem('layer.transform', '自由变换（数值）…', 'Ctrl+T', d),
       leafItem('layer.new', '新建图层', '', d),
       leafItem('layer.rename', '重命名…', '', this.activeLayer() !== undefined),
       leafItem('layer.delete', '删除图层', '', this.activeLayer() !== undefined),
@@ -1242,8 +1268,9 @@ struct Index {
       return;
     }
     // 对话框打开时：Esc 关闭，其余不抢
-    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme) {
+    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform) {
       if (e.keyCode === KC_ESC) {
+        this.showTransform = false;
         this.showExport = false;
         this.showRename = false;
         this.showShortcuts = false;
@@ -1315,6 +1342,9 @@ struct Index {
         case KC_D:
           this.runCommand('select.deselect');
           break;
+        case KC_T_KEY:
+          this.runCommand('layer.transform');
+        break;
         default:
           break;
       }
@@ -1739,6 +1769,41 @@ struct Index {
             }.justifyContent(FlexAlign.End).width('100%')
           }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
             .border({ width: 1, color: $r('app.color.border') }).width(400)
+        }.width('100%').height('100%')
+      }
+            if (this.showTransform) {
+        Stack() {
+          Column().width('100%').height('100%').backgroundColor('#66000000')
+            .onClick((): void => { this.showTransform = false; })
+          Column({ space: 14 }) {
+            Text('自由变换（围绕画布中心）').fontSize(16).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+            Row({ space: 10 }) {
+              Text('缩放%').fontSize(13).fontColor($r('app.color.text_secondary'))
+              TextInput({ text: this.tfScale.toString() }).width(90).height(40)
+                .onChange((v: string): void => { this.tfScale = parseFloat(v) || 0; })
+              Text('旋转°').fontSize(13).fontColor($r('app.color.text_secondary'))
+              TextInput({ text: this.tfRotate.toString() }).width(90).height(40)
+                .onChange((v: string): void => { this.tfRotate = parseFloat(v) || 0; })
+              Text('斜切°').fontSize(13).fontColor($r('app.color.text_secondary'))
+              TextInput({ text: this.tfSkew.toString() }).width(90).height(40)
+                .onChange((v: string): void => { this.tfSkew = parseFloat(v) || 0; })
+            }
+            Text('确认后烘焙进图层（一步撤销）。Esc 取消。')
+              .fontSize(11).fontColor($r('app.color.text_secondary'))
+            Row({ space: 12 }) {
+              Button('取消').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.surface'))
+                .fontColor($r('app.color.text_primary'))
+                .border({ width: 1, color: $r('app.color.border') })
+                .onClick((): void => { this.showTransform = false; })
+              Button('应用变换').fontSize(14).height(40).width(120)
+                .backgroundColor($r('app.color.accent'))
+                .fontColor($r('app.color.on_accent'))
+                .onClick((): void => this.commitTransform())
+            }.justifyContent(FlexAlign.End).width('100%')
+          }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
+            .border({ width: 1, color: $r('app.color.border') }).width(480)
         }.width('100%').height('100%')
       }
             if (this.showAbout || this.showShortcuts || this.showTheme) {

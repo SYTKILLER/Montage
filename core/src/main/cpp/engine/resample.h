@@ -21,6 +21,11 @@ bool resampleDocument(Document& doc, uint32_t newW, uint32_t newH);
 // 任意角旋转（顺时针度数；文档域扩至旋转包围盒；层像素/蒙版经仿射核重采样）。
 bool rotateDocumentArbitrary(Document& doc, double degreesCw);
 
+// M8d 自由变换烘焙：围绕枢轴的 缩放/旋转/斜切 一次性仿射（提交式，PS 普通层语义）。
+// 层网格 warp 到新包围盒；origin/蒙版同步；history 事务由 bridge 包裹。
+bool bakeLayerTransform(Document& doc, LayerId id, double scaleX, double scaleY,
+                        double rotDegCw, double skewDeg, double pivotX, double pivotY);
+
 }  // namespace montage
 
 #endif  // MONTAGE_ENGINE_RESAMPLE_H

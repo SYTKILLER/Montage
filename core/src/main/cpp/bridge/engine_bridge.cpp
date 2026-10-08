@@ -2161,6 +2161,48 @@ napi_value ExportPng(napi_env env, napi_callback_info info) {
     return promise;
 }
 
+// M8d：自由变换烘焙（围绕枢轴 缩放/旋转/斜切；history 事务）
+napi_value BakeLayerTransform(napi_env env, napi_callback_info info) {
+    size_t argc = 8;
+    napi_value argv[8] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 8) {
+        return makeError(env, kErrBadParam,
+                         "bakeLayerTransform(id,sx,sy,rot,skew,px,py) requires 8 args");
+    }
+    double p[7] = {0};
+    for (int i = 1; i < 8; ++i) {
+        if (napi_get_value_double(env, argv[i], &p[i - 1]) != napi_ok) {
+            return makeError(env, kErrBadParam, "bakeLayerTransform: invalid args");
+        }
+    }
+    double id = 0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "bakeLayerTransform: invalid id");
+    }
+    auto& e = Engine::get();
+    bool ok = false;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "bakeLayerTransform: no document");
+        }
+        e.history.beginEdit(e.doc, "free transform", static_cast<uint64_t>(e.docRevision));
+        ok = bakeLayerTransform(e.doc, static_cast<LayerId>(id), p[0], p[1], p[2], p[3], p[4], p[5]);
+        if (ok) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.bumpRevisionLocked();
+            e.requestRender();
+        } else {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        }
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "changed", makeBool(env, ok));
+    return makeOk(env, data);
+}
+
 // M8c：图像大小重采样（history 事务）
 napi_value ResampleDocument(napi_env env, napi_callback_info info) {
     size_t argc = 2;

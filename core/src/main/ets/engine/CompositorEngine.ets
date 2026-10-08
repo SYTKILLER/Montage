@@ -544,6 +544,17 @@ export class CompositorEngine {
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
+  /** 自由变换烘焙（M8d；围绕枢轴 缩放/旋转/斜切，提交式）。 */
+  bakeLayerTransform(id: number, scaleX: number, scaleY: number, rotDeg: number,
+                     skewDeg: number, pivotX: number, pivotY: number): boolean {
+    const r = narrowResult(native.bakeLayerTransform(id, scaleX, scaleY, rotDeg,
+      skewDeg, pivotX, pivotY) as Object);
+    if (!r.ok && r.error !== null) {
+      hilog.error(DOMAIN, TAG, 'bakeLayerTransform rejected: %{public}s', r.error.message);
+    }
+    return r.ok && r.data !== null && boolOf(r.data, 'changed');
+  }
+
   /** 任意角旋转（M8c；顺时针度）。 */
   rotateDocumentArbitrary(deg: number): boolean {
     const r = narrowResult(native.rotateDocumentArbitrary(deg) as Object);

@@ -85,6 +85,8 @@ napi_value TranslateSelection(napi_env env, napi_callback_info info);
 // M8c：图像大小重采样 / 任意角旋转
 napi_value ResampleDocument(napi_env env, napi_callback_info info);
 napi_value RotateDocumentArbitrary(napi_env env, napi_callback_info info);
+// M8d：自由变换烘焙（id, scaleX, scaleY, rotDeg, skewDeg, pivotX, pivotY）
+napi_value BakeLayerTransform(napi_env env, napi_callback_info info);
 // 页面销毁时释放回调与渲染线程
 napi_value Dispose(napi_env env, napi_callback_info info);
 
