@@ -759,6 +759,20 @@ napi_value makeLayerDto(napi_env env, const Layer& l, bool isActive) {
     napi_set_named_property(env, obj, "clipping", makeBool(env, l.clipping));
     napi_set_named_property(env, obj, "isAdjustment", makeBool(env, l.adjustment != nullptr));
     if (l.adjustment != nullptr) {
+        napi_value cxArr = nullptr;
+        napi_create_array(env, &cxArr);
+        for (size_t ci = 0; ci < l.adjustment->curveX.size(); ++ci) {
+            napi_set_element(env, cxArr, static_cast<uint32_t>(ci),
+                             makeDouble(env, l.adjustment->curveX[ci]));
+        }
+        napi_set_named_property(env, obj, "curveX", cxArr);
+        napi_value cyArr = nullptr;
+        napi_create_array(env, &cyArr);
+        for (size_t ci = 0; ci < l.adjustment->curveY.size(); ++ci) {
+            napi_set_element(env, cyArr, static_cast<uint32_t>(ci),
+                             makeDouble(env, l.adjustment->curveY[ci]));
+        }
+        napi_set_named_property(env, obj, "curveY", cyArr);
         napi_set_named_property(env, obj, "adjBlack", makeDouble(env, l.adjustment->inBlack));
         napi_set_named_property(env, obj, "adjWhite", makeDouble(env, l.adjustment->inWhite));
         napi_set_named_property(env, obj, "adjGamma", makeDouble(env, l.adjustment->gamma));
@@ -776,6 +790,16 @@ napi_value makeLayerDto(napi_env env, const Layer& l, bool isActive) {
 
 // M6a：添加 Levels 调整层（插到活动层之上并激活，history 事务）
 napi_value AddAdjustmentLayer(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t reqKind = 0;  // 默认 Levels；M9b：可指定 kind（0..7）
+    if (argc >= 1 && napi_get_value_int32(env, argv[0], &reqKind) != napi_ok) {
+        reqKind = 0;
+    }
+    if (reqKind < 0 || reqKind > 7) {
+        reqKind = 0;
+    }
     auto& e = Engine::get();
     double newId = 0;
     {
@@ -786,9 +810,11 @@ napi_value AddAdjustmentLayer(napi_env env, napi_callback_info info) {
         e.history.beginEdit(e.doc, "add adjustment", static_cast<uint64_t>(e.docRevision));
         Layer layer;
         layer.id = e.nextLayerId();
-        layer.name = "Levels";
+        const char* kindNames[8] = {"Levels", "Curves", "亮度/对比度", "反相", "阈值",
+                                    "色调分离", "色彩平衡", "色相/饱和度"};
+        layer.name = kindNames[reqKind];
         auto adj = std::make_shared<LayerAdjustment>();
-        adj->kind = AdjustmentKind::Levels;
+        adj->kind = static_cast<AdjustmentKind>(reqKind);
         layer.adjustment = std::move(adj);
         size_t at = e.doc.layers.size();
         for (size_t i = 0; i < e.doc.layers.size(); ++i) {
@@ -2367,6 +2393,72 @@ napi_value CancelTransformOverlay(napi_env env, napi_callback_info /*info*/) {
         e.requestRender();
     }
     return makeOk(env, nullptr);
+}
+
+// M9b：曲线控制点设置（id, n, xs[], ys[]；0..1 归一；history 事务）
+napi_value SetCurvePoints(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 3) {
+        return makeError(env, kErrBadParam, "setCurvePoints(id, xs, ys) requires 3 args");
+    }
+    double id = 0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "setCurvePoints: invalid id");
+    }
+    bool isArr1 = false;
+    bool isArr2 = false;
+    napi_is_array(env, argv[1], &isArr1);
+    napi_is_array(env, argv[2], &isArr2);
+    if (!isArr1 || !isArr2) {
+        return makeError(env, kErrBadParam, "setCurvePoints: xs/ys must be arrays");
+    }
+    uint32_t nx = 0;
+    uint32_t ny = 0;
+    napi_get_array_length(env, argv[1], &nx);
+    napi_get_array_length(env, argv[2], &ny);
+    if (nx < 2 || nx != ny || nx > 64) {
+        return makeError(env, kErrBadParam, "setCurvePoints: bad point count");
+    }
+    std::vector<float> xs(nx);
+    std::vector<float> ys(nx);
+    for (uint32_t i = 0; i < nx; ++i) {
+        napi_value xv = nullptr;
+        napi_value yv = nullptr;
+        napi_get_element(env, argv[1], i, &xv);
+        napi_get_element(env, argv[2], i, &yv);
+        double vx = 0;
+        double vy = 0;
+        if (napi_get_value_double(env, xv, &vx) != napi_ok ||
+            napi_get_value_double(env, yv, &vy) != napi_ok || vx < 0 || vx > 1 || vy < -1 ||
+            vy > 2) {
+            return makeError(env, kErrBadParam, "setCurvePoints: bad point value");
+        }
+        xs[i] = static_cast<float>(vx);
+        ys[i] = static_cast<float>(vy);
+    }
+    auto& e = Engine::get();
+    bool ok = false;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        if (l == nullptr || l->adjustment == nullptr) {
+            return makeError(env, kErrBadParam, "setCurvePoints: not an adjustment layer");
+        }
+        e.history.beginEdit(e.doc, "curves points", static_cast<uint64_t>(e.docRevision));
+        l->adjustment->kind = AdjustmentKind::Curves;
+        l->adjustment->curveX = xs;
+        l->adjustment->curveY = ys;
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+        ok = true;
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "performed", makeBool(env, ok));
+    return makeOk(env, data);
 }
 
 // M9a：调整层 kind 切换 + 通用参数（id, kind, p0..p3；kind 对齐 AdjustmentKind 枚举）

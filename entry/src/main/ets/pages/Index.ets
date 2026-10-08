@@ -13,6 +13,7 @@ import { WelcomeView } from '../editor/components/WelcomeView';
 import { LayersPanel, ThumbEntry } from '../editor/components/LayersPanel';
 import { ExportDialog } from '../editor/components/ExportDialog';
 import { TransformOverlay } from '../editor/components/TransformOverlay';
+import { AdjustPanel } from '../editor/components/AdjustPanel';
 import { ABOUT_TEXT, InfoDialog, SHORTCUT_ROWS } from '../editor/components/InfoDialog';
 
 const TAG: string = 'Montage.Shell';
@@ -106,6 +107,14 @@ struct Index {
   @State imgHText: string = '';
   @State showRotateAny: boolean = false;
   @State angleText: string = '';
+  @State histLuma: number[] = [];  // M9 直方图（节流拉取）
+  @State curveXs: number[] = [0, 1];
+  @State curveYs: number[] = [0, 1];
+  @State showAdjCreate: boolean = true;  // 非调整层时显示 kind 网格（点击新建）
+  @State adjP0: number = 0;
+  @State adjP1: number = 0;
+  @State adjP2: number = 0;
+  private histTimer: number = -1;
   @State showTransform: boolean = false;
   @State overlayBox: TransformOverlayBox | null = null;  // M8.1 手柄 overlay 态
   @State overlayMat: number[] = [1, 0, 0, 0, 1, 0];
@@ -168,6 +177,10 @@ struct Index {
       clearInterval(this.statsTimer);
       this.statsTimer = -1;
     }
+    if (this.histTimer >= 0) {
+      clearTimeout(this.histTimer);
+      this.histTimer = -1;
+    }
     this.engine.dispose();
   }
 
@@ -175,6 +188,7 @@ struct Index {
 
   private onDocVersion(): void {
     this.refreshLayers();
+    this.scheduleHistogram();
   }
 
   private refreshLayers(): void {
@@ -186,6 +200,11 @@ struct Index {
       this.adjBlack = Math.round(active.adjBlack * 255);
       this.adjWhite = Math.round(active.adjWhite * 255);
       this.adjGamma = active.adjGamma;
+      this.adjP0 = Math.round(active.adjP0);
+      this.adjP1 = Math.round(active.adjP1);
+      this.adjP2 = Math.round(active.adjP2);
+      this.curveXs = active.curveX.length >= 2 ? active.curveX : [0, 1];
+      this.curveYs = active.curveY.length >= 2 ? active.curveY : [0, 1];
     } else {
       this.blendSel = 0;
       this.layerOpacity = 100;
@@ -1145,6 +1164,22 @@ struct Index {
     const m5 = ty + cy - sy * cy;
     return [m0, m1, m2, m3, m4, m5];
   }
+  private scheduleHistogram(): void {
+    if (!this.docOpen || this.activeLayer()?.isAdjustment !== true) {
+      return;
+    }
+    if (this.histTimer >= 0) {
+      clearTimeout(this.histTimer);
+    }
+    this.histTimer = setTimeout((): void => {
+      this.histTimer = -1;
+      this.engine.getHistogram().then((h): void => {
+        this.histLuma = h.luma;
+      }).catch((_e: BusinessError): void => {
+        // 直方图失败静默（下次 docVersion 再拉）
+      });
+    }, 300);
+  }
   private applyTheme(mode: ThemeMode): void {
     this.themeMode = mode;
     this.prefs.setThemeMode(mode);
@@ -1670,6 +1705,47 @@ struct Index {
           // 右侧面板坞
           if (this.layersVisible) {
             Column() {
+              if (this.activeLayer()?.isAdjustment === true || this.showAdjCreate) {
+                AdjustPanel({
+                  adjKind: this.activeLayer()?.adjKind ?? 0,
+                  adjBlack: this.adjBlack,
+                  adjWhite: this.adjWhite,
+                  adjGammaX100: Math.round(this.adjGamma * 100),
+                  adjP0: this.adjP0,
+                  adjP1: this.adjP1,
+                  adjP2: this.adjP2,
+                  curveXs: this.curveXs,
+                  curveYs: this.curveYs,
+                  histLuma: this.histLuma,
+                  isAdjustment: this.activeLayer()?.isAdjustment === true,
+                  onSetKind: (kind: number): void => {
+                    const a = this.activeLayer();
+                    if (a !== undefined && a.isAdjustment) {
+                      this.engine.setAdjustmentKind(a.id, kind, 0, 0, 0, 0);
+                    } else {
+                      this.engine.addAdjustmentLayer(kind);
+                    }
+                  },
+                  onLevels: (b: number, w: number, g: number): void => {
+                    const a = this.activeLayer();
+                    if (a !== undefined) {
+                      this.engine.setAdjustmentParams(a.id, b / 255, w / 255, g);
+                    }
+                  },
+                  onParams: (p0: number, p1: number, p2: number): void => {
+                    const a = this.activeLayer();
+                    if (a !== undefined) {
+                      this.engine.setAdjustmentKind(a.id, a.adjKind, p0, p1, p2, 0);
+                    }
+                  },
+                  onCurve: (xs: number[], ys: number[]): void => {
+                    const a = this.activeLayer();
+                    if (a !== undefined) {
+                      this.engine.setCurvePoints(a.id, xs, ys);
+                    }
+                  }
+                })
+              }
               LayersPanel({
                 layers: $layers,
                 layerOpacity: $layerOpacity,

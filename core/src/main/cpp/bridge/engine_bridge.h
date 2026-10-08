@@ -30,6 +30,8 @@ napi_value SetAdjustmentParams(napi_env env, napi_callback_info info);
 // M9a：调整层 kind 切换 + 通用参数 / 直方图（4x256）
 napi_value SetAdjustmentKind(napi_env env, napi_callback_info info);
 napi_value GetHistogram(napi_env env, napi_callback_info info);
+// M9b：曲线控制点设置
+napi_value SetCurvePoints(napi_env env, napi_callback_info info);
 // 选区（02 D2.3 M7a）：矩形选框（文档坐标）+ 取消选区
 napi_value SetRectSelection(napi_env env, napi_callback_info info);
 napi_value ClearSelection(napi_env env, napi_callback_info info);

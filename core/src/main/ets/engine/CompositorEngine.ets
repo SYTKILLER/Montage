@@ -109,6 +109,18 @@ function narrowPixelData(r: Record<string, Object>): PixelTestData {
   };
 }
 
+function numArr(r: Record<string, Object>, key: string): number[] {
+  const raw = r[key];
+  const out: number[] = [];
+  if (raw !== undefined && raw !== null) {
+    const arr = raw as Array<Object>;
+    for (const item of arr) {
+      out.push(typeof item === 'number' ? item : 0);
+    }
+  }
+  return out;
+}
+
 function narrowLayer(r: Record<string, Object>): LayerDTO {
   return {
     id: num(r, 'id'),
@@ -131,6 +143,8 @@ function narrowLayer(r: Record<string, Object>): LayerDTO {
     adjP1: num(r, 'adjP1'),
     adjP2: num(r, 'adjP2'),
     adjP3: num(r, 'adjP3'),
+    curveX: numArr(r, 'curveX'),
+    curveY: numArr(r, 'curveY'),
     thumbToken: num(r, 'thumbToken'),
   };
 }
@@ -370,8 +384,10 @@ export class CompositorEngine {
   }
 
   // M6a：添加 Levels 调整层，返回新图层 id（0 = 失败）
-  addAdjustmentLayer(): number {
-    const r = narrowResult(native.addAdjustmentLayer() as Object);
+  addAdjustmentLayer(kind?: number): number {
+    const r = narrowResult(kind === undefined
+      ? (native.addAdjustmentLayer() as Object)
+      : (native.addAdjustmentLayer(kind) as Object));
     if (!r.ok || r.data === null) {
       hilog.error(DOMAIN, TAG, 'addAdjustmentLayer failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
@@ -550,6 +566,12 @@ export class CompositorEngine {
     if (!r.ok && r.error !== null) {
       hilog.error(DOMAIN, TAG, 'setAdjustmentKind rejected: %{public}s', r.error.message);
     }
+    return r.ok;
+  }
+
+  /** 曲线控制点设置（M9b；xs/ys 0..1 归一）。 */
+  setCurvePoints(id: number, xs: number[], ys: number[]): boolean {
+    const r = narrowResult(native.setCurvePoints(id, xs, ys) as Object);
     return r.ok;
   }
 

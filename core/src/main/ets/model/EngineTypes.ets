@@ -60,6 +60,8 @@ export interface LayerDTO {
   adjP1: number;
   adjP2: number;
   adjP3: number;
+  curveX: number[];  // Curves 控制点（0..1）
+  curveY: number[];
   thumbToken: number;
 }
 
