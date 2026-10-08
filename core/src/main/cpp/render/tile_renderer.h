@@ -50,7 +50,8 @@ class TileRenderer {
                   float panY, float vw, float vh);
     void drawTiles(const Layer& layer, float zoom, float panX, float panY, float vw, float vh,
                    const StrokeOverlay* stroke);
-    void uploadLut(const float* lut256);  // M6a：调整层 LUT 上传
+    void uploadLut(const float* lut256);
+    void uploadLutRgba(const float r[256], const float g[256], const float b[256]);  // M9a  // M6a：调整层 LUT 上传
     void rebuildAnts(const Document& doc);  // M7b：selection 变更时重建蚂蚁线缓冲
     void drawAnts(float phase);
     std::unordered_map<uint64_t, uint32_t> strokeTex_;  // key → 临时纹理（逐帧刷新）

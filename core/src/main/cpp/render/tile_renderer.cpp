@@ -379,46 +379,23 @@ void TileRenderer::uploadLut(const float* lut256) {
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
 }
 
-// Levels/Curves → 256 LUT（v1：Curves 控制点线性插值）
-void buildAdjustmentLut(const LayerAdjustment& adj, float* lut256) {
-    if (adj.kind == AdjustmentKind::Levels) {
-        const float lo = std::min(adj.inBlack, adj.inWhite - 0.001f);
-        const float hi = std::max(adj.inWhite, lo + 0.001f);
-        const float g = std::min(10.0f, std::max(0.1f, adj.gamma));
-        for (int i = 0; i < 256; ++i) {
-            float t = (static_cast<float>(i) / 255.0f - lo) / (hi - lo);
-            t = std::min(1.0f, std::max(0.0f, t));
-            lut256[i] = std::pow(t, 1.0f / g);
-        }
-        return;
-    }
-    // Curves：控制点线性插值 + 端点延伸
-    const auto& xs = adj.curveX;
-    const auto& ys = adj.curveY;
-    if (xs.size() < 2 || xs.size() != ys.size()) {
-        for (int i = 0; i < 256; ++i) {
-            lut256[i] = static_cast<float>(i) / 255.0f;
-        }
-        return;
-    }
+void TileRenderer::uploadLutRgba(const float r[256], const float g[256], const float b[256]) {
+    // M9a：三通道独立 LUT（ColorBalance 等）；r/g/b 各 256 个 0..1 值
+    uint8_t px[256 * 4];
     for (int i = 0; i < 256; ++i) {
-        const float x = static_cast<float>(i) / 255.0f;
-        if (x <= xs.front()) {
-            lut256[i] = ys.front();
-            continue;
-        }
-        if (x >= xs.back()) {
-            lut256[i] = ys.back();
-            continue;
-        }
-        size_t k = 1;
-        while (k < xs.size() && xs[k] < x) {
-            ++k;
-        }
-        const float t = (x - xs[k - 1]) / std::max(1e-6f, xs[k] - xs[k - 1]);
-        lut256[i] = ys[k - 1] + (ys[k] - ys[k - 1]) * t;
+        px[i * 4] = static_cast<uint8_t>(std::lround(
+            std::min(1.0f, std::max(0.0f, r[i])) * 255.0f));
+        px[i * 4 + 1] = static_cast<uint8_t>(std::lround(
+            std::min(1.0f, std::max(0.0f, g[i])) * 255.0f));
+        px[i * 4 + 2] = static_cast<uint8_t>(std::lround(
+            std::min(1.0f, std::max(0.0f, b[i])) * 255.0f));
+        px[i * 4 + 3] = 255;
     }
+    glBindTexture(GL_TEXTURE_2D, lutTex_);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
 }
+
+// Levels/Curves → 256 LUT（v1：Curves 控制点线性插值）
 
 void TileRenderer::rebuildAnts(const Document& doc) {
     antsVerts_ = 0;
@@ -532,9 +509,9 @@ void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw
                 continue;
             }
             composited++;
-            float lut[256];
-            buildAdjustmentLut(*layer.adjustment, lut);
-            uploadLut(lut);
+            float lr[256], lg[256], lb[256];
+            buildAdjustmentRgbLut(*layer.adjustment, lr, lg, lb);
+            uploadLutRgba(lr, lg, lb);
             const int dstIdx = accIdx;
             const int outIdx = 1 - accIdx;
             glBindFramebuffer(GL_FRAMEBUFFER, accFbo_[outIdx]);

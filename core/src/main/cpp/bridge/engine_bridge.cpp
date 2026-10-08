@@ -762,6 +762,11 @@ napi_value makeLayerDto(napi_env env, const Layer& l, bool isActive) {
         napi_set_named_property(env, obj, "adjBlack", makeDouble(env, l.adjustment->inBlack));
         napi_set_named_property(env, obj, "adjWhite", makeDouble(env, l.adjustment->inWhite));
         napi_set_named_property(env, obj, "adjGamma", makeDouble(env, l.adjustment->gamma));
+        napi_set_named_property(env, obj, "adjKind", makeInt32(env, static_cast<int32_t>(l.adjustment->kind)));
+        napi_set_named_property(env, obj, "adjP0", makeDouble(env, l.adjustment->p0));
+        napi_set_named_property(env, obj, "adjP1", makeDouble(env, l.adjustment->p1));
+        napi_set_named_property(env, obj, "adjP2", makeDouble(env, l.adjustment->p2));
+        napi_set_named_property(env, obj, "adjP3", makeDouble(env, l.adjustment->p3));
     }
     napi_set_named_property(env, obj, "thumbToken",
                             makeDouble(env, static_cast<double>(l.pixels != nullptr ? l.pixels->revision : 0)));
@@ -2201,6 +2206,128 @@ napi_value BakeLayerTransform(napi_env env, napi_callback_info info) {
     napi_create_object(env, &data);
     napi_set_named_property(env, data, "changed", makeBool(env, ok));
     return makeOk(env, data);
+}
+
+// M9a：调整层 kind 切换 + 通用参数（id, kind, p0..p3；kind 对齐 AdjustmentKind 枚举）
+napi_value SetAdjustmentKind(napi_env env, napi_callback_info info) {
+    size_t argc = 6;
+    napi_value argv[6] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 6) {
+        return makeError(env, kErrBadParam, "setAdjustmentKind(id,kind,p0..p3) requires 6 args");
+    }
+    double v[6] = {0};
+    for (int i = 0; i < 6; ++i) {
+        if (napi_get_value_double(env, argv[i], &v[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "setAdjustmentKind: invalid args");
+        }
+    }
+    auto& e = Engine::get();
+    bool ok = false;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(v[0]));
+        if (l == nullptr || l->adjustment == nullptr) {
+            return makeError(env, kErrBadParam, "setAdjustmentKind: not an adjustment layer");
+        }
+        const int kind = static_cast<int>(v[1]);
+        if (kind < 0 || kind > 7) {
+            return makeError(env, kErrBadParam, "setAdjustmentKind: bad kind");
+        }
+        e.history.beginEdit(e.doc, "adjustment kind", static_cast<uint64_t>(e.docRevision));
+        l->adjustment->kind = static_cast<AdjustmentKind>(kind);
+        l->adjustment->p0 = static_cast<float>(v[2]);
+        l->adjustment->p1 = static_cast<float>(v[3]);
+        l->adjustment->p2 = static_cast<float>(v[4]);
+        l->adjustment->p3 = static_cast<float>(v[5]);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+        ok = true;
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "performed", makeBool(env, ok));
+    return makeOk(env, data);
+}
+
+// M9a：直方图（全文档扁平化的亮度/R/G/B 4×256；异步）
+struct HistogramCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    io::FlattenJob job;
+    io::FlattenResult result;
+    uint32_t luma[256] = {0};
+    uint32_t r[256] = {0};
+    uint32_t g[256] = {0};
+    uint32_t b[256] = {0};
+};
+
+napi_value GetHistogram(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    auto* ctx = new HistogramCtx();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            delete ctx;
+            return makeError(env, kErrNoDoc, "getHistogram: no document");
+        }
+        ctx->job = io::BuildFlattenJob(e.doc, 0, 0, 0, 0);
+    }
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value workName = nullptr;
+    napi_create_string_utf8(env, "montageHistogram", NAPI_AUTO_LENGTH, &workName);
+    napi_status st = napi_create_async_work(
+        env, nullptr, workName,
+        [](napi_env /*env*/, void* data) {
+            auto* c = static_cast<HistogramCtx*>(data);
+            io::FlattenResult fr = io::FlattenVisible(c->job, 0, 0, 0, 0);
+            c->result = std::move(fr);
+            const size_t n = static_cast<size_t>(c->result.width) * c->result.height;
+            for (size_t i = 0; i < n; ++i) {
+                const uint8_t R = c->result.rgba[i * 4];
+                const uint8_t G = c->result.rgba[i * 4 + 1];
+                const uint8_t B = c->result.rgba[i * 4 + 2];
+                const uint8_t A = c->result.rgba[i * 4 + 3];
+                if (A == 0) {
+                    continue;  // 透明区不计（PS 直方图行为）
+                }
+                c->r[R]++;
+                c->g[G]++;
+                c->b[B]++;
+                c->luma[(R * 77 + G * 150 + B * 29) >> 8]++;
+            }
+        },
+        [](napi_env env, napi_status status, void* data) {
+            auto* c = static_cast<HistogramCtx*>(data);
+            if (status == napi_ok && c->result.ok) {
+                napi_value dataObj = nullptr;
+                napi_create_object(env, &dataObj);
+                napi_value arrs[4];
+                const char* names[4] = {"luma", "r", "g", "b"};
+                uint32_t* srcs[4] = {c->luma, c->r, c->g, c->b};
+                for (int k = 0; k < 4; ++k) {
+                    napi_create_array(env, &arrs[k]);
+                    for (int i = 0; i < 256; ++i) {
+                        napi_set_element(env, arrs[k], i, makeUint32(env, srcs[k][i]));
+                    }
+                    napi_set_named_property(env, dataObj, names[k], arrs[k]);
+                }
+                napi_resolve_deferred(env, c->deferred, makeOk(env, dataObj));
+            } else {
+                napi_resolve_deferred(env, c->deferred, makeError(env, kErrInternal, "histogram failed"));
+            }
+            napi_delete_async_work(env, c->work);
+            delete c;
+        },
+        ctx, &ctx->work);
+    if (st != napi_ok) {
+        delete ctx;
+        return makeError(env, kErrInternal, "create async work failed");
+    }
+    napi_queue_async_work(env, ctx->work);
+    return promise;
 }
 
 // M8c：图像大小重采样（history 事务）

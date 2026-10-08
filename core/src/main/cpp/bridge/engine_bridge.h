@@ -27,6 +27,9 @@ napi_value AddLayer(napi_env env, napi_callback_info info);
 // 调整层（02 §3 M6a）：添加 Levels 调整层 / 设置参数
 napi_value AddAdjustmentLayer(napi_env env, napi_callback_info info);
 napi_value SetAdjustmentParams(napi_env env, napi_callback_info info);
+// M9a：调整层 kind 切换 + 通用参数 / 直方图（4x256）
+napi_value SetAdjustmentKind(napi_env env, napi_callback_info info);
+napi_value GetHistogram(napi_env env, napi_callback_info info);
 // 选区（02 D2.3 M7a）：矩形选框（文档坐标）+ 取消选区
 napi_value SetRectSelection(napi_env env, napi_callback_info info);
 napi_value ClearSelection(napi_env env, napi_callback_info info);

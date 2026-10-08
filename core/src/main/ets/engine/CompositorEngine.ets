@@ -1,7 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
-import { EngineStats, ExportPngData, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData } from '../model/EngineTypes';
+import { EngineStats, ExportPngData, HistogramData, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -126,6 +126,11 @@ function narrowLayer(r: Record<string, Object>): LayerDTO {
     adjBlack: num(r, 'adjBlack'),
     adjWhite: num(r, 'adjWhite'),
     adjGamma: num(r, 'adjGamma'),
+    adjKind: num(r, 'adjKind'),
+    adjP0: num(r, 'adjP0'),
+    adjP1: num(r, 'adjP1'),
+    adjP2: num(r, 'adjP2'),
+    adjP3: num(r, 'adjP3'),
     thumbToken: num(r, 'thumbToken'),
   };
 }
@@ -536,6 +541,34 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'translateLayer rejected: %{public}s', r.error.message);
     }
     return r.ok;
+  }
+
+  /** 调整层 kind 切换 + 通用参数（M9a；kind 对齐 AdjustmentKind 枚举）。 */
+  setAdjustmentKind(id: number, kind: number, p0: number, p1: number, p2: number,
+                   p3: number): boolean {
+    const r = narrowResult(native.setAdjustmentKind(id, kind, p0, p1, p2, p3) as Object);
+    if (!r.ok && r.error !== null) {
+      hilog.error(DOMAIN, TAG, 'setAdjustmentKind rejected: %{public}s', r.error.message);
+    }
+    return r.ok;
+  }
+
+  /** 直方图（M9a；全文档扁平化，透明区不计）。 */
+  async getHistogram(): Promise<HistogramData> {
+    const value: Object = await (native.getHistogram() as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok || r.data === null) {
+      throw new Error(r.error !== null ? r.error.message : 'getHistogram failed');
+    }
+    const pick = (key: string): number[] => {
+      const raw = r.data![key] as Array<Object>;
+      const out: number[] = [];
+      for (const item of raw) {
+        out.push(typeof item === 'number' ? item : 0);
+      }
+      return out;
+    };
+    return { luma: pick('luma'), r: pick('r'), g: pick('g'), b: pick('b') };
   }
 
   /** 图像大小重采样（M8c；双线性）。 */

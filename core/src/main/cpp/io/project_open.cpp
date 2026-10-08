@@ -719,6 +719,21 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
         if (jadj != nullptr && jadj->type == JValue::Obj) {
             auto adj = std::make_shared<LayerAdjustment>();
             const JValue* jkind = jadj->find("kind");
+            if (jkind != nullptr && jkind->type == JValue::Str) {
+                if (jkind->str == "bc") {
+                    adj->kind = AdjustmentKind::BrightnessContrast;
+                } else if (jkind->str == "invert") {
+                    adj->kind = AdjustmentKind::Invert;
+                } else if (jkind->str == "threshold") {
+                    adj->kind = AdjustmentKind::Threshold;
+                } else if (jkind->str == "posterize") {
+                    adj->kind = AdjustmentKind::Posterize;
+                } else if (jkind->str == "colorbalance") {
+                    adj->kind = AdjustmentKind::ColorBalance;
+                } else if (jkind->str == "huesat") {
+                    adj->kind = AdjustmentKind::HueSaturation;
+                }
+            }
             if (jkind != nullptr && jkind->type == JValue::Str && jkind->str == "curves") {
                 adj->kind = AdjustmentKind::Curves;
                 const JValue* jcx = jadj->find("curveX");
@@ -756,6 +771,22 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
             adj->inBlack = static_cast<float>(bl);
             adj->inWhite = static_cast<float>(wl);
             adj->gamma = static_cast<float>(gm);
+            const JValue* jp0 = jadj->find("p0");
+            const JValue* jp1 = jadj->find("p1");
+            const JValue* jp2 = jadj->find("p2");
+            const JValue* jp3 = jadj->find("p3");
+            const JValue* jp[4] = {jp0, jp1, jp2, jp3};
+            float* pf[4] = {&adj->p0, &adj->p1, &adj->p2, &adj->p3};
+            for (int pi = 0; pi < 4; ++pi) {
+                if (jp[pi] != nullptr) {
+                    double pv = 0;
+                    if (!getDouble(*jp[pi], pv) || !std::isfinite(pv) || pv < -1000 || pv > 1000) {
+                        err = "bad adjustment param slot";
+                        return false;
+                    }
+                    *pf[pi] = static_cast<float>(pv);
+                }
+            }
             l.adjustment = std::move(adj);
         }
         layers.push_back(l);

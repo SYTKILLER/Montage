@@ -55,6 +55,11 @@ export interface LayerDTO {
   adjBlack: number;
   adjWhite: number;
   adjGamma: number;
+  adjKind: number;   // M9a：对齐 AdjustmentKind 枚举（0=Levels 1=Curves 2=BC 3=Invert 4=Threshold 5=Posterize 6=ColorBalance 7=HueSat）
+  adjP0: number;
+  adjP1: number;
+  adjP2: number;
+  adjP3: number;
   thumbToken: number;
 }
 
@@ -141,4 +146,12 @@ export interface ExportPsdData {
   layers: number;
   bytes: number;
   notes: string[];
+}
+
+/** 直方图（getHistogram 的 data，M9a；0..255 各 256 bin，透明区不计）。 */
+export interface HistogramData {
+  luma: number[];
+  r: number[];
+  g: number[];
+  b: number[];
 }

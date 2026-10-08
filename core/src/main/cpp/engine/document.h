@@ -147,6 +147,13 @@ struct LayerMask {
 enum class AdjustmentKind : int32_t {
     Levels = 0,
     Curves = 1,
+    // M9a 扩充（LUT 类：Invert/Threshold/Posterize/BC/ColorBalance；shader 类：HueSat）
+    BrightnessContrast = 2,  // p0=brightness(-150..150) p1=contrast(-50..100)
+    Invert = 3,
+    Threshold = 4,           // p0=level(0..255)
+    Posterize = 5,           // p0=levels(2..32)
+    ColorBalance = 6,        // p0/p1/p2=R/G/B 增量(-100..100)
+    HueSaturation = 7,       // p0=hue(-180..180) p1=sat(-100..100) p2=light(-100..100)；shader 类
 };
 
 struct LayerAdjustment {
@@ -158,6 +165,11 @@ struct LayerAdjustment {
     // Curves：控制点（x/y 各 0..1，x 单调；v1 线性插值）
     std::vector<float> curveX;
     std::vector<float> curveY;
+    // M9a 通用参数槽（语义随 kind，见 AdjustmentKind 注释）
+    float p0 = 0.0f;
+    float p1 = 0.0f;
+    float p2 = 0.0f;
+    float p3 = 0.0f;
 };
 
 // 图层（值语义，对齐源 ImageLayer；M2 子集：蒙版/剪贴 M5、调整层 M6a、形状/文字后续补）。
@@ -206,6 +218,10 @@ uint8_t selectionGrayAt(const TileGrid& mask, int docX, int docY);
 
 const char* blendModeName(BlendMode mode);  // DTO 显示名（对齐源 LayerBlendMode raw 值）
 bool blendModeFromName(const std::string& name, BlendMode& out);  // 逆映射（.montage 读取，M4c）
+
+// 调整层 RGB LUT 生成（M9a；从 tile_renderer 迁出以便宿主机单测）。
+// r/g/b 各 256 项输出 0..1；多数 kind 三通道同值，ColorBalance 按通道独立。
+void buildAdjustmentRgbLut(const LayerAdjustment& adj, float r[256], float g[256], float b[256]);
 
 // 蒙版合成（M5a）：out.a = a × gray/255（直 alpha 域，rgb 不变）；patch 外取 mask.outside。
 // 无蒙版像素/网格外按语义共享或丢弃；返回的网格与 src 同维度。mask.pixels == null 时

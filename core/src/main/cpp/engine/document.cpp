@@ -1,6 +1,7 @@
 #include "engine/document.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -233,6 +234,103 @@ std::shared_ptr<const TileGrid> composeMasked(std::shared_ptr<const TileGrid> sr
         out->tiles[key] = std::move(t);
     }
     return out;
+}
+
+// 调整层 RGB LUT 生成（M9a）：LUT 类 kind 全覆盖；HueSaturation 走 GPU 逐像素 shader 不在此列。
+void buildAdjustmentRgbLut(const LayerAdjustment& adj, float r[256], float g[256], float b[256]) {
+    // 恒等初始化
+    for (int i = 0; i < 256; ++i) {
+        r[i] = g[i] = b[i] = static_cast<float>(i) / 255.0f;
+    }
+    switch (adj.kind) {
+        case AdjustmentKind::Levels: {
+            const float lo = std::min(adj.inBlack, adj.inWhite - 0.001f);
+            const float hi = std::max(adj.inWhite, lo + 0.001f);
+            const float gm = std::min(10.0f, std::max(0.1f, adj.gamma));
+            for (int i = 0; i < 256; ++i) {
+                float t = (static_cast<float>(i) / 255.0f - lo) / (hi - lo);
+                t = std::min(1.0f, std::max(0.0f, t));
+                r[i] = g[i] = b[i] = std::pow(t, 1.0f / gm);
+            }
+            break;
+        }
+        case AdjustmentKind::Curves: {
+            const auto& xs = adj.curveX;
+            const auto& ys = adj.curveY;
+            if (xs.size() < 2 || xs.size() != ys.size()) {
+                break;  // 恒等
+            }
+            for (int i = 0; i < 256; ++i) {
+                const float x = static_cast<float>(i) / 255.0f;
+                float v = x;
+                if (x <= xs.front()) {
+                    v = ys.front();
+                } else if (x >= xs.back()) {
+                    v = ys.back();
+                } else {
+                    for (size_t k = 0; k + 1 < xs.size(); ++k) {
+                        if (x >= xs[k] && x <= xs[k + 1]) {
+                            const float t = (x - xs[k]) / std::max(1e-6f, xs[k + 1] - xs[k]);
+                            v = ys[k] + (ys[k + 1] - ys[k]) * t;
+                            break;
+                        }
+                    }
+                }
+                r[i] = g[i] = b[i] = std::min(4.0f, std::max(-0.0f, v));
+            }
+            break;
+        }
+        case AdjustmentKind::Invert: {
+            for (int i = 0; i < 256; ++i) {
+                r[i] = g[i] = b[i] = static_cast<float>(255 - i) / 255.0f;
+            }
+            break;
+        }
+        case AdjustmentKind::Threshold: {
+            const float level = std::min(255.0f, std::max(0.0f, adj.p0));
+            for (int i = 0; i < 256; ++i) {
+                r[i] = g[i] = b[i] = static_cast<float>(i) >= level ? 1.0f : 0.0f;  // PS：≥阈值白
+            }
+            break;
+        }
+        case AdjustmentKind::Posterize: {
+            // PS 语义：floor 均分箱（levels 级，值 0/step/2step...），lround 会错 bin
+            const int levels = static_cast<int>(std::min(32.0f, std::max(2.0f, adj.p0)));
+            const float step = 255.0f / (levels - 1);
+            for (int i = 0; i < 256; ++i) {
+                const int bin = std::min(levels - 1,
+                    static_cast<int>(static_cast<float>(i) * levels / 255.0f));  // N 段分箱
+                r[i] = g[i] = b[i] = bin * step / 255.0f;
+            }
+            break;
+        }
+        case AdjustmentKind::BrightnessContrast: {
+            // PS 线性近似（现代版非线性为曲线拟合，登记 v1 近似）
+            const float bright = adj.p0 / 255.0f;         // -150..150 → ±0.588
+            const float c = adj.p1 / 100.0f;              // -0.5..1
+            const float k = std::max(0.0f, 1.0f + c);     // 斜率
+            for (int i = 0; i < 256; ++i) {
+                const float v = static_cast<float>(i) / 255.0f;
+                float out = (v - 0.5f) * k + 0.5f + bright;
+                r[i] = g[i] = b[i] = std::min(1.0f, std::max(0.0f, out));
+            }
+            break;
+        }
+        case AdjustmentKind::ColorBalance: {
+            const float dr = adj.p0 / 255.0f;  // -100..100 → ±0.392
+            const float dg = adj.p1 / 255.0f;
+            const float db = adj.p2 / 255.0f;
+            for (int i = 0; i < 256; ++i) {
+                const float v = static_cast<float>(i) / 255.0f;
+                r[i] = std::min(1.0f, std::max(0.0f, v + dr));
+                g[i] = std::min(1.0f, std::max(0.0f, v + dg));
+                b[i] = std::min(1.0f, std::max(0.0f, v + db));
+            }
+            break;
+        }
+        default:
+            break;  // HueSaturation（shader 类）与未知 kind → 恒等
+    }
 }
 
 }  // namespace montage

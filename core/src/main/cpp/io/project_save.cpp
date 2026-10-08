@@ -22,7 +22,7 @@ namespace {
 constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Save";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
-constexpr int kFormatVersion = 3;  // v3：+调整层（adjustment）；v2：+图层蒙版
+constexpr int kFormatVersion = 4;  // v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
 constexpr int kDeflateLevel = 6;
 // 04 §1.3 格式上限（沿用上游档位，与引擎运行预算分立）
 constexpr uint32_t kMaxSide = 30000;
@@ -527,24 +527,28 @@ std::string buildManifest(const DocSnapshot& doc) {
             std::string fields2;
             char num[32];
             const char* nl = "\n";
+            const char* kindStr = "levels";
+            switch (adj.kind) {
+                case AdjustmentKind::Curves: kindStr = "curves"; break;
+                case AdjustmentKind::BrightnessContrast: kindStr = "bc"; break;
+                case AdjustmentKind::Invert: kindStr = "invert"; break;
+                case AdjustmentKind::Threshold: kindStr = "threshold"; break;
+                case AdjustmentKind::Posterize: kindStr = "posterize"; break;
+                case AdjustmentKind::ColorBalance: kindStr = "colorbalance"; break;
+                case AdjustmentKind::HueSaturation: kindStr = "huesat"; break;
+                default: kindStr = "levels"; break;
+            }
+            fields2 += std::string("      \"kind\": ") + kindStr + "," + nl;
             std::snprintf(num, sizeof(num), "%.6g", adj.inBlack);
             fields2 += std::string("      \"inBlack\": ") + num + "," + nl;
             std::snprintf(num, sizeof(num), "%.6g", adj.inWhite);
             fields2 += std::string("      \"inWhite\": ") + num + "," + nl;
             std::snprintf(num, sizeof(num), "%.6g", adj.gamma);
             fields2 += std::string("      \"gamma\": ") + num;
-            if (adj.kind == AdjustmentKind::Curves && adj.curveX.size() >= 2) {
-                fields2 += std::string(",") + nl + "      \"curveX\": [";
-                for (size_t c = 0; c < adj.curveX.size(); ++c) {
-                    std::snprintf(num, sizeof(num), "%.6g", adj.curveX[c]);
-                    fields2 += std::string(num) + (c + 1 < adj.curveX.size() ? ", " : "");
-                }
-                fields2 += std::string("],") + nl + "      \"curveY\": [";
-                for (size_t c = 0; c < adj.curveY.size(); ++c) {
-                    std::snprintf(num, sizeof(num), "%.6g", adj.curveY[c]);
-                    fields2 += std::string(num) + (c + 1 < adj.curveY.size() ? ", " : "");
-                }
-                fields2 += "]";
+            for (int pi = 0; pi < 4; ++pi) {
+                float pv = (&adj.p0)[pi];
+                std::snprintf(num, sizeof(num), "%.6g", pv);
+                fields2 += std::string(",") + nl + "      \"p" + std::to_string(pi) + "\": " + num;
             }
             fields.push_back(std::string("      \"adjustment\": {") + nl + fields2 + nl + "      }");
         }

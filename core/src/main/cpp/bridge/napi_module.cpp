@@ -25,6 +25,8 @@ napi_value Init(napi_env env, napi_value exports) {
         {"addLayer", nullptr, montage::bridge::AddLayer, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"addAdjustmentLayer", nullptr, montage::bridge::AddAdjustmentLayer, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setAdjustmentParams", nullptr, montage::bridge::SetAdjustmentParams, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setAdjustmentKind", nullptr, montage::bridge::SetAdjustmentKind, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getHistogram", nullptr, montage::bridge::GetHistogram, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setRectSelection", nullptr, montage::bridge::SetRectSelection, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"clearSelection", nullptr, montage::bridge::ClearSelection, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setWandSelection", nullptr, montage::bridge::SetWandSelection, nullptr, nullptr, nullptr, napi_default, nullptr},
