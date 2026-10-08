@@ -54,6 +54,8 @@ export struct OptionsBar {
   onToggleMaskTarget: () => void = () => {};
   onColorPick: (hex: string) => void = (_hex: string) => {};
   onZoom: (cmd: string) => void = (_cmd: string) => {};
+  onCropCommand: (cmd: string) => void = (_cmd: string) => {};
+  @Prop cropPending: boolean = false;
 
   @Builder
   brushOptions() {
@@ -184,7 +186,7 @@ export struct OptionsBar {
           .fontSize(12)
           .fontColor($r('app.color.text_secondary'))
       } else if (this.tool === 'move') {
-        Text('移动工具 M8 提供')
+        Text('拖拽移动图层 · 方向键微调（Shift=10px）')
           .fontSize(12)
           .fontColor($r('app.color.text_secondary'))
       } else if (this.tool === 'lasso') {
@@ -192,9 +194,24 @@ export struct OptionsBar {
           .fontSize(12)
           .fontColor($r('app.color.text_secondary'))
       } else if (this.tool === 'crop') {
-        Text('裁剪工具 M8 提供')
-          .fontSize(12)
-          .fontColor($r('app.color.text_secondary'))
+        if (this.cropPending) {
+          Text('裁剪框就绪：')
+            .fontSize(12)
+            .fontColor($r('app.color.text_secondary'))
+          Button('提交裁剪').fontSize(12).height(28)
+            .backgroundColor($r('app.color.accent'))
+            .fontColor($r('app.color.on_accent'))
+            .onClick((): void => this.onCropCommand('commit'))
+          Button('取消').fontSize(12).height(28)
+            .backgroundColor($r('app.color.surface'))
+            .fontColor($r('app.color.text_primary'))
+            .border({ width: 1, color: $r('app.color.border') })
+            .onClick((): void => this.onCropCommand('cancel'))
+        } else {
+          Text('拖拽出裁剪区域（回车提交 / Esc 取消）')
+            .fontSize(12)
+            .fontColor($r('app.color.text_secondary'))
+        }
       } else if (this.tool === 'hand' || this.tool === 'zoom') {
         this.zoomButtons()
       } else {

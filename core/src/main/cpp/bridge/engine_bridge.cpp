@@ -13,6 +13,7 @@
 #include <multimedia/image_framework/image/pixelmap_native.h>
 
 #include "engine/engine.h"
+#include "engine/transform_ops.h"
 #include "tiles/magic_wand.h"
 #include "io/image_export.h"
 #include "io/image_import.h"
@@ -1722,6 +1723,246 @@ napi_value Dispose(napi_env env, napi_callback_info /*info*/) {
     }
     e.render.stop();
     return makeOk(env, nullptr);
+}
+
+// ---------- M8a 无损文档操作（06 规划 §4）：resizeCanvas / trim / revealAll / rotate / flip / translate ----------
+
+napi_value ResizeCanvas(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 4) {
+        return makeError(env, kErrBadParam, "resizeCanvas(x, y, w, h) requires 4 args");
+    }
+    double x = 0, y = 0, w = 0, h = 0;
+    if (napi_get_value_double(env, argv[0], &x) != napi_ok ||
+        napi_get_value_double(env, argv[1], &y) != napi_ok ||
+        napi_get_value_double(env, argv[2], &w) != napi_ok ||
+        napi_get_value_double(env, argv[3], &h) != napi_ok) {
+        return makeError(env, kErrBadParam, "resizeCanvas: invalid args");
+    }
+    auto& e = Engine::get();
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "resizeCanvas: no document");
+        }
+        e.history.beginEdit(e.doc, "canvas size", static_cast<uint64_t>(e.docRevision));
+        changed = resizeCanvas(e.doc, static_cast<int>(x), static_cast<int>(y),
+                                 static_cast<int>(w), static_cast<int>(h));
+        if (changed) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.bumpRevisionLocked();
+            e.requestRender();
+        } else {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        }
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "changed", makeBool(env, changed));
+    return makeOk(env, data);
+}
+
+napi_value TrimCanvas(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "trimCanvas: no document");
+        }
+        int bx = 0, by = 0, bw = 0, bh = 0;
+        if (!visibleContentBBox(e.doc, bx, by, bw, bh)) {
+            napi_value data = nullptr;
+            napi_create_object(env, &data);
+            napi_set_named_property(env, data, "changed", makeBool(env, false));
+            return makeOk(env, data);
+        }
+        e.history.beginEdit(e.doc, "trim", static_cast<uint64_t>(e.docRevision));
+        changed = resizeCanvas(e.doc, bx, by, bw, bh);
+        if (changed) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.bumpRevisionLocked();
+            e.requestRender();
+        } else {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        }
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "changed", makeBool(env, changed));
+    return makeOk(env, data);
+}
+
+napi_value RevealAll(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "revealAll: no document");
+        }
+        int bx = 0, by = 0, bw = 0, bh = 0;
+        int x = 0;
+        int y = 0;
+        int w = static_cast<int>(e.doc.width);
+        int h = static_cast<int>(e.doc.height);
+        if (visibleContentBBox(e.doc, bx, by, bw, bh)) {
+            const int x1 = std::max(x + w, bx + bw);
+            const int y1 = std::max(y + h, by + bh);
+            x = std::min(x, bx);
+            y = std::min(y, by);
+            w = x1 - x;
+            h = y1 - y;
+        }
+        e.history.beginEdit(e.doc, "reveal all", static_cast<uint64_t>(e.docRevision));
+        changed = resizeCanvas(e.doc, x, y, w, h);
+        if (changed) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.bumpRevisionLocked();
+            e.requestRender();
+        } else {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        }
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "changed", makeBool(env, changed));
+    return makeOk(env, data);
+}
+
+napi_value RotateDocument90(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    bool clockwise = true;
+    if (argc >= 1) {
+        napi_get_value_bool(env, argv[0], &clockwise);
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "rotateDocument90: no document");
+        }
+        e.history.beginEdit(e.doc, clockwise ? "rotate 90 CW" : "rotate 90 CCW",
+                            static_cast<uint64_t>(e.docRevision));
+        rotateDocument90(e.doc, clockwise);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value FlipDocument(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    bool horizontal = true;
+    if (argc >= 1) {
+        napi_get_value_bool(env, argv[0], &horizontal);
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "flipDocument: no document");
+        }
+        e.history.beginEdit(e.doc, horizontal ? "flip horizontal" : "flip vertical",
+                            static_cast<uint64_t>(e.docRevision));
+        flipDocument(e.doc, horizontal);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// 移动工具：三段事务（0=begin 快照 / 1=move 实时平移 / 2=end 提交），拖拽过程实时渲染、
+// 撤销粒度 = 一次拖拽。id=0 表示活动图层。
+napi_value TranslateLayer(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 4) {
+        return makeError(env, kErrBadParam, "translateLayer(id, dx, dy, phase) requires 4 args");
+    }
+    double id = 0, dx = 0, dy = 0, phase = 0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok ||
+        napi_get_value_double(env, argv[1], &dx) != napi_ok ||
+        napi_get_value_double(env, argv[2], &dy) != napi_ok ||
+        napi_get_value_double(env, argv[3], &phase) != napi_ok) {
+        return makeError(env, kErrBadParam, "translateLayer: invalid args");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "translateLayer: no document");
+        }
+        Layer* l = id > 0 ? findLayerLocked(e.doc, static_cast<LayerId>(id)) : nullptr;
+        if (l == nullptr) {
+            for (Layer& li : e.doc.layers) {
+                if (li.id == e.doc.activeId) {
+                    l = &li;
+                    break;
+                }
+            }
+        }
+        if (l == nullptr) {
+            return makeError(env, kErrNoDoc, "translateLayer: no active layer");
+        }
+        const int p = static_cast<int>(phase);
+        if (p == 0) {
+            e.history.beginEdit(e.doc, "move layer", static_cast<uint64_t>(e.docRevision));
+        }
+        l->transform.originX += dx;
+        l->transform.originY += dy;
+        if (p == 2) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.bumpRevisionLocked();
+        }
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value TranslateSelection(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "translateSelection(dx, dy) requires 2 args");
+    }
+    double dx = 0, dy = 0;
+    if (napi_get_value_double(env, argv[0], &dx) != napi_ok ||
+        napi_get_value_double(env, argv[1], &dy) != napi_ok) {
+        return makeError(env, kErrBadParam, "translateSelection: invalid args");
+    }
+    auto& e = Engine::get();
+    bool moved = false;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "translateSelection: no document");
+        }
+        e.history.beginEdit(e.doc, "move selection", static_cast<uint64_t>(e.docRevision));
+        moved = translateSelection(e.doc, static_cast<int>(dx), static_cast<int>(dy));
+        if (moved) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.bumpRevisionLocked();
+            e.requestRender();
+        } else {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        }
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "moved", makeBool(env, moved));
+    return makeOk(env, data);
 }
 
 // ---------- M7.5 导出管线（06 规划 §4）：renameLayer / samplePixel / exportPng / flattenToPixelMap ----------

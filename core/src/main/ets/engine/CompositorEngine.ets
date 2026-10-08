@@ -1,7 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
-import { EngineStats, ExportPngData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData } from '../model/EngineTypes';
+import { EngineStats, ExportPngData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -497,6 +497,51 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
     }
     return r.ok;
+  }
+
+  /** 画布重设（M8a：裁剪/画布大小；无损，选区清除）。 */
+  resizeCanvas(x: number, y: number, w: number, h: number): boolean {
+    const r = narrowResult(native.resizeCanvas(x, y, w, h) as Object);
+    return r.ok && r.data !== null && boolOf(r.data, 'changed');
+  }
+
+  /** 裁切（M8a：可见内容包围盒收画布）。 */
+  trimCanvas(): boolean {
+    const r = narrowResult(native.trimCanvas() as Object);
+    return r.ok && r.data !== null && boolOf(r.data, 'changed');
+  }
+
+  /** 显示全部（M8a：内容包围盒 ∪ 当前文档域）。 */
+  revealAll(): boolean {
+    const r = narrowResult(native.revealAll() as Object);
+    return r.ok && r.data !== null && boolOf(r.data, 'changed');
+  }
+
+  /** 90° 旋转（M8a；clockwise=true 顺时针）。 */
+  rotateDocument90(clockwise: boolean): boolean {
+    const r = narrowResult(native.rotateDocument90(clockwise) as Object);
+    return r.ok;
+  }
+
+  /** 翻转（M8a；horizontal=true 水平）。 */
+  flipDocument(horizontal: boolean): boolean {
+    const r = narrowResult(native.flipDocument(horizontal) as Object);
+    return r.ok;
+  }
+
+  /** 移动图层（M8a 三段事务：phase 0=begin/1=move/2=end；拖拽实时渲染、撤销粒度=一次拖拽）。 */
+  translateLayer(id: number, dx: number, dy: number, phase: number): boolean {
+    const r = narrowResult(native.translateLayer(id, dx, dy, phase) as Object);
+    if (!r.ok && r.error !== null) {
+      hilog.error(DOMAIN, TAG, 'translateLayer rejected: %{public}s', r.error.message);
+    }
+    return r.ok;
+  }
+
+  /** 选区平移（M8a/M7d）。 */
+  translateSelection(dx: number, dy: number): boolean {
+    const r = narrowResult(native.translateSelection(dx, dy) as Object);
+    return r.ok && r.data !== null && boolOf(r.data, 'moved');
   }
 
   /** 取色（M7.5 吸管；合成结果区域采样，异步扁平化单区域）。 */

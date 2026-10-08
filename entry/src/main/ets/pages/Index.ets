@@ -47,6 +47,11 @@ const KC_CTRL_R: number = 2073;
 const KC_NUM0: number = 2000;
 const KC_NUM1: number = 2001;
 const KC_ESC: number = 2070;
+const KC_ENTER: number = 2054;
+const KC_UP: number = 2012;
+const KC_DOWN: number = 2013;
+const KC_LEFT: number = 2014;
+const KC_RIGHT: number = 2015;
 
 /**
  * M7.5 编辑器外壳（06 规划 §4）：菜单栏 + 选项条 + 工具箱 + 画布 + 面板 + 状态栏。
@@ -116,6 +121,14 @@ struct Index {
   private rectY0: number = 0;
   private rectX1: number = 0;
   private rectY1: number = 0;
+  private moveActive: boolean = false;
+  private moveLastX: number = 0;
+  private moveLastY: number = 0;
+  private cropDrag: boolean = false;
+  private cropX0: number = 0;
+  private cropY0: number = 0;
+  @State cropRect: number[] | null = null;   // [x,y,w,h] 文档坐标；非空 = 待提交/取消
+  @State hasSelectionFlag: boolean = false;  // 会话态镜像（引擎无此查询命令，操作点维护）
   private readonly thumbCache: Map<number, ThumbEntry> = new Map();
   private readonly thumbsInFlight: Set<number> = new Set();
 
@@ -363,14 +376,37 @@ struct Index {
       case 'eraser':
         this.strokeTouch(e, t, docX, docY);
         break;
+      case 'move':
+        this.moveTouch(e, docX, docY);
+        break;
+      case 'crop':
+        this.cropTouch(e, docX, docY);
+        break;
       case 'wand':
         if (e.type === TouchType.Down) {
           const ok = this.engine.setWandSelection(docX, docY, this.wandTolerance, this.wandContiguous);
+          this.hasSelectionFlag = ok;
           this.log(`魔棒: (${docX.toFixed(0)},${docY.toFixed(0)}) tol=${this.wandTolerance} ` +
             `contig=${this.wandContiguous} → ${ok ? '选区已生成' : '失败'}`);
         }
         break;
       case 'rectSelect':
+        if (this.altHeld && this.hasSelection) {
+          // Alt+拖拽 = 移动选区（M7d/M8a；Up 时单事务提交）
+          if (e.type === TouchType.Down) {
+            this.moveActive = true;
+            this.moveLastX = docX;
+            this.moveLastY = docY;
+          } else if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.moveActive) {
+            this.moveActive = false;
+            const dx = docX - this.moveLastX;
+            const dy = docY - this.moveLastY;
+            if (this.engine.translateSelection(Math.round(dx), Math.round(dy))) {
+              this.log(`选区平移 (${dx.toFixed(0)},${dy.toFixed(0)})`);
+            }
+          }
+          break;
+        }
         this.rectSelectTouch(e, docX, docY);
         break;
       case 'eyedropper':
@@ -384,8 +420,48 @@ struct Index {
         }
         break;
       default:
-        break;  // move/lasso/crop 占位：M8/M10 提供
+        break;  // lasso 占位：M10 提供
     }
+  }
+
+  private moveTouch(e: TouchEvent, docX: number, docY: number): void {
+    if (e.type === TouchType.Down) {
+      this.engine.translateLayer(0, 0, 0, 0);
+      this.moveActive = true;
+      this.moveLastX = docX;
+      this.moveLastY = docY;
+    } else if (e.type === TouchType.Move && this.moveActive) {
+      this.engine.translateLayer(0, docX - this.moveLastX, docY - this.moveLastY, 1);
+      this.moveLastX = docX;
+      this.moveLastY = docY;
+    } else if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.moveActive) {
+      this.moveActive = false;
+      this.engine.translateLayer(0, 0, 0, 2);
+    }
+  }
+
+  private cropTouch(e: TouchEvent, docX: number, docY: number): void {
+    if (e.type === TouchType.Down) {
+      this.cropDrag = true;
+      this.cropRect = null;
+      this.cropX0 = docX;
+      this.cropY0 = docY;
+    } else if (e.type === TouchType.Move && this.cropDrag) {
+      const x = Math.min(this.cropX0, docX);
+      const y = Math.min(this.cropY0, docY);
+      this.cropRect = [x, y, Math.abs(docX - this.cropX0), Math.abs(docY - this.cropY0)];
+    } else if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.cropDrag) {
+      this.cropDrag = false;
+      const x = Math.min(this.cropX0, docX);
+      const y = Math.min(this.cropY0, docY);
+      const w = Math.abs(docX - this.cropX0);
+      const h = Math.abs(docY - this.cropY0);
+      this.cropRect = w >= 2 && h >= 2 ? [Math.round(x), Math.round(y), Math.round(w), Math.round(h)] : null;
+    }
+  }
+
+  private get hasSelection(): boolean {
+    return this.hasSelectionFlag;
   }
 
   private strokeTouch(e: TouchEvent, t: TouchObject, docX: number, docY: number): void {
@@ -420,10 +496,12 @@ struct Index {
       const h = Math.abs(this.rectY1 - this.rectY0);
       if (w < 2 || h < 2) {
         this.engine.clearSelection();
+        this.hasSelectionFlag = false;
         this.log('矩形选区：拖距过小，已取消选区');
         return;
       }
       const ok = this.engine.setRectSelection(x, y, w, h);
+      this.hasSelectionFlag = ok;
       this.log(`矩形选区: (${x.toFixed(0)},${y.toFixed(0)}) ${w.toFixed(0)}×${h.toFixed(0)} → ${ok}`);
     }
   }
@@ -729,6 +807,9 @@ struct Index {
       this.maskTarget = false;  // 换笔即退出蒙版目标（安全默认）
       this.engine.setBrushTarget(false);
     }
+    if (this.tool === 'crop') {
+      this.cropRect = null;  // 换工具即丢弃未提交裁剪框
+    }
     this.tool = id;
     this.log(`工具 → ${id}`);
   }
@@ -849,7 +930,38 @@ struct Index {
         break;
       case 'select.deselect':
         this.engine.clearSelection();
+        this.hasSelectionFlag = false;
         this.log('选区已取消');
+        break;
+      case 'image.rotate90cw':
+        this.docOp((): boolean => this.engine.rotateDocument90(true), '旋转 90° 顺时针');
+        break;
+      case 'image.rotate90ccw':
+        this.docOp((): boolean => this.engine.rotateDocument90(false), '旋转 90° 逆时针');
+        break;
+      case 'image.rotate180':
+        this.docOp((): boolean => {
+          const a = this.engine.rotateDocument90(true);
+          return a && this.engine.rotateDocument90(true);
+        }, '旋转 180°');
+        break;
+      case 'image.flipH':
+        this.docOp((): boolean => this.engine.flipDocument(true), '水平翻转');
+        break;
+      case 'image.flipV':
+        this.docOp((): boolean => this.engine.flipDocument(false), '垂直翻转');
+        break;
+      case 'image.trim':
+        this.docOp((): boolean => this.engine.trimCanvas(), '裁切');
+        break;
+      case 'image.revealAll':
+        this.docOp((): boolean => this.engine.revealAll(), '显示全部');
+        break;
+      case 'crop.commit':
+        this.commitCrop();
+        break;
+      case 'crop.cancel':
+        this.cropRect = null;
         break;
       case 'view.zoomIn':
         this.doZoomStep(1.25);
@@ -895,6 +1007,44 @@ struct Index {
     this.showTheme = false;
   }
 
+  /** M8a 文档级操作统一包装：执行 + 刷文档尺寸 + 清选区镜像 + 提示。 */
+  private docOp(op: () => boolean, label: string): void {
+    if (!this.docOpen) {
+      return;
+    }
+    if (op()) {
+      this.hasSelectionFlag = false;
+      this.cropRect = null;
+      this.refreshDocMeta();
+      this.toast(label + '完成');
+      this.log(`${label} 完成`);
+    }
+  }
+
+  private refreshDocMeta(): void {
+    const s = this.engine.getStats();
+    if (s.docWidth > 0) {
+      this.docW = s.docWidth;
+      this.docH = s.docHeight;
+      this.fittedOnce = false;
+      this.tryFit();
+    }
+  }
+
+  private commitCrop(): void {
+    const r = this.cropRect;
+    if (r === null || !this.docOpen) {
+      return;
+    }
+    if (this.engine.resizeCanvas(r[0], r[1], r[2], r[3])) {
+      this.hasSelectionFlag = false;
+      this.cropRect = null;
+      this.refreshDocMeta();
+      this.toast(`画布已裁剪 ${r[2]}×${r[3]}`);
+      this.log(`裁剪: (${r[0]},${r[1]}) ${r[2]}×${r[3]}`);
+    }
+  }
+
   private buildMenuGroups(): MenuGroupVM[] {
     const d = this.docOpen;
     const file: MenuItemVM[] = [
@@ -917,8 +1067,13 @@ struct Index {
     const imageMenu: MenuItemVM[] = [
       leafItem('image.canvasSize', '画布大小…', '', false),
       leafItem('image.imageSize', '图像大小…', '', false),
-      leafItem('image.rotate90cw', '顺时针旋转 90°', '', false),
-      leafItem('image.flipH', '水平翻转', '', false),
+      leafItem('image.rotate90cw', '顺时针旋转 90°', '', d),
+      leafItem('image.rotate90ccw', '逆时针旋转 90°', '', d),
+      leafItem('image.rotate180', '旋转 180°', '', d),
+      leafItem('image.flipH', '水平翻转画布', '', d),
+      leafItem('image.flipV', '垂直翻转画布', '', d),
+      leafItem('image.trim', '裁切（基于像素）', '', d),
+      leafItem('image.revealAll', '显示全部', '', d),
     ];
     const layer: MenuItemVM[] = [
       leafItem('layer.new', '新建图层', '', d),
@@ -1034,6 +1189,36 @@ struct Index {
         this.showTheme = false;
       }
       return;
+    }
+    // 裁剪待提交：回车提交 / Esc 取消
+    if (this.cropRect !== null) {
+      if (e.keyCode === KC_ENTER) {
+        this.commitCrop();
+      } else if (e.keyCode === KC_ESC) {
+        this.cropRect = null;
+      }
+      return;
+    }
+    // 移动工具方向键微调（Shift=10px；一次按键 = 一步事务）
+    if (this.tool === 'move' && this.docOpen) {
+      const nudge: number = this.shiftHeld ? 10 : 1;
+      let ndx: number = 0;
+      let ndy: number = 0;
+      if (e.keyCode === KC_LEFT) {
+        ndx = 0 - nudge;
+      } else if (e.keyCode === KC_RIGHT) {
+        ndx = nudge;
+      } else if (e.keyCode === KC_UP) {
+        ndy = 0 - nudge;
+      } else if (e.keyCode === KC_DOWN) {
+        ndy = nudge;
+      }
+      if (ndx !== 0 || ndy !== 0) {
+        this.engine.translateLayer(0, 0, 0, 0);
+        this.engine.translateLayer(0, ndx, ndy, 1);
+        this.engine.translateLayer(0, 0, 0, 2);
+        return;
+      }
     }
     const code = e.keyCode;
     if (this.ctrlHeld) {
@@ -1215,11 +1400,13 @@ struct Index {
           brushColor: this.brushColor,
           maskTarget: this.maskTarget,
           hasMaskOnActive: this.activeLayerHasMask(),
+          cropPending: this.cropRect !== null,
           onToggleMaskTarget: (): void => this.onToggleMaskTarget(),
           onColorPick: (hex: string): void => {
             this.brushColor = hex;
           },
           onZoom: (cmd: string): void => this.runCommand(`view.${cmd === 'fit' ? 'fit' : cmd === '100' ? 'zoom100' : cmd === 'in' ? 'zoomIn' : 'zoomOut'}`),
+          onCropCommand: (cmd: string): void => this.runCommand(`crop.${cmd}`),
         })
         Row() {
           Toolbox({ tools: this.buildTools(), activeTool: this.tool,
@@ -1250,6 +1437,18 @@ struct Index {
                 .height(Math.abs(this.rectY1 - this.rectY0) * this.zoom / this.pxPerVp())
                 .border({ width: 1, color: '#FFFFFF' })
                 .backgroundColor('#22000000')
+            }
+            // 裁剪框（拖拽中 + 待提交常显）
+            if (this.cropRect !== null) {
+              Column()
+                .position({
+                  x: (this.cropRect[0] - this.panX) * this.zoom / this.pxPerVp(),
+                  y: (this.cropRect[1] - this.panY) * this.zoom / this.pxPerVp()
+                })
+                .width(this.cropRect[2] * this.zoom / this.pxPerVp())
+                .height(this.cropRect[3] * this.zoom / this.pxPerVp())
+                .border({ width: 1.5, color: '#00E5FF' })
+                .backgroundColor('#14000000')
             }
             if (!this.docOpen) {
               WelcomeView({

@@ -129,3 +129,9 @@ export interface FlattenData {
   height: number;
   pixelMap: Object | null;
 }
+
+/** 画布重设/选区平移等操作结果（M8a；changed/moved = 有实际变更）。 */
+export interface OpResultData {
+  changed: boolean;
+  moved: boolean;
+}

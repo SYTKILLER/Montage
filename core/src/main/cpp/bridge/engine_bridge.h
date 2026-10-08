@@ -71,6 +71,15 @@ napi_value RenameLayer(napi_env env, napi_callback_info info);
 napi_value SamplePixel(napi_env env, napi_callback_info info);
 napi_value ExportPng(napi_env env, napi_callback_info info);
 napi_value FlattenToPixelMap(napi_env env, napi_callback_info info);
+// M8a 无损文档操作：画布重设（裁剪/画布大小）/ 裁切 / 显示全部 / 90°旋转 / 翻转 /
+// 移动图层（三段事务）/ 选区平移
+napi_value ResizeCanvas(napi_env env, napi_callback_info info);
+napi_value TrimCanvas(napi_env env, napi_callback_info info);
+napi_value RevealAll(napi_env env, napi_callback_info info);
+napi_value RotateDocument90(napi_env env, napi_callback_info info);
+napi_value FlipDocument(napi_env env, napi_callback_info info);
+napi_value TranslateLayer(napi_env env, napi_callback_info info);
+napi_value TranslateSelection(napi_env env, napi_callback_info info);
 // 页面销毁时释放回调与渲染线程
 napi_value Dispose(napi_env env, napi_callback_info info);
 

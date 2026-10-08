@@ -48,6 +48,13 @@ napi_value Init(napi_env env, napi_value exports) {
         {"samplePixel", nullptr, montage::bridge::SamplePixel, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"exportPng", nullptr, montage::bridge::ExportPng, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"flattenToPixelMap", nullptr, montage::bridge::FlattenToPixelMap, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"resizeCanvas", nullptr, montage::bridge::ResizeCanvas, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"trimCanvas", nullptr, montage::bridge::TrimCanvas, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"revealAll", nullptr, montage::bridge::RevealAll, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"rotateDocument90", nullptr, montage::bridge::RotateDocument90, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"flipDocument", nullptr, montage::bridge::FlipDocument, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"translateLayer", nullptr, montage::bridge::TranslateLayer, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"translateSelection", nullptr, montage::bridge::TranslateSelection, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"dispose", nullptr, montage::bridge::Dispose, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props);

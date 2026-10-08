@@ -11,6 +11,7 @@ add_library(compositor SHARED
         engine/document.cpp
         engine/engine.cpp
         engine/history.cpp
+        engine/transform_ops.cpp
         io/image_import.cpp
         io/image_export.cpp
         io/png_decode.cpp
