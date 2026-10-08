@@ -56,6 +56,8 @@ napi_value Init(napi_env env, napi_value exports) {
         {"flipDocument", nullptr, montage::bridge::FlipDocument, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"translateLayer", nullptr, montage::bridge::TranslateLayer, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"translateSelection", nullptr, montage::bridge::TranslateSelection, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"resampleDocument", nullptr, montage::bridge::ResampleDocument, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"rotateDocumentArbitrary", nullptr, montage::bridge::RotateDocumentArbitrary, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"dispose", nullptr, montage::bridge::Dispose, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props);

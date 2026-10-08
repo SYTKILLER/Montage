@@ -14,6 +14,7 @@
 
 #include "engine/engine.h"
 #include "engine/transform_ops.h"
+#include "engine/resample.h"
 #include "tiles/magic_wand.h"
 #include "io/image_export.h"
 #include "io/image_import.h"
@@ -2158,6 +2159,69 @@ napi_value ExportPng(napi_env env, napi_callback_info info) {
     }
     napi_queue_async_work(env, ctx->work);
     return promise;
+}
+
+// M8c：图像大小重采样（history 事务）
+napi_value ResampleDocument(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "resampleDocument(w, h) requires 2 args");
+    }
+    double w = 0, h = 0;
+    if (napi_get_value_double(env, argv[0], &w) != napi_ok ||
+        napi_get_value_double(env, argv[1], &h) != napi_ok || w < 1 || h < 1) {
+        return makeError(env, kErrBadParam, "resampleDocument: invalid size");
+    }
+    auto& e = Engine::get();
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "resampleDocument: no document");
+        }
+        e.history.beginEdit(e.doc, "image size", static_cast<uint64_t>(e.docRevision));
+        changed = resampleDocument(e.doc, static_cast<uint32_t>(w), static_cast<uint32_t>(h));
+        if (changed) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.bumpRevisionLocked();
+            e.requestRender();
+        } else {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        }
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "changed", makeBool(env, changed));
+    return makeOk(env, data);
+}
+
+// M8c：任意角旋转（度，顺时针；history 事务）
+napi_value RotateDocumentArbitrary(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "rotateDocumentArbitrary(deg) requires 1 arg");
+    }
+    double deg = 0;
+    if (napi_get_value_double(env, argv[0], &deg) != napi_ok) {
+        return makeError(env, kErrBadParam, "rotateDocumentArbitrary: invalid deg");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "rotateDocumentArbitrary: no document");
+        }
+        e.history.beginEdit(e.doc, "rotate arbitrary", static_cast<uint64_t>(e.docRevision));
+        rotateDocumentArbitrary(e.doc, deg);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
 }
 
 // M8b：PSD 导出（锁内拍快照 + 扁平化任务，锁外编码写出；fd 全路径接管）

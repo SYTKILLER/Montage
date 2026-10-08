@@ -99,6 +99,11 @@ struct Index {
   @State showAbout: boolean = false;
   @State showTheme: boolean = false;
   @State renameText: string = '';
+  @State showImageSize: boolean = false;
+  @State imgWText: string = '';
+  @State imgHText: string = '';
+  @State showRotateAny: boolean = false;
+  @State angleText: string = '';
   @State thumbVersion: number = 0;
 
   private engine: CompositorEngine = new CompositorEngine();
@@ -1003,6 +1008,26 @@ struct Index {
       case 'help.theme':
         this.showTheme = true;
         break;
+      case 'image.imageSize':
+        if (this.docOpen) {
+          this.imgWText = `${this.docW}`;
+          this.imgHText = `${this.docH}`;
+          this.showImageSize = true;
+        }
+        break;
+      case 'image.canvasSize':
+        if (this.docOpen) {
+          this.imgWText = `${this.docW}`;
+          this.imgHText = `${this.docH}`;
+          this.showImageSize = true;  // v1 复用尺寸对话框
+        }
+        break;
+      case 'image.rotateAny':
+        if (this.docOpen) {
+          this.angleText = '0';
+          this.showRotateAny = true;
+        }
+        break;
       case 'theme.system':
       case 'theme.light':
       case 'theme.dark':
@@ -1016,6 +1041,26 @@ struct Index {
     }
   }
 
+  private commitImageSize(): void {
+    const w = parseInt(this.imgWText);
+    const h = parseInt(this.imgHText);
+    if (isNaN(w) || isNaN(h) || w < 1 || h < 1 || w > 16384 || h > 16384) {
+      this.toast('尺寸无效（1-16384）');
+      return;
+    }
+    this.showImageSize = false;
+    this.docOp((): boolean => this.engine.resampleDocument(w, h), `图像大小 ${w}×${h}`);
+  }
+
+  private commitRotateAny(): void {
+    const deg = parseFloat(this.angleText);
+    if (isNaN(deg)) {
+      this.toast('角度无效');
+      return;
+    }
+    this.showRotateAny = false;
+    this.docOp((): boolean => this.engine.rotateDocumentArbitrary(deg), `旋转 ${deg} 度`);
+  }
   private applyTheme(mode: ThemeMode): void {
     this.themeMode = mode;
     this.prefs.setThemeMode(mode);
@@ -1081,11 +1126,12 @@ struct Index {
       leafItem('edit.paste', '粘贴', 'Ctrl+V', false),
     ];
     const imageMenu: MenuItemVM[] = [
-      leafItem('image.canvasSize', '画布大小…', '', false),
-      leafItem('image.imageSize', '图像大小…', '', false),
+      leafItem('image.canvasSize', '画布大小…', '', d),
+      leafItem('image.imageSize', '图像大小…', '', d),
       leafItem('image.rotate90cw', '顺时针旋转 90°', '', d),
       leafItem('image.rotate90ccw', '逆时针旋转 90°', '', d),
       leafItem('image.rotate180', '旋转 180°', '', d),
+      leafItem('image.rotateAny', '任意角度旋转…', '', d),
       leafItem('image.flipH', '水平翻转画布', '', d),
       leafItem('image.flipV', '垂直翻转画布', '', d),
       leafItem('image.trim', '裁切（基于像素）', '', d),
@@ -1637,7 +1683,65 @@ struct Index {
         .width('100%')
         .height('100%')
       }
-      if (this.showAbout || this.showShortcuts || this.showTheme) {
+      if (this.showImageSize) {
+        Stack() {
+          Column().width('100%').height('100%').backgroundColor('#66000000')
+            .onClick((): void => { this.showImageSize = false; })
+          Column({ space: 14 }) {
+            Text('图像大小').fontSize(16).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+            Row({ space: 10 }) {
+              Text('宽').fontSize(13).fontColor($r('app.color.text_secondary'))
+              TextInput({ text: this.imgWText }).width(120).height(40)
+                .onChange((v: string): void => { this.imgWText = v; })
+              Text('高').fontSize(13).fontColor($r('app.color.text_secondary'))
+              TextInput({ text: this.imgHText }).width(120).height(40)
+                .onChange((v: string): void => { this.imgHText = v; })
+            }
+            Row({ space: 12 }) {
+              Button('取消').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.surface'))
+                .fontColor($r('app.color.text_primary'))
+                .border({ width: 1, color: $r('app.color.border') })
+                .onClick((): void => { this.showImageSize = false; })
+              Button('确定').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.accent'))
+                .fontColor($r('app.color.on_accent'))
+                .onClick((): void => this.commitImageSize())
+            }.justifyContent(FlexAlign.End).width('100%')
+          }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
+            .border({ width: 1, color: $r('app.color.border') }).width(400)
+        }.width('100%').height('100%')
+      }
+      if (this.showRotateAny) {
+        Stack() {
+          Column().width('100%').height('100%').backgroundColor('#66000000')
+            .onClick((): void => { this.showRotateAny = false; })
+          Column({ space: 14 }) {
+            Text('任意角度旋转（顺时针）').fontSize(16).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+            Row({ space: 10 }) {
+              Text('角度').fontSize(13).fontColor($r('app.color.text_secondary'))
+              TextInput({ text: this.angleText }).width(120).height(40)
+                .onChange((v: string): void => { this.angleText = v; })
+              Text('度').fontSize(13).fontColor($r('app.color.text_secondary'))
+            }
+            Row({ space: 12 }) {
+              Button('取消').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.surface'))
+                .fontColor($r('app.color.text_primary'))
+                .border({ width: 1, color: $r('app.color.border') })
+                .onClick((): void => { this.showRotateAny = false; })
+              Button('确定').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.accent'))
+                .fontColor($r('app.color.on_accent'))
+                .onClick((): void => this.commitRotateAny())
+            }.justifyContent(FlexAlign.End).width('100%')
+          }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
+            .border({ width: 1, color: $r('app.color.border') }).width(400)
+        }.width('100%').height('100%')
+      }
+            if (this.showAbout || this.showShortcuts || this.showTheme) {
         InfoDialog({
           title: this.showAbout ? '关于 Montage' : (this.showShortcuts ? '快捷键' : '主题'),
           rows: this.showShortcuts ? SHORTCUT_ROWS : [],

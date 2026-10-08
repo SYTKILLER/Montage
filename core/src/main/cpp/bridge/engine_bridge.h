@@ -82,6 +82,9 @@ napi_value RotateDocument90(napi_env env, napi_callback_info info);
 napi_value FlipDocument(napi_env env, napi_callback_info info);
 napi_value TranslateLayer(napi_env env, napi_callback_info info);
 napi_value TranslateSelection(napi_env env, napi_callback_info info);
+// M8c：图像大小重采样 / 任意角旋转
+napi_value ResampleDocument(napi_env env, napi_callback_info info);
+napi_value RotateDocumentArbitrary(napi_env env, napi_callback_info info);
 // 页面销毁时释放回调与渲染线程
 napi_value Dispose(napi_env env, napi_callback_info info);
 

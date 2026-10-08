@@ -538,6 +538,18 @@ export class CompositorEngine {
     return r.ok;
   }
 
+  /** 图像大小重采样（M8c；双线性）。 */
+  resampleDocument(w: number, h: number): boolean {
+    const r = narrowResult(native.resampleDocument(w, h) as Object);
+    return r.ok && r.data !== null && boolOf(r.data, 'changed');
+  }
+
+  /** 任意角旋转（M8c；顺时针度）。 */
+  rotateDocumentArbitrary(deg: number): boolean {
+    const r = narrowResult(native.rotateDocumentArbitrary(deg) as Object);
+    return r.ok;
+  }
+
   /** 选区平移（M8a/M7d）。 */
   translateSelection(dx: number, dy: number): boolean {
     const r = narrowResult(native.translateSelection(dx, dy) as Object);
