@@ -55,6 +55,8 @@ class Engine {
     std::mutex strokeCycleMtx;              // 生命周期互斥：begin/end 处理段与 dispose 清理串行
     std::unique_ptr<StrokeDraft> draft;     // 绘制中的笔画（mutex 内访问）
     BrushSettings brush;                    // 当前笔刷参数（ArkTS setBrushSettings 写入）
+    float fgColor[3] = {0.0f, 0.0f, 0.0f};  // M9c 前景色（直 alpha 0..1；起笔覆盖 brush 色）
+    float bgColor[3] = {1.0f, 1.0f, 1.0f};  // M9c 背景色（渐变/填充 M11 用）
     bool brushOnMask = false;               // M5b：落笔目标 = 活动图层蒙版（setBrushTarget 写入）
     std::thread strokeThread_;
     bool strokeThreadStarted_ = false;

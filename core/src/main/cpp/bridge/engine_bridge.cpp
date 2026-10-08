@@ -2461,6 +2461,36 @@ napi_value SetCurvePoints(napi_env env, napi_callback_info info) {
     return makeOk(env, data);
 }
 
+// M9c：前景/背景色（fg 即笔刷色——PS 语义；X 交换/D 重置由 UI 侧调）
+napi_value SetColors(napi_env env, napi_callback_info info) {
+    size_t argc = 6;
+    napi_value argv[6] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 6) {
+        return makeError(env, kErrBadParam, "setColors(fgR,fgG,fgB,bgR,bgG,bgB) requires 6 args");
+    }
+    double v[6] = {0};
+    for (int i = 0; i < 6; ++i) {
+        if (napi_get_value_double(env, argv[i], &v[i]) != napi_ok || v[i] < 0 || v[i] > 1) {
+            return makeError(env, kErrBadParam, "setColors: invalid color");
+        }
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        e.fgColor[0] = static_cast<float>(v[0]);
+        e.fgColor[1] = static_cast<float>(v[1]);
+        e.fgColor[2] = static_cast<float>(v[2]);
+        e.bgColor[0] = static_cast<float>(v[3]);
+        e.bgColor[1] = static_cast<float>(v[4]);
+        e.bgColor[2] = static_cast<float>(v[5]);
+        e.brush.red = e.fgColor[0];
+        e.brush.green = e.fgColor[1];
+        e.brush.blue = e.fgColor[2];
+    }
+    return makeOk(env, nullptr);
+}
+
 // M9a：调整层 kind 切换 + 通用参数（id, kind, p0..p3；kind 对齐 AdjustmentKind 枚举）
 napi_value SetAdjustmentKind(napi_env env, napi_callback_info info) {
     size_t argc = 6;

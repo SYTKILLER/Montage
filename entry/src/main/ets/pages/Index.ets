@@ -50,6 +50,7 @@ const KC_NUM0: number = 2000;
 const KC_NUM1: number = 2001;
 const KC_ESC: number = 2070;
 const KC_T_KEY: number = 2036;
+const KC_X_KEY: number = 2040;
 const KC_ENTER: number = 2054;
 const KC_UP: number = 2012;
 const KC_DOWN: number = 2013;
@@ -86,7 +87,8 @@ struct Index {
   @State brushSize: number = 40;
   @State brushHardness: number = 80;
   @State brushOpacity: number = 100;   // 5-100 百分比（引擎单位 0-1 在 pushBrushSettings 换算）
-  @State brushColor: string = '#D93025';
+  @State brushColor: string = '#D93025';   // 前景色（= 笔刷色）
+  @State bgColor: string = '#FFFFFF';      // 背景色
   @State maskTarget: boolean = false;
   @State wandTolerance: number = 32;
   @State wandContiguous: boolean = true;
@@ -545,7 +547,7 @@ struct Index {
         return;
       }
       const hex = this.rgbToHex(d.red, d.green, d.blue);
-      this.brushColor = hex;
+      this.applyColors(hex, this.bgColor);
       this.toast(`取色 ${hex}`);
       this.log(`吸管: (${docX.toFixed(0)},${docY.toFixed(0)}) → ${hex} a=${d.alpha}`);
     }).catch((e: BusinessError): void => {
@@ -873,6 +875,15 @@ struct Index {
     const rgb = this.hexToRgb(this.brushColor);
     this.engine.setBrushSettings(this.brushSize, this.brushHardness / 100, this.brushOpacity / 100,
       rgb[0], rgb[1], rgb[2], this.tool === 'eraser');
+  }
+
+  /** M9c：颜色变更统一入口（引擎 fg/bg + UI 镜像同步）。 */
+  private applyColors(fg: string, bg: string): void {
+    this.brushColor = fg;
+    this.bgColor = bg;
+    const f = this.hexToRgb(fg);
+    const b = this.hexToRgb(bg);
+    this.engine.setColors(f[0], f[1], f[2], b[0], b[1], b[2]);
   }
 
   private activeLayerHasMask(): boolean {
@@ -1486,6 +1497,12 @@ struct Index {
       case KC_Z:
         this.pickTool('zoom');
         break;
+      case KC_X_KEY:
+        this.applyColors(this.bgColor, this.brushColor);  // 交换前后景
+        break;
+      case KC_D:
+        this.applyColors('#000000', '#FFFFFF');  // 重置黑白
+        break;
       case KC_LBRACKET:
         this.brushSize = Math.max(2, this.brushSize - 4);
         break;
@@ -1599,7 +1616,7 @@ struct Index {
           cropPending: this.cropRect !== null,
           onToggleMaskTarget: (): void => this.onToggleMaskTarget(),
           onColorPick: (hex: string): void => {
-            this.brushColor = hex;
+            this.applyColors(hex, this.bgColor);
           },
           onZoom: (cmd: string): void => this.runCommand(`view.${cmd === 'fit' ? 'fit' : cmd === '100' ? 'zoom100' : cmd === 'in' ? 'zoomIn' : 'zoomOut'}`),
           onCropCommand: (cmd: string): void => this.runCommand(`crop.${cmd}`),

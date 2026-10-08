@@ -569,6 +569,13 @@ export class CompositorEngine {
     return r.ok;
   }
 
+  /** 前景/背景色（M9c；0..1；fg 即笔刷色）。 */
+  setColors(fgR: number, fgG: number, fgB: number, bgR: number, bgG: number,
+            bgB: number): boolean {
+    const r = narrowResult(native.setColors(fgR, fgG, fgB, bgR, bgG, bgB) as Object);
+    return r.ok;
+  }
+
   /** 曲线控制点设置（M9b；xs/ys 0..1 归一）。 */
   setCurvePoints(id: number, xs: number[], ys: number[]): boolean {
     const r = narrowResult(native.setCurvePoints(id, xs, ys) as Object);
