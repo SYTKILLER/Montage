@@ -44,6 +44,9 @@ struct Record {
     bool maskEnabled = true;
     LayerKind kind = LayerKind::Raster;
     std::vector<std::string> notes;  // 降级提示（逐层）
+    // M9d：调整层数据（kind=Adjustment 时；levl/curv/nvrt 可映射非破坏，其余 payload 原样）
+    std::string adjKey;
+    std::vector<uint8_t> adjPayload;
 };
 
 struct PsdDocument {

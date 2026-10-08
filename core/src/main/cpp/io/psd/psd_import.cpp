@@ -132,7 +132,58 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
                                    static_cast<double>(std::max<size_t>(doc.layers.size(), 1)));
         const uint64_t parent = 0;  // M2 无组层级：全部视作根（组已扁平化）
         if (rec.kind == psd::LayerKind::Adjustment) {
-            continue;  // 跳过调整层（note 已带）
+            // M9d：levl/curv/nvrt → 非破坏调整层（无像素内容）；其余仍跳过
+            auto adj = std::make_shared<LayerAdjustment>();
+            bool mapped = false;
+            if (rec.adjKey == "levl" && rec.adjPayload.size() >= 14) {
+                // ver u32 + inB i16 + inW i16 + gamma i16(/100) + outB i16 + outW i16
+                auto rd16 = [&rec](size_t o) -> int {
+                    return static_cast<int16_t>(rec.adjPayload[o] << 8 | rec.adjPayload[o + 1]);
+                };
+                const int inB = rd16(4);
+                const int inW = rd16(6);
+                const int gm = rd16(8);
+                adj->kind = AdjustmentKind::Levels;
+                adj->inBlack = std::min(1.0f, std::max(0.0f, inB / 255.0f));
+                adj->inWhite = std::min(1.0f, std::max(0.001f, inW / 255.0f));
+                adj->gamma = std::min(10.0f, std::max(0.1f, gm / 100.0f));
+                mapped = true;
+            } else if (rec.adjKey == "curv" && rec.adjPayload.size() >= 6) {
+                // ver u32 + count u16 + count×(x,y) 字节
+                const uint32_t ver =
+                    static_cast<uint32_t>(rec.adjPayload[0]) << 24 |
+                    static_cast<uint32_t>(rec.adjPayload[1]) << 16 |
+                    static_cast<uint32_t>(rec.adjPayload[2]) << 8 | rec.adjPayload[3];
+                if (ver == 1) {
+                    const uint32_t count = static_cast<uint32_t>(rec.adjPayload[4]) << 8 |
+                                           rec.adjPayload[5];
+                    if (count >= 2 && rec.adjPayload.size() >= 6 + count * 2) {
+                        adj->kind = AdjustmentKind::Curves;
+                        for (uint32_t p = 0; p < count; ++p) {
+                            adj->curveX.push_back(rec.adjPayload[6 + p * 2] / 255.0f);
+                            adj->curveY.push_back(rec.adjPayload[7 + p * 2] / 255.0f);
+                        }
+                        mapped = true;
+                    }
+                }
+            } else if (rec.adjKey == "nvrt") {
+                adj->kind = AdjustmentKind::Invert;
+                mapped = true;
+            }
+            if (mapped) {
+                Layer layer;
+                layer.id = engine.nextLayerId();
+                layer.name = rec.name;
+                layer.visible = rec.visible;
+                layer.opacity = std::min(1.0, std::max(0.0, rec.opacity));
+                layer.blendMode = rec.blendMode;
+                layer.clipping = rec.clipping;
+                layer.adjustment = std::move(adj);
+                layers.push_back(std::move(layer));
+                done++;
+                continue;
+            }
+            continue;  // 其余调整类（hue2/blnc/...）仍跳过（note 已带）
         }
         Layer layer;
         layer.id = engine.nextLayerId();

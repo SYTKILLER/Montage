@@ -811,7 +811,21 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
             } else if (rec.kind == LayerKind::Effects) {
                 rec.notes.push_back("Layer effects were discarded.");
             } else if (rec.kind == LayerKind::Adjustment) {
-                rec.notes.push_back("Adjustment layer was skipped.");
+                // M9d：levl/curv/nvrt 可映射非破坏（payload 提取给 import）；其余仍跳过
+                static const std::vector<const char*> kMappable = {"levl", "curv", "nvrt"};
+                bool extracted = false;
+                for (const char* k : kMappable) {
+                    auto it = layer.extra.find(k);
+                    if (it != layer.extra.end()) {
+                        rec.adjKey = k;
+                        rec.adjPayload = it->second;
+                        extracted = true;
+                        break;
+                    }
+                }
+                if (!extracted) {
+                    rec.notes.push_back("Adjustment layer was skipped.");
+                }
             }
             if (!rec.blendExact) {
                 rec.notes.push_back("Blend mode \"" + layer.blendKey + "\" applied as Normal.");
