@@ -149,7 +149,8 @@ void Engine::strokeThreadMain() {
                     draft = std::make_unique<StrokeDraft>();
                     std::string err;
                     if (!draft->begin(doc, doc.activeId, brush, !qm && brushOnMask, qm,
-                                      useClone ? &cloneParams : nullptr, err)) {
+                                      useClone ? &cloneParams : nullptr, err,
+                                      qm ? BrushEffect::None : brushEffect)) {
                         OH_LOG_Print(LOG_APP, LOG_WARN, 0x4D30, "Montage.Brush",
                                      "draft begin failed: %{public}s", err.c_str());
                         history.endEdit(doc, static_cast<uint64_t>(docRevision));
@@ -349,6 +350,7 @@ void Engine::resetDocument() {
     // 落笔目标标志随文档清空（否则新文档上蒙版目标笔画静默拒绝——连带修复潜伏 bug）
     brushOnMask = false;
     brushIsClone = false;
+    brushEffect = BrushEffect::None;
     cloneSource = CloneSource{};
     needsRender.store(true);
     render.wake();

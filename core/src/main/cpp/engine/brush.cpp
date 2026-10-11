@@ -18,7 +18,7 @@ constexpr float kSpacingSoft = 0.025f;
 
 bool StrokeDraft::begin(const Document& doc, LayerId layerId, const BrushSettings& settings,
                         bool onMask, bool onQuickMask, const CloneParams* cloneSrc,
-                        std::string& err) {
+                        std::string& err, BrushEffect effect) {
     const Layer* layer = nullptr;
     for (const Layer& l : doc.layers) {
         if (l.id == layerId) {
@@ -44,6 +44,12 @@ bool StrokeDraft::begin(const Document& doc, LayerId layerId, const BrushSetting
     srcGrid_ = nullptr;
     srcCacheBase_ = nullptr;
     srcCacheKey_ = 0;
+    baseCacheBase_ = nullptr;
+    baseCacheKey_ = 0;
+    smudgeHas_ = false;
+    smudgeR_ = smudgeG_ = smudgeB_ = smudgeA_ = 0.0f;
+    // M11e：效果族仅像素目标生效（QM/蒙版灰度域退化普通笔，登记）
+    effect_ = (cloneSrc == nullptr && !onMask && !onQuickMask) ? effect : BrushEffect::None;
     if (cloneSrc != nullptr && cloneSrc->srcGrid != nullptr) {
         // M11d 仿制图章：目标 = 当前层像素网格；源 = 克隆源网格快照（不可变）
         if (layer == nullptr) {
@@ -260,6 +266,23 @@ void StrokeDraft::dab(float gx, float gy) {
             }
         }
     }
+    if (effect_ == BrushEffect::Smudge) {
+        // M11e 涂抹：dab 中心取色混入 held（首 dab 抓取、后续 40% 混入——沿笔拖颜料）
+        const uint8_t* s = baseAt(static_cast<int>(gx), static_cast<int>(gy));
+        const float sr = s != nullptr ? s[0] / 255.0f : 0.0f;
+        const float sg = s != nullptr ? s[1] / 255.0f : 0.0f;
+        const float sb = s != nullptr ? s[2] / 255.0f : 0.0f;
+        const float sa = s != nullptr ? s[3] / 255.0f : 0.0f;
+        if (!smudgeHas_) {
+            // v1 单色涂抹：held = 起笔区采样色（沿途混入会随 dab 覆盖互相抹除，
+            // 位移混合模型登记 M19/后续批）
+            smudgeR_ = sr;
+            smudgeG_ = sg;
+            smudgeB_ = sb;
+            smudgeA_ = sa;
+            smudgeHas_ = true;
+        }
+    }
 }
 
 void StrokeDraft::walkTo(float gx, float gy) {
@@ -406,6 +429,11 @@ void StrokeDraft::append(float docX, float docY, float pressure) {
     if (n == 1) {
         pressure_ = pr;
         walkTo(gx, gy);
+    } else if (effect_ == BrushEffect::Smudge) {
+        // M11e 涂抹：禁用 provisional tail（tail 重画会用稀释后的 held 全程覆盖直写
+        // 痕迹——颜色历史按 dab 演化无法精确重放）。直线段直连，曲线平滑度降为折线、
+        // 尾段滞后一拍，登记 v1 取舍。
+        walkTo(gx, gy);
     } else {
         if (n >= 3) {
             // 上一段现已拿到真实后置样本 → 落最终曲线段
@@ -425,7 +453,9 @@ void StrokeDraft::end() {
     }
     removeTail();
     const size_t n = samples_.size();
-    if (n >= 2) {
+    // M11e 涂抹：末段已在 append 的 walkTo 直连中落墨（禁 tail 同理——重放会用
+    // 终点稀释后的 held 覆盖整段直写），跳过 curvePiece
+    if (n >= 2 && effect_ != BrushEffect::Smudge) {
         curvePiece(samples_[n - 2], samples_[n - 1],
                    samples_[n >= 3 ? n - 3 : n - 2], samples_[n - 1]);
     }
@@ -484,6 +514,33 @@ const uint8_t* StrokeDraft::srcAt(int gx, int gy) const {
            static_cast<size_t>(gx % static_cast<int>(kTileSize)) * 4u;
 }
 
+// M11e：base_ 网格局部采样（涂抹 dab 取色；结构同 srcAt、独立缓存）
+const uint8_t* StrokeDraft::baseAt(int gx, int gy) const {
+    if (base_ == nullptr || gx < 0 || gy < 0 ||
+        gx >= static_cast<int>(base_->cols * kTileSize) ||
+        gy >= static_cast<int>(base_->rows * kTileSize)) {
+        return nullptr;
+    }
+    const uint32_t key = static_cast<uint32_t>(gy / static_cast<int>(kTileSize)) * base_->cols +
+                         static_cast<uint32_t>(gx / static_cast<int>(kTileSize));
+    if (key != baseCacheKey_ || baseCacheBase_ == nullptr) {
+        auto it = base_->tiles.find(key);
+        if (it == base_->tiles.end() || it->second == nullptr) {
+            baseCacheBase_ = nullptr;
+            baseCacheKey_ = key;
+            return nullptr;
+        }
+        baseCacheBase_ = it->second->pixels->mapCpu();
+        baseCacheStride_ = it->second->pixels->rowBytes();
+        baseCacheKey_ = key;
+    }
+    if (baseCacheBase_ == nullptr) {
+        return nullptr;
+    }
+    return baseCacheBase_ + static_cast<size_t>(gy % static_cast<int>(kTileSize)) * baseCacheStride_ +
+           static_cast<size_t>(gx % static_cast<int>(kTileSize)) * 4u;
+}
+
 // publish 语义（对拍 publish()）：瓦片 = base + color × coverage × opacity；
 // 橡皮 = destinationOut。直通 alpha 域换算。
 void StrokeDraft::paintTile(uint32_t key) {
@@ -495,6 +552,87 @@ void StrokeDraft::paintTile(uint32_t key) {
     const uint8_t* cov = covIt->second.data();
     uint8_t* px = workIt->second.data();
     const float op = settings_.opacity;
+    if (effect_ != BrushEffect::None) {
+        // M11e dab 内核族：像素域逐像素 × coverage（orig 副本供邻域/混合基准）
+        constexpr size_t kN = static_cast<size_t>(kTileSize) * kTileSize;
+        std::vector<uint8_t> orig(px, px + kN * 4u);
+        constexpr float kStrength = 0.5f;  // 效果强度 v1 固定（曝光/流量滑条登记）
+        for (size_t i = 0; i < kN; ++i) {
+            const float covA = (cov[i] / 255.0f) * op;
+            if (covA <= 0.0f) {
+                continue;
+            }
+            uint8_t* p = px + i * 4u;
+            if (effect_ == BrushEffect::Blur || effect_ == BrushEffect::Sharpen) {
+                // 3×3 盒卷积（work_ 瓦片内 clamp 边缘）；sharpen = 反锐化掩模
+                const int cx = static_cast<int>(i % kTileSize);
+                const int cy = static_cast<int>(i / kTileSize);
+                float acc[4] = {0, 0, 0, 0};
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const int nx = std::min(static_cast<int>(kTileSize) - 1,
+                                                std::max(0, cx + dx));
+                        const int ny = std::min(static_cast<int>(kTileSize) - 1,
+                                                std::max(0, cy + dy));
+                        const uint8_t* q = orig.data() +
+                            (static_cast<size_t>(ny) * kTileSize + static_cast<size_t>(nx)) * 4u;
+                        for (int ch = 0; ch < 4; ++ch) {
+                            acc[ch] += q[static_cast<size_t>(ch)];
+                        }
+                    }
+                }
+                for (int ch = 0; ch < 4; ++ch) {
+                    float v = acc[ch] / 9.0f;
+                    if (effect_ == BrushEffect::Sharpen) {
+                        const float o = orig[i * 4u + static_cast<size_t>(ch)];
+                        v = o + (o - v) * 1.0f;  // amount=1（锐化差放大的钝核 v1）
+                    }
+                    v = std::min(255.0f, std::max(0.0f, v));
+                    const float o = orig[i * 4u + static_cast<size_t>(ch)];
+                    p[static_cast<size_t>(ch)] =
+                        static_cast<uint8_t>(std::lround(v * covA + o * (1.0f - covA)));
+                }
+            } else if (effect_ == BrushEffect::Smudge) {
+                // held 颜色 src-over（held alpha 参与；尾段残影登记）
+                const float sa = smudgeA_ * covA;
+                if (sa > 0.0f) {
+                    const float da = orig[i * 4u + 3] / 255.0f;
+                    const float oa = sa + da * (1.0f - sa);
+                    const float srcP[3] = {smudgeR_ * sa, smudgeG_ * sa, smudgeB_ * sa};
+                    for (int ch = 0; ch < 3; ++ch) {
+                        const float d = orig[i * 4u + static_cast<size_t>(ch)] / 255.0f * da *
+                                        (1.0f - sa);
+                        p[static_cast<size_t>(ch)] = static_cast<uint8_t>(std::lround(
+                            std::min(1.0f, oa > 0.0001f ? (srcP[ch] + d) / oa : 0.0f) * 255.0f));
+                    }
+                    p[3] = static_cast<uint8_t>(std::lround(std::min(1.0f, oa) * 255.0f));
+                }
+            } else if (effect_ == BrushEffect::Dodge) {
+                for (int ch = 0; ch < 3; ++ch) {
+                    const float c = orig[i * 4u + static_cast<size_t>(ch)];
+                    const float v = c + (255.0f - c) * covA * kStrength;
+                    p[static_cast<size_t>(ch)] =
+                        static_cast<uint8_t>(std::lround(std::min(255.0f, v)));
+                }
+            } else if (effect_ == BrushEffect::Burn) {
+                for (int ch = 0; ch < 3; ++ch) {
+                    const float c = orig[i * 4u + static_cast<size_t>(ch)];
+                    p[static_cast<size_t>(ch)] =
+                        static_cast<uint8_t>(std::lround(c * (1.0f - covA * kStrength)));
+                }
+            } else {  // Sponge（去饱和）
+                const float r = orig[i * 4u];
+                const float g = orig[i * 4u + 1];
+                const float b = orig[i * 4u + 2];
+                const float lum = 0.3f * r + 0.59f * g + 0.11f * b;
+                const float k = 1.0f - covA * kStrength;
+                p[0] = static_cast<uint8_t>(std::lround(lum + (r - lum) * k));
+                p[1] = static_cast<uint8_t>(std::lround(lum + (g - lum) * k));
+                p[2] = static_cast<uint8_t>(std::lround(lum + (b - lum) * k));
+            }
+        }
+        return;
+    }
     if (cloneMode_) {
         // M11d 仿制图章：out = src × covA + dst × (1−covA)（src 含自身 alpha；
         // 源恒读笔画开始快照——本笔已画像素在 work_，绝不重采）

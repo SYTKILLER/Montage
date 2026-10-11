@@ -614,6 +614,12 @@ export class CompositorEngine {
     return r.ok;
   }
 
+  // M11e dab 内核族：mode 对齐 BrushEffect（0=None 1=Blur 2=Sharpen 3=Smudge 4=Dodge 5=Burn 6=Sponge）
+  setBrushEffect(mode: number): boolean {
+    const r = narrowResult(native.setBrushEffect(mode) as Object);
+    return r.ok;
+  }
+
   // M11c 形状栅格化（kind 0=矩形/1=圆角/2=椭圆/3=直线；fill/stroke 0/1 number；前景填充/背景描边）
   rasterizeShape(kind: number, x0: number, y0: number, x1: number, y1: number,
     cornerRadius: number, fill: boolean, stroke: boolean, strokeWidth: number): boolean {

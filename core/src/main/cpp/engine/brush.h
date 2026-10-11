@@ -34,6 +34,20 @@ struct BrushSettings {
     bool erasing = false;
 };
 
+// M11e dab 内核族（06 规划 §4 M11）：效果工具在像素域逐像素作用 × coverage（选区约束
+// 经 coverage 自动生效）。blur/sharpen 用 work_ 瓦片内 3×3 邻域（瓦片边缘 1px clamp
+// 近似，接缝不连续登记）；smudge 为 held 颜色模型（dab 级混入、paintTile 单色涂抹，
+// 尾段残影登记）；dodge/burn/sponge 就地变换（重复涂抹迭代——PS 同）。
+enum class BrushEffect : int32_t {
+    None = 0,
+    Blur = 1,     // 3×3 盒卷积
+    Sharpen = 2,  // 反锐化掩模 amount=0.5
+    Smudge = 3,   // 涂抹（held 颜色）
+    Dodge = 4,    // 减淡：c' = c + (1−c)·covA·0.5
+    Burn = 5,     // 加深：c' = c·(1−covA·0.5)
+    Sponge = 6,   // 海绵（去饱和）：c' = lum + (c−lum)·(1−covA·0.5)
+};
+
 class StrokeDraft {
   public:
     // 绑定图层开始笔画。grid = 图层像素网格（origin 平移，1:1）；空图层从触笔区域动态扩展。
@@ -51,7 +65,8 @@ class StrokeDraft {
         double offsetY = 0.0;
     };
     bool begin(const Document& doc, LayerId layerId, const BrushSettings& settings, bool onMask,
-               bool onQuickMask, const CloneParams* cloneSrc, std::string& err);
+               bool onQuickMask, const CloneParams* cloneSrc, std::string& err,
+               BrushEffect effect = BrushEffect::None);
     // 文档坐标追加样本（Catmull-Rom 落 dab；pressure ∈ [0,1]，调制 dab 直径）
     void append(float docX, float docY, float pressure);
     void end();
@@ -109,10 +124,20 @@ class StrokeDraft {
     int srcOriginY_ = 0;
     double srcOffsetX_ = 0.0;
     double srcOffsetY_ = 0.0;
+    BrushEffect effect_ = BrushEffect::None;  // M11e：dab 内核族
+    float smudgeR_ = 0.0f;     // 涂抹 held 颜色（dab 级混入）
+    float smudgeG_ = 0.0f;
+    float smudgeB_ = 0.0f;
+    float smudgeA_ = 0.0f;
+    bool smudgeHas_ = false;
     mutable uint32_t srcCacheKey_ = 0;   // srcAt 单瓦片缓存（克隆采样跨瓦片随机访问）
     mutable const uint8_t* srcCacheBase_ = nullptr;
     mutable uint32_t srcCacheStride_ = 0;
     const uint8_t* srcAt(int srcGridX, int srcGridY) const;  // 源网格局部采样（越界=透明）
+    const uint8_t* baseAt(int gx, int gy) const;  // base_ 网格局部采样（涂抹 dab 取色；越界=透明）
+    mutable uint32_t baseCacheKey_ = 0;
+    mutable const uint8_t* baseCacheBase_ = nullptr;
+    mutable uint32_t baseCacheStride_ = 0;
     float maskLum_ = 0.0f;     // 蒙版笔刷亮度（settings 颜色均值）
     bool layerHadPixels_ = false;
     int originX_ = 0;   // 网格原点 doc 坐标（= 图层 origin；空层 = 首触点整瓦片对齐）

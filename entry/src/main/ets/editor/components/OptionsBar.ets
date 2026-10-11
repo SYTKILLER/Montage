@@ -400,6 +400,51 @@ export struct OptionsBar {
     .height(36)
   }
 
+  // M11e 效果工具选项：直径/不透明度 + 提示（强度 v1 固定 50%）
+  @Builder
+  effectOptions() {
+    Row({ space: 10 }) {
+      OptionSlider({
+        label: '直径',
+        min: 2,
+        max: 400,
+        step: 1,
+        value: $brushSize,
+        onCommitted: (v: number): void => {
+          this.brushSize = v;
+        }
+      })
+      OptionSlider({
+        label: '不透明度',
+        min: 5,
+        max: 100,
+        step: 1,
+        value: $brushOpacity,
+        suffix: '%',
+        onCommitted: (v: number): void => {
+          this.brushOpacity = v;
+        }
+      })
+      Text(this.effectHint())
+        .fontSize(11)
+        .fontColor($r('app.color.text_secondary'))
+    }
+    .height(36)
+  }
+
+  private effectHint(): string {
+    const hints: Record<string, string> = {
+      'blur': '模糊：柔化涂抹区',
+      'sharpen': '锐化：增强边缘',
+      'smudge': '涂抹：拖颜料',
+      'dodge': '减淡：提亮',
+      'burn': '加深：压暗',
+      'sponge': '海绵：去饱和',
+    };
+    const v = hints[this.tool];
+    return v !== undefined ? v + ' · Shift+同键循环' : '';
+  }
+
   build() {
     Row({ space: 8 }) {
       Text(this.toolLabel)
@@ -409,6 +454,9 @@ export struct OptionsBar {
         .width(60)
       if (this.tool === 'brush' || this.tool === 'eraser') {
         this.brushOptions()
+      } else if (this.tool === 'blur' || this.tool === 'sharpen' || this.tool === 'smudge'
+        || this.tool === 'dodge' || this.tool === 'burn' || this.tool === 'sponge') {
+        this.effectOptions()
       } else if (this.tool === 'pencil') {
         // 铅笔 = 硬度 100 画笔别名：无硬度滑条（强制硬边）
         Row({ space: 10 }) {

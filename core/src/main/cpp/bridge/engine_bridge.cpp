@@ -2185,6 +2185,31 @@ napi_value SetBrushClone(napi_env env, napi_callback_info info) {
     return makeOk(env, nullptr);
 }
 
+// M11e：效果工具切换（mode 对齐 BrushEffect；非 0 时与克隆/蒙版目标互斥由 UI 侧保证，
+// 引擎在 begin 处再兜底降级）
+napi_value SetBrushEffect(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "setBrushEffect(mode) requires 1 arg");
+    }
+    double mode = 0;
+    if (napi_get_value_double(env, argv[0], &mode) != napi_ok) {
+        return makeError(env, kErrBadParam, "setBrushEffect: invalid arg");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        const int m = static_cast<int>(mode);
+        e.brushEffect = (m >= 0 && m <= 6) ? static_cast<BrushEffect>(m) : BrushEffect::None;
+        if (e.brushEffect != BrushEffect::None) {
+            e.brushIsClone = false;  // 效果与克隆互斥（工具切换互斥的引擎侧兜底）
+        }
+    }
+    return makeOk(env, nullptr);
+}
+
 napi_value StoreSelection(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value argv[1] = {nullptr};

@@ -58,6 +58,7 @@ const KC_F5: number = 2094;  // KEYCODE_F5（SDK 核验，2026-10-11）
 const KC_G: number = 2023;   // KEYCODE_G（SDK 核验，2026-10-11）
 const KC_T_KEY: number = 2036;
 const KC_U: number = 2037;  // KEYCODE_U（SDK 核验，2026-10-11）
+const KC_R: number = 2034;  // KEYCODE_R（SDK 核验，2026-10-11；KC_O=2031 见上）
 const KC_X_KEY: number = 2040;
 const KC_ENTER: number = 2054;
 const KC_UP: number = 2012;
@@ -119,6 +120,25 @@ struct Index {
   @State cloneAligned: boolean = true;   // M11d 仿制图章对齐开关
   @State cloneSourceSet: boolean = false; // 已取源镜像（选项条提示态）
   @State clonePicking: boolean = false;   // 取源模式：下一次画布点击 = 取源（触屏兜底）
+  // M11e 效果工具（R 组：blur/sharpen/smudge；O 组：dodge/burn/sponge）
+  @State effectTool: string = 'blur';
+
+  private effectModeOf(id: string): number {
+    if (id === 'blur') {
+      return 1;
+    } else if (id === 'sharpen') {
+      return 2;
+    } else if (id === 'smudge') {
+      return 3;
+    } else if (id === 'dodge') {
+      return 4;
+    } else if (id === 'burn') {
+      return 5;
+    } else if (id === 'sponge') {
+      return 6;
+    }
+    return 0;
+  }
   @State wandTolerance: number = 32;
   @State wandContiguous: boolean = true;
   @State wandAllLayers: boolean = false;
@@ -459,6 +479,12 @@ struct Index {
       case 'brush':
       case 'pencil':
       case 'eraser':
+      case 'blur':
+      case 'sharpen':
+      case 'smudge':
+      case 'dodge':
+      case 'burn':
+      case 'sponge':
         this.strokeTouch(e, t, docX, docY);
         break;
       case 'gradient':
@@ -1148,6 +1174,16 @@ struct Index {
     }
     if (id !== 'stamp' && this.tool === 'stamp') {
       this.engine.setBrushClone(false);  // 离开图章工具即清除克隆标志
+    }
+    if (this.effectModeOf(id) > 0) {
+      // M11e 效果工具：互斥克隆/蒙版目标，激活对应内核
+      this.maskTarget = false;
+      this.engine.setBrushTarget(false);
+      this.engine.setBrushClone(false);
+      this.engine.setBrushEffect(this.effectModeOf(id));
+      this.effectTool = id;
+    } else if (this.effectModeOf(this.tool) > 0 && id !== 'stamp') {
+      this.engine.setBrushEffect(0);  // 离开效果组归零
     }
     if (this.gradDragging) {
       this.gradDragging = false;  // 换工具丢弃未完成拖线
@@ -1880,6 +1916,8 @@ struct Index {
       { id: 'bucket', label: '油漆桶', symbol: $r('sys.symbol.paint_bucket'), enabled: true },
       { id: 'shape', label: '形状', symbol: $r('sys.symbol.circle_on_square'), enabled: true },
       { id: 'stamp', label: '仿制图章', symbol: $r('sys.symbol.seal'), enabled: true },
+      { id: 'blur', label: '模糊', symbol: $r('sys.symbol.hand_draw'), enabled: true },
+      { id: 'dodge', label: '减淡', symbol: $r('sys.symbol.contrast'), enabled: true },
       { id: '-', label: '', symbol: $r('sys.symbol.minus'), enabled: false },
       { id: 'hand', label: '抓手', symbol: $r('sys.symbol.hand'), enabled: true },
       { id: 'zoom', label: '缩放', symbol: $r('sys.symbol.magnifyingglass'), enabled: true },
@@ -1887,6 +1925,14 @@ struct Index {
   }
 
   private toolLabel(id: string): string {
+    // M11e 效果组内具体工具名（buildTools 只列代表按钮）
+    const effectLabels: Record<string, string> = {
+      'blur': '模糊', 'sharpen': '锐化', 'smudge': '涂抹',
+      'dodge': '减淡', 'burn': '加深', 'sponge': '海绵',
+    };
+    if (effectLabels[id] !== undefined) {
+      return effectLabels[id];
+    }
     for (const t of this.buildTools()) {
       if (t.id === id) {
         return t.label;
@@ -2105,6 +2151,26 @@ struct Index {
         // Ctrl+S 已在 Ctrl 分支处理；单键 S = 仿制图章（PS 语义）
         this.pickTool('stamp');
         break;
+      case KC_R:
+        // R = 模糊组（Shift+R 循环 模糊→锐化→涂抹）
+        if (this.shiftHeld) {
+          const next: string = this.tool === 'blur' ? 'sharpen'
+            : this.tool === 'sharpen' ? 'smudge' : 'blur';
+          this.pickTool(next);
+        } else {
+          this.pickTool('blur');
+        }
+        break;
+      case KC_O:
+        // O = 减淡组（Shift+O 循环 减淡→加深→海绵）
+        if (this.shiftHeld) {
+          const next: string = this.tool === 'dodge' ? 'burn'
+            : this.tool === 'burn' ? 'sponge' : 'dodge';
+          this.pickTool(next);
+        } else {
+          this.pickTool('dodge');
+        }
+        break;
       case KC_W:
         this.pickTool('wand');
         break;
@@ -2292,7 +2358,9 @@ struct Index {
           onCropCommand: (cmd: string): void => this.runCommand(`crop.${cmd}`),
         })
         Row() {
-          Toolbox({ tools: this.buildTools(), activeTool: this.tool,
+          Toolbox({ tools: this.buildTools(),
+            activeTool: this.tool === 'sharpen' || this.tool === 'smudge' ? 'blur'
+              : this.tool === 'burn' || this.tool === 'sponge' ? 'dodge' : this.tool,
             onPick: (id: string): void => this.pickTool(id) })
 
           // 画布区
