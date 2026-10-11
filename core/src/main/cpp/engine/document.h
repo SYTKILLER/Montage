@@ -208,6 +208,9 @@ struct Document {
     LayerId activeId = 0;
     // M7a 选区：文档域 8-bit 覆盖掩码（null = 无选区，全图可编辑）；随 Document 快照走撤销
     std::shared_ptr<const TileGrid> selection;
+    // M10d 快速蒙版（非 null = 快速蒙版模式中）：临时通道（选中度灰度，缺瓦片 = 0 = 全红）；
+    // 会话态不持久化；随 Document 快照走撤销（进出 Q 与通道涂画均为历史事务）
+    std::shared_ptr<const TileGrid> quickMask;
     // M10c Alpha 通道（存储选区；主选区保持会话态不持久化，通道经 .montage v5 持久化）
     std::vector<AlphaChannel> channels;
 };

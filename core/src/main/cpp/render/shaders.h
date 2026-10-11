@@ -132,6 +132,24 @@ void main() {
 }
 )";
 
+// 快速蒙版红 overlay（M10d）：采样通道灰度 g（选中度），未选中区红色半透明覆盖——
+// alpha = (1 − g) × 50%（PS 默认不透明度）。缺瓦片（未选中）由 CPU 侧绑 1×1 零纹理，
+// 同shader 输出满红；半纹素内缩防 LINEAR 跨瓦片接缝（同 kTileFrag）。
+inline const char* kQuickMaskFrag = R"(#version 300 es
+precision mediump float;
+uniform sampler2D uTex;
+in vec2 vDoc;
+uniform vec4 uRect;
+out vec4 o;
+void main() {
+  vec2 uv = (vDoc - uRect.xy) / uRect.zw;
+  const float texel = 1.0 / 256.0;
+  uv = clamp(uv, texel * 0.5, 1.0 - texel * 0.5);
+  float g = texture(uTex, uv).r;
+  o = vec4(1.0, 0.0, 0.0, (1.0 - g) * 0.5);
+}
+)";
+
 // Pass B 混合公共模板：%%BODY%% 占位声明由 buildBlendProgram 按模式替换为完整函数。
 inline const char* kBlendCommon = R"(#version 300 es
 precision mediump float;

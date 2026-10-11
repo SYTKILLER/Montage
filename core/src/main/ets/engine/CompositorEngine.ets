@@ -1,7 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
-import { EngineStats, ExportPngData, HistogramData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData } from '../model/EngineTypes';
+import { EngineStats, ExportPngData, HistogramData, QuickMaskState, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -77,6 +77,7 @@ function narrowStats(r: Record<string, Object>): EngineStats {
     lastError: str(r, 'lastError'),
     canUndo: boolOf(r, 'canUndo'),
     canRedo: boolOf(r, 'canRedo'),
+    quickMask: boolOf(r, 'quickMask'),
     historyVersion: num(r, 'historyVersion'),
   };
 }
@@ -531,6 +532,20 @@ export class CompositorEngine {
     return r.ok;
   }
 
+  // M10d 快速蒙版 toggle（PS Q 键）；失败返回 null
+  toggleQuickMask(): QuickMaskState | null {
+    // 变量类型必须 EngineResult（no-structural-typing 注解纪律，同 setWandSelection）
+    let r: EngineResult;
+    const v: Object = native.toggleQuickMask() as Object;
+    r = narrowResult(v);
+    if (!r.ok || r.data === null) {
+      hilog.error(DOMAIN, TAG, 'toggleQuickMask failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return null;
+    }
+    return { active: boolOf(r.data, 'active'), hasSelection: boolOf(r.data, 'hasSelection') };
+  }
+
   // M10c Alpha 通道：存储选区（同名覆盖）/ 载入（op 布尔四态）/ 删除 / 列表
   storeSelection(name: string): boolean {
     const r = narrowResult(native.storeSelection(name) as Object);
@@ -937,7 +952,8 @@ export class CompositorEngine {
         fps: 0, frames: 0, bufferWidth: 0, bufferHeight: 0, docRevision: 0,
         docWidth: 0, docHeight: 0, zoom: 1, panX: 0, panY: 0,
         importRunning: false, importProgress: 0, renderRunning: false,
-        lastError: 'getStats failed', canUndo: false, canRedo: false, historyVersion: 0,
+        lastError: 'getStats failed', canUndo: false, canRedo: false, quickMask: false,
+        historyVersion: 0,
       };
     }
     return narrowStats(r.data);

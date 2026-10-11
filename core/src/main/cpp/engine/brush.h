@@ -12,6 +12,7 @@
 //   （几何安全：不透明度压感会破坏 coverage max/screen 笔画级模型，登记后续）。
 // - 简化（相对源，登记后续里程碑）：无 GPU 路径、无 clone/heal/blur。
 
+#include <cmath>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -38,8 +39,10 @@ class StrokeDraft {
     // 绑定图层开始笔画。grid = 图层像素网格（origin 平移，1:1）；空图层从触笔区域动态扩展。
     // onMask = true 时绑定图层蒙版 patch 网格（灰度落笔：L×covA + base×(1-covA)；
     // 要求蒙版已有 patch 网格，erasing 标志被忽略）。
+    // onQuickMask = true 时绑定文档快速蒙版通道（灰度落笔同蒙版；文档域 origin=(0,0)，
+    // 优先级高于 onMask——QM 模式中 selection 为 null，蒙版目标不可达，此参数为显式语义）。
     bool begin(const Document& doc, LayerId layerId, const BrushSettings& settings, bool onMask,
-               std::string& err);
+               bool onQuickMask, std::string& err);
     // 文档坐标追加样本（Catmull-Rom 落 dab；pressure ∈ [0,1]，调制 dab 直径）
     void append(float docX, float docY, float pressure);
     void end();
@@ -48,6 +51,7 @@ class StrokeDraft {
     bool active() const { return active_; }
     LayerId layerId() const { return layerId_; }
     bool maskTarget() const { return maskTarget_; }
+    bool qmTarget() const { return qmTarget_; }  // M10d：落笔目标 = 快速蒙版通道（文档域灰度）
     // 渲染取数：draft 中该瓦片的合成像素（直通 RGBA，256×256）；无则返回 false
     bool tileFor(uint32_t tx, uint32_t ty, std::vector<uint8_t>& out) const;
     const std::set<uint32_t>& touchedTiles() const { return touched_; }
@@ -89,6 +93,7 @@ class StrokeDraft {
     LayerId layerId_ = 0;
     bool active_ = false;
     bool maskTarget_ = false;  // M5b：落笔目标 = 图层蒙版（灰度）
+    bool qmTarget_ = false;    // M10d：落笔目标 = 快速蒙版通道（文档域灰度）
     float maskLum_ = 0.0f;     // 蒙版笔刷亮度（settings 颜色均值）
     bool layerHadPixels_ = false;
     int originX_ = 0;   // 网格原点 doc 坐标（= 图层 origin；空层 = 首触点整瓦片对齐）

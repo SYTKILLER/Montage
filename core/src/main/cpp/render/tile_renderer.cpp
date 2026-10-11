@@ -174,6 +174,7 @@ void TileRenderer::ensureInit() {
     clipProg_ = buildProgram(shaders::kQuadVert, shaders::kClipFrag);
     adjustProg_ = buildProgram(shaders::kQuadVert, shaders::kAdjustFrag);
     antsProg_ = buildProgram(shaders::kAntsVert, shaders::kAntsFrag);
+    qmProg_ = buildProgram(shaders::kQuadVert, shaders::kQuickMaskFrag);
     for (int m = 0; m < kBlendModeCount; ++m) {
         blendProgs_[m] = buildBlendProgram(m);
         if (blendProgs_[m] == 0) {
@@ -181,12 +182,23 @@ void TileRenderer::ensureInit() {
         }
     }
     if (checkerProg_ == 0 || tileProg_ == 0 || plainProg_ == 0 || clipProg_ == 0 ||
-        adjustProg_ == 0 || antsProg_ == 0 || blendProgs_[0] == 0) {
+        adjustProg_ == 0 || antsProg_ == 0 || qmProg_ == 0 || blendProgs_[0] == 0) {
         return;
     }
     if (antsVao_ == 0) {
         glGenBuffers(1, &antsVbo_);
         glGenVertexArrays(1, &antsVao_);
+    }
+    if (qmZeroTex_ == 0) {
+        // 1×1 零灰度纹理：快速蒙版缺瓦片 = 未选中 = alpha 0.5 满红
+        glGenTextures(1, &qmZeroTex_);
+        glBindTexture(GL_TEXTURE_2D, qmZeroTex_);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        const uint8_t zero[4] = {0, 0, 0, 255};
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, zero);
     }
     const float quad[8] = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f};
     glGenVertexArrays(1, &vao_);
@@ -227,11 +239,26 @@ void TileRenderer::invalidate() {
     if (clipProg_ != 0) glDeleteProgram(clipProg_);
     if (adjustProg_ != 0) glDeleteProgram(adjustProg_);
     if (antsProg_ != 0) glDeleteProgram(antsProg_);
+    if (qmProg_ != 0) glDeleteProgram(qmProg_);
     for (int m = 0; m < kBlendModeCount; ++m) {
         if (blendProgs_[m] != 0) glDeleteProgram(blendProgs_[m]);
         blendProgs_[m] = 0;
     }
-    checkerProg_ = tileProg_ = plainProg_ = clipProg_ = adjustProg_ = antsProg_ = 0;
+    checkerProg_ = tileProg_ = plainProg_ = clipProg_ = adjustProg_ = antsProg_ = qmProg_ = 0;
+    if (qmZeroTex_ != 0) glDeleteTextures(1, &qmZeroTex_);
+    qmZeroTex_ = 0;
+    for (auto& kv : qmCache_) {
+        if (kv.second.tex != 0) {
+            glDeleteTextures(1, &kv.second.tex);
+        }
+    }
+    qmCache_.clear();
+    for (auto& kv : qmStrokeTex_) {
+        if (kv.second != 0) {
+            glDeleteTextures(1, &kv.second);
+        }
+    }
+    qmStrokeTex_.clear();
     if (antsVbo_ != 0) glDeleteBuffers(1, &antsVbo_);
     if (antsVao_ != 0) glDeleteVertexArrays(1, &antsVao_);
     antsVbo_ = antsVao_ = 0;
@@ -504,6 +531,117 @@ void TileRenderer::drawAnts(float phase) {
     glBindVertexArray(0);
 }
 
+// M10d 快速蒙版红 overlay：文档域逐瓦片单趟绘制（每像素恰画一次，同色半透明不叠画）——
+// 草稿瓦片（笔画中）> 通道瓦片 > 1×1 零纹理（缺瓦片 = 未选中 = 满红）。
+void TileRenderer::drawQuickMask(const Document& doc, float zoom, float panX, float panY,
+                                 float vw, float vh, const StrokeOverlay* qmStroke) {
+    if (doc.quickMask == nullptr || qmProg_ == 0 || qmZeroTex_ == 0) {
+        return;
+    }
+    const TileGrid& qm = *doc.quickMask;
+    if (qm.cols == 0 || qm.rows == 0) {
+        return;
+    }
+    if (qmStroke == nullptr || !qmStroke->active || !qmStroke->quickMask) {
+        // 笔画结束：清草稿纹理（逐帧直传生命周期）
+        for (auto& kv : qmStrokeTex_) {
+            if (kv.second != 0) {
+                glDeleteTextures(1, &kv.second);
+            }
+        }
+        qmStrokeTex_.clear();
+    }
+    glUseProgram(qmProg_);
+    glUniform1i(glGetUniformLocation(qmProg_, "uTex"), 0);
+    glActiveTexture(GL_TEXTURE0);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    // 视口求交（同 drawTiles 剔除）：可见瓦片范围
+    const float docX0 = panX;
+    const float docY0 = panY;
+    const float docX1 = panX + vw / zoom;
+    const float docY1 = panY + vh / zoom;
+    const uint32_t tx0 = static_cast<uint32_t>(std::max(0.0f, std::floor(docX0 / kTileSize)));
+    const uint32_t ty0 = static_cast<uint32_t>(std::max(0.0f, std::floor(docY0 / kTileSize)));
+    const uint32_t tx1 = std::min(qm.cols - 1u, static_cast<uint32_t>(
+        std::max(0.0f, std::floor(docX1 / kTileSize))));
+    const uint32_t ty1 = std::min(qm.rows - 1u, static_cast<uint32_t>(
+        std::max(0.0f, std::floor(docY1 / kTileSize))));
+
+    for (uint32_t ty = ty0; ty <= ty1; ++ty) {
+        for (uint32_t tx = tx0; tx <= tx1; ++tx) {
+            const uint32_t idx = ty * qm.cols + tx;
+            const std::vector<uint8_t>* strokeTile = nullptr;
+            if (qmStroke != nullptr && qmStroke->active && qmStroke->quickMask &&
+                qmStroke->gridCols == qm.cols && qmStroke->gridRows == qm.rows) {
+                auto st = qmStroke->tiles->find(idx);
+                if (st != qmStroke->tiles->end()) {
+                    strokeTile = &st->second;
+                }
+            }
+            if (strokeTile != nullptr) {
+                // 草稿瓦片逐帧直传（同像素笔画 overlay 语义）
+                uint32_t& tex = qmStrokeTex_[idx];
+                if (tex == 0) {
+                    glGenTextures(1, &tex);
+                }
+                glBindTexture(GL_TEXTURE_2D, tex);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kTileSize, kTileSize, 0, GL_RGBA,
+                             GL_UNSIGNED_BYTE, strokeTile->data());
+            } else {
+                auto it = qm.tiles.find(idx);
+                if (it == qm.tiles.end() || it->second == nullptr) {
+                    glBindTexture(GL_TEXTURE_2D, qmZeroTex_);
+                } else {
+                    const Tile* tile = it->second.get();
+                    QmCacheEntry& entry = qmCache_[tile];
+                    if (entry.tex == 0) {
+                        const uint8_t* pixels = tile->pixels->mapCpu();
+                        if (pixels != nullptr) {
+                            glGenTextures(1, &entry.tex);
+                            glBindTexture(GL_TEXTURE_2D, entry.tex);
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kTileSize, kTileSize, 0,
+                                         GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+                            tile->pixels->unmap();
+                        }
+                    } else {
+                        glBindTexture(GL_TEXTURE_2D, entry.tex);
+                    }
+                    entry.lastFrame = frame_;
+                }
+            }
+            drawQuad(qmProg_, static_cast<float>(tx * kTileSize),
+                     static_cast<float>(ty * kTileSize),
+                     static_cast<float>(kTileSize), static_cast<float>(kTileSize), zoom, panX,
+                     panY, vw, vh);
+        }
+    }
+    // 陈旧缓存逐出（提交后 Tile* 换新 → 旧键 8 帧老化释放；键仅作身份比较不解引用）
+    if (qmCache_.size() > 64) {
+        std::vector<const Tile*> victims;
+        for (auto& kv : qmCache_) {
+            if (frame_ - kv.second.lastFrame > 8) {
+                victims.push_back(kv.first);
+            }
+        }
+        for (const Tile* k : victims) {
+            if (qmCache_[k].tex != 0) {
+                glDeleteTextures(1, &qmCache_[k].tex);
+            }
+            qmCache_.erase(k);
+        }
+    }
+}
+
 void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw, int32_t vh,
                              const StrokeOverlay* stroke, const LayerXformPreview* preview) {
     frame_++;
@@ -649,6 +787,12 @@ void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw
     glBindTexture(GL_TEXTURE_2D, accTex_[accIdx]);
     drawQuad(plainProg_, 0.0f, 0.0f, static_cast<float>(doc.width), static_cast<float>(doc.height),
              zoom, panX, panY, vwF, vhF);
+
+    // M10d 快速蒙版红 overlay：图层合成之上、蚂蚁线之下（QM 模式 selection=null，ants 不画）
+    if (doc.quickMask != nullptr) {
+        drawQuickMask(doc, zoom, panX, panY, vwF, vhF,
+                      stroke != nullptr && stroke->quickMask ? stroke : nullptr);
+    }
     glDisable(GL_BLEND);
 
     // M7b 蚂蚁线：selection 指针身份变化时惰性重建，相位随帧推进

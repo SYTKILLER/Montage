@@ -16,6 +16,7 @@
 #include "engine/transform_ops.h"
 #include "engine/resample.h"
 #include "tiles/magic_wand.h"
+#include "tiles/quick_mask.h"
 #include "tiles/selection_ops.h"
 #include "io/image_export.h"
 #include "io/image_import.h"
@@ -662,12 +663,14 @@ napi_value GetStats(napi_env env, napi_callback_info /*info*/) {
     uint32_t dh = 0;
     double progress = 0.0;
     bool importing = false;
+    bool quickMask = false;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
         vp = e.viewport;
         rev = e.docRevision;
         dw = e.doc.width;
         dh = e.doc.height;
+        quickMask = e.doc.quickMask != nullptr;  // M10d：UI 镜像（撤销跨 Q 边界后刷新）
     }
     {
         std::lock_guard<std::mutex> lk(e.import.mtx);
@@ -692,6 +695,7 @@ napi_value GetStats(napi_env env, napi_callback_info /*info*/) {
     napi_set_named_property(env, data, "lastError", makeString(env, snap.lastError));
     napi_set_named_property(env, data, "canUndo", makeBool(env, e.history.canUndo()));
     napi_set_named_property(env, data, "canRedo", makeBool(env, e.history.canRedo()));
+    napi_set_named_property(env, data, "quickMask", makeBool(env, quickMask));
     napi_set_named_property(env, data, "historyVersion",
                             makeDouble(env, static_cast<double>(e.historyVersion.load())));
     return makeOk(env, data);
@@ -1842,6 +1846,35 @@ napi_value SmoothSelection(napi_env env, napi_callback_info /*info*/) {
 }
 
 // ---- M10c Alpha 通道（存储/载入选区）与剪贴板 ----
+
+// M10d 快速蒙版 toggle（PS Q 键）：进入 = selection→quickMask（selection 置 null）；
+// 退出 = quickMask→selection（全 0 → null）。撤销粒度 = 单次 toggle（快照带两网格）。
+napi_value ToggleQuickMask(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "toggleQuickMask: no document");
+        }
+        const bool entering = e.doc.quickMask == nullptr;
+        e.history.beginEdit(e.doc, "quick mask toggle", static_cast<uint64_t>(e.docRevision));
+        if (entering) {
+            tiles::enterQuickMask(e.doc);
+        } else {
+            tiles::exitQuickMask(e.doc);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+        OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "quick mask %{public}s",
+                     entering ? "enter" : "exit");
+        napi_value data = nullptr;
+        napi_create_object(env, &data);
+        napi_set_named_property(env, data, "active", makeBool(env, e.doc.quickMask != nullptr));
+        napi_set_named_property(env, data, "hasSelection", makeBool(env, e.doc.selection != nullptr));
+        return makeOk(env, data);
+    }
+}
 
 napi_value StoreSelection(napi_env env, napi_callback_info info) {
     size_t argc = 1;

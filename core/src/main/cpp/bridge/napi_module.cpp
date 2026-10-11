@@ -42,6 +42,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"contractSelection", nullptr, montage::bridge::ContractSelection, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"borderSelection", nullptr, montage::bridge::BorderSelection, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"smoothSelection", nullptr, montage::bridge::SmoothSelection, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"toggleQuickMask", nullptr, montage::bridge::ToggleQuickMask, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"storeSelection", nullptr, montage::bridge::StoreSelection, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"loadSelection", nullptr, montage::bridge::LoadSelection, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"deleteChannel", nullptr, montage::bridge::DeleteChannel, nullptr, nullptr, nullptr, napi_default, nullptr},

@@ -52,6 +52,8 @@ napi_value ExpandSelection(napi_env env, napi_callback_info info);
 napi_value ContractSelection(napi_env env, napi_callback_info info);
 napi_value BorderSelection(napi_env env, napi_callback_info info);
 napi_value SmoothSelection(napi_env env, napi_callback_info info);
+// M10d 快速蒙版：toggle（选区 ↔ 临时通道；返回 {active, hasSelection}）
+napi_value ToggleQuickMask(napi_env env, napi_callback_info info);
 // M10c Alpha 通道：存储/载入/删除 + 列表（v1 通道面板只读）
 napi_value StoreSelection(napi_env env, napi_callback_info info);
 napi_value LoadSelection(napi_env env, napi_callback_info info);

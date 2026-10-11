@@ -90,6 +90,7 @@ class Engine {
         uint32_t gridRows = 0;
         std::map<uint32_t, std::vector<uint8_t>> tiles;
         bool active = false;
+        bool quickMask = false;  // M10d：草稿瓦片 = 快速蒙版通道灰度（渲染走红 overlay 替换）
     };
     StrokeSnapshot copyStrokeSnapshotLocked();
 

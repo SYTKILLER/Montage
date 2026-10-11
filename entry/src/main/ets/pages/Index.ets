@@ -33,6 +33,7 @@ const KC_L: number = 2028;
 const KC_M: number = 2029;
 const KC_N: number = 2030;
 const KC_O: number = 2031;
+const KC_Q: number = 2033;  // KEYCODE_Q（SDK keyCode.d.ts 核验，2026-10-11）
 const KC_S: number = 2035;
 const KC_V: number = 2038;
 const KC_W: number = 2039;
@@ -94,6 +95,7 @@ struct Index {
   @State brushColor: string = '#D93025';   // 前景色（= 笔刷色）
   @State bgColor: string = '#FFFFFF';      // 背景色
   @State maskTarget: boolean = false;
+  @State quickMaskActive: boolean = false;  // M10d 快速蒙版模式（引擎镜像；Q/菜单 toggle）
   @State wandTolerance: number = 32;
   @State wandContiguous: boolean = true;
   @State wandAllLayers: boolean = false;
@@ -213,6 +215,7 @@ struct Index {
 
   private onDocVersion(): void {
     this.refreshLayers();
+    this.refreshStats();  // M10d：撤销跨 Q 边界时同步快速蒙版镜像（canUndo/Redo 同步受益）
     this.scheduleHistogram();
   }
 
@@ -246,6 +249,7 @@ struct Index {
     this.fps = s.fps;
     this.canUndo = s.canUndo;
     this.canRedo = s.canRedo;
+    this.quickMaskActive = s.quickMask;  // M10d
   }
 
   private log(msg: string): void {
@@ -740,6 +744,7 @@ struct Index {
     this.docOpen = true;
     this.fittedOnce = false;
     this.maskTarget = false;
+    this.quickMaskActive = false;
     this.engine.setBrushTarget(false);
     this.refreshChannelCount();
     this.refreshLayers();
@@ -1156,6 +1161,23 @@ struct Index {
         const ok = this.engine.reselectSelection();
         this.hasSelectionFlag = ok;
         this.log(`重新选择: ${ok ? '已恢复最近取消的选区' : '无可恢复选区'}`);
+        break;
+      }
+      case 'select.quickMask': {
+        // M10d 快速蒙版 toggle（PS Q）：进入 = 选区挂起转通道（红 overlay），退出 = 通道转选区
+        if (!this.docOpen) {
+          this.toast('无文档');
+          break;
+        }
+        const st = this.engine.toggleQuickMask();
+        if (st !== null) {
+          this.quickMaskActive = st.active;
+          this.hasSelectionFlag = st.hasSelection;
+          if (st.active) {
+            this.maskTarget = false;  // QM 模式笔画由引擎路由到通道，图层蒙版目标挂起
+          }
+          this.log(`快速蒙版: ${st.active ? '进入（蒙版笔编辑通道，Q 退出）' : '退出'}`);
+        }
         break;
       }
       case 'select.feather':
@@ -1617,6 +1639,7 @@ struct Index {
       leafItem('select.deselect', '取消选择', 'Ctrl+D', d),
       leafItem('select.inverse', '反选', 'Ctrl+Shift+I', d),
       leafItem('select.reselect', '重新选择', 'Shift+Ctrl+D', d),
+      leafItem('select.quickMask', '快速蒙版', 'Q', d, this.quickMaskActive),
       leafItem('select.feather', '羽化…', 'Shift+F6', selReady),
       leafItem('select.store', '存储选区…', '', selReady),
       leafItem('select.load', '载入选区…', '', d && this.channelsCount > 0),
@@ -1870,6 +1893,9 @@ struct Index {
       case KC_W:
         this.pickTool('wand');
         break;
+      case KC_Q:
+        this.runCommand('select.quickMask');  // M10d 快速蒙版 toggle（PS Q 语义）
+        break;
       case KC_C:
         this.pickTool('crop');
         break;
@@ -1980,7 +2006,7 @@ struct Index {
         `${g.id}|${g.items.length}|${this.docOpen ? 1 : 0}|${this.canUndo ? 1 : 0}|` +
         `${this.canRedo ? 1 : 0}|${this.layersVisible ? 1 : 0}|${this.themeMode}|` +
         `${this.activeLayer() !== undefined ? 1 : 0}${this.activeLayerHasMask() ? 1 : 0}` +
-        `${this.hasSelectionFlag ? 1 : 0}`)
+        `${this.hasSelectionFlag ? 1 : 0}${this.quickMaskActive ? 1 : 0}`)
     }
     .width('100%')
     .height(36)
@@ -2007,6 +2033,7 @@ struct Index {
           brushColor: this.brushColor,
           maskTarget: this.maskTarget,
           hasMaskOnActive: this.activeLayerHasMask(),
+          quickMaskActive: this.quickMaskActive,
           cropPending: this.cropRect !== null,
           selOp: $selOp,
           selShape: this.selShape,

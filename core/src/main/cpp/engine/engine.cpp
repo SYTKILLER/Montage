@@ -101,12 +101,16 @@ void Engine::strokeThreadMain() {
                     if (draft != nullptr) {
                         continue;  // 上一笔未提交（异常序列）：丢弃新 begin 防串笔
                     }
-                    history.beginEdit(doc, brushOnMask ? "mask brush"
-                                        : (brush.erasing ? "eraser" : "brush"),
+                    // M10d：快速蒙版模式（doc.quickMask 非 null）= 落笔目标即通道，
+                    // 由文档状态推导（撤销跨 Q 边界回退时自动跟随，无独立标志位失同步）
+                    const bool qm = doc.quickMask != nullptr;
+                    history.beginEdit(doc, qm ? "quick mask"
+                                        : (brushOnMask ? "mask brush"
+                                          : (brush.erasing ? "eraser" : "brush")),
                                       static_cast<uint64_t>(docRevision));
                     draft = std::make_unique<StrokeDraft>();
                     std::string err;
-                    if (!draft->begin(doc, doc.activeId, brush, brushOnMask, err)) {
+                    if (!draft->begin(doc, doc.activeId, brush, !qm && brushOnMask, qm, err)) {
                         OH_LOG_Print(LOG_APP, LOG_WARN, 0x4D30, "Montage.Brush",
                                      "draft begin failed: %{public}s", err.c_str());
                         history.endEdit(doc, static_cast<uint64_t>(docRevision));
@@ -119,7 +123,14 @@ void Engine::strokeThreadMain() {
                         continue;  // 陈旧 end 标记（背靠背笔画残留）
                     }
                     draft->end();
-                    if (draft->maskTarget()) {
+                    if (draft->qmTarget()) {
+                        // M10d：提交到快速蒙版通道（COW 换网格）。必须以原网格为合并基底
+                        //（nullptr 会丢未触碰瓦片——M5b-1 实证教训）
+                        auto merged = draft->commitGrid(doc.quickMask.get());
+                        if (merged != nullptr) {
+                            doc.quickMask = std::move(merged);
+                        }
+                    } else if (draft->maskTarget()) {
                         // M5b：提交到蒙版 patch 网格（COW 换 LayerMask）+ 重合成
                         // 必须以原 patch 网格为合并基底（nullptr 会丢未触碰瓦片 → patch 缺行）
                         const LayerId lid = draft->layerId();
@@ -170,6 +181,20 @@ void Engine::strokeThreadMain() {
 Engine::StrokeSnapshot Engine::copyStrokeSnapshotLocked() {
     StrokeSnapshot snap;
     if (draft == nullptr || !draft->active()) {
+        return snap;
+    }
+    if (draft->qmTarget()) {
+        // M10d：快速蒙版草稿 = 文档域通道灰度（work 已并 base），渲染侧直接替换该瓦片
+        snap.active = true;
+        snap.quickMask = true;
+        snap.gridCols = draft->gridCols();
+        snap.gridRows = draft->gridRows();
+        for (const uint32_t key : draft->touchedTiles()) {
+            std::vector<uint8_t> px;
+            if (draft->tileFor(key % draft->gridCols(), key / draft->gridCols(), px)) {
+                snap.tiles[key] = std::move(px);
+            }
+        }
         return snap;
     }
     snap.layerId = draft->layerId();
@@ -282,6 +307,8 @@ void Engine::resetDocument() {
     std::lock_guard<std::mutex> lk(docMutex);
     doc = Document{};
     viewport = Viewport{};
+    // 落笔目标标志随文档清空（否则新文档上蒙版目标笔画静默拒绝——连带修复潜伏 bug）
+    brushOnMask = false;
     needsRender.store(true);
     render.wake();
 }

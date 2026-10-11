@@ -17,6 +17,7 @@ export const SHORTCUT_ROWS: ShortcutRow[] = [
   { keys: 'Ctrl+0 / Ctrl+1', desc: '适配画布 / 100%' },
   { keys: 'Ctrl+= / Ctrl+-', desc: '放大 / 缩小' },
   { keys: 'Ctrl+D', desc: '取消选区' },
+  { keys: 'Q', desc: '快速蒙版（选区↔红 overlay 通道编辑）' },
   { keys: '[ / ]', desc: '笔刷缩小 / 放大' },
   { keys: '空格按住', desc: '临时抓手' },
 ];

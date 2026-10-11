@@ -21,7 +21,14 @@ export interface EngineStats {
   lastError: string;
   canUndo: boolean;
   canRedo: boolean;
+  quickMask: boolean;  // M10d：快速蒙版模式中（撤销跨 Q 边界后经 1s 轮询/docVersion 刷新镜像）
   historyVersion: number;
+}
+
+/** 快速蒙版 toggle 结果（toggleQuickMask 的 data，M10d）。 */
+export interface QuickMaskState {
+  active: boolean;        // true = 已进入快速蒙版模式
+  hasSelection: boolean;  // toggle 后主选区是否存在（退出时通道内容非零）
 }
 
 /** 视口（pan = 视口左上角文档坐标，doc px）。 */

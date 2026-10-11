@@ -27,6 +27,7 @@ class TileRenderer {
         uint32_t gridCols = 0;
         uint32_t gridRows = 0;
         const std::map<uint32_t, std::vector<uint8_t>>* tiles = nullptr;
+        bool quickMask = false;  // M10d：草稿瓦片 = 快速蒙版通道（红 overlay 内替换，不走图层）
     };
     // M8.1：自由变换预览（layerId 匹配的层经 doc→doc 仿射实时绘制）
     struct LayerXformPreview {
@@ -60,6 +61,8 @@ class TileRenderer {
     void uploadLutRgba(const float r[256], const float g[256], const float b[256]);  // M9a  // M6a：调整层 LUT 上传
     void rebuildAnts(const Document& doc);  // M7b：selection 变更时重建蚂蚁线缓冲
     void drawAnts(float phase);
+    void drawQuickMask(const Document& doc, float zoom, float panX, float panY, float vw,
+                       float vh, const StrokeOverlay* qmStroke);  // M10d：红 overlay（乘通道灰度）
     std::unordered_map<uint64_t, uint32_t> strokeTex_;  // key → 临时纹理（逐帧刷新）
 
     GLuint checkerProg_ = 0;
@@ -68,6 +71,16 @@ class TileRenderer {
     GLuint clipProg_ = 0;  // M5b-2：剪贴 alpha 乘法
     GLuint adjustProg_ = 0;  // M6a：调整层 LUT
     GLuint antsProg_ = 0;    // M7b：蚂蚁线
+    GLuint qmProg_ = 0;      // M10d：快速蒙版红 overlay
+    GLuint qmZeroTex_ = 0;   // 1×1 零纹理（缺瓦片 = 未选中 = 满红采样源）
+    // 快速蒙版通道瓦片纹理缓存：键 = Tile* 身份（未触碰瓦片跨提交共享指针 → 不重传）；
+    // lastFrame 老化逐出（陈旧 Tile* 键只作身份比较不解引用）
+    struct QmCacheEntry {
+        GLuint tex = 0;
+        uint64_t lastFrame = 0;
+    };
+    std::unordered_map<const Tile*, QmCacheEntry> qmCache_;
+    std::unordered_map<uint32_t, uint32_t> qmStrokeTex_;  // 快速蒙版草稿瓦片（key → 纹理）
     GLuint antsVbo_ = 0;
     GLuint antsVao_ = 0;
     GLsizei antsVerts_ = 0;              // 顶点数（= 段数×6）

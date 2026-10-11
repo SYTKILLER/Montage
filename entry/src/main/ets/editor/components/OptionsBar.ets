@@ -53,6 +53,7 @@ export struct OptionsBar {
   @Prop brushColor: string = '#000000';
   @Prop maskTarget: boolean = false;
   @Prop hasMaskOnActive: boolean = false;
+  @Prop quickMaskActive: boolean = false;  // M10d：快速蒙版模式中（笔画自动落通道）
   @Prop cropPending: boolean = false;
   // M10a 选区增强：布尔四态 + 选框形状
   @Link selOp: number;
@@ -126,17 +127,25 @@ export struct OptionsBar {
         }
       })
       Row({ space: 4 }) {
-        Text('蒙版笔')
-          .fontSize(12)
-          .fontColor($r('app.color.text_secondary'))
-        Toggle({ type: ToggleType.Checkbox, isOn: this.maskTarget })
-          .selectedColor($r('app.color.danger'))
-          .opacity(this.hasMaskOnActive ? 1 : 0.35)
-          .onChange((on: boolean): void => {
-            if (on !== this.maskTarget) {
-              this.onToggleMaskTarget();
-            }
-          })
+        if (this.quickMaskActive) {
+          // M10d：QM 模式中笔画由引擎路由到快速蒙版通道（黑笔加红减选 / 白笔减红加选）
+          Text('快速蒙版：黑笔加红（减选区）· 白笔减红（加选区）· Q 退出')
+            .fontSize(11)
+            .fontColor($r('app.color.danger'))
+            .maxLines(1)
+        } else {
+          Text('蒙版笔')
+            .fontSize(12)
+            .fontColor($r('app.color.text_secondary'))
+          Toggle({ type: ToggleType.Checkbox, isOn: this.maskTarget })
+            .selectedColor($r('app.color.danger'))
+            .opacity(this.hasMaskOnActive ? 1 : 0.35)
+            .onChange((on: boolean): void => {
+              if (on !== this.maskTarget) {
+                this.onToggleMaskTarget();
+              }
+            })
+        }
       }
       .height(28)
       Row({ space: 6 }) {

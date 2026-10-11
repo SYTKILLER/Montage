@@ -17,7 +17,7 @@ constexpr float kSpacingSoft = 0.025f;
 }  // namespace
 
 bool StrokeDraft::begin(const Document& doc, LayerId layerId, const BrushSettings& settings,
-                        bool onMask, std::string& err) {
+                        bool onMask, bool onQuickMask, std::string& err) {
     const Layer* layer = nullptr;
     for (const Layer& l : doc.layers) {
         if (l.id == layerId) {
@@ -25,7 +25,7 @@ bool StrokeDraft::begin(const Document& doc, LayerId layerId, const BrushSetting
             break;
         }
     }
-    if (layer == nullptr) {
+    if (layer == nullptr && !onQuickMask) {
         err = "brush: layer not found";
         return false;
     }
@@ -38,7 +38,24 @@ bool StrokeDraft::begin(const Document& doc, LayerId layerId, const BrushSetting
     settings_ = settings;
     layerId_ = layerId;
     maskTarget_ = false;
-    if (onMask) {
+    qmTarget_ = false;
+    if (onQuickMask) {
+        // M10d 快速蒙版：绑定文档域通道网格（灰度落笔；网格 = 通道网格，origin=(0,0)）
+        if (doc.quickMask == nullptr) {
+            err = "brush: quick mask not active";
+            return false;
+        }
+        maskLum_ = std::min(1.0f, std::max(0.0f, (settings.red + settings.green + settings.blue) / 3.0f));
+        base_ = doc.quickMask;
+        originX_ = 0;
+        originY_ = 0;
+        imgW_ = base_->cols * kTileSize;
+        imgH_ = base_->rows * kTileSize;
+        gridCols_ = base_->cols;
+        gridRows_ = base_->rows;
+        layerHadPixels_ = true;
+        qmTarget_ = true;
+    } else if (onMask) {
         // M5b 蒙版模式：绑定 patch 网格（灰度落笔）；网格原点 = 图层 origin + patch offset
         if (layer->mask == nullptr || layer->mask->pixels == nullptr) {
             err = "brush: layer has no editable mask";
@@ -414,8 +431,8 @@ void StrokeDraft::paintTile(uint32_t key) {
     const uint8_t* cov = covIt->second.data();
     uint8_t* px = workIt->second.data();
     const float op = settings_.opacity;
-    if (maskTarget_) {
-        // 蒙版灰度落笔：out = L×covA + base×(1-covA)（base 恒灰，RGB 同值）；erasing 忽略
+    if (maskTarget_ || qmTarget_) {
+        // 蒙版/快速蒙版灰度落笔：out = L×covA + base×(1-covA)（base 恒灰，RGB 同值）；erasing 忽略
         for (size_t i = 0; i < static_cast<size_t>(kTileSize) * kTileSize; ++i) {
             const float covA = (cov[i] / 255.0f) * op;
             uint8_t* p = px + i * 4;

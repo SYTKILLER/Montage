@@ -301,6 +301,7 @@ void RenderLoop::doFrame() {
         overlay.gridCols = strokeSnap.gridCols;
         overlay.gridRows = strokeSnap.gridRows;
         overlay.tiles = &strokeSnap.tiles;
+        overlay.quickMask = strokeSnap.quickMask;  // M10d
     }
 
     renderer_.ensureInit();
