@@ -525,6 +525,80 @@ export class CompositorEngine {
     return r.ok;
   }
 
+  // M10c Alpha 通道：存储选区（同名覆盖）/ 载入（op 布尔四态）/ 删除 / 列表
+  storeSelection(name: string): boolean {
+    const r = narrowResult(native.storeSelection(name) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'storeSelection failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  loadSelection(name: string, op?: number): boolean {
+    const r = narrowResult(op === undefined
+      ? native.loadSelection(name) as Object
+      : native.loadSelection(name, op) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'loadSelection failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  deleteChannel(name: string): boolean {
+    const r = narrowResult(native.deleteChannel(name) as Object);
+    return r.ok;
+  }
+
+  async getChannelList(): Promise<string[]> {
+    const value = native.getChannelList() as string[];
+    const out: string[] = [];
+    if (value !== null && value !== undefined) {
+      for (const v of value) {
+        out.push(v);
+      }
+    }
+    return out;
+  }
+
+  // M10c 剪贴板：拷贝/剪切（merged=合并拷贝）/粘贴/清除选区像素
+  copySelection(merged: boolean): boolean {
+    const r = narrowResult(native.copySelection(merged) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'copySelection failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  cutSelection(merged: boolean): boolean {
+    const r = narrowResult(native.cutSelection(merged) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'cutSelection failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  pasteClipboard(): boolean {
+    const r = narrowResult(native.pasteClipboard() as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'pasteClipboard failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  deleteSelectionPixels(): boolean {
+    const r = narrowResult(native.deleteSelectionPixels() as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'deleteSelectionPixels failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
   clearSelection(): boolean {
     const r = narrowResult(native.clearSelection() as Object);
     return r.ok;

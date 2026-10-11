@@ -14,6 +14,7 @@ import { LayersPanel, ThumbEntry } from '../editor/components/LayersPanel';
 import { ExportDialog } from '../editor/components/ExportDialog';
 import { TransformOverlay } from '../editor/components/TransformOverlay';
 import { AdjustPanel } from '../editor/components/AdjustPanel';
+import { ChannelsPanel } from '../editor/components/ChannelsPanel';
 import { ABOUT_TEXT, InfoDialog, SHORTCUT_ROWS } from '../editor/components/InfoDialog';
 
 const TAG: string = 'Montage.Shell';
@@ -22,6 +23,7 @@ const DOMAIN: number = 0x4D30;
 // KeyCode（@ohos.multimodalInput.keyCode 已核验，2026-10-07）
 const KC_B: number = 2018;
 const KC_A: number = 2017;
+const KC_X: number = 2040;  // KEYCODE_X（M8.1 核验记录）
 const KC_C: number = 2019;
 const KC_D: number = 2020;
 const KC_E: number = 2021;
@@ -112,6 +114,11 @@ struct Index {
   @State showImageSize: boolean = false;
   @State imgWText: string = '';
   @State imgHText: string = '';
+  @State channelsCount: number = 0;       // M10c Alpha 通道数（镜像，驱动菜单使能）
+  @State showStoreSel: boolean = false;   // 存储选区名字对话框
+  @State storeSelText: string = '';
+  @State showLoadSel: boolean = false;    // 载入选区名字对话框
+  @State loadSelText: string = '';
   @State showModify: boolean = false;     // M10b 羽化/修改族数值对话框
   @State modifyKind: string = 'feather';  // feather | border | expand | contract
   @State modifyText: string = '';
@@ -731,6 +738,7 @@ struct Index {
     this.fittedOnce = false;
     this.maskTarget = false;
     this.engine.setBrushTarget(false);
+    this.refreshChannelCount();
     this.refreshLayers();
     this.updateTitle();
     this.tryFit();
@@ -1192,6 +1200,48 @@ struct Index {
         this.log(`平滑选区: ${ok}`);
         break;
       }
+      case 'select.store':
+        if (this.docOpen && this.hasSelectionFlag) {
+          this.storeSelText = `选区 ${this.channelsCount + 1}`;  // 预填默认名（PS 记忆语义）
+          this.showStoreSel = true;
+        } else {
+          this.toast('需要先建立选区');
+        }
+        break;
+      case 'select.load':
+        if (this.docOpen && this.channelsCount > 0) {
+          this.loadSelText = `选区 ${this.channelsCount}`;  // 预填最近通道名
+          this.showLoadSel = true;
+        } else {
+          this.toast('无已存储的通道');
+        }
+        break;
+      case 'edit.copy':
+        this.runClipboard(false, false);
+        break;
+      case 'edit.copyMerged':
+        this.runClipboard(true, false);
+        break;
+      case 'edit.cut':
+        this.runClipboard(false, true);
+        break;
+      case 'edit.paste': {
+        if (!this.docOpen) {
+          break;
+        }
+        const ok = this.engine.pasteClipboard();
+        this.log(`粘贴: ${ok ? '新图层已创建' : '剪贴板为空'}`);
+        break;
+      }
+      case 'edit.clear': {
+        if (!this.docOpen || !this.hasSelectionFlag) {
+          this.toast('需要先建立选区');
+          break;
+        }
+        const ok = this.engine.deleteSelectionPixels();
+        this.log(`清除选区像素: ${ok}`);
+        break;
+      }
       case 'image.rotate90cw':
         this.docOp((): boolean => this.engine.rotateDocument90(true), '旋转 90° 顺时针');
         break;
@@ -1299,6 +1349,51 @@ struct Index {
     }
     this.showImageSize = false;
     this.docOp((): boolean => this.engine.resampleDocument(w, h), `图像大小 ${w}×${h}`);
+  }
+
+  // M10c 通道数镜像刷新（存储/删除后调用；驱动载入选区菜单使能）
+  private refreshChannelCount(): void {
+    this.engine.getChannelList().then((list: string[]): void => {
+      this.channelsCount = list.length;
+    }).catch((_e: BusinessError): void => {
+      this.channelsCount = 0;
+    });
+  }
+
+  // M10c 剪贴板：拷贝/剪切（merged=合并拷贝）
+  private runClipboard(merged: boolean, cut: boolean): void {
+    if (!this.docOpen || !this.hasSelectionFlag) {
+      this.toast('需要先建立选区');
+      return;
+    }
+    const ok = cut ? this.engine.cutSelection(merged) : this.engine.copySelection(merged);
+    this.log(`${cut ? '剪切' : merged ? '合并拷贝' : '拷贝'}: ${ok}`);
+  }
+
+  private commitStoreSel(): void {
+    const name = this.storeSelText.trim();
+    if (name.length === 0) {
+      this.toast('请输入通道名');
+      return;
+    }
+    this.showStoreSel = false;
+    const ok = this.engine.storeSelection(name);
+    this.log(`存储选区 "${name}": ${ok}`);
+    if (ok) {
+      this.refreshChannelCount();
+    }
+  }
+
+  private commitLoadSel(): void {
+    const name = this.loadSelText.trim();
+    if (name.length === 0) {
+      this.toast('请输入通道名');
+      return;
+    }
+    this.showLoadSel = false;
+    const ok = this.engine.loadSelection(name, 0);
+    this.hasSelectionFlag = ok;
+    this.log(`载入选区 "${name}": ${ok}`);
   }
 
   // M10b 羽化/修改族提交（半径数值对话框共用）
@@ -1482,9 +1577,11 @@ struct Index {
     const edit: MenuItemVM[] = [
       leafItem('edit.undo', '撤销', 'Ctrl+Z', this.canUndo),
       leafItem('edit.redo', '重做', 'Ctrl+Shift+Z', this.canRedo),
-      leafItem('edit.cut', '剪切', 'Ctrl+X', false),
-      leafItem('edit.copy', '拷贝', 'Ctrl+C', false),
-      leafItem('edit.paste', '粘贴', 'Ctrl+V', false),
+      leafItem('edit.cut', '剪切', 'Ctrl+X', d && this.hasSelectionFlag),
+      leafItem('edit.copy', '拷贝', 'Ctrl+C', d && this.hasSelectionFlag),
+      leafItem('edit.copyMerged', '合并拷贝', 'Shift+Ctrl+C', d && this.hasSelectionFlag),
+      leafItem('edit.paste', '粘贴', 'Ctrl+V', d),
+      leafItem('edit.clear', '清除', '', d && this.hasSelectionFlag),
     ];
     const imageMenu: MenuItemVM[] = [
       leafItem('image.canvasSize', '画布大小…', '', d),
@@ -1518,6 +1615,8 @@ struct Index {
       leafItem('select.inverse', '反选', 'Ctrl+Shift+I', d),
       leafItem('select.reselect', '重新选择', 'Shift+Ctrl+D', d),
       leafItem('select.feather', '羽化…', 'Shift+F6', selReady),
+      leafItem('select.store', '存储选区…', '', selReady),
+      leafItem('select.load', '载入选区…', '', d && this.channelsCount > 0),
       leafItem('select.border', '修改：边界…', '', selReady),
       leafItem('select.smooth', '修改：平滑', '', selReady),
       leafItem('select.expand', '修改：扩展…', '', selReady),
@@ -1613,7 +1712,7 @@ struct Index {
       return;
     }
     // 对话框打开时：Esc 关闭，其余不抢
-    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform || this.showModify) {
+    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform || this.showModify || this.showStoreSel || this.showLoadSel) {
       if (e.keyCode === KC_ESC) {
         this.showTransform = false;
         this.showExport = false;
@@ -1622,6 +1721,8 @@ struct Index {
         this.showAbout = false;
         this.showTheme = false;
         this.showModify = false;
+        this.showStoreSel = false;
+        this.showLoadSel = false;
       }
       return;
     }
@@ -1711,6 +1812,15 @@ struct Index {
           break;
         case KC_A:
           this.runCommand('select.all');
+          break;
+        case KC_C:
+          this.runCommand('edit.copy');
+          break;
+        case KC_X:
+          this.runCommand('edit.cut');
+          break;
+        case KC_V:
+          this.runCommand('edit.paste');
           break;
         case KC_I:
           if (this.shiftHeld) {
@@ -2075,6 +2185,13 @@ struct Index {
                   }
                 })
               }
+              // M10c 通道面板 v1（只读列表 + 删除；存储选区入口在选择菜单）
+              if (this.channelsCount > 0) {
+                ChannelsPanel({
+                  engine: this.engine,
+                  onChanged: (): void => this.refreshChannelCount(),
+                })
+              }
               LayersPanel({
                 layers: $layers,
                 layerOpacity: $layerOpacity,
@@ -2260,6 +2377,60 @@ struct Index {
                 .backgroundColor($r('app.color.accent'))
                 .fontColor($r('app.color.on_accent'))
                 .onClick((): void => this.commitModify())
+            }.justifyContent(FlexAlign.End).width('100%')
+          }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
+            .border({ width: 1, color: $r('app.color.border') }).width(360)
+        }.width('100%').height('100%')
+      }
+      if (this.showStoreSel) {
+        Stack() {
+          Column().width('100%').height('100%').backgroundColor('#66000000')
+            .onClick((): void => { this.showStoreSel = false; })
+          Column({ space: 14 }) {
+            Text('存储选区为 Alpha 通道').fontSize(16).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+            Row({ space: 10 }) {
+              Text('名称').fontSize(13).fontColor($r('app.color.text_secondary'))
+              TextInput({ text: this.storeSelText }).width(180).height(40)
+                .onChange((v: string): void => { this.storeSelText = v; })
+            }
+            Row({ space: 12 }) {
+              Button('取消').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.surface'))
+                .fontColor($r('app.color.text_primary'))
+                .border({ width: 1, color: $r('app.color.border') })
+                .onClick((): void => { this.showStoreSel = false; })
+              Button('存储').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.accent'))
+                .fontColor($r('app.color.on_accent'))
+                .onClick((): void => this.commitStoreSel())
+            }.justifyContent(FlexAlign.End).width('100%')
+          }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
+            .border({ width: 1, color: $r('app.color.border') }).width(360)
+        }.width('100%').height('100%')
+      }
+      if (this.showLoadSel) {
+        Stack() {
+          Column().width('100%').height('100%').backgroundColor('#66000000')
+            .onClick((): void => { this.showLoadSel = false; })
+          Column({ space: 14 }) {
+            Text('载入选区（输入通道名）').fontSize(16).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+            Row({ space: 10 }) {
+              Text('名称').fontSize(13).fontColor($r('app.color.text_secondary'))
+              TextInput({ text: this.loadSelText }).width(180).height(40)
+                .onChange((v: string): void => { this.loadSelText = v; })
+            }
+            Row({ space: 12 }) {
+              Button('取消').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.surface'))
+                .fontColor($r('app.color.text_primary'))
+                .border({ width: 1, color: $r('app.color.border') })
+                .onClick((): void => { this.showLoadSel = false; })
+              Button('载入').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.accent'))
+                .fontColor($r('app.color.on_accent'))
+                .onClick((): void => this.commitLoadSel())
             }.justifyContent(FlexAlign.End).width('100%')
           }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
             .border({ width: 1, color: $r('app.color.border') }).width(360)

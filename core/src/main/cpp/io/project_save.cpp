@@ -22,7 +22,7 @@ namespace {
 constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Save";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
-constexpr int kFormatVersion = 4;  // v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
+constexpr int kFormatVersion = 5;  // v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
 constexpr int kDeflateLevel = 6;
 // 04 §1.3 格式上限（沿用上游档位，与引擎运行预算分立）
 constexpr uint32_t kMaxSide = 30000;
@@ -440,12 +440,18 @@ struct LayerSnapshot {
     std::shared_ptr<LayerAdjustment> adjustment;  // M6a：null = 普通层
 };
 
+struct ChannelSnapshot {
+    std::string name;
+    std::shared_ptr<const TileGrid> mask;  // 文档域灰度网格
+};
+
 struct DocSnapshot {
     uint32_t width = 0;
     uint32_t height = 0;
     std::string name;
     LayerId activeId = 0;
     std::vector<LayerSnapshot> layers;
+    std::vector<ChannelSnapshot> channels;  // v5：Alpha 通道（存储选区）
 };
 
 std::string jsonEscape(const std::string& in) {
@@ -580,7 +586,22 @@ std::string buildManifest(const DocSnapshot& doc) {
         j += "    }";
         j += (i + 1 < doc.layers.size()) ? ",\n" : "\n";
     }
-    j += "  ]\n}\n";
+    j += "  ]";
+    // v5：Alpha 通道（存储选区；文档域灰度 PNG）
+    if (!doc.channels.empty()) {
+        j += ",\n  \"channels\": [\n";
+        for (size_t i = 0; i < doc.channels.size(); ++i) {
+            j += "    {\n";
+            j += "      \"name\": " + jsonEscape(doc.channels[i].name) + ",\n";
+            j += "      \"file\": \"channels/" + std::to_string(i) + ".png\"\n";
+            j += "    }";
+            j += (i + 1 < doc.channels.size()) ? ",\n" : "\n";
+        }
+        j += "  ]\n";
+    } else {
+        j += "\n";
+    }
+    j += "}\n";
     return j;
 }
 
@@ -601,6 +622,14 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
         snap.height = e.doc.height;
         snap.name = e.doc.name;
         snap.activeId = e.doc.activeId;
+        for (const AlphaChannel& c : e.doc.channels) {
+            if (c.mask != nullptr) {
+                ChannelSnapshot cs;
+                cs.name = c.name;
+                cs.mask = c.mask;
+                snap.channels.push_back(std::move(cs));
+            }
+        }
         snap.layers.reserve(e.doc.layers.size());
         for (const Layer& l : e.doc.layers) {
             LayerSnapshot s;
@@ -759,6 +788,16 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
                      "layer %{public}lu saved %{public}ux%{public}u @(%{public}ld,%{public}ld)",
                      static_cast<unsigned long>(l.id), l.pw, l.ph,
                      static_cast<long>(l.originX), static_cast<long>(l.originY));
+    }
+
+    // v5：Alpha 通道掩码（文档域全幅灰度 PNG）
+    for (size_t i = 0; i < snap.channels.size(); ++i) {
+        const ChannelSnapshot& c = snap.channels[i];
+        if (!encodeGridPng(*c.mask, snap.width, snap.height,
+                           "channels/" + std::to_string(i) + ".png")) {
+            close(fd);
+            return false;
+        }
     }
 
     const std::string manifest = buildManifest(snap);

@@ -1397,13 +1397,16 @@ napi_value AddLayerMask(napi_env env, napi_callback_info info) {
         if (l->mask != nullptr) {
             return makeError(env, kErrBadParam, "addLayerMask: layer already has mask");
         }
-        if (l->pixels == nullptr) {
-            return makeError(env, kErrBadParam, "addLayerMask: empty layer");
-        }
         e.history.beginEdit(e.doc, "add mask", static_cast<uint64_t>(e.docRevision));
         auto m = std::make_shared<LayerMask>();
-        const uint32_t cols = l->pixels->cols;
-        const uint32_t rows = l->pixels->rows;
+        // M10c：解除"蒙版需先有像素"前提——空图层蒙版网格取文档域（全 255 显示全部；
+        // composeMasked 对 null 像素层输出 null，渲染路径不变）
+        const uint32_t cols = l->pixels != nullptr
+            ? l->pixels->cols
+            : (e.doc.width + kTileSize - 1u) / kTileSize;
+        const uint32_t rows = l->pixels != nullptr
+            ? l->pixels->rows
+            : (e.doc.height + kTileSize - 1u) / kTileSize;
         TileGridBuilder builder(cols, rows);
         for (uint32_t ty = 0; ty < rows; ++ty) {
             for (uint32_t tx = 0; tx < cols; ++tx) {
@@ -1804,6 +1807,243 @@ napi_value SmoothSelection(napi_env env, napi_callback_info /*info*/) {
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();
         e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// ---- M10c Alpha 通道（存储/载入选区）与剪贴板 ----
+
+napi_value StoreSelection(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    char name[128] = {0};
+    size_t nameLen = 0;
+    if (argc < 1 || napi_get_value_string_utf8(env, argv[0], name, sizeof(name) - 1, &nameLen) != napi_ok ||
+        nameLen == 0) {
+        return makeError(env, kErrBadParam, "storeSelection(name) requires name");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "storeSelection: no document");
+        }
+        if (e.doc.selection == nullptr) {
+            return makeError(env, kErrBadParam, "storeSelection: no active selection");
+        }
+        e.history.beginEdit(e.doc, "store selection", static_cast<uint64_t>(e.docRevision));
+        AlphaChannel ch;
+        ch.name = name;
+        ch.mask = e.doc.selection;
+        bool replaced = false;
+        for (AlphaChannel& c : e.doc.channels) {
+            if (c.name == ch.name) {
+                c.mask = ch.mask;  // PS：同名覆盖
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) {
+            e.doc.channels.push_back(std::move(ch));
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value LoadSelection(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    char name[128] = {0};
+    size_t nameLen = 0;
+    int32_t op = 0;
+    if (argc < 1 || napi_get_value_string_utf8(env, argv[0], name, sizeof(name) - 1, &nameLen) != napi_ok ||
+        nameLen == 0) {
+        return makeError(env, kErrBadParam, "loadSelection(name, op?) requires name");
+    }
+    if (argc >= 2 && napi_get_value_int32(env, argv[1], &op) != napi_ok) {
+        return makeError(env, kErrBadParam, "loadSelection: invalid op");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "loadSelection: no document");
+        }
+        const TileGrid* mask = nullptr;
+        for (const AlphaChannel& c : e.doc.channels) {
+            if (c.name == name && c.mask != nullptr) {
+                mask = c.mask.get();
+                break;
+            }
+        }
+        if (mask == nullptr) {
+            return makeError(env, kErrBadParam, "loadSelection: channel not found");
+        }
+        // 通道掩码（shared_ptr 共享零拷贝）→ 布尔合并走既有 combineSelection
+        std::shared_ptr<const TileGrid> next;
+        for (const AlphaChannel& c : e.doc.channels) {
+            if (c.name == name) {
+                next = c.mask;
+                break;
+            }
+        }
+        auto merged = tiles::combineSelection(e.doc, next, static_cast<tiles::SelectionOp>(op));
+        e.history.beginEdit(e.doc, "load selection", static_cast<uint64_t>(e.docRevision));
+        e.doc.selection = std::move(merged);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value DeleteChannel(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    char name[128] = {0};
+    size_t nameLen = 0;
+    if (argc < 1 || napi_get_value_string_utf8(env, argv[0], name, sizeof(name) - 1, &nameLen) != napi_ok ||
+        nameLen == 0) {
+        return makeError(env, kErrBadParam, "deleteChannel(name) requires name");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        e.history.beginEdit(e.doc, "delete channel", static_cast<uint64_t>(e.docRevision));
+        const size_t before = e.doc.channels.size();
+        for (size_t i = 0; i < e.doc.channels.size(); ++i) {
+            if (e.doc.channels[i].name == name) {
+                e.doc.channels.erase(e.doc.channels.begin() + static_cast<long>(i));
+                break;
+            }
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        if (e.doc.channels.size() != before) {
+            e.bumpRevisionLocked();
+            e.requestRender();
+        }
+    }
+    return makeOk(env, nullptr);
+}
+
+// 通道列表（名字数组；v1 通道面板只读）
+napi_value GetChannelList(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    napi_value arr = nullptr;
+    napi_create_array_with_length(env, e.doc.channels.size(), &arr);
+    for (size_t i = 0; i < e.doc.channels.size(); ++i) {
+        napi_value s = nullptr;
+        napi_create_string_utf8(env, e.doc.channels[i].name.c_str(), NAPI_AUTO_LENGTH, &s);
+        napi_set_element(env, arr, static_cast<uint32_t>(i), s);
+    }
+    return arr;
+}
+
+napi_value CopySelection(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    bool merged = false;
+    if (argc >= 1) {
+        napi_get_value_bool(env, argv[0], &merged);
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "copySelection: no document");
+        }
+        if (e.doc.selection == nullptr) {
+            return makeError(env, kErrBadParam, "copySelection: no active selection");
+        }
+        if (!copySelectionToClipboard(e.doc, merged, e.clipboard)) {
+            return makeError(env, kErrBadParam, "copySelection: nothing to copy");
+        }
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Clipboard",
+                     "copy %{public}s %{public}ux%{public}u @(%{public}d,%{public}d)",
+                     merged ? "merged" : "layer", e.clipboard.width, e.clipboard.height,
+                     e.clipboard.docX, e.clipboard.docY);
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value CutSelection(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    bool merged = false;
+    if (argc >= 1) {
+        napi_get_value_bool(env, argv[0], &merged);
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "cutSelection: no document");
+        }
+        if (e.doc.selection == nullptr) {
+            return makeError(env, kErrBadParam, "cutSelection: no active selection");
+        }
+        if (!copySelectionToClipboard(e.doc, merged, e.clipboard)) {
+            return makeError(env, kErrBadParam, "cutSelection: nothing to cut");
+        }
+        e.history.beginEdit(e.doc, "cut", static_cast<uint64_t>(e.docRevision));
+        eraseSelectionPixels(e.doc);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value DeleteSelectionPixels(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "deleteSelectionPixels: no document");
+        }
+        if (e.doc.selection == nullptr) {
+            return makeError(env, kErrBadParam, "deleteSelectionPixels: no active selection");
+        }
+        e.history.beginEdit(e.doc, "clear", static_cast<uint64_t>(e.docRevision));
+        const bool changed = eraseSelectionPixels(e.doc);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        if (changed) {
+            e.bumpRevisionLocked();
+            e.requestRender();
+        }
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value PasteClipboard(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "pasteClipboard: no document");
+        }
+        if (e.clipboard.width == 0) {
+            return makeError(env, kErrBadParam, "pasteClipboard: clipboard empty");
+        }
+        e.history.beginEdit(e.doc, "paste", static_cast<uint64_t>(e.docRevision));
+        const LayerId newId = e.nextLayerId();
+        pasteClipboardAsLayer(e.doc, e.clipboard, newId);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Clipboard",
+                     "paste layer=%{public}llu %{public}ux%{public}u @(%{public}d,%{public}d)",
+                     static_cast<unsigned long long>(newId), e.clipboard.width, e.clipboard.height,
+                     e.clipboard.docX, e.clipboard.docY);
     }
     return makeOk(env, nullptr);
 }

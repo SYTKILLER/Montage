@@ -14,6 +14,7 @@
 #include <napi/native_api.h>
 
 #include "engine/brush.h"
+#include "engine/clipboard_ops.h"
 #include "engine/document.h"
 #include "engine/history.h"
 #include "render/render_loop.h"
@@ -74,6 +75,9 @@ class Engine {
     // M10a 重新选择（PS 语义会话态）：最近一次取消的选区，reselectSelection 恢复。
     // 不随 History 快照走（撤销不恢复"重新选择"来源）。
     std::shared_ptr<const TileGrid> lastSelection;
+
+    // M10c 内部剪贴板（引擎内存；不随快照/持久化走，关闭文档保留——PS 同语义）
+    ClipBuffer clipboard;
 
     // M4a 撤销
     History history;

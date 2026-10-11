@@ -52,6 +52,16 @@ napi_value ExpandSelection(napi_env env, napi_callback_info info);
 napi_value ContractSelection(napi_env env, napi_callback_info info);
 napi_value BorderSelection(napi_env env, napi_callback_info info);
 napi_value SmoothSelection(napi_env env, napi_callback_info info);
+// M10c Alpha 通道：存储/载入/删除 + 列表（v1 通道面板只读）
+napi_value StoreSelection(napi_env env, napi_callback_info info);
+napi_value LoadSelection(napi_env env, napi_callback_info info);
+napi_value DeleteChannel(napi_env env, napi_callback_info info);
+napi_value GetChannelList(napi_env env, napi_callback_info info);
+// M10c 剪贴板（引擎内存内部剪贴板）：拷贝/剪切（merged=合并拷贝）/粘贴/清除
+napi_value CopySelection(napi_env env, napi_callback_info info);
+napi_value CutSelection(napi_env env, napi_callback_info info);
+napi_value PasteClipboard(napi_env env, napi_callback_info info);
+napi_value DeleteSelectionPixels(napi_env env, napi_callback_info info);
 napi_value RemoveLayer(napi_env env, napi_callback_info info);
 napi_value SelectLayer(napi_env env, napi_callback_info info);
 napi_value SetLayerVisible(napi_env env, napi_callback_info info);

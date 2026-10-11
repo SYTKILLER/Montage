@@ -26,7 +26,7 @@ constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Open";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
 constexpr int kMinVersion = 1;
-constexpr int kMaxVersion = 3;  // v3：+调整层；v2：+图层蒙版（按字段存在性兼容 v1/v2）
+constexpr int kMaxVersion = 5;  // v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
 constexpr uint32_t kMaxSide = 30000;
 constexpr uint64_t kMaxTotalPixels = 100ull * 1000 * 1000;
 constexpr size_t kMaxLayers = 10000;
@@ -537,6 +537,7 @@ bool getDouble(const JValue& v, double& out) {
 }
 
 bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector<LayerRecord>& layers,
+                   std::vector<std::string>& channelFiles,
                    std::string& err) {
     if (bytes.size() > kMaxManifestBytes) {
         err = "manifest too large";
@@ -795,6 +796,50 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
         err = "total layer pixels exceed format budget";
         return false;
     }
+    // v5 Alpha 通道（可选字段；v4 及以下无此字段 = 无通道）
+    const JValue* jch = root.find("channels");
+    if (jch != nullptr && jch->type == JValue::Arr) {
+        if (jch->arr.size() > 64) {
+            err = "channel count exceeds format limit";
+            return false;
+        }
+        for (const JValue& item : jch->arr) {
+            if (item.type != JValue::Obj) {
+                err = "bad channel record";
+                return false;
+            }
+            const JValue* jn = item.find("name");
+            const JValue* jf = item.find("file");
+            if (jn == nullptr || jn->type != JValue::Str || jn->str.empty() ||
+                jf == nullptr || jf->type != JValue::Str) {
+                err = "bad channel record";
+                return false;
+            }
+            // 文件名白名单（防路径注入）：channels/<十进制索引>.png
+            const std::string expectPrefix = "channels/";
+            const std::string expectSuffix = ".png";
+            const std::string f = jf->str;
+            bool ok = f.size() > expectPrefix.size() + expectSuffix.size() &&
+                      f.compare(0, expectPrefix.size(), expectPrefix) == 0 &&
+                      f.compare(f.size() - expectSuffix.size(), expectSuffix.size(), expectSuffix) == 0;
+            if (ok) {
+                for (size_t k = expectPrefix.size(); k + expectSuffix.size() < f.size(); ++k) {
+                    if (f[k] < '0' || f[k] > '9') {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if (!ok) {
+                err = "bad channel file reference";
+                return false;
+            }
+            AlphaChannel ch;
+            ch.name = jn->str;
+            doc.channels.push_back(std::move(ch));
+            channelFiles.push_back(f);
+        }
+    }
     // activeLayerId 必须在集合内（对齐上游 validate）
     const JValue* jactive = root.find("activeLayerId");
     if (jactive != nullptr && jactive->type == JValue::Num && jactive->num > 0) {
@@ -850,7 +895,8 @@ bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
     }
     Document doc;
     std::vector<LayerRecord> records;
-    if (!parseManifest(manifestBytes, doc, records, err)) {
+    std::vector<std::string> channelFiles;
+    if (!parseManifest(manifestBytes, doc, records, channelFiles, err)) {
         return false;
     }
 
@@ -932,6 +978,30 @@ bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
         layers.push_back(std::move(l));
     }
 
+    // v5：Alpha 通道 PNG（文档域灰度网格；尺寸须与文档一致）
+    for (size_t i = 0; i < channelFiles.size(); ++i) {
+        const ZipReader::CdEntry* cpng = zip.find(channelFiles[i]);
+        if (cpng == nullptr) {
+            err = "channel image missing: " + channelFiles[i];
+            return false;
+        }
+        std::vector<uint8_t> cBytes;
+        if (!zip.extract(*cpng, cBytes, err)) {
+            return false;
+        }
+        std::shared_ptr<const TileGrid> cgrid = decodePngToGrid(cBytes.data(), cBytes.size(), err);
+        if (cgrid == nullptr) {
+            return false;
+        }
+        const uint32_t cCols = (doc.width + kTileSize - 1u) / kTileSize;
+        const uint32_t cRows = (doc.height + kTileSize - 1u) / kTileSize;
+        if (cgrid->cols != cCols || cgrid->rows != cRows) {
+            err = "channel image size mismatch: " + channelFiles[i];
+            return false;
+        }
+        doc.channels[i].mask = std::move(cgrid);
+    }
+
     // 整档替换（02 §5 语义）+ History 清空（撤销不跨文档）
     auto& engine = Engine::get();
     {
@@ -942,6 +1012,7 @@ bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
         engine.doc.name = doc.name;
         engine.doc.layers = std::move(layers);
         engine.doc.activeId = doc.activeId;
+        engine.doc.channels = std::move(doc.channels);
         engine.history.clear();
         engine.bumpRevisionLocked();
         engine.requestRender();

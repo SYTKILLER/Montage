@@ -192,6 +192,13 @@ struct Layer {
     }
 };
 
+// M10c Alpha 通道（06 规划 §4 M10）：文档级 8-bit 灰度集合——存储选区（PS 通道语义）。
+// 掩码网格与 Document.selection 同约定（RGBA 灰度瓦片）；随 Document 快照走撤销。
+struct AlphaChannel {
+    std::string name;
+    std::shared_ptr<const TileGrid> mask;
+};
+
 // M2：图层栈文档（无组；蒙版/剪贴/调整层 M5/M6；选区 M7a）。
 struct Document {
     uint32_t width = 0;
@@ -201,6 +208,8 @@ struct Document {
     LayerId activeId = 0;
     // M7a 选区：文档域 8-bit 覆盖掩码（null = 无选区，全图可编辑）；随 Document 快照走撤销
     std::shared_ptr<const TileGrid> selection;
+    // M10c Alpha 通道（存储选区；主选区保持会话态不持久化，通道经 .montage v5 持久化）
+    std::vector<AlphaChannel> channels;
 };
 
 // 视口：pan = 视口左上角的文档坐标（doc px），screen = (doc - pan) * zoom。

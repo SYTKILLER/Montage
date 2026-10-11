@@ -8,6 +8,7 @@ add_library(compositor SHARED
         bridge/napi_module.cpp
         bridge/engine_bridge.cpp
         engine/brush.cpp
+        engine/clipboard_ops.cpp
         engine/document.cpp
         engine/engine.cpp
         engine/history.cpp
