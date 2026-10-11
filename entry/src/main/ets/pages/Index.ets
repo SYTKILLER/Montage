@@ -54,6 +54,8 @@ const KC_NUM0: number = 2000;
 const KC_NUM1: number = 2001;
 const KC_ESC: number = 2070;
 const KC_F6: number = 2095;  // @ohos.multimodalInput.keyCode KEYCODE_F6（SDK 核验）
+const KC_F5: number = 2094;  // KEYCODE_F5（SDK 核验，2026-10-11）
+const KC_G: number = 2023;   // KEYCODE_G（SDK 核验，2026-10-11）
 const KC_T_KEY: number = 2036;
 const KC_X_KEY: number = 2040;
 const KC_ENTER: number = 2054;
@@ -96,6 +98,14 @@ struct Index {
   @State bgColor: string = '#FFFFFF';      // 背景色
   @State maskTarget: boolean = false;
   @State quickMaskActive: boolean = false;  // M10d 快速蒙版模式（引擎镜像；Q/菜单 toggle）
+  // M11a 渐变工具：类型/样式/目标 + 拖线预览（文档域 [x0,y0,x1,y1]）
+  @State gradientType: number = 0;      // 0=线性 1=径向
+  @State gradientStyle: number = 0;     // 0=前景→背景 1=前景→透明
+  @State gradientTarget: number = 0;    // 0=像素 1=图层蒙版
+  @State gradientLine: number[] | null = null;  // 非空 = 拖线中（overlay 预览）
+  @State showFill: boolean = false;     // M11a 填充对话框（Shift+F5）
+  @State fillSource: number = 0;        // 0=前景 1=背景 2=黑 3=白
+  private gradDragging: boolean = false;
   @State wandTolerance: number = 32;
   @State wandContiguous: boolean = true;
   @State wandAllLayers: boolean = false;
@@ -437,6 +447,9 @@ struct Index {
       case 'eraser':
         this.strokeTouch(e, t, docX, docY);
         break;
+      case 'gradient':
+        this.gradientTouch(e, docX, docY);
+        break;
       case 'move':
         this.moveTouch(e, docX, docY);
         break;
@@ -606,6 +619,23 @@ struct Index {
     return out;
   }
 
+  // M11a 渐变拖线视口换算（Polyline 两点）
+  private gradientViewportPts(): number[][] {
+    const line = this.gradientLine;
+    const k = this.pxPerVp();
+    if (line === null) {
+      return [];
+    }
+    return [
+      [(line[0] - this.panX) * this.zoom / k, (line[1] - this.panY) * this.zoom / k],
+      [(line[2] - this.panX) * this.zoom / k, (line[3] - this.panY) * this.zoom / k],
+    ];
+  }
+
+  private gradientViewportHandles(): number[][] {
+    return this.gradientViewportPts();
+  }
+
   private moveTouch(e: TouchEvent, docX: number, docY: number): void {
     if (e.type === TouchType.Down) {
       this.engine.translateLayer(0, 0, 0, 0);
@@ -651,6 +681,41 @@ struct Index {
       this.engine.continueStroke(docX, docY, pressure);
     } else if (e.type === TouchType.Up || e.type === TouchType.Cancel) {
       this.engine.endStroke();
+    }
+  }
+
+  // M11a 渐变拖线：Down 起线 / Move 更新终点（overlay 预览）/ Up 提交单事务
+  private gradientTouch(e: TouchEvent, docX: number, docY: number): void {
+    if (e.type === TouchType.Down) {
+      if (this.gradientTarget === 1 && !this.activeLayerHasMask()) {
+        this.toast('当前图层无蒙版');
+        return;
+      }
+      this.gradDragging = true;
+      this.gradientLine = [docX, docY, docX, docY];
+    } else if (e.type === TouchType.Move && this.gradDragging) {
+      const line = this.gradientLine;
+      if (line !== null) {
+        this.gradientLine = [line[0], line[1], docX, docY];
+      }
+    } else if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.gradDragging) {
+      this.gradDragging = false;
+      const line = this.gradientLine;
+      this.gradientLine = null;
+      const a = this.activeLayer();
+      if (line === null || a === undefined) {
+        return;
+      }
+      const dx = line[2] - line[0];
+      const dy = line[3] - line[1];
+      if (dx * dx + dy * dy < 1) {
+        this.toast('拖线过短');
+        return;
+      }
+      const ok = this.engine.applyGradient(a.id, this.gradientType, this.gradientStyle,
+        line[0], line[1], line[2], line[3], this.gradientTarget);
+      this.log(`渐变(${this.gradientType === 0 ? '线性' : '径向'}/` +
+        `${this.gradientTarget === 0 ? '像素' : '蒙版'}): ${ok ? '已应用' : '失败'}`);
     }
   }
 
@@ -1007,6 +1072,10 @@ struct Index {
       this.maskTarget = false;  // 换笔即退出蒙版目标（安全默认）
       this.engine.setBrushTarget(false);
     }
+    if (this.gradDragging) {
+      this.gradDragging = false;  // 换工具丢弃未完成拖线
+      this.gradientLine = null;
+    }
     if (this.tool === 'crop') {
       this.cropRect = null;  // 换工具即丢弃未提交裁剪框
     }
@@ -1267,6 +1336,21 @@ struct Index {
         this.log(`清除选区像素: ${ok}`);
         break;
       }
+      case 'edit.fill':
+        if (this.docOpen) {
+          this.fillSource = 0;
+          this.showFill = true;
+        }
+        break;
+      case 'edit.stroke':
+        if (this.docOpen && this.hasSelectionFlag) {
+          this.modifyKind = 'stroke';
+          this.modifyText = '2';
+          this.showModify = true;
+        } else {
+          this.toast('需要先建立选区');
+        }
+        break;
       case 'image.rotate90cw':
         this.docOp((): boolean => this.engine.rotateDocument90(true), '旋转 90° 顺时针');
         break;
@@ -1421,7 +1505,7 @@ struct Index {
     this.log(`载入选区 "${name}": ${ok}`);
   }
 
-  // M10b 羽化/修改族提交（半径数值对话框共用）
+  // M10b 羽化/修改族 + M11a 描边提交（半径/宽度数值对话框共用）
   private commitModify(): void {
     const r = parseInt(this.modifyText);
     const kindLabel: Record<string, string> = {
@@ -1429,9 +1513,10 @@ struct Index {
       'border': '边界',
       'expand': '扩展',
       'contract': '收缩',
+      'stroke': '描边',
     };
     if (isNaN(r) || r < 1 || r > 100) {
-      this.toast('半径无效（1-100）');
+      this.toast('数值无效（1-100）');
       return;
     }
     this.showModify = false;
@@ -1445,11 +1530,21 @@ struct Index {
       ok = this.engine.expandSelection(r);
     } else if (kind === 'contract') {
       ok = this.engine.contractSelection(r);
+    } else if (kind === 'stroke') {
+      ok = this.engine.strokeSelection(r);
     }
-    this.log(`${kindLabel[kind] ?? '修改'}选区 r=${r}: ${ok}`);
+    this.log(`${kindLabel[kind] ?? '修改'} r=${r}: ${ok}`);
     if (!ok) {
-      this.toast('操作失败（收缩可能清空选区）');
+      this.toast('操作失败');
     }
+  }
+
+  // M11a 填充提交（色源 = 引擎 fg/bg 现值或黑白）
+  private commitFill(): void {
+    this.showFill = false;
+    const ok = this.engine.fillSelection(this.fillSource);
+    const names: string[] = ['前景色', '背景色', '黑色', '白色'];
+    this.log(`填充（${names[this.fillSource]}）: ${ok}`);
   }
 
   private commitRotateAny(): void {
@@ -1607,6 +1702,8 @@ struct Index {
       leafItem('edit.copyMerged', '合并拷贝', 'Shift+Ctrl+C', d && this.hasSelectionFlag),
       leafItem('edit.paste', '粘贴', 'Ctrl+V', d),
       leafItem('edit.clear', '清除', '', d && this.hasSelectionFlag),
+      leafItem('edit.fill', '填充…', 'Shift+F5', d),
+      leafItem('edit.stroke', '描边…', '', d && this.hasSelectionFlag),
     ];
     const imageMenu: MenuItemVM[] = [
       leafItem('image.canvasSize', '画布大小…', '', d),
@@ -1690,6 +1787,7 @@ struct Index {
       { id: 'eyedropper', label: '吸管', symbol: $r('sys.symbol.eyedropper'), enabled: true },
       { id: 'brush', label: '画笔', symbol: $r('sys.symbol.paintbrush_pointed'), enabled: true },
       { id: 'eraser', label: '橡皮', symbol: $r('sys.symbol.eraser_line'), enabled: true },
+      { id: 'gradient', label: '渐变', symbol: $r('sys.symbol.rectangle_righthalf_inset_filled'), enabled: true },
       { id: '-', label: '', symbol: $r('sys.symbol.minus'), enabled: false },
       { id: 'hand', label: '抓手', symbol: $r('sys.symbol.hand'), enabled: true },
       { id: 'zoom', label: '缩放', symbol: $r('sys.symbol.magnifyingglass'), enabled: true },
@@ -1738,7 +1836,7 @@ struct Index {
       return;
     }
     // 对话框打开时：Esc 关闭，其余不抢
-    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform || this.showModify || this.showStoreSel || this.showLoadSel) {
+    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform || this.showModify || this.showStoreSel || this.showLoadSel || this.showFill) {
       if (e.keyCode === KC_ESC) {
         this.showTransform = false;
         this.showExport = false;
@@ -1749,6 +1847,7 @@ struct Index {
         this.showModify = false;
         this.showStoreSel = false;
         this.showLoadSel = false;
+        this.showFill = false;
       }
       return;
     }
@@ -1866,6 +1965,10 @@ struct Index {
       this.runCommand('select.feather');  // Shift+F6 羽化（PS 语义）
       return;
     }
+    if (this.shiftHeld && e.keyCode === KC_F5) {
+      this.runCommand('edit.fill');  // Shift+F5 填充（PS 语义）
+      return;
+    }
     switch (code) {
       case KC_V:
         this.pickTool('move');
@@ -1907,6 +2010,9 @@ struct Index {
         break;
       case KC_E:
         this.pickTool('eraser');
+        break;
+      case KC_G:
+        this.pickTool('gradient');  // M11a 渐变（PS G 语义）
         break;
       case KC_H:
         this.pickTool('hand');
@@ -2034,6 +2140,10 @@ struct Index {
           maskTarget: this.maskTarget,
           hasMaskOnActive: this.activeLayerHasMask(),
           quickMaskActive: this.quickMaskActive,
+          gradientType: $gradientType,
+          gradientStyle: $gradientStyle,
+          gradientTarget: $gradientTarget,
+          hasMaskOnActiveForGrad: this.activeLayerHasMask(),
           cropPending: this.cropRect !== null,
           selOp: $selOp,
           selShape: this.selShape,
@@ -2121,6 +2231,25 @@ struct Index {
                   y: (this.polyPendingPts[1] - this.panY) * this.zoom / this.pxPerVp() - 4
                 })
                 .hitTestBehavior(HitTestMode.None)
+            }
+            // M11a 渐变拖线预览：白线（视口两点）+ 两端手柄（纯视觉，None 防拦截触摸）
+            if (this.gradientLine !== null) {
+              Polyline()
+                .width('100%')
+                .height('100%')
+                .points(this.gradientViewportPts())
+                .stroke('#FFFFFF')
+                .strokeWidth(1)
+                .fillOpacity(0)
+                .hitTestBehavior(HitTestMode.None)
+              ForEach(this.gradientViewportHandles(), (p: number[]) => {
+                Circle()
+                  .width(10)
+                  .height(10)
+                  .fill('#00E5FF')
+                  .position({ x: p[0] - 5, y: p[1] - 5 })
+                  .hitTestBehavior(HitTestMode.None)
+              }, (p: number[], idx: number): string => `${idx}|${p[0]}|${p[1]}`)
             }
             // 裁剪框（拖拽中 + 待提交常显）
             if (this.cropRect !== null) {
@@ -2390,11 +2519,13 @@ struct Index {
           Column({ space: 14 }) {
             Text(this.modifyKind === 'feather' ? '羽化选区' :
               this.modifyKind === 'border' ? '边界' :
-              this.modifyKind === 'expand' ? '扩展选区' : '收缩选区')
+              this.modifyKind === 'expand' ? '扩展选区' :
+              this.modifyKind === 'stroke' ? '描边' : '收缩选区')
               .fontSize(16).fontWeight(FontWeight.Bold)
               .fontColor($r('app.color.text_primary'))
             Row({ space: 10 }) {
-              Text('半径').fontSize(13).fontColor($r('app.color.text_secondary'))
+              Text(this.modifyKind === 'stroke' ? '宽度' : '半径').fontSize(13)
+                .fontColor($r('app.color.text_secondary'))
               TextInput({ text: this.modifyText }).width(120).height(40)
                 .onChange((v: string): void => { this.modifyText = v; })
               Text('像素').fontSize(13).fontColor($r('app.color.text_secondary'))
@@ -2412,6 +2543,47 @@ struct Index {
             }.justifyContent(FlexAlign.End).width('100%')
           }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
             .border({ width: 1, color: $r('app.color.border') }).width(360)
+        }.width('100%').height('100%')
+      }
+      if (this.showFill) {
+        Stack() {
+          Column().width('100%').height('100%').backgroundColor('#66000000')
+            .onClick((): void => { this.showFill = false; })
+          Column({ space: 14 }) {
+            Text('填充').fontSize(16).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+            Text('选区约束生效（无选区 = 整层）').fontSize(12)
+              .fontColor($r('app.color.text_secondary'))
+            Row({ space: 8 }) {
+              ForEach(['前景色', '背景色', '黑色', '白色'], (label: string, idx: number) => {
+                Button(label)
+                  .fontSize(12).height(32)
+                  .backgroundColor(this.fillSource === idx
+                    ? $r('app.color.accent_container') : $r('app.color.surface'))
+                  .fontColor(this.fillSource === idx
+                    ? $r('app.color.accent') : $r('app.color.text_primary'))
+                  .border({
+                    width: this.fillSource === idx ? 1.5 : 1,
+                    color: this.fillSource === idx ? $r('app.color.accent') : $r('app.color.border')
+                  })
+                  .onClick((): void => {
+                    this.fillSource = idx;
+                  })
+              }, (label: string): string => label)
+            }
+            Row({ space: 12 }) {
+              Button('取消').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.surface'))
+                .fontColor($r('app.color.text_primary'))
+                .border({ width: 1, color: $r('app.color.border') })
+                .onClick((): void => { this.showFill = false; })
+              Button('填充').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.accent'))
+                .fontColor($r('app.color.on_accent'))
+                .onClick((): void => this.commitFill())
+            }.justifyContent(FlexAlign.End).width('100%')
+          }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
+            .border({ width: 1, color: $r('app.color.border') }).width(420)
         }.width('100%').height('100%')
       }
       if (this.showStoreSel) {

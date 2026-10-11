@@ -11,6 +11,7 @@ add_library(compositor SHARED
         engine/clipboard_ops.cpp
         engine/document.cpp
         engine/engine.cpp
+        engine/gradient_ops.cpp
         engine/history.cpp
         engine/transform_ops.cpp
         engine/resample.cpp

@@ -54,6 +54,11 @@ export struct OptionsBar {
   @Prop maskTarget: boolean = false;
   @Prop hasMaskOnActive: boolean = false;
   @Prop quickMaskActive: boolean = false;  // M10d：快速蒙版模式中（笔画自动落通道）
+  // M11a 渐变工具
+  @Link gradientType: number;    // 0=线性 1=径向
+  @Link gradientStyle: number;   // 0=前景→背景 1=前景→透明
+  @Link gradientTarget: number;  // 0=像素 1=图层蒙版
+  @Prop hasMaskOnActiveForGrad: boolean = false;
   @Prop cropPending: boolean = false;
   // M10a 选区增强：布尔四态 + 选框形状
   @Link selOp: number;
@@ -225,6 +230,42 @@ export struct OptionsBar {
     }
   }
 
+  // M11a 渐变选项：类型/样式/目标
+  @Builder
+  gradientOptions() {
+    Row({ space: 10 }) {
+      Button(this.gradientType === 0 ? '线性' : '径向')
+        .fontSize(12).height(28).width(56)
+        .backgroundColor($r('app.color.surface'))
+        .fontColor($r('app.color.text_primary'))
+        .border({ width: 1, color: $r('app.color.border') })
+        .onClick((): void => {
+          this.gradientType = this.gradientType === 0 ? 1 : 0;
+        })
+      Button(this.gradientStyle === 0 ? '前景→背景' : '前景→透明')
+        .fontSize(12).height(28).width(96)
+        .backgroundColor($r('app.color.surface'))
+        .fontColor($r('app.color.text_primary'))
+        .border({ width: 1, color: $r('app.color.border') })
+        .onClick((): void => {
+          this.gradientStyle = this.gradientStyle === 0 ? 1 : 0;
+        })
+      Button(this.gradientTarget === 0 ? '目标:像素' : '目标:蒙版')
+        .fontSize(12).height(28).width(88)
+        .backgroundColor($r('app.color.surface'))
+        .fontColor(this.gradientTarget === 1 ? $r('app.color.danger') : $r('app.color.text_primary'))
+        .border({ width: 1, color: $r('app.color.border') })
+        .opacity(this.gradientTarget === 1 && !this.hasMaskOnActiveForGrad ? 0.35 : 1)
+        .onClick((): void => {
+          this.gradientTarget = this.gradientTarget === 0 ? 1 : 0;
+        })
+      Text('拖线定方向与长度 · 选区约束生效')
+        .fontSize(11)
+        .fontColor($r('app.color.text_secondary'))
+    }
+    .height(36)
+  }
+
   build() {
     Row({ space: 8 }) {
       Text(this.toolLabel)
@@ -234,6 +275,8 @@ export struct OptionsBar {
         .width(60)
       if (this.tool === 'brush' || this.tool === 'eraser') {
         this.brushOptions()
+      } else if (this.tool === 'gradient') {
+        this.gradientOptions()
       } else if (this.tool === 'wand') {
         Row({ space: 10 }) {
           this.selOpButtons()

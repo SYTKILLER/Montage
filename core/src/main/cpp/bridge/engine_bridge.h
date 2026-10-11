@@ -54,6 +54,11 @@ napi_value BorderSelection(napi_env env, napi_callback_info info);
 napi_value SmoothSelection(napi_env env, napi_callback_info info);
 // M10d 快速蒙版：toggle（选区 ↔ 临时通道；返回 {active, hasSelection}）
 napi_value ToggleQuickMask(napi_env env, napi_callback_info info);
+// M11a 绘图工具第一批：渐变（layerId,type,style,x0,y0,x1,y1,target）/ 填充（source）/
+// 描边（width）；色源一律引擎 fg/bg 现值
+napi_value ApplyGradient(napi_env env, napi_callback_info info);
+napi_value FillSelection(napi_env env, napi_callback_info info);
+napi_value StrokeSelection(napi_env env, napi_callback_info info);
 // M10c Alpha 通道：存储/载入/删除 + 列表（v1 通道面板只读）
 napi_value StoreSelection(napi_env env, napi_callback_info info);
 napi_value LoadSelection(napi_env env, napi_callback_info info);

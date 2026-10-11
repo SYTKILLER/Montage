@@ -546,6 +546,41 @@ export class CompositorEngine {
     return { active: boolOf(r.data, 'active'), hasSelection: boolOf(r.data, 'hasSelection') };
   }
 
+  // M11a 渐变（type 0=线性/1=径向；style 0=前景→背景/1=前景→透明；
+  // target 0=像素/1=图层蒙版；拖线文档域）
+  applyGradient(layerId: number, type: number, style: number, x0: number, y0: number,
+    x1: number, y1: number, target: number): boolean {
+    let r: EngineResult;
+    const v: Object = native.applyGradient(layerId, type, style, x0, y0, x1, y1,
+      target) as Object;
+    r = narrowResult(v);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'applyGradient rejected: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  // M11a 填充（source 0=前景/1=背景/2=黑/3=白；色源引擎 fg/bg 现值）
+  fillSelection(source: number): boolean {
+    const r = narrowResult(native.fillSelection(source) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'fillSelection rejected: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  // M11a 描边（width 1..100 中心位置；前景色）
+  strokeSelection(width: number): boolean {
+    const r = narrowResult(native.strokeSelection(width) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'strokeSelection rejected: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
   // M10c Alpha 通道：存储选区（同名覆盖）/ 载入（op 布尔四态）/ 删除 / 列表
   storeSelection(name: string): boolean {
     const r = narrowResult(native.storeSelection(name) as Object);

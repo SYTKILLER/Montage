@@ -11,6 +11,7 @@ export const SHORTCUT_ROWS: ShortcutRow[] = [
   { keys: 'V / M / L / W', desc: '移动 / 选框 / 套索 / 魔棒' },
   { keys: 'C / I', desc: '裁剪 / 吸管' },
   { keys: 'B / E', desc: '画笔 / 橡皮' },
+  { keys: 'G', desc: '渐变（拖线应用，蒙版目标可切）' },
   { keys: 'H / Z', desc: '抓手 / 缩放' },
   { keys: 'Ctrl+Z / Ctrl+Shift+Z', desc: '撤销 / 重做' },
   { keys: 'Ctrl+N / O / S', desc: '新建 / 打开 / 保存' },

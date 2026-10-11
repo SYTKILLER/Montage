@@ -13,6 +13,7 @@
 #include <multimedia/image_framework/image/pixelmap_native.h>
 
 #include "engine/engine.h"
+#include "engine/gradient_ops.h"
 #include "engine/transform_ops.h"
 #include "engine/resample.h"
 #include "tiles/magic_wand.h"
@@ -1874,6 +1875,120 @@ napi_value ToggleQuickMask(napi_env env, napi_callback_info /*info*/) {
         napi_set_named_property(env, data, "hasSelection", makeBool(env, e.doc.selection != nullptr));
         return makeOk(env, data);
     }
+}
+
+// ---- M11a 绘图工具第一批（渐变/填充/描边；色源 = 引擎 fg/bg 现值）----
+
+// applyGradient(layerId, type, style, x0, y0, x1, y1, target)；撤销粒度 = 单次拖线
+napi_value ApplyGradient(napi_env env, napi_callback_info info) {
+    size_t argc = 8;
+    napi_value argv[8] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 8) {
+        return makeError(env, kErrBadParam,
+                         "applyGradient(layerId,type,style,x0,y0,x1,y1,target) requires 8 args");
+    }
+    double id = 0, type = 0, style = 0, x0 = 0, y0 = 0, x1 = 0, y1 = 0, target = 0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok ||
+        napi_get_value_double(env, argv[1], &type) != napi_ok ||
+        napi_get_value_double(env, argv[2], &style) != napi_ok ||
+        napi_get_value_double(env, argv[3], &x0) != napi_ok ||
+        napi_get_value_double(env, argv[4], &y0) != napi_ok ||
+        napi_get_value_double(env, argv[5], &x1) != napi_ok ||
+        napi_get_value_double(env, argv[6], &y1) != napi_ok ||
+        napi_get_value_double(env, argv[7], &target) != napi_ok) {
+        return makeError(env, kErrBadParam, "applyGradient: invalid args");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "applyGradient: no document");
+        }
+        GradientSpec spec;
+        spec.type = static_cast<GradientType>(static_cast<int32_t>(type));
+        spec.style = static_cast<GradientStyle>(static_cast<int32_t>(style));
+        spec.x0 = x0;
+        spec.y0 = y0;
+        spec.x1 = x1;
+        spec.y1 = y1;
+        const auto gt = static_cast<GradientTarget>(static_cast<int32_t>(target));
+        std::string err;
+        e.history.beginEdit(e.doc, "gradient", static_cast<uint64_t>(e.docRevision));
+        const bool ok = applyGradient(e.doc, static_cast<LayerId>(id), spec, gt,
+                                      e.fgColor, e.bgColor, err);
+        if (!ok) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, err);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// fillSelection(source 0=前景/1=背景/2=黑/3=白)
+napi_value FillSelection(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double source = 0;
+    if (argc < 1 || napi_get_value_double(env, argv[0], &source) != napi_ok) {
+        return makeError(env, kErrBadParam, "fillSelection(source) requires 1 arg");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "fillSelection: no document");
+        }
+        std::string err;
+        e.history.beginEdit(e.doc, "fill", static_cast<uint64_t>(e.docRevision));
+        const bool ok = fillWithColor(e.doc, e.doc.activeId,
+                                      static_cast<FillSource>(static_cast<int32_t>(source)),
+                                      e.fgColor[0], e.fgColor[1], e.fgColor[2],
+                                      e.bgColor[0], e.bgColor[1], e.bgColor[2], err);
+        if (!ok) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, err);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// strokeSelection(width 1..100，中心位置语义，前景色)
+napi_value StrokeSelection(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double width = 2;
+    if (argc < 1 || napi_get_value_double(env, argv[0], &width) != napi_ok) {
+        return makeError(env, kErrBadParam, "strokeSelection(width) requires 1 arg");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "strokeSelection: no document");
+        }
+        std::string err;
+        e.history.beginEdit(e.doc, "stroke", static_cast<uint64_t>(e.docRevision));
+        const bool ok = strokeSelectionBorder(e.doc, e.doc.activeId,
+                                              static_cast<int>(width),
+                                              e.fgColor[0], e.fgColor[1], e.fgColor[2], err);
+        if (!ok) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, err);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
 }
 
 napi_value StoreSelection(napi_env env, napi_callback_info info) {
