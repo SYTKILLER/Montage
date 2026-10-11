@@ -17,7 +17,8 @@ constexpr float kSpacingSoft = 0.025f;
 }  // namespace
 
 bool StrokeDraft::begin(const Document& doc, LayerId layerId, const BrushSettings& settings,
-                        bool onMask, bool onQuickMask, std::string& err) {
+                        bool onMask, bool onQuickMask, const CloneParams* cloneSrc,
+                        std::string& err) {
     const Layer* layer = nullptr;
     for (const Layer& l : doc.layers) {
         if (l.id == layerId) {
@@ -39,7 +40,40 @@ bool StrokeDraft::begin(const Document& doc, LayerId layerId, const BrushSetting
     layerId_ = layerId;
     maskTarget_ = false;
     qmTarget_ = false;
-    if (onQuickMask) {
+    cloneMode_ = false;
+    srcGrid_ = nullptr;
+    srcCacheBase_ = nullptr;
+    srcCacheKey_ = 0;
+    if (cloneSrc != nullptr && cloneSrc->srcGrid != nullptr) {
+        // M11d 仿制图章：目标 = 当前层像素网格；源 = 克隆源网格快照（不可变）
+        if (layer == nullptr) {
+            err = "clone: layer not found";
+            return false;
+        }
+        maskLum_ = 0.0f;
+        base_ = layer->pixels;
+        originX_ = static_cast<int>(std::lround(layer->transform.originX));
+        originY_ = static_cast<int>(std::lround(layer->transform.originY));
+        if (base_ != nullptr) {
+            imgW_ = base_->cols * kTileSize;
+            imgH_ = base_->rows * kTileSize;
+            gridCols_ = base_->cols;
+            gridRows_ = base_->rows;
+        } else {
+            imgW_ = imgH_ = 0;
+            gridCols_ = (doc.width + kTileSize - 1u) / kTileSize;
+            gridRows_ = (doc.height + kTileSize - 1u) / kTileSize;
+            originX_ = std::min(0, originX_);
+            originY_ = std::min(0, originY_);
+        }
+        layerHadPixels_ = true;
+        srcGrid_ = cloneSrc->srcGrid;
+        srcOriginX_ = cloneSrc->srcOriginX;
+        srcOriginY_ = cloneSrc->srcOriginY;
+        srcOffsetX_ = cloneSrc->offsetX;
+        srcOffsetY_ = cloneSrc->offsetY;
+        cloneMode_ = true;
+    } else if (onQuickMask) {
         // M10d 快速蒙版：绑定文档域通道网格（灰度落笔；网格 = 通道网格，origin=(0,0)）
         if (doc.quickMask == nullptr) {
             err = "brush: quick mask not active";
@@ -406,6 +440,9 @@ void StrokeDraft::cancel() {
     work_.clear();
     touched_.clear();
     tailBackup_.clear();
+    srcGrid_ = nullptr;      // 源网格为借用指针，笔画终止即弃用（缓存随清）
+    srcCacheBase_ = nullptr;
+    srcCacheKey_ = 0;
 }
 
 bool StrokeDraft::tileFor(uint32_t tx, uint32_t ty, std::vector<uint8_t>& out) const {
@@ -420,6 +457,33 @@ bool StrokeDraft::tileFor(uint32_t tx, uint32_t ty, std::vector<uint8_t>& out) c
     return true;
 }
 
+// M11d：源网格局部采样（越界 = 全透明）；单瓦片缓存（克隆采样逐像素随机访问）
+const uint8_t* StrokeDraft::srcAt(int gx, int gy) const {
+    if (srcGrid_ == nullptr || gx < 0 || gy < 0 ||
+        gx >= static_cast<int>(srcGrid_->cols * kTileSize) ||
+        gy >= static_cast<int>(srcGrid_->rows * kTileSize)) {
+        return nullptr;
+    }
+    const uint32_t key = static_cast<uint32_t>(gy / static_cast<int>(kTileSize)) * srcGrid_->cols +
+                         static_cast<uint32_t>(gx / static_cast<int>(kTileSize));
+    if (key != srcCacheKey_ || srcCacheBase_ == nullptr) {
+        auto it = srcGrid_->tiles.find(key);
+        if (it == srcGrid_->tiles.end() || it->second == nullptr) {
+            srcCacheBase_ = nullptr;
+            srcCacheKey_ = key;
+            return nullptr;
+        }
+        srcCacheBase_ = it->second->pixels->mapCpu();
+        srcCacheStride_ = it->second->pixels->rowBytes();
+        srcCacheKey_ = key;
+    }
+    if (srcCacheBase_ == nullptr) {
+        return nullptr;
+    }
+    return srcCacheBase_ + static_cast<size_t>(gy % static_cast<int>(kTileSize)) * srcCacheStride_ +
+           static_cast<size_t>(gx % static_cast<int>(kTileSize)) * 4u;
+}
+
 // publish 语义（对拍 publish()）：瓦片 = base + color × coverage × opacity；
 // 橡皮 = destinationOut。直通 alpha 域换算。
 void StrokeDraft::paintTile(uint32_t key) {
@@ -431,6 +495,46 @@ void StrokeDraft::paintTile(uint32_t key) {
     const uint8_t* cov = covIt->second.data();
     uint8_t* px = workIt->second.data();
     const float op = settings_.opacity;
+    if (cloneMode_) {
+        // M11d 仿制图章：out = src × covA + dst × (1−covA)（src 含自身 alpha；
+        // 源恒读笔画开始快照——本笔已画像素在 work_，绝不重采）
+        const float tx = static_cast<float>(key % gridCols_ * kTileSize);
+        const float ty = static_cast<float>(key / gridCols_ * kTileSize);
+        for (uint32_t r = 0; r < kTileSize; ++r) {
+            for (uint32_t c = 0; c < kTileSize; ++c) {
+                const size_t i = (static_cast<size_t>(r) * kTileSize + c) * 4u;
+                const float covA = (cov[i / 4u] / 255.0f) * op;
+                if (covA <= 0.0f) {
+                    continue;
+                }
+                // 源网格局部坐标 = 目标网格局部 − 偏移（两网格 origin 同为层 origin，同层恒成立；
+                // 跨层 v1 约定双方 origin≈0，登记跨 origin 蒙版/位移层后续批）
+                const uint8_t* src = srcAt(
+                    static_cast<int>(tx + static_cast<float>(c) - static_cast<float>(srcOffsetX_)),
+                    static_cast<int>(ty + static_cast<float>(r) - static_cast<float>(srcOffsetY_)));
+                uint8_t* p = px + i;
+                if (src == nullptr) {
+                    continue;  // 源越界 = 无源像素（底不变）
+                }
+                const float srcA = (src[3] / 255.0f) * covA;
+                if (srcA <= 0.0f) {
+                    continue;
+                }
+                const float da = p[3] / 255.0f;
+                const float oa = srcA + da * (1.0f - srcA);
+                const float srcP[3] = {src[0] / 255.0f * srcA, src[1] / 255.0f * srcA,
+                                       src[2] / 255.0f * srcA};
+                for (int ch = 0; ch < 3; ++ch) {
+                    const float d = p[static_cast<size_t>(ch)] / 255.0f * da * (1.0f - srcA);
+                    p[static_cast<size_t>(ch)] =
+                        static_cast<uint8_t>(std::lround(
+                            std::min(1.0f, oa > 0.0001f ? (srcP[ch] + d) / oa : 0.0f) * 255.0f));
+                }
+                p[3] = static_cast<uint8_t>(std::lround(std::min(1.0f, oa) * 255.0f));
+            }
+        }
+        return;
+    }
     if (maskTarget_ || qmTarget_) {
         // 蒙版/快速蒙版灰度落笔：out = L×covA + base×(1-covA)（base 恒灰，RGB 同值）；erasing 忽略
         for (size_t i = 0; i < static_cast<size_t>(kTileSize) * kTileSize; ++i) {

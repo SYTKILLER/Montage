@@ -63,6 +63,11 @@ napi_value StrokeSelection(napi_env env, napi_callback_info info);
 napi_value BucketFill(napi_env env, napi_callback_info info);
 // M11c 形状栅格化（layerId,kind,x0,y0,x1,y1,cornerRadius,fill,stroke,strokeWidth；全 number）
 napi_value RasterizeShape(napi_env env, napi_callback_info info);
+// M11d 仿制图章：setCloneSource(x,y) Alt 取源 / setCloneAligned(aligned) 对齐开关 /
+// setBrushClone(active) 图章工具激活标志
+napi_value SetCloneSource(napi_env env, napi_callback_info info);
+napi_value SetCloneAligned(napi_env env, napi_callback_info info);
+napi_value SetBrushClone(napi_env env, napi_callback_info info);
 // M10c Alpha 通道：存储/载入/删除 + 列表（v1 通道面板只读）
 napi_value StoreSelection(napi_env env, napi_callback_info info);
 napi_value LoadSelection(napi_env env, napi_callback_info info);

@@ -64,6 +64,12 @@ export struct OptionsBar {
   @Link shapeFill: boolean;
   @Link shapeStroke: boolean;
   @Link shapeStrokeWidth: number;
+  // M11d 仿制图章
+  @Link cloneAligned: boolean;
+  @Prop cloneSourceSet: boolean = false;
+  @Prop clonePicking: boolean = false;
+  onCloneAligned: (on: boolean) => void = (_on: boolean) => {};
+  onClonePickToggle: () => void = () => {};
   @Prop cropPending: boolean = false;
   // M10a 选区增强：布尔四态 + 选框形状
   @Link selOp: number;
@@ -317,6 +323,38 @@ export struct OptionsBar {
     return labels[this.shapeKind] ?? '形状';
   }
 
+  // M11d 仿制图章选项：取源按钮/对齐开关 + 提示
+  @Builder
+  stampOptions() {
+    Row({ space: 10 }) {
+      Button(this.clonePicking ? '点击画布取源…' : '取源')
+        .fontSize(12).height(28).width(this.clonePicking ? 130 : 56)
+        .backgroundColor(this.clonePicking ? $r('app.color.accent') : $r('app.color.surface'))
+        .fontColor(this.clonePicking ? $r('app.color.on_accent') : $r('app.color.text_primary'))
+        .border({ width: 1, color: $r('app.color.border') })
+        .onClick((): void => {
+          this.onClonePickToggle();
+        })
+      Row({ space: 4 }) {
+        Text('对齐')
+          .fontSize(12)
+          .fontColor($r('app.color.text_secondary'))
+        Toggle({ type: ToggleType.Checkbox, isOn: this.cloneAligned })
+          .selectedColor($r('app.color.accent'))
+          .onChange((on: boolean): void => {
+            this.cloneAligned = on;
+            this.onCloneAligned(on);
+          })
+      }
+      .height(28)
+      Text(this.cloneSourceSet ? '已取源 · 涂抹克隆' :
+        'Alt+点击或取源模式选点 → 涂抹克隆')
+        .fontSize(11)
+        .fontColor(this.cloneSourceSet ? $r('app.color.text_secondary') : $r('app.color.danger'))
+    }
+    .height(36)
+  }
+
   @Builder
   shapeOptions() {
     Row({ space: 10 }) {
@@ -406,6 +444,8 @@ export struct OptionsBar {
         this.bucketOptions()
       } else if (this.tool === 'shape') {
         this.shapeOptions()
+      } else if (this.tool === 'stamp') {
+        this.stampOptions()
       } else if (this.tool === 'wand') {
         Row({ space: 10 }) {
           this.selOpButtons()

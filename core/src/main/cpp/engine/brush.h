@@ -41,8 +41,17 @@ class StrokeDraft {
     // 要求蒙版已有 patch 网格，erasing 标志被忽略）。
     // onQuickMask = true 时绑定文档快速蒙版通道（灰度落笔同蒙版；文档域 origin=(0,0)，
     // 优先级高于 onMask——QM 模式中 selection 为 null，蒙版目标不可达，此参数为显式语义）。
+    // cloneSrc 非空 = 仿制图章（M11d）：coverage 加权克隆 srcGrid_（采样点 = 落点 − 偏移），
+    // 源恒读笔画开始快照（base_/srcGrid_ 不可变）——本笔已画像素在 work_，绝不重采。
+    struct CloneParams {
+        const TileGrid* srcGrid = nullptr;  // 源层像素网格（不可变快照；同层时 == base_）
+        int srcOriginX = 0;                 // 源网格原点 doc 坐标
+        int srcOriginY = 0;
+        double offsetX = 0.0;               // 采样偏移：源 doc 坐标 = 目标 doc 坐标 − offset
+        double offsetY = 0.0;
+    };
     bool begin(const Document& doc, LayerId layerId, const BrushSettings& settings, bool onMask,
-               bool onQuickMask, std::string& err);
+               bool onQuickMask, const CloneParams* cloneSrc, std::string& err);
     // 文档坐标追加样本（Catmull-Rom 落 dab；pressure ∈ [0,1]，调制 dab 直径）
     void append(float docX, float docY, float pressure);
     void end();
@@ -94,6 +103,16 @@ class StrokeDraft {
     bool active_ = false;
     bool maskTarget_ = false;  // M5b：落笔目标 = 图层蒙版（灰度）
     bool qmTarget_ = false;    // M10d：落笔目标 = 快速蒙版通道（文档域灰度）
+    bool cloneMode_ = false;   // M11d：仿制图章（coverage 加权克隆源网格）
+    const TileGrid* srcGrid_ = nullptr;  // 克隆源网格（笔画期不可变快照，不持有）
+    int srcOriginX_ = 0;
+    int srcOriginY_ = 0;
+    double srcOffsetX_ = 0.0;
+    double srcOffsetY_ = 0.0;
+    mutable uint32_t srcCacheKey_ = 0;   // srcAt 单瓦片缓存（克隆采样跨瓦片随机访问）
+    mutable const uint8_t* srcCacheBase_ = nullptr;
+    mutable uint32_t srcCacheStride_ = 0;
+    const uint8_t* srcAt(int srcGridX, int srcGridY) const;  // 源网格局部采样（越界=透明）
     float maskLum_ = 0.0f;     // 蒙版笔刷亮度（settings 颜色均值）
     bool layerHadPixels_ = false;
     int originX_ = 0;   // 网格原点 doc 坐标（= 图层 origin；空层 = 首触点整瓦片对齐）

@@ -59,6 +59,20 @@ class Engine {
     float fgColor[3] = {0.0f, 0.0f, 0.0f};  // M9c 前景色（直 alpha 0..1；起笔覆盖 brush 色）
     float bgColor[3] = {1.0f, 1.0f, 1.0f};  // M9c 背景色（渐变/填充 M11 用）
     bool brushOnMask = false;               // M5b：落笔目标 = 活动图层蒙版（setBrushTarget 写入）
+    bool brushIsClone = false;              // M11d：仿制图章工具激活（setBrushClone 写入）
+
+    // M11d 仿制图章克隆源（会话态：不随快照/持久化走；Alt+点击设置）
+    struct CloneSource {
+        bool active = false;
+        LayerId layerId = 0;   // 取源时的活动层（v1 同层/跨层均可，采样用源层原像素）
+        double srcX = 0.0;     // 源点（文档域）
+        double srcY = 0.0;
+        bool aligned = true;   // 对齐：笔画间保持同一偏移映射；否则每笔重置为源点起步
+        bool hasOffset = false; // 对齐模式：首个克隆笔画后锁定偏移
+        double lockOffsetX = 0.0;
+        double lockOffsetY = 0.0;
+    };
+    CloneSource cloneSource;
     std::thread strokeThread_;
     bool strokeThreadStarted_ = false;
     void ensureStrokeThreadLocked();        // 须持 strokeMtx；幂等，先 join 已退出线程

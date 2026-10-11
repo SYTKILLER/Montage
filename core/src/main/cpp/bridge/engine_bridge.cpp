@@ -2110,6 +2110,81 @@ napi_value RasterizeShape(napi_env env, napi_callback_info info) {
     return makeOk(env, nullptr);
 }
 
+// ---- M11d 仿制图章 ----
+
+// Alt+点击取源：记录源点 = 当前活动层（v1 采样源层原像素）
+napi_value SetCloneSource(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "setCloneSource(x, y) requires 2 args");
+    }
+    double x = 0, y = 0;
+    if (napi_get_value_double(env, argv[0], &x) != napi_ok ||
+        napi_get_value_double(env, argv[1], &y) != napi_ok) {
+        return makeError(env, kErrBadParam, "setCloneSource: invalid args");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "setCloneSource: no document");
+        }
+        if (e.doc.activeId == 0) {
+            return makeError(env, kErrBadParam, "setCloneSource: no active layer");
+        }
+        e.cloneSource.active = true;
+        e.cloneSource.layerId = e.doc.activeId;
+        e.cloneSource.srcX = x;
+        e.cloneSource.srcY = y;
+        e.cloneSource.hasOffset = false;  // 新源点：对齐偏移重新锁定
+        e.cloneSource.lockOffsetX = 0;
+        e.cloneSource.lockOffsetY = 0;
+    }
+    OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "clone source set (%.0f, %.0f)", x, y);
+    return makeOk(env, nullptr);
+}
+
+napi_value SetCloneAligned(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "setCloneAligned(aligned) requires 1 arg");
+    }
+    bool aligned = true;
+    if (napi_get_value_bool(env, argv[0], &aligned) != napi_ok) {
+        return makeError(env, kErrBadParam, "setCloneAligned: invalid arg");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        e.cloneSource.aligned = aligned;
+        e.cloneSource.hasOffset = false;  // 切换模式：偏移重锁
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value SetBrushClone(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "setBrushClone(active) requires 1 arg");
+    }
+    bool active = false;
+    if (napi_get_value_bool(env, argv[0], &active) != napi_ok) {
+        return makeError(env, kErrBadParam, "setBrushClone: invalid arg");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        e.brushIsClone = active;
+    }
+    return makeOk(env, nullptr);
+}
+
 napi_value StoreSelection(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value argv[1] = {nullptr};

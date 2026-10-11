@@ -594,6 +594,26 @@ export class CompositorEngine {
     return r.ok;
   }
 
+  // M11d 仿制图章：Alt 取源 / 对齐开关 / 工具激活标志
+  setCloneSource(x: number, y: number): boolean {
+    const r = narrowResult(native.setCloneSource(x, y) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setCloneSource rejected: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  setCloneAligned(aligned: boolean): boolean {
+    const r = narrowResult(native.setCloneAligned(aligned) as Object);
+    return r.ok;
+  }
+
+  setBrushClone(active: boolean): boolean {
+    const r = narrowResult(native.setBrushClone(active) as Object);
+    return r.ok;
+  }
+
   // M11c 形状栅格化（kind 0=矩形/1=圆角/2=椭圆/3=直线；fill/stroke 0/1 number；前景填充/背景描边）
   rasterizeShape(kind: number, x0: number, y0: number, x1: number, y1: number,
     cornerRadius: number, fill: boolean, stroke: boolean, strokeWidth: number): boolean {

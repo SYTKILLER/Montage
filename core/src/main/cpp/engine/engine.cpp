@@ -104,13 +104,52 @@ void Engine::strokeThreadMain() {
                     // M10d：快速蒙版模式（doc.quickMask 非 null）= 落笔目标即通道，
                     // 由文档状态推导（撤销跨 Q 边界回退时自动跟随，无独立标志位失同步）
                     const bool qm = doc.quickMask != nullptr;
-                    history.beginEdit(doc, qm ? "quick mask"
+                    // M11d：克隆模式 = 图章工具激活 + 克隆源已设（QM 优先；蒙版目标与克隆互斥，
+                    // UI 侧切换工具时已互斥置位）
+                    StrokeDraft::CloneParams cloneParams;
+                    const bool useClone = !qm && brushIsClone && cloneSource.active &&
+                                          cloneSource.layerId != 0;
+                    if (useClone) {
+                        const Layer* srcLayer = nullptr;
+                        for (const Layer& l : doc.layers) {
+                            if (l.id == cloneSource.layerId) {
+                                srcLayer = &l;
+                                break;
+                            }
+                        }
+                        if (srcLayer != nullptr && srcLayer->pixels != nullptr) {
+                            cloneParams.srcGrid = srcLayer->pixels.get();
+                            cloneParams.srcOriginX =
+                                static_cast<int>(std::lround(srcLayer->transform.originX));
+                            cloneParams.srcOriginY =
+                                static_cast<int>(std::lround(srcLayer->transform.originY));
+                            // 对齐：首个克隆笔画锁定偏移持续复用；非对齐：每笔重置为源点起步
+                            if (cloneSource.aligned && cloneSource.hasOffset) {
+                                cloneParams.offsetX = cloneSource.lockOffsetX;
+                                cloneParams.offsetY = cloneSource.lockOffsetY;
+                            } else {
+                                cloneParams.offsetX = p.x - cloneSource.srcX;
+                                cloneParams.offsetY = p.y - cloneSource.srcY;
+                                if (cloneSource.aligned) {
+                                    cloneSource.lockOffsetX = cloneParams.offsetX;
+                                    cloneSource.lockOffsetY = cloneParams.offsetY;
+                                    cloneSource.hasOffset = true;
+                                }
+                            }
+                        } else {
+                            OH_LOG_Print(LOG_APP, LOG_WARN, 0x4D30, "Montage.Clone",
+                                         "clone source layer missing, fallback to brush");
+                        }
+                    }
+                    history.beginEdit(doc, useClone ? "clone stamp"
+                                        : qm ? "quick mask"
                                         : (brushOnMask ? "mask brush"
                                           : (brush.erasing ? "eraser" : "brush")),
                                       static_cast<uint64_t>(docRevision));
                     draft = std::make_unique<StrokeDraft>();
                     std::string err;
-                    if (!draft->begin(doc, doc.activeId, brush, !qm && brushOnMask, qm, err)) {
+                    if (!draft->begin(doc, doc.activeId, brush, !qm && brushOnMask, qm,
+                                      useClone ? &cloneParams : nullptr, err)) {
                         OH_LOG_Print(LOG_APP, LOG_WARN, 0x4D30, "Montage.Brush",
                                      "draft begin failed: %{public}s", err.c_str());
                         history.endEdit(doc, static_cast<uint64_t>(docRevision));
@@ -309,6 +348,8 @@ void Engine::resetDocument() {
     viewport = Viewport{};
     // 落笔目标标志随文档清空（否则新文档上蒙版目标笔画静默拒绝——连带修复潜伏 bug）
     brushOnMask = false;
+    brushIsClone = false;
+    cloneSource = CloneSource{};
     needsRender.store(true);
     render.wake();
 }

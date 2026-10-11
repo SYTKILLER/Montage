@@ -116,6 +116,9 @@ struct Index {
   private shapeDragging: boolean = false;
   private shapeStartDocX: number = 0;
   private shapeStartDocY: number = 0;
+  @State cloneAligned: boolean = true;   // M11d 仿制图章对齐开关
+  @State cloneSourceSet: boolean = false; // 已取源镜像（选项条提示态）
+  @State clonePicking: boolean = false;   // 取源模式：下一次画布点击 = 取源（触屏兜底）
   @State wandTolerance: number = 32;
   @State wandContiguous: boolean = true;
   @State wandAllLayers: boolean = false;
@@ -463,6 +466,18 @@ struct Index {
         break;
       case 'shape':
         this.shapeTouch(e, docX, docY);
+        break;
+      case 'stamp':
+        if (e.type === TouchType.Down && (this.altHeld || this.clonePicking)) {
+          // Alt+点击 / 取源模式点击 = 取克隆源（PS Alt 语义 + 触屏兜底）
+          if (this.engine.setCloneSource(docX, docY)) {
+            this.cloneSourceSet = true;
+            this.clonePicking = false;
+            this.log(`克隆源已设 (${docX.toFixed(0)},${docY.toFixed(0)})`);
+          }
+        } else {
+          this.strokeTouch(e, t, docX, docY);
+        }
         break;
       case 'bucket':
         if (e.type === TouchType.Down) {
@@ -1131,6 +1146,9 @@ struct Index {
       this.maskTarget = false;  // 换笔即退出蒙版目标（安全默认）
       this.engine.setBrushTarget(false);
     }
+    if (id !== 'stamp' && this.tool === 'stamp') {
+      this.engine.setBrushClone(false);  // 离开图章工具即清除克隆标志
+    }
     if (this.gradDragging) {
       this.gradDragging = false;  // 换工具丢弃未完成拖线
       this.gradientLine = null;
@@ -1146,6 +1164,11 @@ struct Index {
       this.cancelPolygonSelection();  // 换工具丢弃未闭合多边形
     }
     this.tool = id;
+    if (id === 'stamp') {
+      this.maskTarget = false;  // 图章与蒙版目标互斥（克隆优先走像素）
+      this.engine.setBrushTarget(false);
+      this.engine.setBrushClone(true);
+    }
     this.log(`工具 → ${id}`);
   }
 
@@ -1856,6 +1879,7 @@ struct Index {
       { id: 'gradient', label: '渐变', symbol: $r('sys.symbol.rectangle_righthalf_inset_filled'), enabled: true },
       { id: 'bucket', label: '油漆桶', symbol: $r('sys.symbol.paint_bucket'), enabled: true },
       { id: 'shape', label: '形状', symbol: $r('sys.symbol.circle_on_square'), enabled: true },
+      { id: 'stamp', label: '仿制图章', symbol: $r('sys.symbol.seal'), enabled: true },
       { id: '-', label: '', symbol: $r('sys.symbol.minus'), enabled: false },
       { id: 'hand', label: '抓手', symbol: $r('sys.symbol.hand'), enabled: true },
       { id: 'zoom', label: '缩放', symbol: $r('sys.symbol.magnifyingglass'), enabled: true },
@@ -2077,6 +2101,10 @@ struct Index {
           this.pickTool('lasso');
         }
         break;
+      case KC_S:
+        // Ctrl+S 已在 Ctrl 分支处理；单键 S = 仿制图章（PS 语义）
+        this.pickTool('stamp');
+        break;
       case KC_W:
         this.pickTool('wand');
         break;
@@ -2235,6 +2263,17 @@ struct Index {
           shapeFill: $shapeFill,
           shapeStroke: $shapeStroke,
           shapeStrokeWidth: $shapeStrokeWidth,
+          cloneAligned: $cloneAligned,
+          cloneSourceSet: this.cloneSourceSet,
+          clonePicking: this.clonePicking,
+          onCloneAligned: (on: boolean): void => {
+            this.engine.setCloneAligned(on);
+            this.log(`克隆对齐: ${on ? '开' : '关'}`);
+          },
+          onClonePickToggle: (): void => {
+            this.clonePicking = !this.clonePicking;
+            this.log(`取源模式: ${this.clonePicking ? '开（点击画布取源）' : '关'}`);
+          },
           cropPending: this.cropRect !== null,
           selOp: $selOp,
           selShape: this.selShape,
