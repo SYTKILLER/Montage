@@ -52,6 +52,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"setCloneAligned", nullptr, montage::bridge::SetCloneAligned, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setBrushClone", nullptr, montage::bridge::SetBrushClone, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setBrushEffect", nullptr, montage::bridge::SetBrushEffect, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setHistoryBrush", nullptr, montage::bridge::SetHistoryBrush, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"storeSelection", nullptr, montage::bridge::StoreSelection, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"loadSelection", nullptr, montage::bridge::LoadSelection, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"deleteChannel", nullptr, montage::bridge::DeleteChannel, nullptr, nullptr, nullptr, napi_default, nullptr},

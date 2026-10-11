@@ -620,6 +620,12 @@ export class CompositorEngine {
     return r.ok;
   }
 
+  // M11f 历史画笔：steps 0=关闭，1=最近一次编辑前快照…
+  setHistoryBrush(steps: number): boolean {
+    const r = narrowResult(native.setHistoryBrush(steps) as Object);
+    return r.ok;
+  }
+
   // M11c 形状栅格化（kind 0=矩形/1=圆角/2=椭圆/3=直线；fill/stroke 0/1 number；前景填充/背景描边）
   rasterizeShape(kind: number, x0: number, y0: number, x1: number, y1: number,
     cornerRadius: number, fill: boolean, stroke: boolean, strokeWidth: number): boolean {

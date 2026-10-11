@@ -122,6 +122,7 @@ struct Index {
   @State clonePicking: boolean = false;   // 取源模式：下一次画布点击 = 取源（触屏兜底）
   // M11e 效果工具（R 组：blur/sharpen/smudge；O 组：dodge/burn/sponge）
   @State effectTool: string = 'blur';
+  @State historyBrushSteps: number = 1;  // M11f 历史画笔源步数（1=最近一次编辑前）
 
   private effectModeOf(id: string): number {
     if (id === 'blur') {
@@ -485,6 +486,7 @@ struct Index {
       case 'dodge':
       case 'burn':
       case 'sponge':
+      case 'historyBrush':
         this.strokeTouch(e, t, docX, docY);
         break;
       case 'gradient':
@@ -1174,6 +1176,16 @@ struct Index {
     }
     if (id !== 'stamp' && this.tool === 'stamp') {
       this.engine.setBrushClone(false);  // 离开图章工具即清除克隆标志
+    }
+    if (id === 'historyBrush') {
+      // M11f 历史画笔：互斥克隆/效果/蒙版目标
+      this.maskTarget = false;
+      this.engine.setBrushTarget(false);
+      this.engine.setBrushClone(false);
+      this.engine.setBrushEffect(0);
+      this.engine.setHistoryBrush(this.historyBrushSteps);
+    } else if (this.tool === 'historyBrush') {
+      this.engine.setHistoryBrush(0);  // 离开历史画笔归零
     }
     if (this.effectModeOf(id) > 0) {
       // M11e 效果工具：互斥克隆/蒙版目标，激活对应内核
@@ -1918,6 +1930,7 @@ struct Index {
       { id: 'stamp', label: '仿制图章', symbol: $r('sys.symbol.seal'), enabled: true },
       { id: 'blur', label: '模糊', symbol: $r('sys.symbol.hand_draw'), enabled: true },
       { id: 'dodge', label: '减淡', symbol: $r('sys.symbol.contrast'), enabled: true },
+      { id: 'historyBrush', label: '历史画笔', symbol: $r('sys.symbol.clock'), enabled: true },
       { id: '-', label: '', symbol: $r('sys.symbol.minus'), enabled: false },
       { id: 'hand', label: '抓手', symbol: $r('sys.symbol.hand'), enabled: true },
       { id: 'zoom', label: '缩放', symbol: $r('sys.symbol.magnifyingglass'), enabled: true },
@@ -2161,6 +2174,9 @@ struct Index {
           this.pickTool('blur');
         }
         break;
+      case KC_Y:
+        this.pickTool('historyBrush');  // M11f 历史画笔（PS Y 语义）
+        break;
       case KC_O:
         // O = 减淡组（Shift+O 循环 减淡→加深→海绵）
         if (this.shiftHeld) {
@@ -2332,6 +2348,7 @@ struct Index {
           cloneAligned: $cloneAligned,
           cloneSourceSet: this.cloneSourceSet,
           clonePicking: this.clonePicking,
+          historyBrushSteps: $historyBrushSteps,
           onCloneAligned: (on: boolean): void => {
             this.engine.setCloneAligned(on);
             this.log(`克隆对齐: ${on ? '开' : '关'}`);

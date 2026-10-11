@@ -70,6 +70,8 @@ napi_value SetCloneAligned(napi_env env, napi_callback_info info);
 napi_value SetBrushClone(napi_env env, napi_callback_info info);
 // M11e dab 内核族：setBrushEffect(mode 0..6，对齐 BrushEffect 枚举)
 napi_value SetBrushEffect(napi_env env, napi_callback_info info);
+// M11f 历史画笔：setHistoryBrush(steps 0=关闭，1=最近一次编辑前快照…)
+napi_value SetHistoryBrush(napi_env env, napi_callback_info info);
 // M10c Alpha 通道：存储/载入/删除 + 列表（v1 通道面板只读）
 napi_value StoreSelection(napi_env env, napi_callback_info info);
 napi_value LoadSelection(napi_env env, napi_callback_info info);

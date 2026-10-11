@@ -78,6 +78,7 @@ bool StrokeDraft::begin(const Document& doc, LayerId layerId, const BrushSetting
         srcOriginY_ = cloneSrc->srcOriginY;
         srcOffsetX_ = cloneSrc->offsetX;
         srcOffsetY_ = cloneSrc->offsetY;
+        restoreMode_ = cloneSrc->restoreMode;
         cloneMode_ = true;
     } else if (onQuickMask) {
         // M10d 快速蒙版：绑定文档域通道网格（灰度落笔；网格 = 通道网格，origin=(0,0)）
@@ -635,7 +636,9 @@ void StrokeDraft::paintTile(uint32_t key) {
     }
     if (cloneMode_) {
         // M11d 仿制图章：out = src × covA + dst × (1−covA)（src 含自身 alpha；
-        // 源恒读笔画开始快照——本笔已画像素在 work_，绝不重采）
+        // 源恒读笔画开始快照——本笔已画像素在 work_，绝不重采）。
+        // M11f 历史画笔 restoreMode：RGBA 直混（含 alpha 还原——快照透明也要恢复），
+        // 且源越界/透明不再跳过（透明即恢复目标）
         const float tx = static_cast<float>(key % gridCols_ * kTileSize);
         const float ty = static_cast<float>(key / gridCols_ * kTileSize);
         for (uint32_t r = 0; r < kTileSize; ++r) {
@@ -651,24 +654,37 @@ void StrokeDraft::paintTile(uint32_t key) {
                     static_cast<int>(tx + static_cast<float>(c) - static_cast<float>(srcOffsetX_)),
                     static_cast<int>(ty + static_cast<float>(r) - static_cast<float>(srcOffsetY_)));
                 uint8_t* p = px + i;
-                if (src == nullptr) {
-                    continue;  // 源越界 = 无源像素（底不变）
+                float srcP[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                if (src != nullptr) {
+                    for (int ch = 0; ch < 4; ++ch) {
+                        srcP[ch] = src[static_cast<size_t>(ch)] / 255.0f;
+                    }
+                } else if (!restoreMode_) {
+                    continue;  // 图章：源越界 = 无源像素（底不变）；恢复：越界 = 透明恢复
                 }
-                const float srcA = (src[3] / 255.0f) * covA;
-                if (srcA <= 0.0f) {
-                    continue;
+                if (restoreMode_) {
+                    // RGBA 直混：out = src × covA + dst × (1−covA)
+                    for (int ch = 0; ch < 4; ++ch) {
+                        p[static_cast<size_t>(ch)] = static_cast<uint8_t>(
+                            std::lround((srcP[ch] * covA + p[static_cast<size_t>(ch)] / 255.0f *
+                                         (1.0f - covA)) * 255.0f));
+                    }
+                } else {
+                    const float srcA = srcP[3] * covA;
+                    if (srcA <= 0.0f) {
+                        continue;
+                    }
+                    const float da = p[3] / 255.0f;
+                    const float oa = srcA + da * (1.0f - srcA);
+                    const float sP[3] = {srcP[0] * srcA, srcP[1] * srcA, srcP[2] * srcA};
+                    for (int ch = 0; ch < 3; ++ch) {
+                        const float d = p[static_cast<size_t>(ch)] / 255.0f * da * (1.0f - srcA);
+                        p[static_cast<size_t>(ch)] =
+                            static_cast<uint8_t>(std::lround(
+                                std::min(1.0f, oa > 0.0001f ? (sP[ch] + d) / oa : 0.0f) * 255.0f));
+                    }
+                    p[3] = static_cast<uint8_t>(std::lround(std::min(1.0f, oa) * 255.0f));
                 }
-                const float da = p[3] / 255.0f;
-                const float oa = srcA + da * (1.0f - srcA);
-                const float srcP[3] = {src[0] / 255.0f * srcA, src[1] / 255.0f * srcA,
-                                       src[2] / 255.0f * srcA};
-                for (int ch = 0; ch < 3; ++ch) {
-                    const float d = p[static_cast<size_t>(ch)] / 255.0f * da * (1.0f - srcA);
-                    p[static_cast<size_t>(ch)] =
-                        static_cast<uint8_t>(std::lround(
-                            std::min(1.0f, oa > 0.0001f ? (srcP[ch] + d) / oa : 0.0f) * 255.0f));
-                }
-                p[3] = static_cast<uint8_t>(std::lround(std::min(1.0f, oa) * 255.0f));
             }
         }
         return;

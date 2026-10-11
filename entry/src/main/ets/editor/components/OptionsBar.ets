@@ -70,6 +70,8 @@ export struct OptionsBar {
   @Prop clonePicking: boolean = false;
   onCloneAligned: (on: boolean) => void = (_on: boolean) => {};
   onClonePickToggle: () => void = () => {};
+  // M11f 历史画笔
+  @Link historyBrushSteps: number;
   @Prop cropPending: boolean = false;
   // M10a 选区增强：布尔四态 + 选框形状
   @Link selOp: number;
@@ -445,6 +447,25 @@ export struct OptionsBar {
     return v !== undefined ? v + ' · Shift+同键循环' : '';
   }
 
+  // M11f 历史画笔选项：源步数
+  @Builder
+  historyBrushOptions() {
+    Row({ space: 10 }) {
+      OptionSlider({
+        label: '回溯',
+        min: 1,
+        max: 10,
+        step: 1,
+        value: $historyBrushSteps,
+        suffix: ' 步'
+      })
+      Text(`从 ${this.historyBrushSteps} 步前的快照恢复当前层涂抹`)
+        .fontSize(11)
+        .fontColor($r('app.color.text_secondary'))
+    }
+    .height(36)
+  }
+
   build() {
     Row({ space: 8 }) {
       Text(this.toolLabel)
@@ -494,6 +515,8 @@ export struct OptionsBar {
         this.shapeOptions()
       } else if (this.tool === 'stamp') {
         this.stampOptions()
+      } else if (this.tool === 'historyBrush') {
+        this.historyBrushOptions()
       } else if (this.tool === 'wand') {
         Row({ space: 10 }) {
           this.selOpButtons()

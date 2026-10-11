@@ -139,4 +139,20 @@ bool History::canRedo() const {
     return !redo_.empty();
 }
 
+// M11f 历史画笔源：steps 步前的层像素快照（shared_ptr 共享；调用方持 docMutex 亦可并行，
+// 本函数自持 mtx_）
+std::shared_ptr<const TileGrid> History::layerPixelsStepsBack(int steps, LayerId layerId) const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (steps < 1 || static_cast<size_t>(steps) > undo_.size()) {
+        return nullptr;
+    }
+    const Entry& e = undo_[undo_.size() - static_cast<size_t>(steps)];
+    for (const Layer& l : e.before.doc.layers) {
+        if (l.id == layerId) {
+            return l.pixels;
+        }
+    }
+    return nullptr;
+}
+
 }  // namespace montage

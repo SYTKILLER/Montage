@@ -27,6 +27,10 @@ class History {
     // 整档替换（打开工程/PSD）时清空：撤销不许跨文档回退
     void clear();
 
+    // M11f 历史画笔：取 steps 步前（1 = 最近一次编辑的 before）快照中指定层的像素
+    // （shared_ptr 共享，trim 不影响持有者）。越界/层不存在返回 nullptr。
+    std::shared_ptr<const TileGrid> layerPixelsStepsBack(int steps, LayerId layerId) const;
+
   private:
     struct Snapshot {
         Document doc;

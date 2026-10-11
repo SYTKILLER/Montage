@@ -63,6 +63,8 @@ class StrokeDraft {
         int srcOriginY = 0;
         double offsetX = 0.0;               // 采样偏移：源 doc 坐标 = 目标 doc 坐标 − offset
         double offsetY = 0.0;
+        bool restoreMode = false;           // M11f 历史画笔：RGBA 直混恢复（含 alpha 还原——
+                                            // src-over 无法把快照透明恢复到有像素处）
     };
     bool begin(const Document& doc, LayerId layerId, const BrushSettings& settings, bool onMask,
                bool onQuickMask, const CloneParams* cloneSrc, std::string& err,
@@ -124,6 +126,7 @@ class StrokeDraft {
     int srcOriginY_ = 0;
     double srcOffsetX_ = 0.0;
     double srcOffsetY_ = 0.0;
+    bool restoreMode_ = false;  // M11f：历史画笔恢复语义（RGBA 直混含 alpha）
     BrushEffect effect_ = BrushEffect::None;  // M11e：dab 内核族
     float smudgeR_ = 0.0f;     // 涂抹 held 颜色（dab 级混入）
     float smudgeG_ = 0.0f;

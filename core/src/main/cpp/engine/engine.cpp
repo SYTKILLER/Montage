@@ -109,6 +109,25 @@ void Engine::strokeThreadMain() {
                     StrokeDraft::CloneParams cloneParams;
                     const bool useClone = !qm && brushIsClone && cloneSource.active &&
                                           cloneSource.layerId != 0;
+                    // M11f 历史画笔：源 = History steps 步前快照的同层像素（1:1 无偏移恢复，
+                    // 复用克隆管线；克隆工具优先——两者互斥由 UI 切换保证）
+                    bool useHistoryBrush = false;
+                    if (!qm && !useClone && historyBrushSteps > 0) {
+                        auto snap = history.layerPixelsStepsBack(historyBrushSteps, doc.activeId);
+                        if (snap != nullptr) {
+                            cloneParams.srcGrid = snap.get();
+                            cloneParams.srcOriginX = 0;
+                            cloneParams.srcOriginY = 0;
+                            cloneParams.offsetX = 0.0;
+                            cloneParams.offsetY = 0.0;
+                            cloneParams.restoreMode = true;  // 含 alpha 还原（快照透明可恢复）
+                            useHistoryBrush = true;
+                        } else {
+                            OH_LOG_Print(LOG_APP, LOG_WARN, 0x4D30, "Montage.HistoryBrush",
+                                         "no snapshot at steps=%d for layer, fallback to brush",
+                                         historyBrushSteps);
+                        }
+                    }
                     if (useClone) {
                         const Layer* srcLayer = nullptr;
                         for (const Layer& l : doc.layers) {
@@ -141,7 +160,8 @@ void Engine::strokeThreadMain() {
                                          "clone source layer missing, fallback to brush");
                         }
                     }
-                    history.beginEdit(doc, useClone ? "clone stamp"
+                    history.beginEdit(doc, useHistoryBrush ? "history brush"
+                                        : useClone ? "clone stamp"
                                         : qm ? "quick mask"
                                         : (brushOnMask ? "mask brush"
                                           : (brush.erasing ? "eraser" : "brush")),
@@ -149,7 +169,7 @@ void Engine::strokeThreadMain() {
                     draft = std::make_unique<StrokeDraft>();
                     std::string err;
                     if (!draft->begin(doc, doc.activeId, brush, !qm && brushOnMask, qm,
-                                      useClone ? &cloneParams : nullptr, err,
+                                      (useClone || useHistoryBrush) ? &cloneParams : nullptr, err,
                                       qm ? BrushEffect::None : brushEffect)) {
                         OH_LOG_Print(LOG_APP, LOG_WARN, 0x4D30, "Montage.Brush",
                                      "draft begin failed: %{public}s", err.c_str());
@@ -351,6 +371,7 @@ void Engine::resetDocument() {
     brushOnMask = false;
     brushIsClone = false;
     brushEffect = BrushEffect::None;
+    historyBrushSteps = 0;
     cloneSource = CloneSource{};
     needsRender.store(true);
     render.wake();

@@ -2210,6 +2210,30 @@ napi_value SetBrushEffect(napi_env env, napi_callback_info info) {
     return makeOk(env, nullptr);
 }
 
+// M11f：历史画笔源（steps 0=关闭；1=最近一次编辑前快照…；笔画时实时取快照）
+napi_value SetHistoryBrush(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "setHistoryBrush(steps) requires 1 arg");
+    }
+    double steps = 0;
+    if (napi_get_value_double(env, argv[0], &steps) != napi_ok) {
+        return makeError(env, kErrBadParam, "setHistoryBrush: invalid arg");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        e.historyBrushSteps = static_cast<int>(steps);
+        if (e.historyBrushSteps > 0) {
+            e.brushIsClone = false;      // 与克隆互斥（引擎侧兜底）
+            e.brushEffect = BrushEffect::None;
+        }
+    }
+    return makeOk(env, nullptr);
+}
+
 napi_value StoreSelection(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value argv[1] = {nullptr};
