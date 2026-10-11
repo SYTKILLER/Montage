@@ -49,6 +49,24 @@ std::shared_ptr<const TileGrid> invertSelection(const Document& doc);
 // 全选网格：文档域满铺 255（PS 全选有蚂蚁线边界，非"无选区"语义）。
 std::shared_ptr<const TileGrid> fullSelection(uint32_t docW, uint32_t docH);
 
+// ---- M10b 选区修改族（PS 选择→修改/羽化；全部 Replace 语义，无选区返回 nullptr）----
+
+// 羽化：3×盒模糊近似高斯（σ = r/2，PS 对拍校准起步值），edge-clamp（文档边缘不衰减）。
+// r ≤ 0 返回 nullptr。
+std::shared_ptr<const TileGrid> featherSelection(const Document& doc, double radius);
+
+// 扩展：方形 SE 形态学膨胀（两趟可分离 van Herk O(N)；圆盘角差异登记 v1 近似）。
+std::shared_ptr<const TileGrid> expandSelection(const Document& doc, int radius);
+
+// 收缩：形态学腐蚀；全部腐蚀掉 → nullptr。
+std::shared_ptr<const TileGrid> contractSelection(const Document& doc, int radius);
+
+// 边界：环带 = dilate(r) − erode(r)。
+std::shared_ptr<const TileGrid> borderSelection(const Document& doc, int radius);
+
+// 平滑：阈值 127 二值化 + 两轮 3×3 多数滤波（≥5 为选中），消除锯齿与孤立点。
+std::shared_ptr<const TileGrid> smoothSelection(const Document& doc);
+
 // 灰度写助手（布尔/反选共享）：把灰度行带写入 builder（0 保持稀疏不落瓦片）。
 // 返回是否写过任何非零像素。
 void setMaskGray(TileGridBuilder& builder, uint32_t cols, uint32_t docX, uint32_t docY,

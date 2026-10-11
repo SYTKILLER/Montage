@@ -479,6 +479,52 @@ export class CompositorEngine {
     return r.ok;
   }
 
+  // M10b 修改族：羽化（三盒高斯近似）/ 扩展 / 收缩 / 边界 / 平滑（Replace 语义）
+  featherSelection(radius: number): boolean {
+    const r = narrowResult(native.featherSelection(radius) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'featherSelection failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  expandSelection(radius: number): boolean {
+    const r = narrowResult(native.expandSelection(radius) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'expandSelection failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  contractSelection(radius: number): boolean {
+    const r = narrowResult(native.contractSelection(radius) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'contractSelection failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  borderSelection(radius: number): boolean {
+    const r = narrowResult(native.borderSelection(radius) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'borderSelection failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  smoothSelection(): boolean {
+    const r = narrowResult(native.smoothSelection() as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'smoothSelection failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
   clearSelection(): boolean {
     const r = narrowResult(native.clearSelection() as Object);
     return r.ok;

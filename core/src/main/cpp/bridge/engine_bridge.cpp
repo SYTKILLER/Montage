@@ -1707,6 +1707,107 @@ napi_value ReselectSelection(napi_env env, napi_callback_info /*info*/) {
     return makeOk(env, nullptr);
 }
 
+// M10b 修改族公共实现（Replace 语义；fn 返回 null 时保留原选区并报错）
+napi_value applySelectionKernel(napi_env env, const char* label,
+                                std::shared_ptr<const TileGrid> (*fn)(const Document&, int),
+                                int param) {
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "selection op: no document");
+        }
+        if (e.doc.selection == nullptr) {
+            return makeError(env, kErrBadParam, "selection op: no active selection");
+        }
+        auto next = fn(e.doc, param);
+        if (next == nullptr) {
+            return makeError(env, kErrBadParam, "selection op: kernel produced empty result");
+        }
+        e.history.beginEdit(e.doc, label, static_cast<uint64_t>(e.docRevision));
+        e.doc.selection = std::move(next);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value FeatherSelection(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double r = 0;
+    if (argc < 1 || napi_get_value_double(env, argv[0], &r) != napi_ok || r <= 0 || r > 250) {
+        return makeError(env, kErrBadParam, "featherSelection(radius 0..250) requires radius");
+    }
+    return applySelectionKernel(env, "feather selection",
+                                [](const Document& d, int p) { return tiles::featherSelection(d, p); },
+                                static_cast<int>(std::lround(r)));
+}
+
+napi_value ExpandSelection(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double r = 0;
+    if (argc < 1 || napi_get_value_double(env, argv[0], &r) != napi_ok || r <= 0 || r > 100) {
+        return makeError(env, kErrBadParam, "expandSelection(radius 1..100) requires radius");
+    }
+    return applySelectionKernel(env, "expand selection",
+                                [](const Document& d, int p) { return tiles::expandSelection(d, p); },
+                                static_cast<int>(r));
+}
+
+napi_value ContractSelection(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double r = 0;
+    if (argc < 1 || napi_get_value_double(env, argv[0], &r) != napi_ok || r <= 0 || r > 100) {
+        return makeError(env, kErrBadParam, "contractSelection(radius 1..100) requires radius");
+    }
+    return applySelectionKernel(env, "contract selection",
+                                [](const Document& d, int p) { return tiles::contractSelection(d, p); },
+                                static_cast<int>(r));
+}
+
+napi_value BorderSelection(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double r = 0;
+    if (argc < 1 || napi_get_value_double(env, argv[0], &r) != napi_ok || r <= 0 || r > 100) {
+        return makeError(env, kErrBadParam, "borderSelection(radius 1..100) requires radius");
+    }
+    return applySelectionKernel(env, "border selection",
+                                [](const Document& d, int p) { return tiles::borderSelection(d, p); },
+                                static_cast<int>(r));
+}
+
+napi_value SmoothSelection(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "smoothSelection: no document");
+        }
+        if (e.doc.selection == nullptr) {
+            return makeError(env, kErrBadParam, "smoothSelection: no active selection");
+        }
+        auto next = tiles::smoothSelection(e.doc);
+        if (next == nullptr) {
+            return makeError(env, kErrBadParam, "smoothSelection: empty result");
+        }
+        e.history.beginEdit(e.doc, "smooth selection", static_cast<uint64_t>(e.docRevision));
+        e.doc.selection = std::move(next);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
 napi_value BeginStroke(napi_env env, napi_callback_info info) {
     size_t argc = 3;
     napi_value argv[3] = {nullptr, nullptr, nullptr};

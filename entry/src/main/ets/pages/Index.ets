@@ -50,6 +50,7 @@ const KC_CTRL_R: number = 2073;
 const KC_NUM0: number = 2000;
 const KC_NUM1: number = 2001;
 const KC_ESC: number = 2070;
+const KC_F6: number = 2095;  // @ohos.multimodalInput.keyCode KEYCODE_F6（SDK 核验）
 const KC_T_KEY: number = 2036;
 const KC_X_KEY: number = 2040;
 const KC_ENTER: number = 2054;
@@ -111,6 +112,9 @@ struct Index {
   @State showImageSize: boolean = false;
   @State imgWText: string = '';
   @State imgHText: string = '';
+  @State showModify: boolean = false;     // M10b 羽化/修改族数值对话框
+  @State modifyKind: string = 'feather';  // feather | border | expand | contract
+  @State modifyText: string = '';
   @State showRotateAny: boolean = false;
   @State angleText: string = '';
   @State histLuma: number[] = [];  // M9 直方图（节流拉取）
@@ -442,7 +446,7 @@ struct Index {
         this.polyLassoTouch(e, docX, docY, t.x, t.y);
         break;
       case 'rectSelect':
-        if (this.altHeld && this.hasSelection) {
+        if (this.altHeld && this.hasSelectionFlag) {
           // Alt+拖拽 = 移动选区（M7d/M8a；Up 时单事务提交）
           if (e.type === TouchType.Down) {
             this.moveActive = true;
@@ -622,10 +626,6 @@ struct Index {
       const h = Math.abs(docY - this.cropY0);
       this.cropRect = w >= 2 && h >= 2 ? [Math.round(x), Math.round(y), Math.round(w), Math.round(h)] : null;
     }
-  }
-
-  private get hasSelection(): boolean {
-    return this.hasSelectionFlag;
   }
 
   private strokeTouch(e: TouchEvent, t: TouchObject, docX: number, docY: number): void {
@@ -1147,6 +1147,51 @@ struct Index {
         this.log(`重新选择: ${ok ? '已恢复最近取消的选区' : '无可恢复选区'}`);
         break;
       }
+      case 'select.feather':
+        if (this.docOpen && this.hasSelectionFlag) {
+          this.modifyKind = 'feather';
+          this.modifyText = '10';
+          this.showModify = true;
+        } else {
+          this.toast('需要先建立选区');
+        }
+        break;
+      case 'select.border':
+        if (this.docOpen && this.hasSelectionFlag) {
+          this.modifyKind = 'border';
+          this.modifyText = '5';
+          this.showModify = true;
+        } else {
+          this.toast('需要先建立选区');
+        }
+        break;
+      case 'select.expand':
+        if (this.docOpen && this.hasSelectionFlag) {
+          this.modifyKind = 'expand';
+          this.modifyText = '5';
+          this.showModify = true;
+        } else {
+          this.toast('需要先建立选区');
+        }
+        break;
+      case 'select.contract':
+        if (this.docOpen && this.hasSelectionFlag) {
+          this.modifyKind = 'contract';
+          this.modifyText = '5';
+          this.showModify = true;
+        } else {
+          this.toast('需要先建立选区');
+        }
+        break;
+      case 'select.smooth': {
+        if (!this.docOpen || !this.hasSelectionFlag) {
+          this.toast('需要先建立选区');
+          break;
+        }
+        const ok = this.engine.smoothSelection();
+        this.log(`平滑选区: ${ok}`);
+        break;
+      }
       case 'image.rotate90cw':
         this.docOp((): boolean => this.engine.rotateDocument90(true), '旋转 90° 顺时针');
         break;
@@ -1254,6 +1299,37 @@ struct Index {
     }
     this.showImageSize = false;
     this.docOp((): boolean => this.engine.resampleDocument(w, h), `图像大小 ${w}×${h}`);
+  }
+
+  // M10b 羽化/修改族提交（半径数值对话框共用）
+  private commitModify(): void {
+    const r = parseInt(this.modifyText);
+    const kindLabel: Record<string, string> = {
+      'feather': '羽化',
+      'border': '边界',
+      'expand': '扩展',
+      'contract': '收缩',
+    };
+    if (isNaN(r) || r < 1 || r > 100) {
+      this.toast('半径无效（1-100）');
+      return;
+    }
+    this.showModify = false;
+    const kind = this.modifyKind;
+    let ok = false;
+    if (kind === 'feather') {
+      ok = this.engine.featherSelection(r);
+    } else if (kind === 'border') {
+      ok = this.engine.borderSelection(r);
+    } else if (kind === 'expand') {
+      ok = this.engine.expandSelection(r);
+    } else if (kind === 'contract') {
+      ok = this.engine.contractSelection(r);
+    }
+    this.log(`${kindLabel[kind] ?? '修改'}选区 r=${r}: ${ok}`);
+    if (!ok) {
+      this.toast('操作失败（收缩可能清空选区）');
+    }
   }
 
   private commitRotateAny(): void {
@@ -1435,11 +1511,17 @@ struct Index {
       leafItem('layer.maskEnableToggle', '启用/停用蒙版', '', d && this.activeLayerHasMask()),
       leafItem('layer.adjustAdd', '新建调整图层（色阶）', '', d),
     ];
+    const selReady: boolean = d && this.hasSelectionFlag;  // M10b：选区类命令使能态
     const select: MenuItemVM[] = [
-      leafItem('select.all', '全部选择', 'Ctrl+A', false),
+      leafItem('select.all', '全部选择', 'Ctrl+A', d),
       leafItem('select.deselect', '取消选择', 'Ctrl+D', d),
-      leafItem('select.inverse', '反选', 'Ctrl+Shift+I', false),
-      leafItem('select.reselect', '重新选择', 'Shift+Ctrl+D', false),
+      leafItem('select.inverse', '反选', 'Ctrl+Shift+I', d),
+      leafItem('select.reselect', '重新选择', 'Shift+Ctrl+D', d),
+      leafItem('select.feather', '羽化…', 'Shift+F6', selReady),
+      leafItem('select.border', '修改：边界…', '', selReady),
+      leafItem('select.smooth', '修改：平滑', '', selReady),
+      leafItem('select.expand', '修改：扩展…', '', selReady),
+      leafItem('select.contract', '修改：收缩…', '', selReady),
     ];
     const view: MenuItemVM[] = [
       leafItem('view.zoomIn', '放大', 'Ctrl+=', d),
@@ -1531,7 +1613,7 @@ struct Index {
       return;
     }
     // 对话框打开时：Esc 关闭，其余不抢
-    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform) {
+    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform || this.showModify) {
       if (e.keyCode === KC_ESC) {
         this.showTransform = false;
         this.showExport = false;
@@ -1539,6 +1621,7 @@ struct Index {
         this.showShortcuts = false;
         this.showAbout = false;
         this.showTheme = false;
+        this.showModify = false;
       }
       return;
     }
@@ -1643,6 +1726,10 @@ struct Index {
       return;
     }
     // 单键
+    if (this.shiftHeld && e.keyCode === KC_F6) {
+      this.runCommand('select.feather');  // Shift+F6 羽化（PS 语义）
+      return;
+    }
     switch (code) {
       case KC_V:
         this.pickTool('move');
@@ -1779,7 +1866,8 @@ struct Index {
       }, (g: MenuGroupVM): string =>
         `${g.id}|${g.items.length}|${this.docOpen ? 1 : 0}|${this.canUndo ? 1 : 0}|` +
         `${this.canRedo ? 1 : 0}|${this.layersVisible ? 1 : 0}|${this.themeMode}|` +
-        `${this.activeLayer() !== undefined ? 1 : 0}${this.activeLayerHasMask() ? 1 : 0}`)
+        `${this.activeLayer() !== undefined ? 1 : 0}${this.activeLayerHasMask() ? 1 : 0}` +
+        `${this.hasSelectionFlag ? 1 : 0}`)
     }
     .width('100%')
     .height(36)
@@ -2144,6 +2232,37 @@ struct Index {
             }.justifyContent(FlexAlign.End).width('100%')
           }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
             .border({ width: 1, color: $r('app.color.border') }).width(400)
+        }.width('100%').height('100%')
+      }
+      if (this.showModify) {
+        Stack() {
+          Column().width('100%').height('100%').backgroundColor('#66000000')
+            .onClick((): void => { this.showModify = false; })
+          Column({ space: 14 }) {
+            Text(this.modifyKind === 'feather' ? '羽化选区' :
+              this.modifyKind === 'border' ? '边界' :
+              this.modifyKind === 'expand' ? '扩展选区' : '收缩选区')
+              .fontSize(16).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+            Row({ space: 10 }) {
+              Text('半径').fontSize(13).fontColor($r('app.color.text_secondary'))
+              TextInput({ text: this.modifyText }).width(120).height(40)
+                .onChange((v: string): void => { this.modifyText = v; })
+              Text('像素').fontSize(13).fontColor($r('app.color.text_secondary'))
+            }
+            Row({ space: 12 }) {
+              Button('取消').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.surface'))
+                .fontColor($r('app.color.text_primary'))
+                .border({ width: 1, color: $r('app.color.border') })
+                .onClick((): void => { this.showModify = false; })
+              Button('确定').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.accent'))
+                .fontColor($r('app.color.on_accent'))
+                .onClick((): void => this.commitModify())
+            }.justifyContent(FlexAlign.End).width('100%')
+          }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
+            .border({ width: 1, color: $r('app.color.border') }).width(360)
         }.width('100%').height('100%')
       }
       if (this.showRotateAny) {

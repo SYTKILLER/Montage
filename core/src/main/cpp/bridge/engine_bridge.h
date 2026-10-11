@@ -46,6 +46,12 @@ napi_value SetEllipseSelection(napi_env env, napi_callback_info info);
 napi_value SelectAll(napi_env env, napi_callback_info info);
 napi_value InvertSelection(napi_env env, napi_callback_info info);
 napi_value ReselectSelection(napi_env env, napi_callback_info info);
+// M10b 修改族：羽化（半径=px，三盒高斯近似）/ 扩展 / 收缩 / 边界 / 平滑（Replace 语义）
+napi_value FeatherSelection(napi_env env, napi_callback_info info);
+napi_value ExpandSelection(napi_env env, napi_callback_info info);
+napi_value ContractSelection(napi_env env, napi_callback_info info);
+napi_value BorderSelection(napi_env env, napi_callback_info info);
+napi_value SmoothSelection(napi_env env, napi_callback_info info);
 napi_value RemoveLayer(napi_env env, napi_callback_info info);
 napi_value SelectLayer(napi_env env, napi_callback_info info);
 napi_value SetLayerVisible(napi_env env, napi_callback_info info);
