@@ -581,6 +581,20 @@ export class CompositorEngine {
     return r.ok;
   }
 
+  // M11b 油漆桶（魔棒核命中域填充前景色；allLayers 0/1 number 化同 setWandSelection）
+  bucketFill(x: number, y: number, tolerance: number, contiguous: boolean,
+    allLayers?: number, sampleSize?: number): boolean {
+    let r: EngineResult;
+    const v: Object = native.bucketFill(x, y, tolerance, contiguous, allLayers ?? 0,
+      sampleSize ?? 1) as Object;
+    r = narrowResult(v);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'bucketFill rejected: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
   // M10c Alpha 通道：存储选区（同名覆盖）/ 载入（op 布尔四态）/ 删除 / 列表
   storeSelection(name: string): boolean {
     const r = narrowResult(native.storeSelection(name) as Object);

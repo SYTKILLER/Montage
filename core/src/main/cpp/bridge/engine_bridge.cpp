@@ -1503,6 +1503,33 @@ napi_value ClearSelection(napi_env env, napi_callback_info /*info*/) {
 
 // M7c/M10a/M10d：魔棒选区。参数 (x, y, tolerance, contiguous, op?, allLayers?, sampleSize?)。
 // allLayers=true 采样源=全部可见层合成（CPU flatten）；sampleSize=N×N 均值种子（1..101 奇数）。
+// ---- M11b 油漆桶：魔棒 BFS 核复用（A-3 验收 = 两命令内核对拍一致）----
+// 掩码计算提取共享（SetWandSelection / BucketFill 同源）；须持 docMutex。
+std::shared_ptr<const TileGrid> computeWandMaskLocked(Engine& e, int x, int y, int tol,
+                                                      bool contiguous, bool allLayers,
+                                                      int sampleSize, std::string& err) {
+    std::unique_ptr<tiles::WandSource> src;
+    if (allLayers) {
+        // 采样源 = 全部可见层合成（flatten 区域版全域；v1 登记整域一次性）
+        const io::FlattenJob job = io::BuildFlattenJob(e.doc, 0, 0, 0, 0);
+        io::FlattenResult res = io::FlattenVisible(job, 0, 0, 0, 0);
+        if (!res.ok) {
+            err = "wand: flatten failed";
+            return nullptr;
+        }
+        auto flat = std::make_shared<std::vector<uint8_t>>(std::move(res.rgba));
+        src = tiles::makeFlatSource(std::move(flat), e.doc.width, e.doc.height);
+    } else {
+        Layer* l = findLayerLocked(e.doc, e.doc.activeId);
+        if (l == nullptr || l->effectivePixels() == nullptr) {
+            err = "wand: no pixels to sample";
+            return nullptr;
+        }
+        src = tiles::makeTileSource(*l->effectivePixels());
+    }
+    return tiles::wandMask(*src, e.doc.width, e.doc.height, x, y, tol, contiguous, sampleSize);
+}
+
 napi_value SetWandSelection(napi_env env, napi_callback_info info) {
     size_t argc = 7;
     napi_value argv[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
@@ -1543,29 +1570,12 @@ napi_value SetWandSelection(napi_env env, napi_callback_info info) {
         if (e.doc.width == 0 || e.doc.height == 0) {
             return makeError(env, kErrNoDoc, "setWandSelection: no document");
         }
-        std::unique_ptr<tiles::WandSource> src;
-        if (allLayers) {
-            // 采样源 = 全部可见层合成（flatten 区域版全域；v1 登记整域一次性）
-            const io::FlattenJob job = io::BuildFlattenJob(e.doc, 0, 0, 0, 0);
-            io::FlattenResult res = io::FlattenVisible(job, 0, 0, 0, 0);
-            if (!res.ok) {
-                return makeError(env, kErrBadParam, "setWandSelection: flatten failed");
-            }
-            auto flat = std::make_shared<std::vector<uint8_t>>(std::move(res.rgba));
-            src = tiles::makeFlatSource(std::move(flat), e.doc.width, e.doc.height);
-        } else {
-            Layer* l = findLayerLocked(e.doc, e.doc.activeId);
-            if (l == nullptr || l->effectivePixels() == nullptr) {
-                return makeError(env, kErrBadParam, "setWandSelection: no pixels to sample");
-            }
-            src = tiles::makeTileSource(*l->effectivePixels());
-        }
-        auto mask = tiles::wandMask(*src, e.doc.width, e.doc.height,
-                                    static_cast<int>(x), static_cast<int>(y),
-                                    static_cast<int>(tol), contiguous,
-                                    static_cast<int>(sampleSize));
+        std::string maskErr;
+        auto mask = computeWandMaskLocked(e, static_cast<int>(x), static_cast<int>(y),
+                                          static_cast<int>(tol), contiguous, allLayers,
+                                          static_cast<int>(sampleSize), maskErr);
         if (mask == nullptr) {
-            return makeError(env, kErrBadParam, "setWandSelection: nothing matched");
+            return makeError(env, kErrBadParam, "setWandSelection: " + maskErr);
         }
         auto merged = tiles::combineSelection(e.doc, std::move(mask),
                                               static_cast<tiles::SelectionOp>(op));
@@ -1983,6 +1993,68 @@ napi_value StrokeSelection(napi_env env, napi_callback_info info) {
         if (!ok) {
             e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
             return makeError(env, kErrBadParam, err);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// 油漆桶 bucketFill(x, y, tolerance, contiguous, allLayers, sampleSize)：
+// 魔棒核算命中域 → ∩ 现有选区（PS 油漆桶受活动选区约束）→ 临时选区填充前景色后还原。
+napi_value BucketFill(napi_env env, napi_callback_info info) {
+    size_t argc = 6;
+    napi_value argv[6] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 4) {
+        return makeError(env, kErrBadParam,
+                         "bucketFill(x, y, tolerance, contiguous, allLayers?, sampleSize?) requires 4+ args");
+    }
+    double x = 0, y = 0, tol = 32, allLayersNum = 0, sampleSize = 1;
+    bool contiguous = true;
+    if (napi_get_value_double(env, argv[0], &x) != napi_ok ||
+        napi_get_value_double(env, argv[1], &y) != napi_ok ||
+        napi_get_value_double(env, argv[2], &tol) != napi_ok ||
+        napi_get_value_bool(env, argv[3], &contiguous) != napi_ok) {
+        return makeError(env, kErrBadParam, "bucketFill: invalid args");
+    }
+    if (argc >= 5 && napi_get_value_double(env, argv[4], &allLayersNum) != napi_ok) {
+        return makeError(env, kErrBadParam, "bucketFill: invalid allLayers");
+    }
+    if (argc >= 6 && napi_get_value_double(env, argv[5], &sampleSize) != napi_ok) {
+        return makeError(env, kErrBadParam, "bucketFill: invalid sampleSize");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lg(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "bucketFill: no document");
+        }
+        std::string err;
+        auto mask = computeWandMaskLocked(e, static_cast<int>(x), static_cast<int>(y),
+                                          static_cast<int>(tol), contiguous,
+                                          allLayersNum != 0, static_cast<int>(sampleSize), err);
+        if (mask == nullptr) {
+            return makeError(env, kErrBadParam, "bucketFill: " + err);
+        }
+        // 活动选区约束（有选区时油漆桶只填交集——PS 语义）
+        std::shared_ptr<const TileGrid> saved = e.doc.selection;
+        if (saved != nullptr) {
+            mask = tiles::combineSelection(e.doc, mask, tiles::SelectionOp::Intersect);
+            if (mask == nullptr) {
+                return makeError(env, kErrBadParam, "bucketFill: empty intersection");
+            }
+        }
+        e.history.beginEdit(e.doc, "bucket fill", static_cast<uint64_t>(e.docRevision));
+        e.doc.selection = std::move(mask);
+        const bool ok = fillWithColor(e.doc, e.doc.activeId, FillSource::Foreground,
+                                      e.fgColor[0], e.fgColor[1], e.fgColor[2],
+                                      e.bgColor[0], e.bgColor[1], e.bgColor[2], err);
+        e.doc.selection = saved;
+        if (!ok) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, "bucketFill: " + err);
         }
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();

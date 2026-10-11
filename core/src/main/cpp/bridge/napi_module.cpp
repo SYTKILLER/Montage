@@ -46,6 +46,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"applyGradient", nullptr, montage::bridge::ApplyGradient, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"fillSelection", nullptr, montage::bridge::FillSelection, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"strokeSelection", nullptr, montage::bridge::StrokeSelection, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"bucketFill", nullptr, montage::bridge::BucketFill, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"storeSelection", nullptr, montage::bridge::StoreSelection, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"loadSelection", nullptr, montage::bridge::LoadSelection, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"deleteChannel", nullptr, montage::bridge::DeleteChannel, nullptr, nullptr, nullptr, napi_default, nullptr},

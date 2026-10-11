@@ -444,11 +444,20 @@ struct Index {
     }
     switch (this.tool) {
       case 'brush':
+      case 'pencil':
       case 'eraser':
         this.strokeTouch(e, t, docX, docY);
         break;
       case 'gradient':
         this.gradientTouch(e, docX, docY);
+        break;
+      case 'bucket':
+        if (e.type === TouchType.Down) {
+          const ok = this.engine.bucketFill(docX, docY, this.wandTolerance,
+            this.wandContiguous, this.wandAllLayers ? 1 : 0, this.wandSampleSize);
+          this.log(`油漆桶: (${docX.toFixed(0)},${docY.toFixed(0)}) tol=${this.wandTolerance} ` +
+            `→ ${ok ? '已填充' : '失败'}`);
+        }
         break;
       case 'move':
         this.moveTouch(e, docX, docY);
@@ -1095,7 +1104,9 @@ struct Index {
 
   private pushBrushSettings(): void {
     const rgb = this.hexToRgb(this.brushColor);
-    this.engine.setBrushSettings(this.brushSize, this.brushHardness / 100, this.brushOpacity / 100,
+    // 铅笔 = 硬度 100 画笔别名（PS 语义；选项条硬度滑条被忽略）
+    const hardness = this.tool === 'pencil' ? 1.0 : this.brushHardness / 100;
+    this.engine.setBrushSettings(this.brushSize, hardness, this.brushOpacity / 100,
       rgb[0], rgb[1], rgb[2], this.tool === 'eraser');
   }
 
@@ -1786,8 +1797,10 @@ struct Index {
       { id: '-', label: '', symbol: $r('sys.symbol.minus'), enabled: false },
       { id: 'eyedropper', label: '吸管', symbol: $r('sys.symbol.eyedropper'), enabled: true },
       { id: 'brush', label: '画笔', symbol: $r('sys.symbol.paintbrush_pointed'), enabled: true },
+      { id: 'pencil', label: '铅笔', symbol: $r('sys.symbol.pencil_line'), enabled: true },
       { id: 'eraser', label: '橡皮', symbol: $r('sys.symbol.eraser_line'), enabled: true },
       { id: 'gradient', label: '渐变', symbol: $r('sys.symbol.rectangle_righthalf_inset_filled'), enabled: true },
+      { id: 'bucket', label: '油漆桶', symbol: $r('sys.symbol.paint_bucket'), enabled: true },
       { id: '-', label: '', symbol: $r('sys.symbol.minus'), enabled: false },
       { id: 'hand', label: '抓手', symbol: $r('sys.symbol.hand'), enabled: true },
       { id: 'zoom', label: '缩放', symbol: $r('sys.symbol.magnifyingglass'), enabled: true },
@@ -1967,6 +1980,16 @@ struct Index {
     }
     if (this.shiftHeld && e.keyCode === KC_F5) {
       this.runCommand('edit.fill');  // Shift+F5 填充（PS 语义）
+      return;
+    }
+    if (this.shiftHeld && e.keyCode === KC_B) {
+      // Shift+B 循环画笔组：画笔 ↔ 铅笔（PS 工具组语义）
+      this.pickTool(this.tool === 'pencil' ? 'brush' : 'pencil');
+      return;
+    }
+    if (this.shiftHeld && e.keyCode === KC_G) {
+      // Shift+G 循环填充组：渐变 ↔ 油漆桶（PS 工具组语义）
+      this.pickTool(this.tool === 'bucket' ? 'gradient' : 'bucket');
       return;
     }
     switch (code) {

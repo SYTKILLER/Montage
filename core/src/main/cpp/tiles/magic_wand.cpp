@@ -17,6 +17,10 @@ inline bool withinTolerance(const uint8_t* a, const uint8_t* b, int tol) {
     return dr <= tol && dg <= tol && db <= tol;
 }
 
+// 缺瓦片 = 全透明像素（网格内稀疏语义；M11b 修正：此前返回 nullptr 使魔棒/油漆桶
+// 无法命中透明区——PS 两者都可作用于透明区）
+const uint8_t kTransparentPixel[4] = {0, 0, 0, 0};
+
 // 单层采样源：瓦片惰性加载缓存（BFS 前沿活跃瓦片集，远小于整层 flatten）
 class TileSource : public WandSource {
   public:
@@ -41,7 +45,7 @@ class TileSource : public WandSource {
             if (tileIt == grid_.tiles.end() || tileIt->second == nullptr ||
                 tileIt->second->pixels == nullptr) {
                 cache_.emplace(key, Loaded{});  // 缺瓦片缓存空标记（避免重复查 map）
-                return nullptr;
+                return kTransparentPixel;
             }
             Loaded loaded;
             loaded.loaded = true;
@@ -55,7 +59,7 @@ class TileSource : public WandSource {
             it = cache_.emplace(key, std::move(loaded)).first;
         }
         if (!it->second.loaded) {
-            return nullptr;
+            return kTransparentPixel;  // 空标记 = 缺瓦片 = 全透明
         }
         return it->second.bytes.data() +
                (static_cast<size_t>(uy % kTileSize) * kTileSize + ux % kTileSize) * 4u;

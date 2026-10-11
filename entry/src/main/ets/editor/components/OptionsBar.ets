@@ -266,6 +266,46 @@ export struct OptionsBar {
     .height(36)
   }
 
+  // M11b 油漆桶选项（与魔棒同参：容差/连续/所有图层/取样）
+  @Builder
+  bucketOptions() {
+    Row({ space: 10 }) {
+      OptionSlider({
+        label: '容差',
+        min: 1,
+        max: 255,
+        step: 1,
+        value: $wandTolerance,
+        onCommitted: (v: number): void => {
+          this.wandTolerance = v;
+        }
+      })
+      Row({ space: 4 }) {
+        Text('连续')
+          .fontSize(12)
+          .fontColor($r('app.color.text_secondary'))
+        Toggle({ type: ToggleType.Checkbox, isOn: this.wandContiguous })
+          .selectedColor($r('app.color.accent'))
+          .onChange((on: boolean): void => {
+            this.wandContiguous = on;
+          })
+        Text('所有图层')
+          .fontSize(12)
+          .fontColor($r('app.color.text_secondary'))
+        Toggle({ type: ToggleType.Checkbox, isOn: this.wandAllLayers })
+          .selectedColor($r('app.color.accent'))
+          .onChange((on: boolean): void => {
+            this.wandAllLayers = on;
+          })
+      }
+      .height(28)
+      Text('点击填充前景色 · 受选区约束')
+        .fontSize(11)
+        .fontColor($r('app.color.text_secondary'))
+    }
+    .height(36)
+  }
+
   build() {
     Row({ space: 8 }) {
       Text(this.toolLabel)
@@ -275,8 +315,39 @@ export struct OptionsBar {
         .width(60)
       if (this.tool === 'brush' || this.tool === 'eraser') {
         this.brushOptions()
+      } else if (this.tool === 'pencil') {
+        // 铅笔 = 硬度 100 画笔别名：无硬度滑条（强制硬边）
+        Row({ space: 10 }) {
+          OptionSlider({
+            label: '直径',
+            min: 2,
+            max: 400,
+            step: 1,
+            value: $brushSize,
+            onCommitted: (v: number): void => {
+              this.brushSize = v;
+            }
+          })
+          OptionSlider({
+            label: '不透明度',
+            min: 5,
+            max: 100,
+            step: 1,
+            value: $brushOpacity,
+            suffix: '%',
+            onCommitted: (v: number): void => {
+              this.brushOpacity = v;
+            }
+          })
+          Text('铅笔：硬边无衰减')
+            .fontSize(11)
+            .fontColor($r('app.color.text_secondary'))
+        }
+        .height(36)
       } else if (this.tool === 'gradient') {
         this.gradientOptions()
+      } else if (this.tool === 'bucket') {
+        this.bucketOptions()
       } else if (this.tool === 'wand') {
         Row({ space: 10 }) {
           this.selOpButtons()
