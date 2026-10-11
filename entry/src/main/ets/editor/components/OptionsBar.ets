@@ -48,6 +48,8 @@ export struct OptionsBar {
   @Link brushOpacity: number;
   @Link wandTolerance: number;
   @Link wandContiguous: boolean;
+  @Link wandAllLayers: boolean;
+  @Link wandSampleSize: number;
   @Prop brushColor: string = '#000000';
   @Prop maskTarget: boolean = false;
   @Prop hasMaskOnActive: boolean = false;
@@ -179,9 +181,25 @@ export struct OptionsBar {
           .onChange((on: boolean): void => {
             this.wandContiguous = on;
           })
-        Text('点击画布取样生成选区')
-          .fontSize(11)
+        Text('所有图层')
+          .fontSize(12)
           .fontColor($r('app.color.text_secondary'))
+        Toggle({ type: ToggleType.Checkbox, isOn: this.wandAllLayers })
+          .selectedColor($r('app.color.accent'))
+          .onChange((on: boolean): void => {
+            this.wandAllLayers = on;
+          })
+        Text('取样')
+          .fontSize(12)
+          .fontColor($r('app.color.text_secondary'))
+        OptionSlider({
+          label: '',
+          min: 1,
+          max: 101,
+          step: 2,
+          value: $wandSampleSize,
+          suffix: 'px'
+        })
       }
       .height(28)
     }

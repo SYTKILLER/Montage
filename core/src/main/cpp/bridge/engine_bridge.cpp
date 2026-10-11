@@ -1496,13 +1496,15 @@ napi_value ClearSelection(napi_env env, napi_callback_info /*info*/) {
     return makeOk(env, nullptr);
 }
 
-// M7c/M10a：魔棒选区（活动图层有效像素；点击文档坐标 + 容差 + 连通性；第 5 可选参 = 布尔 op）
+// M7c/M10a/M10d：魔棒选区。参数 (x, y, tolerance, contiguous, op?, allLayers?, sampleSize?)。
+// allLayers=true 采样源=全部可见层合成（CPU flatten）；sampleSize=N×N 均值种子（1..101 奇数）。
 napi_value SetWandSelection(napi_env env, napi_callback_info info) {
-    size_t argc = 5;
-    napi_value argv[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    size_t argc = 7;
+    napi_value argv[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 4) {
-        return makeError(env, kErrBadParam, "setWandSelection(x, y, tolerance, contiguous, op?) requires 4+ args");
+        return makeError(env, kErrBadParam,
+                         "setWandSelection(x, y, tolerance, contiguous, op?, allLayers?, sampleSize?) requires 4+ args");
     }
     double x = 0, y = 0, tol = 32;
     bool contiguous = true;
@@ -1516,19 +1518,47 @@ napi_value SetWandSelection(napi_env env, napi_callback_info info) {
     if (argc >= 5 && napi_get_value_int32(env, argv[4], &op) != napi_ok) {
         return makeError(env, kErrBadParam, "setWandSelection: invalid op");
     }
+    // allLayers = number 0/1（ArkTS 侧 number 化，napi_get_value_bool 不收 number）
+    double allLayersNum = 0;
+    if (argc >= 6) {
+        if (napi_get_value_double(env, argv[5], &allLayersNum) != napi_ok) {
+            return makeError(env, kErrBadParam, "setWandSelection: invalid allLayers");
+        }
+    }
+    const bool allLayers = allLayersNum != 0;
+    double sampleSize = 1;
+    if (argc >= 7) {
+        if (napi_get_value_double(env, argv[6], &sampleSize) != napi_ok) {
+            return makeError(env, kErrBadParam, "setWandSelection: invalid sampleSize");
+        }
+    }
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
         if (e.doc.width == 0 || e.doc.height == 0) {
             return makeError(env, kErrNoDoc, "setWandSelection: no document");
         }
-        Layer* l = findLayerLocked(e.doc, e.doc.activeId);
-        if (l == nullptr || l->effectivePixels() == nullptr) {
-            return makeError(env, kErrBadParam, "setWandSelection: no pixels to sample");
+        std::unique_ptr<tiles::WandSource> src;
+        if (allLayers) {
+            // 采样源 = 全部可见层合成（flatten 区域版全域；v1 登记整域一次性）
+            const io::FlattenJob job = io::BuildFlattenJob(e.doc, 0, 0, 0, 0);
+            io::FlattenResult res = io::FlattenVisible(job, 0, 0, 0, 0);
+            if (!res.ok) {
+                return makeError(env, kErrBadParam, "setWandSelection: flatten failed");
+            }
+            auto flat = std::make_shared<std::vector<uint8_t>>(std::move(res.rgba));
+            src = tiles::makeFlatSource(std::move(flat), e.doc.width, e.doc.height);
+        } else {
+            Layer* l = findLayerLocked(e.doc, e.doc.activeId);
+            if (l == nullptr || l->effectivePixels() == nullptr) {
+                return makeError(env, kErrBadParam, "setWandSelection: no pixels to sample");
+            }
+            src = tiles::makeTileSource(*l->effectivePixels());
         }
-        auto mask = tiles::wandMask(*l->effectivePixels(), e.doc.width, e.doc.height,
+        auto mask = tiles::wandMask(*src, e.doc.width, e.doc.height,
                                     static_cast<int>(x), static_cast<int>(y),
-                                    static_cast<int>(tol), contiguous);
+                                    static_cast<int>(tol), contiguous,
+                                    static_cast<int>(sampleSize));
         if (mask == nullptr) {
             return makeError(env, kErrBadParam, "setWandSelection: nothing matched");
         }

@@ -96,6 +96,8 @@ struct Index {
   @State maskTarget: boolean = false;
   @State wandTolerance: number = 32;
   @State wandContiguous: boolean = true;
+  @State wandAllLayers: boolean = false;
+  @State wandSampleSize: number = 1;
   @State selOp: number = 0;          // M10a 布尔四态：0 新/1 加/2 减/3 交（Shift=加 Alt=减 临时修饰）
   @State selShape: string = 'rect';  // M10a 选框形状：rect | ellipse
   @State polyPendingPts: number[] = [];  // M10a 多边形套索已落点（文档域扁平），非空 = 待闭合
@@ -440,7 +442,8 @@ struct Index {
       case 'wand':
         if (e.type === TouchType.Down) {
           const ok = this.engine.setWandSelection(docX, docY, this.wandTolerance,
-            this.wandContiguous, this.effectiveSelOp());
+            this.wandContiguous, this.effectiveSelOp(), this.wandAllLayers ? 1 : 0,
+            this.wandSampleSize);
           this.hasSelectionFlag = ok;
           this.log(`魔棒: (${docX.toFixed(0)},${docY.toFixed(0)}) tol=${this.wandTolerance} ` +
             `contig=${this.wandContiguous} op=${this.effectiveSelOp()} → ${ok ? '选区已生成' : '失败'}`);
@@ -1999,6 +2002,8 @@ struct Index {
           brushOpacity: $brushOpacity,
           wandTolerance: $wandTolerance,
           wandContiguous: $wandContiguous,
+          wandAllLayers: $wandAllLayers,
+          wandSampleSize: $wandSampleSize,
           brushColor: this.brushColor,
           maskTarget: this.maskTarget,
           hasMaskOnActive: this.activeLayerHasMask(),

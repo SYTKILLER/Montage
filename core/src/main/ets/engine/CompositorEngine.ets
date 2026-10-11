@@ -406,12 +406,18 @@ export class CompositorEngine {
     return r.ok;
   }
 
-  // M7c：魔棒选区（活动图层采样）；op 可选：0 新/1 加/2 减/3 交（M10a）
+  // M7c：魔棒选区；op 布尔四态（M10a）；allLayers 0/1=所有图层采样、sampleSize=N×N 均值种子（M10d）。
+  // allLayers 用 number（0/1，napi_get_value_bool 不收 number）。
   setWandSelection(x: number, y: number, tolerance: number, contiguous: boolean,
-    op?: number): boolean {
-    const r = narrowResult(op === undefined
-      ? native.setWandSelection(x, y, tolerance, contiguous) as Object
-      : native.setWandSelection(x, y, tolerance, contiguous, op) as Object);
+    op?: number, allLayers?: number, sampleSize?: number): boolean {
+    // 全 number 化参数（contiguous 0/1）做 no-structural-typing 二分
+    // 统一 7 参调用（op 缺省 0、allLayers 缺省 0、sampleSize 缺省 1；native 侧可变 argc）
+    // 注意：变量类型必须 EngineResult（narrowResult 返回类型；曾误注 OpResultData 触发
+    // no-structural-typing——与参数个数/类型无关，纯注解笔误）
+    let r: EngineResult;
+    const v: Object = native.setWandSelection(x, y, tolerance, contiguous,
+      op ?? 0, allLayers ?? 0, sampleSize ?? 1) as Object;
+    r = narrowResult(v);
     if (!r.ok) {
       hilog.error(DOMAIN, TAG, 'setWandSelection failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
