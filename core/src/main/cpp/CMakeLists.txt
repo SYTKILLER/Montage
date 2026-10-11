@@ -13,6 +13,7 @@ add_library(compositor SHARED
         engine/engine.cpp
         engine/gradient_ops.cpp
         engine/history.cpp
+        engine/shape_ops.cpp
         engine/transform_ops.cpp
         engine/resample.cpp
         io/image_import.cpp
@@ -29,6 +30,7 @@ add_library(compositor SHARED
         tiles/selection_outline.cpp
         tiles/selection_ops.cpp
         tiles/quick_mask.cpp
+        tiles/shape_mask.cpp
         tiles/magic_wand.cpp)
 
 target_include_directories(compositor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

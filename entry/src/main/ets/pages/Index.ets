@@ -57,6 +57,7 @@ const KC_F6: number = 2095;  // @ohos.multimodalInput.keyCode KEYCODE_F6（SDK �
 const KC_F5: number = 2094;  // KEYCODE_F5（SDK 核验，2026-10-11）
 const KC_G: number = 2023;   // KEYCODE_G（SDK 核验，2026-10-11）
 const KC_T_KEY: number = 2036;
+const KC_U: number = 2037;  // KEYCODE_U（SDK 核验，2026-10-11）
 const KC_X_KEY: number = 2040;
 const KC_ENTER: number = 2054;
 const KC_UP: number = 2012;
@@ -106,6 +107,15 @@ struct Index {
   @State showFill: boolean = false;     // M11a 填充对话框（Shift+F5）
   @State fillSource: number = 0;        // 0=前景 1=背景 2=黑 3=白
   private gradDragging: boolean = false;
+  // M11c 形状工具：种类/样式 + 拖拽预览（视口 [x,y,w,h]）
+  @State shapeKind: number = 0;         // 0=矩形 1=圆角矩形 2=椭圆 3=直线
+  @State shapeFill: boolean = true;
+  @State shapeStroke: boolean = false;
+  @State shapeStrokeWidth: number = 4;
+  @State shapePreview: number[] | null = null;  // 非空 = 拖拽中
+  private shapeDragging: boolean = false;
+  private shapeStartDocX: number = 0;
+  private shapeStartDocY: number = 0;
   @State wandTolerance: number = 32;
   @State wandContiguous: boolean = true;
   @State wandAllLayers: boolean = false;
@@ -451,6 +461,9 @@ struct Index {
       case 'gradient':
         this.gradientTouch(e, docX, docY);
         break;
+      case 'shape':
+        this.shapeTouch(e, docX, docY);
+        break;
       case 'bucket':
         if (e.type === TouchType.Down) {
           const ok = this.engine.bucketFill(docX, docY, this.wandTolerance,
@@ -691,6 +704,43 @@ struct Index {
     } else if (e.type === TouchType.Up || e.type === TouchType.Cancel) {
       this.engine.endStroke();
     }
+  }
+
+  // M11c 形状拖拽：Down 定对角起点 / Move 更新预览 / Up 提交单事务
+  private shapeTouch(e: TouchEvent, docX: number, docY: number): void {
+    const k = this.pxPerVp();
+    if (e.type === TouchType.Down) {
+      this.shapeDragging = true;
+      this.shapeStartDocX = docX;
+      this.shapeStartDocY = docY;
+      this.shapePreview = [(docX - this.panX) * this.zoom / k, (docY - this.panY) * this.zoom / k, 0, 0];
+    } else if (e.type === TouchType.Move && this.shapeDragging) {
+      const x0 = (this.shapeStartDocX - this.panX) * this.zoom / k;
+      const y0 = (this.shapeStartDocY - this.panY) * this.zoom / k;
+      const x1 = (docX - this.panX) * this.zoom / k;
+      const y1 = (docY - this.panY) * this.zoom / k;
+      this.shapePreview = [Math.min(x0, x1), Math.min(y0, y1),
+        Math.abs(x1 - x0), Math.abs(y1 - y0)];
+    } else if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.shapeDragging) {
+      this.shapeDragging = false;
+      this.shapePreview = null;
+      const w = Math.abs(docX - this.shapeStartDocX);
+      const h = Math.abs(docY - this.shapeStartDocY);
+      if (w < 1 && h < 1) {
+        this.toast('拖拽过短');
+        return;
+      }
+      const ok = this.engine.rasterizeShape(this.shapeKind, this.shapeStartDocX,
+        this.shapeStartDocY, docX, docY,
+        this.shapeKind === 1 ? Math.min(w, h) * 0.25 : 0,
+        this.shapeFill, this.shapeStroke, this.shapeStrokeWidth);
+      this.log(`形状(${this.shapeKindLabel()}): ${ok ? '已绘制' : '失败'}`);
+    }
+  }
+
+  private shapeKindLabel(): string {
+    const labels: string[] = ['矩形', '圆角矩形', '椭圆', '直线'];
+    return labels[this.shapeKind] ?? '形状';
   }
 
   // M11a 渐变拖线：Down 起线 / Move 更新终点（overlay 预览）/ Up 提交单事务
@@ -1084,6 +1134,10 @@ struct Index {
     if (this.gradDragging) {
       this.gradDragging = false;  // 换工具丢弃未完成拖线
       this.gradientLine = null;
+    }
+    if (this.shapeDragging) {
+      this.shapeDragging = false;  // 换工具丢弃未完成形状
+      this.shapePreview = null;
     }
     if (this.tool === 'crop') {
       this.cropRect = null;  // 换工具即丢弃未提交裁剪框
@@ -1801,6 +1855,7 @@ struct Index {
       { id: 'eraser', label: '橡皮', symbol: $r('sys.symbol.eraser_line'), enabled: true },
       { id: 'gradient', label: '渐变', symbol: $r('sys.symbol.rectangle_righthalf_inset_filled'), enabled: true },
       { id: 'bucket', label: '油漆桶', symbol: $r('sys.symbol.paint_bucket'), enabled: true },
+      { id: 'shape', label: '形状', symbol: $r('sys.symbol.circle_on_square'), enabled: true },
       { id: '-', label: '', symbol: $r('sys.symbol.minus'), enabled: false },
       { id: 'hand', label: '抓手', symbol: $r('sys.symbol.hand'), enabled: true },
       { id: 'zoom', label: '缩放', symbol: $r('sys.symbol.magnifyingglass'), enabled: true },
@@ -1992,6 +2047,12 @@ struct Index {
       this.pickTool(this.tool === 'bucket' ? 'gradient' : 'bucket');
       return;
     }
+    if (e.keyCode === KC_U && this.shiftHeld) {
+      // Shift+U 循环形状种类（矩形→圆角→椭圆→直线）
+      this.shapeKind = (this.shapeKind + 1) % 4;
+      this.log(`形状种类: ${this.shapeKindLabel()}`);
+      return;
+    }
     switch (code) {
       case KC_V:
         this.pickTool('move');
@@ -2036,6 +2097,9 @@ struct Index {
         break;
       case KC_G:
         this.pickTool('gradient');  // M11a 渐变（PS G 语义）
+        break;
+      case KC_U:
+        this.pickTool('shape');  // M11c 形状（PS U 语义）→ Shift+U 循环种类
         break;
       case KC_H:
         this.pickTool('hand');
@@ -2167,6 +2231,10 @@ struct Index {
           gradientStyle: $gradientStyle,
           gradientTarget: $gradientTarget,
           hasMaskOnActiveForGrad: this.activeLayerHasMask(),
+          shapeKind: $shapeKind,
+          shapeFill: $shapeFill,
+          shapeStroke: $shapeStroke,
+          shapeStrokeWidth: $shapeStrokeWidth,
           cropPending: this.cropRect !== null,
           selOp: $selOp,
           selShape: this.selShape,
@@ -2273,6 +2341,19 @@ struct Index {
                   .position({ x: p[0] - 5, y: p[1] - 5 })
                   .hitTestBehavior(HitTestMode.None)
               }, (p: number[], idx: number): string => `${idx}|${p[0]}|${p[1]}`)
+            }
+            // M11c 形状拖拽预览：青色虚线框（纯视觉，None 防拦截触摸）
+            if (this.shapePreview !== null) {
+              Column()
+                .position({
+                  x: this.shapePreview[0],
+                  y: this.shapePreview[1]
+                })
+                .width(this.shapePreview[2])
+                .height(this.shapePreview[3])
+                .border({ width: 1, color: '#00E5FF' })
+                .backgroundColor('#14000000')
+                .hitTestBehavior(HitTestMode.None)
             }
             // 裁剪框（拖拽中 + 待提交常显）
             if (this.cropRect !== null) {

@@ -59,6 +59,11 @@ export struct OptionsBar {
   @Link gradientStyle: number;   // 0=前景→背景 1=前景→透明
   @Link gradientTarget: number;  // 0=像素 1=图层蒙版
   @Prop hasMaskOnActiveForGrad: boolean = false;
+  // M11c 形状工具
+  @Link shapeKind: number;       // 0=矩形 1=圆角矩形 2=椭圆 3=直线
+  @Link shapeFill: boolean;
+  @Link shapeStroke: boolean;
+  @Link shapeStrokeWidth: number;
   @Prop cropPending: boolean = false;
   // M10a 选区增强：布尔四态 + 选框形状
   @Link selOp: number;
@@ -306,6 +311,57 @@ export struct OptionsBar {
     .height(36)
   }
 
+  // M11c 形状选项：种类循环 / 填充描边 / 描边宽
+  private shapeKindLabel(): string {
+    const labels: string[] = ['矩形', '圆角矩形', '椭圆', '直线'];
+    return labels[this.shapeKind] ?? '形状';
+  }
+
+  @Builder
+  shapeOptions() {
+    Row({ space: 10 }) {
+      Button(this.shapeKindLabel())
+        .fontSize(12).height(28).width(84)
+        .backgroundColor($r('app.color.surface'))
+        .fontColor($r('app.color.text_primary'))
+        .border({ width: 1, color: $r('app.color.border') })
+        .onClick((): void => {
+          this.shapeKind = (this.shapeKind + 1) % 4;
+        })
+      Row({ space: 4 }) {
+        Text('填充')
+          .fontSize(12)
+          .fontColor($r('app.color.text_secondary'))
+        Toggle({ type: ToggleType.Checkbox, isOn: this.shapeFill })
+          .selectedColor($r('app.color.accent'))
+          .onChange((on: boolean): void => {
+            this.shapeFill = on;
+          })
+        Text('描边')
+          .fontSize(12)
+          .fontColor($r('app.color.text_secondary'))
+        Toggle({ type: ToggleType.Checkbox, isOn: this.shapeStroke })
+          .selectedColor($r('app.color.danger'))
+          .onChange((on: boolean): void => {
+            this.shapeStroke = on;
+          })
+      }
+      .height(28)
+      OptionSlider({
+        label: '描边宽',
+        min: 1,
+        max: 40,
+        step: 1,
+        value: $shapeStrokeWidth,
+        suffix: 'px'
+      })
+      Text('填充=前景 · 描边=背景 · 拖拽绘制')
+        .fontSize(11)
+        .fontColor($r('app.color.text_secondary'))
+    }
+    .height(36)
+  }
+
   build() {
     Row({ space: 8 }) {
       Text(this.toolLabel)
@@ -348,6 +404,8 @@ export struct OptionsBar {
         this.gradientOptions()
       } else if (this.tool === 'bucket') {
         this.bucketOptions()
+      } else if (this.tool === 'shape') {
+        this.shapeOptions()
       } else if (this.tool === 'wand') {
         Row({ space: 10 }) {
           this.selOpButtons()

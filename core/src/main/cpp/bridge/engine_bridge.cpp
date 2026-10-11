@@ -14,6 +14,7 @@
 
 #include "engine/engine.h"
 #include "engine/gradient_ops.h"
+#include "engine/shape_ops.h"
 #include "engine/transform_ops.h"
 #include "engine/resample.h"
 #include "tiles/magic_wand.h"
@@ -2055,6 +2056,52 @@ napi_value BucketFill(napi_env env, napi_callback_info info) {
         if (!ok) {
             e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
             return makeError(env, kErrBadParam, "bucketFill: " + err);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// M11c 形状栅格化（kind 0=矩形/1=圆角矩形/2=椭圆/3=直线；fill/stroke 用 0/1 number——
+// napi_get_value_bool 不收 number 的跨桥坑；撤销粒度 = 单次拖拽）
+napi_value RasterizeShape(napi_env env, napi_callback_info info) {
+    size_t argc = 10;
+    napi_value argv[10] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 10) {
+        return makeError(env, kErrBadParam,
+                         "rasterizeShape(layerId,kind,x0,y0,x1,y1,cornerRadius,fill,stroke,strokeWidth) requires 10 args");
+    }
+    double v[10] = {0};
+    for (size_t i = 0; i < 10; ++i) {
+        if (napi_get_value_double(env, argv[i], &v[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "rasterizeShape: invalid args");
+        }
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "rasterizeShape: no document");
+        }
+        ShapeSpec spec;
+        spec.kind = static_cast<ShapeSpec::Kind>(static_cast<int32_t>(v[1]));
+        spec.x0 = v[2];
+        spec.y0 = v[3];
+        spec.x1 = v[4];
+        spec.y1 = v[5];
+        spec.cornerRadius = v[6];
+        spec.fill = v[7] != 0;
+        spec.stroke = v[8] != 0;
+        spec.strokeWidth = v[9];
+        std::string err;
+        e.history.beginEdit(e.doc, "shape", static_cast<uint64_t>(e.docRevision));
+        const bool ok = rasterizeShape(e.doc, e.doc.activeId, spec, e.fgColor, e.bgColor, err);
+        if (!ok) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, err);
         }
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();

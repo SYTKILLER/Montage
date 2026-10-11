@@ -589,7 +589,20 @@ export class CompositorEngine {
       sampleSize ?? 1) as Object;
     r = narrowResult(v);
     if (!r.ok) {
-      hilog.error(DOMAIN, TAG, 'bucketFill rejected: %{public}s',
+      hilog.error(DOMAIN, TAG, 'bucketFill rejected: %{public}s', r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  // M11c 形状栅格化（kind 0=矩形/1=圆角/2=椭圆/3=直线；fill/stroke 0/1 number；前景填充/背景描边）
+  rasterizeShape(kind: number, x0: number, y0: number, x1: number, y1: number,
+    cornerRadius: number, fill: boolean, stroke: boolean, strokeWidth: number): boolean {
+    let r: EngineResult;
+    const v: Object = native.rasterizeShape(0, kind, x0, y0, x1, y1, cornerRadius,
+      fill ? 1 : 0, stroke ? 1 : 0, strokeWidth) as Object;
+    r = narrowResult(v);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'rasterizeShape rejected: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
     return r.ok;

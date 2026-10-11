@@ -12,6 +12,7 @@ export const SHORTCUT_ROWS: ShortcutRow[] = [
   { keys: 'C / I', desc: '裁剪 / 吸管' },
   { keys: 'B / E', desc: '画笔 / 橡皮（Shift+B 切铅笔）' },
   { keys: 'G', desc: '渐变（Shift+G 切油漆桶）' },
+  { keys: 'U', desc: '形状（Shift+U 切种类；填充=前景 描边=背景）' },
   { keys: 'H / Z', desc: '抓手 / 缩放' },
   { keys: 'Ctrl+Z / Ctrl+Shift+Z', desc: '撤销 / 重做' },
   { keys: 'Ctrl+N / O / S', desc: '新建 / 打开 / 保存' },
