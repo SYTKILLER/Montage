@@ -21,6 +21,7 @@ const DOMAIN: number = 0x4D30;
 
 // KeyCode（@ohos.multimodalInput.keyCode 已核验，2026-10-07）
 const KC_B: number = 2018;
+const KC_A: number = 2017;
 const KC_C: number = 2019;
 const KC_D: number = 2020;
 const KC_E: number = 2021;
@@ -92,6 +93,9 @@ struct Index {
   @State maskTarget: boolean = false;
   @State wandTolerance: number = 32;
   @State wandContiguous: boolean = true;
+  @State selOp: number = 0;          // M10a 布尔四态：0 新/1 加/2 减/3 交（Shift=加 Alt=减 临时修饰）
+  @State selShape: string = 'rect';  // M10a 选框形状：rect | ellipse
+  @State polyPendingPts: number[] = [];  // M10a 多边形套索已落点（文档域扁平），非空 = 待闭合
   @State canUndo: boolean = false;
   @State canRedo: boolean = false;
   @State fps: number = 0;
@@ -145,6 +149,12 @@ struct Index {
   private rectY0: number = 0;
   private rectX1: number = 0;
   private rectY1: number = 0;
+  private lassoActive: boolean = false;  // M10a 套索拖拽中
+  private lassoPts: number[] = [];       // M10a 套索拖拽点集（文档域扁平）
+  @State lassoPreview: number[] = [];    // 套索/多边形 overlay 折线（文档域扁平；驱动重绘）
+  private polyLastDownTime: number = 0;  // 多边形套索双击检测（屏幕坐标）
+  private polyLastDownScrX: number = 0;
+  private polyLastDownScrY: number = 0;
   private moveActive: boolean = false;
   private moveLastX: number = 0;
   private moveLastY: number = 0;
@@ -418,11 +428,18 @@ struct Index {
         break;
       case 'wand':
         if (e.type === TouchType.Down) {
-          const ok = this.engine.setWandSelection(docX, docY, this.wandTolerance, this.wandContiguous);
+          const ok = this.engine.setWandSelection(docX, docY, this.wandTolerance,
+            this.wandContiguous, this.effectiveSelOp());
           this.hasSelectionFlag = ok;
           this.log(`魔棒: (${docX.toFixed(0)},${docY.toFixed(0)}) tol=${this.wandTolerance} ` +
-            `contig=${this.wandContiguous} → ${ok ? '选区已生成' : '失败'}`);
+            `contig=${this.wandContiguous} op=${this.effectiveSelOp()} → ${ok ? '选区已生成' : '失败'}`);
         }
+        break;
+      case 'lasso':
+        this.lassoTouch(e, docX, docY);
+        break;
+      case 'polyLasso':
+        this.polyLassoTouch(e, docX, docY, t.x, t.y);
         break;
       case 'rectSelect':
         if (this.altHeld && this.hasSelection) {
@@ -454,8 +471,121 @@ struct Index {
         }
         break;
       default:
-        break;  // lasso 占位：M10 提供
+        break;
     }
+  }
+
+  // M10a：布尔 op（选项条四态为基准；Shift 临时加 / Alt 临时减，PS 语义）
+  private effectiveSelOp(): number {
+    if (this.shiftHeld) {
+      return 1;
+    }
+    if (this.altHeld) {
+      return 2;
+    }
+    return this.selOp;
+  }
+
+  // M10a：选区命令后的会话态镜像维护（Replace 以结果为准；Add 成功必有选区）
+  private updateSelFlag(op: number, ok: boolean): void {
+    if (op === 0) {
+      this.hasSelectionFlag = ok;
+    } else if (ok) {
+      this.hasSelectionFlag = true;
+    }
+  }
+
+  // M10a：自由套索（拖拽收集折线，抬起自动闭合；偶奇规则）
+  private lassoTouch(e: TouchEvent, docX: number, docY: number): void {
+    if (e.type === TouchType.Down) {
+      this.lassoActive = true;
+      this.lassoPts = [docX, docY];
+      this.lassoPreview = [docX, docY];
+    } else if (e.type === TouchType.Move && this.lassoActive) {
+      const n = this.lassoPts.length;
+      const dx = docX - this.lassoPts[n - 2];
+      const dy = docY - this.lassoPts[n - 1];
+      if (dx * dx + dy * dy >= 4) {  // ≥2px 才记点（文档域）
+        this.lassoPts.push(docX, docY);
+        this.lassoPreview = this.lassoPts;
+      }
+    } else if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.lassoActive) {
+      this.lassoActive = false;
+      this.lassoPreview = [];
+      if (this.lassoPts.length >= 6) {
+        const op = this.effectiveSelOp();
+        const ok = this.engine.setPolygonSelection(this.lassoPts, op);
+        this.updateSelFlag(op, ok);
+        this.log(`套索选区: ${this.lassoPts.length / 2} 点 op=${op} → ${ok}`);
+      } else {
+        this.log('套索：拖距过小，未生成选区');
+      }
+      this.lassoPts = [];
+    }
+  }
+
+  // M10a：多边形套索（点击加点；点起点附近/双击闭合；Esc 取消）。
+  // nearStart/双击判定用屏幕像素（文档域阈值随 zoom 缩小会不可命中，M10a 验证期修正）。
+  private polyLassoTouch(e: TouchEvent, docX: number, docY: number, scrX: number, scrY: number): void {
+    if (e.type !== TouchType.Down) {
+      return;
+    }
+    const now = Date.now();
+    const dbl = (now - this.polyLastDownTime < 400) &&
+      Math.hypot(scrX - this.polyLastDownScrX, scrY - this.polyLastDownScrY) < 12;
+    this.polyLastDownTime = now;
+    this.polyLastDownScrX = scrX;
+    this.polyLastDownScrY = scrY;
+    const n = this.polyPendingPts.length;
+    if (n >= 6) {
+      // 点首点附近（屏幕 14px）或双击 → 闭合
+      const k = this.pxPerVp();
+      const fx = (this.polyPendingPts[0] - this.panX) * this.zoom / k;
+      const fy = (this.polyPendingPts[1] - this.panY) * this.zoom / k;
+      const nearStart = Math.hypot(scrX - fx, scrY - fy) < 14;
+      if (nearStart || dbl) {
+        this.commitPolygonSelection();
+        return;
+      }
+    }
+    if (dbl) {
+      return;  // 双击但点数不足：忽略（避免误加点）
+    }
+    this.polyPendingPts.push(docX, docY);
+    this.lassoPreview = this.polyPendingPts;
+  }
+
+  private commitPolygonSelection(): void {
+    const pts = this.polyPendingPts;
+    this.polyPendingPts = [];
+    this.lassoPreview = [];
+    if (pts.length >= 6) {
+      const op = this.effectiveSelOp();
+      const ok = this.engine.setPolygonSelection(pts, op);
+      this.updateSelFlag(op, ok);
+      this.log(`多边形套索: ${pts.length / 2} 点 op=${op} → ${ok}`);
+    } else {
+      this.log(`多边形套索提交取消：仅 ${pts.length / 2} 点（需≥3）`);
+    }
+  }
+
+  private cancelPolygonSelection(): void {
+    if (this.polyPendingPts.length > 0) {
+      this.polyPendingPts = [];
+      this.lassoPreview = [];
+      this.log('多边形套索已取消');
+    }
+  }
+
+  // M10a：折线预览文档域 → 视口 points（Polyline 组件坐标 = vp）
+  private lassoViewportPts(): number[][] {
+    const k = this.pxPerVp();
+    const out: number[][] = [];
+    for (let i = 0; i + 1 < this.lassoPreview.length; i += 2) {
+      out.push([(this.lassoPreview[i] - this.panX) * this.zoom / k,
+                (this.lassoPreview[i + 1] - this.panY) * this.zoom / k]);
+    }
+    return out;
   }
 
   private moveTouch(e: TouchEvent, docX: number, docY: number): void {
@@ -531,12 +661,16 @@ struct Index {
       if (w < 2 || h < 2) {
         this.engine.clearSelection();
         this.hasSelectionFlag = false;
-        this.log('矩形选区：拖距过小，已取消选区');
+        this.log('选框：拖距过小，已取消选区');
         return;
       }
-      const ok = this.engine.setRectSelection(x, y, w, h);
-      this.hasSelectionFlag = ok;
-      this.log(`矩形选区: (${x.toFixed(0)},${y.toFixed(0)}) ${w.toFixed(0)}×${h.toFixed(0)} → ${ok}`);
+      const op = this.effectiveSelOp();
+      const ok = this.selShape === 'ellipse'
+        ? this.engine.setEllipseSelection(x, y, w, h, op)
+        : this.engine.setRectSelection(x, y, w, h, op);
+      this.updateSelFlag(op, ok);
+      this.log(`${this.selShape === 'ellipse' ? '椭圆' : '矩形'}选区: (${x.toFixed(0)},${y.toFixed(0)}) ` +
+        `${w.toFixed(0)}×${h.toFixed(0)} op=${op} → ${ok}`);
     }
   }
 
@@ -860,6 +994,9 @@ struct Index {
     if (this.tool === 'crop') {
       this.cropRect = null;  // 换工具即丢弃未提交裁剪框
     }
+    if (this.tool === 'polyLasso' && id !== 'polyLasso') {
+      this.cancelPolygonSelection();  // 换工具丢弃未闭合多边形
+    }
     this.tool = id;
     this.log(`工具 → ${id}`);
   }
@@ -992,6 +1129,24 @@ struct Index {
         this.hasSelectionFlag = false;
         this.log('选区已取消');
         break;
+      case 'select.all': {
+        const ok = this.engine.selectAll();
+        this.hasSelectionFlag = ok;
+        this.log(`全选: ${ok}`);
+        break;
+      }
+      case 'select.inverse': {
+        const ok = this.engine.invertSelection();
+        this.hasSelectionFlag = ok;
+        this.log(`反选: ${ok}`);
+        break;
+      }
+      case 'select.reselect': {
+        const ok = this.engine.reselectSelection();
+        this.hasSelectionFlag = ok;
+        this.log(`重新选择: ${ok ? '已恢复最近取消的选区' : '无可恢复选区'}`);
+        break;
+      }
       case 'image.rotate90cw':
         this.docOp((): boolean => this.engine.rotateDocument90(true), '旋转 90° 顺时针');
         break;
@@ -1284,6 +1439,7 @@ struct Index {
       leafItem('select.all', '全部选择', 'Ctrl+A', false),
       leafItem('select.deselect', '取消选择', 'Ctrl+D', d),
       leafItem('select.inverse', '反选', 'Ctrl+Shift+I', false),
+      leafItem('select.reselect', '重新选择', 'Shift+Ctrl+D', false),
     ];
     const view: MenuItemVM[] = [
       leafItem('view.zoomIn', '放大', 'Ctrl+=', d),
@@ -1320,6 +1476,7 @@ struct Index {
       { id: 'move', label: '移动', symbol: $r('sys.symbol.move'), enabled: true },
       { id: 'rectSelect', label: '选框', symbol: $r('sys.symbol.Inverse_selection'), enabled: true },
       { id: 'lasso', label: '套索', symbol: $r('sys.symbol.smart_selection_area'), enabled: true },
+      { id: 'polyLasso', label: '多边形套索', symbol: $r('sys.symbol.pencil_tip'), enabled: true },
       { id: 'wand', label: '魔棒', symbol: $r('sys.symbol.wand_and_stars'), enabled: true },
       { id: 'crop', label: '裁剪', symbol: $r('sys.symbol.crop'), enabled: true },
       { id: '-', label: '', symbol: $r('sys.symbol.minus'), enabled: false },
@@ -1394,6 +1551,11 @@ struct Index {
       }
       return;
     }
+    // 多边形套索待闭合：Esc 取消（M10a）
+    if (this.polyPendingPts.length > 0 && e.keyCode === KC_ESC) {
+      this.cancelPolygonSelection();
+      return;
+    }
     // 裁剪待提交：回车提交 / Esc 取消
     if (this.cropRect !== null) {
       if (e.keyCode === KC_ENTER) {
@@ -1455,7 +1617,22 @@ struct Index {
           this.runCommand('view.zoomOut');
           break;
         case KC_D:
-          this.runCommand('select.deselect');
+          if (this.shiftHeld) {
+            // Shift+Ctrl+D 重新选择（M10a）
+            const ok = this.engine.reselectSelection();
+            this.hasSelectionFlag = ok;
+            this.log(`重新选择: ${ok ? '已恢复' : '无可恢复选区'}`);
+          } else {
+            this.runCommand('select.deselect');
+          }
+          break;
+        case KC_A:
+          this.runCommand('select.all');
+          break;
+        case KC_I:
+          if (this.shiftHeld) {
+            this.runCommand('select.inverse');
+          }
           break;
         case KC_T_KEY:
           this.runCommand('layer.transform');
@@ -1471,10 +1648,24 @@ struct Index {
         this.pickTool('move');
         break;
       case KC_M:
-        this.pickTool('rectSelect');
+        // M 循环选框组：矩形 ↔ 椭圆（PS 工具组语义）
+        if (this.tool === 'rectSelect') {
+          this.selShape = this.selShape === 'rect' ? 'ellipse' : 'rect';
+          this.log(`选框形状: ${this.selShape === 'ellipse' ? '椭圆' : '矩形'}`);
+        } else {
+          this.pickTool('rectSelect');
+        }
         break;
       case KC_L:
-        this.pickTool('lasso');
+        // L 循环套索组：自由套索 ↔ 多边形套索
+        if (this.tool === 'lasso') {
+          this.pickTool('polyLasso');
+        } else if (this.tool === 'polyLasso') {
+          this.cancelPolygonSelection();
+          this.pickTool('lasso');
+        } else {
+          this.pickTool('lasso');
+        }
         break;
       case KC_W:
         this.pickTool('wand');
@@ -1614,6 +1805,15 @@ struct Index {
           maskTarget: this.maskTarget,
           hasMaskOnActive: this.activeLayerHasMask(),
           cropPending: this.cropRect !== null,
+          selOp: $selOp,
+          selShape: this.selShape,
+          onSelOpPick: (op: number): void => {
+            this.selOp = op;
+          },
+          onSelShapeToggle: (): void => {
+            this.selShape = this.selShape === 'rect' ? 'ellipse' : 'rect';
+            this.log(`选框形状: ${this.selShape === 'ellipse' ? '椭圆' : '矩形'}`);
+          },
           onToggleMaskTarget: (): void => this.onToggleMaskTarget(),
           onColorPick: (hex: string): void => {
             this.applyColors(hex, this.bgColor);
@@ -1656,7 +1856,7 @@ struct Index {
                 }
               })
             }
-                        // 矩形选区拖拽预览（GL 蚂蚁线在提交后接管）
+                        // 选框拖拽预览（矩形方框 / 椭圆圆角框；GL 蚂蚁线在提交后接管）
             if (this.rectDrag) {
               Column()
                 .position({
@@ -1666,7 +1866,31 @@ struct Index {
                 .width(Math.abs(this.rectX1 - this.rectX0) * this.zoom / this.pxPerVp())
                 .height(Math.abs(this.rectY1 - this.rectY0) * this.zoom / this.pxPerVp())
                 .border({ width: 1, color: '#FFFFFF' })
+                .borderRadius(this.selShape === 'ellipse' ? '50%' : 0)
                 .backgroundColor('#22000000')
+            }
+            // M10a 套索拖拽 / 多边形套索已落点折线预览（文档域 → 视口）。
+            // hitTestBehavior=None：纯视觉 overlay，防全屏 Polyline 拦截画布触摸（模拟器实证）。
+            if (this.lassoPreview.length >= 4) {
+              Polyline()
+                .width('100%')
+                .height('100%')
+                .points(this.lassoViewportPts())
+                .stroke('#FFFFFF')
+                .strokeWidth(1)
+                .fillOpacity(0)
+                .hitTestBehavior(HitTestMode.None)
+            }
+            if (this.polyPendingPts.length >= 2) {
+              Circle()
+                .width(8)
+                .height(8)
+                .fill('#00E5FF')
+                .position({
+                  x: (this.polyPendingPts[0] - this.panX) * this.zoom / this.pxPerVp() - 4,
+                  y: (this.polyPendingPts[1] - this.panY) * this.zoom / this.pxPerVp() - 4
+                })
+                .hitTestBehavior(HitTestMode.None)
             }
             // 裁剪框（拖拽中 + 待提交常显）
             if (this.cropRect !== null) {

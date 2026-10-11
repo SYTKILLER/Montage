@@ -406,9 +406,12 @@ export class CompositorEngine {
     return r.ok;
   }
 
-  // M7c：魔棒选区（活动图层采样）
-  setWandSelection(x: number, y: number, tolerance: number, contiguous: boolean): boolean {
-    const r = narrowResult(native.setWandSelection(x, y, tolerance, contiguous) as Object);
+  // M7c：魔棒选区（活动图层采样）；op 可选：0 新/1 加/2 减/3 交（M10a）
+  setWandSelection(x: number, y: number, tolerance: number, contiguous: boolean,
+    op?: number): boolean {
+    const r = narrowResult(op === undefined
+      ? native.setWandSelection(x, y, tolerance, contiguous) as Object
+      : native.setWandSelection(x, y, tolerance, contiguous, op) as Object);
     if (!r.ok) {
       hilog.error(DOMAIN, TAG, 'setWandSelection failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
@@ -416,13 +419,63 @@ export class CompositorEngine {
     return r.ok;
   }
 
-  // M7a：矩形选框（文档坐标）/ 取消选区
-  setRectSelection(x: number, y: number, w: number, h: number): boolean {
-    const r = narrowResult(native.setRectSelection(x, y, w, h) as Object);
+  // M7a：矩形选框（文档坐标）；op 可选布尔四态（M10a）
+  setRectSelection(x: number, y: number, w: number, h: number, op?: number): boolean {
+    const r = narrowResult(op === undefined
+      ? native.setRectSelection(x, y, w, h) as Object
+      : native.setRectSelection(x, y, w, h, op) as Object);
     if (!r.ok) {
       hilog.error(DOMAIN, TAG, 'setRectSelection failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    return r.ok;
+  }
+
+  // M10a：多边形套索（点列扁平 [x0,y0,...] 文档域；偶奇扫描线）
+  setPolygonSelection(points: number[], op?: number): boolean {
+    const r = narrowResult(op === undefined
+      ? native.setPolygonSelection(points) as Object
+      : native.setPolygonSelection(points, op) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setPolygonSelection failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  // M10a：椭圆选框（内切矩形）
+  setEllipseSelection(x: number, y: number, w: number, h: number, op?: number): boolean {
+    const r = narrowResult(op === undefined
+      ? native.setEllipseSelection(x, y, w, h) as Object
+      : native.setEllipseSelection(x, y, w, h, op) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setEllipseSelection failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  // M10a：全选 / 反选 / 重新选择
+  selectAll(): boolean {
+    const r = narrowResult(native.selectAll() as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'selectAll failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  invertSelection(): boolean {
+    const r = narrowResult(native.invertSelection() as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'invertSelection failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  reselectSelection(): boolean {
+    const r = narrowResult(native.reselectSelection() as Object);
     return r.ok;
   }
 

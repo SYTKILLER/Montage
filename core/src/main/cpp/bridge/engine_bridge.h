@@ -39,6 +39,13 @@ napi_value SetRectSelection(napi_env env, napi_callback_info info);
 napi_value ClearSelection(napi_env env, napi_callback_info info);
 // 魔棒（M7c）：点击容差选区
 napi_value SetWandSelection(napi_env env, napi_callback_info info);
+// M10a 选区增强：多边形套索（点列偶奇扫描线）/ 椭圆选框 / 全选 / 反选 / 重新选择。
+// 布尔四态 op：0=Replace 1=Add 2=Subtract 3=Intersect（setRect/setWand 第 5 可选参同语义）。
+napi_value SetPolygonSelection(napi_env env, napi_callback_info info);
+napi_value SetEllipseSelection(napi_env env, napi_callback_info info);
+napi_value SelectAll(napi_env env, napi_callback_info info);
+napi_value InvertSelection(napi_env env, napi_callback_info info);
+napi_value ReselectSelection(napi_env env, napi_callback_info info);
 napi_value RemoveLayer(napi_env env, napi_callback_info info);
 napi_value SelectLayer(napi_env env, napi_callback_info info);
 napi_value SetLayerVisible(napi_env env, napi_callback_info info);

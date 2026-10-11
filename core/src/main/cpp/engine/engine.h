@@ -71,6 +71,10 @@ class Engine {
     };
     TransformPreview transformPreview;
 
+    // M10a 重新选择（PS 语义会话态）：最近一次取消的选区，reselectSelection 恢复。
+    // 不随 History 快照走（撤销不恢复"重新选择"来源）。
+    std::shared_ptr<const TileGrid> lastSelection;
+
     // M4a 撤销
     History history;
     std::atomic<uint32_t> historyVersion{0};

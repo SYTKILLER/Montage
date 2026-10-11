@@ -25,6 +25,7 @@ add_library(compositor SHARED
         render/tile_renderer.cpp
         tiles/pixel_probe.cpp
         tiles/selection_outline.cpp
+        tiles/selection_ops.cpp
         tiles/magic_wand.cpp)
 
 target_include_directories(compositor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

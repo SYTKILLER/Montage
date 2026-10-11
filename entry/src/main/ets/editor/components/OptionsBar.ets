@@ -51,11 +51,43 @@ export struct OptionsBar {
   @Prop brushColor: string = '#000000';
   @Prop maskTarget: boolean = false;
   @Prop hasMaskOnActive: boolean = false;
+  @Prop cropPending: boolean = false;
+  // M10a 选区增强：布尔四态 + 选框形状
+  @Link selOp: number;
+  @Prop selShape: string = 'rect';
+  onSelOpPick: (op: number) => void = (_op: number) => {};
+  onSelShapeToggle: () => void = () => {};
   onToggleMaskTarget: () => void = () => {};
   onColorPick: (hex: string) => void = (_hex: string) => {};
   onZoom: (cmd: string) => void = (_cmd: string) => {};
   onCropCommand: (cmd: string) => void = (_cmd: string) => {};
-  @Prop cropPending: boolean = false;
+
+  // M10a 布尔四态按钮（新/加/减/交；PS 选项条语义，Shift/Alt 临时修饰在引擎入口生效）
+  @Builder
+  selOpButtons() {
+    Row({ space: 2 }) {
+      this.selOpBtn('square_dashed', 0, '新选区')
+      this.selOpBtn('plus_square_on_square', 1, '添加到选区')
+      this.selOpBtn('minus_square_fill', 2, '从选区减去')
+      this.selOpBtn('plus_square_dashed_on_square', 3, '与选区交叉')
+    }
+    .height(28)
+  }
+
+  @Builder
+  selOpBtn(symbol: string, op: number, _tip: string) {
+    Column() {
+      SymbolGlyph($r(`sys.symbol.${symbol}`))
+        .fontSize(18)
+        .fontColor([this.selOp === op ? $r('app.color.accent') : $r('app.color.text_secondary')])
+    }
+    .justifyContent(FlexAlign.Center)
+    .width(32)
+    .height(28)
+    .borderRadius(6)
+    .backgroundColor(this.selOp === op ? $r('app.color.accent_container') : Color.Transparent)
+    .onClick((): void => this.onSelOpPick(op))
+  }
 
   @Builder
   brushOptions() {
@@ -176,11 +208,25 @@ export struct OptionsBar {
       if (this.tool === 'brush' || this.tool === 'eraser') {
         this.brushOptions()
       } else if (this.tool === 'wand') {
-        this.wandOptions()
+        Row({ space: 10 }) {
+          this.selOpButtons()
+          this.wandOptions()
+        }
+        .height(36)
       } else if (this.tool === 'rectSelect') {
-        Text('在画布拖拽出矩形选区')
-          .fontSize(12)
-          .fontColor($r('app.color.text_secondary'))
+        Row({ space: 10 }) {
+          Button(this.selShape === 'ellipse' ? '椭圆' : '矩形')
+            .fontSize(12).height(28).width(52)
+            .backgroundColor($r('app.color.surface'))
+            .fontColor($r('app.color.text_primary'))
+            .border({ width: 1, color: $r('app.color.border') })
+            .onClick((): void => this.onSelShapeToggle())
+          this.selOpButtons()
+          Text('拖拽出选区 · M 切形状 · Shift=加 Alt=减')
+            .fontSize(11)
+            .fontColor($r('app.color.text_secondary'))
+        }
+        .height(36)
       } else if (this.tool === 'eyedropper') {
         Text('点击画布取色（合成结果）')
           .fontSize(12)
@@ -190,9 +236,21 @@ export struct OptionsBar {
           .fontSize(12)
           .fontColor($r('app.color.text_secondary'))
       } else if (this.tool === 'lasso') {
-        Text('套索工具 M10 提供')
-          .fontSize(12)
-          .fontColor($r('app.color.text_secondary'))
+        Row({ space: 10 }) {
+          this.selOpButtons()
+          Text('拖拽画折线，抬起自动闭合 · Shift=加 Alt=减')
+            .fontSize(11)
+            .fontColor($r('app.color.text_secondary'))
+        }
+        .height(36)
+      } else if (this.tool === 'polyLasso') {
+        Row({ space: 10 }) {
+          this.selOpButtons()
+          Text('点击加点 → 点起点/双击闭合 · Esc 取消')
+            .fontSize(11)
+            .fontColor($r('app.color.text_secondary'))
+        }
+        .height(36)
       } else if (this.tool === 'crop') {
         if (this.cropPending) {
           Text('裁剪框就绪：')

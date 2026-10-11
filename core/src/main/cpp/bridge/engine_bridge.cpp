@@ -16,6 +16,7 @@
 #include "engine/transform_ops.h"
 #include "engine/resample.h"
 #include "tiles/magic_wand.h"
+#include "tiles/selection_ops.h"
 #include "io/image_export.h"
 #include "io/image_import.h"
 #include "io/project_open.h"
@@ -1431,13 +1432,13 @@ napi_value AddLayerMask(napi_env env, napi_callback_info info) {
     return makeOk(env, nullptr);
 }
 
-// M7a：矩形选框（文档坐标；硬边 v1）。掩码 = 文档域网格，255 在框内。
+// M7a/M10a：矩形选框（文档坐标；硬边）。第 5 可选参 = 布尔 op（0 新/1 加/2 减/3 交）。
 napi_value SetRectSelection(napi_env env, napi_callback_info info) {
-    size_t argc = 4;
-    napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+    size_t argc = 5;
+    napi_value argv[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 4) {
-        return makeError(env, kErrBadParam, "setRectSelection(x, y, w, h) requires 4 args");
+        return makeError(env, kErrBadParam, "setRectSelection(x, y, w, h, op?) requires 4+ args");
     }
     double x = 0, y = 0, w = 0, h = 0;
     if (napi_get_value_double(env, argv[0], &x) != napi_ok ||
@@ -1445,6 +1446,10 @@ napi_value SetRectSelection(napi_env env, napi_callback_info info) {
         napi_get_value_double(env, argv[2], &w) != napi_ok ||
         napi_get_value_double(env, argv[3], &h) != napi_ok) {
         return makeError(env, kErrBadParam, "setRectSelection: invalid args");
+    }
+    int32_t op = 0;
+    if (argc >= 5 && napi_get_value_int32(env, argv[4], &op) != napi_ok) {
+        return makeError(env, kErrBadParam, "setRectSelection: invalid op");
     }
     auto& e = Engine::get();
     {
@@ -1455,37 +1460,14 @@ napi_value SetRectSelection(napi_env env, napi_callback_info info) {
         if (w <= 0 || h <= 0) {
             return makeError(env, kErrBadParam, "setRectSelection: empty rect");
         }
-        e.history.beginEdit(e.doc, "rect select", static_cast<uint64_t>(e.docRevision));
-        const uint32_t cols = (e.doc.width + kTileSize - 1u) / kTileSize;
-        const uint32_t rows = (e.doc.height + kTileSize - 1u) / kTileSize;
-        TileGridBuilder builder(cols, rows);
-        for (uint32_t ty = 0; ty < rows; ++ty) {
-            for (uint32_t tx = 0; tx < cols; ++tx) {
-                EngineBuffer& buf = builder.ensureTile(tx, ty);
-                uint8_t* px = buf.mapCpuWrite();
-                const int32_t y0 = static_cast<int32_t>(ty * kTileSize);
-                const int32_t x0 = static_cast<int32_t>(tx * kTileSize);
-                for (uint32_t r = 0; r < kTileSize; ++r) {
-                    uint8_t* row = px + static_cast<size_t>(r) * kTileSize * 4u;
-                    const int32_t dy = y0 + static_cast<int32_t>(r);
-                    const bool inY = dy >= static_cast<int32_t>(y) &&
-                                     dy < static_cast<int32_t>(y + h);
-                    for (uint32_t c = 0; c < kTileSize; ++c) {
-                        const int32_t dx = x0 + static_cast<int32_t>(c);
-                        const uint8_t v = (inY && dx >= static_cast<int32_t>(x) &&
-                                           dx < static_cast<int32_t>(x + w))
-                                              ? 255
-                                              : 0;
-                        // 选区掩码灰度存 R 通道（约定与蒙版 patch 一致）
-                        row[c * 4u] = v;
-                        row[c * 4u + 1u] = v;
-                        row[c * 4u + 2u] = v;
-                        row[c * 4u + 3u] = 255;
-                    }
-                }
-            }
+        auto mask = tiles::rectMask(x, y, w, h, e.doc.width, e.doc.height);
+        if (mask == nullptr) {
+            return makeError(env, kErrBadParam, "setRectSelection: rect outside document");
         }
-        e.doc.selection = builder.publish(1);
+        auto merged = tiles::combineSelection(e.doc, std::move(mask),
+                                              static_cast<tiles::SelectionOp>(op));
+        e.history.beginEdit(e.doc, "rect select", static_cast<uint64_t>(e.docRevision));
+        e.doc.selection = std::move(merged);
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();
         e.requestRender();
@@ -1493,7 +1475,7 @@ napi_value SetRectSelection(napi_env env, napi_callback_info info) {
     return makeOk(env, nullptr);
 }
 
-// M7a：取消选区
+// M7a/M10a：取消选区（保存到 lastSelection 供重新选择）
 napi_value ClearSelection(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
     {
@@ -1502,6 +1484,7 @@ napi_value ClearSelection(napi_env env, napi_callback_info /*info*/) {
             return makeOk(env, nullptr);
         }
         e.history.beginEdit(e.doc, "deselect", static_cast<uint64_t>(e.docRevision));
+        e.lastSelection = e.doc.selection;
         e.doc.selection = nullptr;
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();
@@ -1510,13 +1493,13 @@ napi_value ClearSelection(napi_env env, napi_callback_info /*info*/) {
     return makeOk(env, nullptr);
 }
 
-// M7c：魔棒选区（活动图层有效像素；点击文档坐标 + 容差 + 连通性；history 事务）
+// M7c/M10a：魔棒选区（活动图层有效像素；点击文档坐标 + 容差 + 连通性；第 5 可选参 = 布尔 op）
 napi_value SetWandSelection(napi_env env, napi_callback_info info) {
-    size_t argc = 4;
-    napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+    size_t argc = 5;
+    napi_value argv[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 4) {
-        return makeError(env, kErrBadParam, "setWandSelection(x, y, tolerance, contiguous) requires 4 args");
+        return makeError(env, kErrBadParam, "setWandSelection(x, y, tolerance, contiguous, op?) requires 4+ args");
     }
     double x = 0, y = 0, tol = 32;
     bool contiguous = true;
@@ -1525,6 +1508,10 @@ napi_value SetWandSelection(napi_env env, napi_callback_info info) {
         napi_get_value_double(env, argv[2], &tol) != napi_ok ||
         napi_get_value_bool(env, argv[3], &contiguous) != napi_ok) {
         return makeError(env, kErrBadParam, "setWandSelection: invalid args");
+    }
+    int32_t op = 0;
+    if (argc >= 5 && napi_get_value_int32(env, argv[4], &op) != napi_ok) {
+        return makeError(env, kErrBadParam, "setWandSelection: invalid op");
     }
     auto& e = Engine::get();
     {
@@ -1542,8 +1529,177 @@ napi_value SetWandSelection(napi_env env, napi_callback_info info) {
         if (mask == nullptr) {
             return makeError(env, kErrBadParam, "setWandSelection: nothing matched");
         }
+        auto merged = tiles::combineSelection(e.doc, std::move(mask),
+                                              static_cast<tiles::SelectionOp>(op));
+        if (merged == nullptr && op != 0) {
+            // 减/交后清空或与现有相同：仍作为一次事务落盘（PS 允许减到无选区）
+            e.history.beginEdit(e.doc, "magic wand", static_cast<uint64_t>(e.docRevision));
+            e.doc.selection = nullptr;
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.bumpRevisionLocked();
+            e.requestRender();
+            return makeOk(env, nullptr);
+        }
         e.history.beginEdit(e.doc, "magic wand", static_cast<uint64_t>(e.docRevision));
-        e.doc.selection = std::move(mask);
+        e.doc.selection = std::move(merged);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// M10a：多边形套索选区（点列 [x0,y0,...] 文档域；偶奇扫描线；第 2 可选参 = op）
+napi_value SetPolygonSelection(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "setPolygonSelection(points, op?) requires 1+ args");
+    }
+    // 数组判定：ArkTS 运行时的 number[] 跨桥后 napi_is_array/napi_get_array_length 均
+    // 报告失败（M10a 模拟器实证），但 napi_get_element 可正常读——逐元素探测长度。
+    uint32_t n = 0;
+    napi_get_array_length(env, argv[0], &n);  // 报告失败时保持 0，走元素探测
+    if (n == 0) {
+        const uint32_t kMaxProbe = 2 * 4096 + 1;
+        for (uint32_t i = 0; i < kMaxProbe; ++i) {
+            napi_value v = nullptr;
+            if (napi_get_element(env, argv[0], i, &v) != napi_ok || v == nullptr) {
+                break;
+            }
+            napi_valuetype vt = napi_undefined;
+            napi_typeof(env, v, &vt);
+            if (vt != napi_number) {
+                break;
+            }
+            n = i + 1;
+        }
+    }
+    if (n < 6 || (n % 2) != 0 || n > 2 * 4096) {
+        return makeError(env, kErrBadParam, "setPolygonSelection: bad point count");
+    }
+    std::vector<double> xy(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        napi_value v = nullptr;
+        napi_get_element(env, argv[0], i, &v);
+        double d = 0;
+        if (napi_get_value_double(env, v, &d) != napi_ok) {
+            return makeError(env, kErrBadParam, "setPolygonSelection: bad coord");
+        }
+        xy[i] = d;
+    }
+    int32_t op = 0;
+    if (argc >= 2 && napi_get_value_int32(env, argv[1], &op) != napi_ok) {
+        return makeError(env, kErrBadParam, "setPolygonSelection: invalid op");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "setPolygonSelection: no document");
+        }
+        auto mask = tiles::polygonMask(xy, e.doc.width, e.doc.height);
+        auto merged = tiles::combineSelection(e.doc, std::move(mask),
+                                              static_cast<tiles::SelectionOp>(op));
+        e.history.beginEdit(e.doc, "polygon select", static_cast<uint64_t>(e.docRevision));
+        e.doc.selection = std::move(merged);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// M10a：椭圆选框（内切于文档域矩形；2×2 覆盖抗锯齿；第 5 可选参 = op）
+napi_value SetEllipseSelection(napi_env env, napi_callback_info info) {
+    size_t argc = 5;
+    napi_value argv[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 4) {
+        return makeError(env, kErrBadParam, "setEllipseSelection(x, y, w, h, op?) requires 4+ args");
+    }
+    double x = 0, y = 0, w = 0, h = 0;
+    if (napi_get_value_double(env, argv[0], &x) != napi_ok ||
+        napi_get_value_double(env, argv[1], &y) != napi_ok ||
+        napi_get_value_double(env, argv[2], &w) != napi_ok ||
+        napi_get_value_double(env, argv[3], &h) != napi_ok) {
+        return makeError(env, kErrBadParam, "setEllipseSelection: invalid args");
+    }
+    int32_t op = 0;
+    if (argc >= 5 && napi_get_value_int32(env, argv[4], &op) != napi_ok) {
+        return makeError(env, kErrBadParam, "setEllipseSelection: invalid op");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "setEllipseSelection: no document");
+        }
+        auto mask = tiles::ellipseMask(x, y, w, h, e.doc.width, e.doc.height);
+        auto merged = tiles::combineSelection(e.doc, std::move(mask),
+                                              static_cast<tiles::SelectionOp>(op));
+        e.history.beginEdit(e.doc, "ellipse select", static_cast<uint64_t>(e.docRevision));
+        e.doc.selection = std::move(merged);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// M10a：全选（满铺 255 蚂蚁线边界；Ctrl+A）
+napi_value SelectAll(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "selectAll: no document");
+        }
+        e.history.beginEdit(e.doc, "select all", static_cast<uint64_t>(e.docRevision));
+        e.doc.selection = tiles::fullSelection(e.doc.width, e.doc.height);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// M10a：反选（无选区 = 全选；Ctrl+Shift+I）
+napi_value InvertSelection(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "invertSelection: no document");
+        }
+        auto inv = tiles::invertSelection(e.doc);
+        if (inv == nullptr && e.doc.selection == nullptr) {
+            return makeError(env, kErrBadParam, "invertSelection: nothing to invert");
+        }
+        e.history.beginEdit(e.doc, "invert selection", static_cast<uint64_t>(e.docRevision));
+        e.doc.selection = std::move(inv);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// M10a：重新选择（恢复最近取消的选区；Shift+Ctrl+D）
+napi_value ReselectSelection(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "reselectSelection: no document");
+        }
+        if (e.lastSelection == nullptr) {
+            return makeError(env, kErrBadParam, "reselectSelection: no reselectable selection");
+        }
+        e.history.beginEdit(e.doc, "reselect", static_cast<uint64_t>(e.docRevision));
+        e.doc.selection = e.lastSelection;
+        e.lastSelection = nullptr;
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();
         e.requestRender();

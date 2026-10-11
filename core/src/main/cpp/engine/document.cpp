@@ -144,7 +144,10 @@ uint8_t selectionGrayAt(const TileGrid& mask, int docX, int docY) {
         return 0;  // 稀疏网格缺瓦片 = 未选中
     }
     const uint8_t* px = it->second->pixels->mapCpu();
-    return px[(static_cast<size_t>(uy % kTileSize) * kTileSize) + static_cast<size_t>(ux % kTileSize)];
+    // 掩码网格 = RGBA8888（R=G=B=灰度，与全部写入方一致；旧读法漏乘 4 为 M10a 修复的
+    // M5a/M7a 潜伏布局错位——大面积二值掩码 4×4 下采样近似正确、渐变蒙版完全错位）
+    return px[(static_cast<size_t>(uy % kTileSize) * kTileSize +
+               static_cast<size_t>(ux % kTileSize)) * 4u];
 }
 
 uint8_t layerMaskGrayAt(const LayerMask& mask, int gx, int gy) {
@@ -168,7 +171,9 @@ uint8_t layerMaskGrayAt(const LayerMask& mask, int gx, int gy) {
         return 0;  // 网格内缺瓦片 = 透明（构建方保证不缺，防御）
     }
     const uint8_t* mPx = it->second->pixels->mapCpu();
-    return mPx[(static_cast<size_t>(my % kTileSize) * kTileSize) + static_cast<size_t>(mx % kTileSize)];
+    // RGBA8888 布局（同 selectionGrayAt，M10a 布局错位修复）
+    return mPx[(static_cast<size_t>(my % kTileSize) * kTileSize +
+                static_cast<size_t>(mx % kTileSize)) * 4u];
 }
 
 std::shared_ptr<const TileGrid> composeMasked(std::shared_ptr<const TileGrid> src,
