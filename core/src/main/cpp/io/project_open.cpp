@@ -26,7 +26,7 @@ constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Open";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
 constexpr int kMinVersion = 1;
-constexpr int kMaxVersion = 5;  // v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
+constexpr int kMaxVersion = 6;  // v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
 constexpr uint32_t kMaxSide = 30000;
 constexpr uint64_t kMaxTotalPixels = 100ull * 1000 * 1000;
 constexpr size_t kMaxLayers = 10000;
@@ -509,6 +509,7 @@ struct LayerRecord {
     uint32_t maskHeight = 0;
     bool clipping = false;  // v2
     std::shared_ptr<LayerAdjustment> adjustment;  // v3
+    std::shared_ptr<TextLayerState> text;  // v6（M12）
 };
 
 bool getU64(const JValue& v, uint64_t& out) {
@@ -790,6 +791,99 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
             }
             l.adjustment = std::move(adj);
         }
+        // v6 文本层（可选字段；旧版无此字段 = 普通层）。styleHash 置 0：首编辑触发重栅格。
+        const JValue* jtx = item.find("text");
+        if (jtx != nullptr && jtx->type == JValue::Obj) {
+            auto t = std::make_shared<TextLayerState>();
+            const JValue* jcontent = jtx->find("content");
+            if (jcontent == nullptr || jcontent->type != JValue::Str) {
+                err = "bad text content";
+                return false;
+            }
+            if (jcontent->str.size() > 1u * 1024 * 1024) {
+                err = "text content too long";
+                return false;
+            }
+            t->content = jcontent->str;
+            const JValue* jfam = jtx->find("fontFamily");
+            if (jfam != nullptr && jfam->type == JValue::Str) {
+                if (jfam->str.size() > 256) {
+                    err = "text fontFamily too long";
+                    return false;
+                }
+                t->fontFamily = jfam->str;
+            }
+            const JValue* jfs = jtx->find("fontSize");
+            double fs = 40.0;
+            if (jfs != nullptr && (!getDouble(*jfs, fs) || !std::isfinite(fs) || fs < 1 || fs > 2000)) {
+                err = "bad text fontSize";
+                return false;
+            }
+            t->fontSize = fs;
+            const JValue* jlh = jtx->find("lineHeight");
+            double lh = 1.2;
+            if (jlh != nullptr && (!getDouble(*jlh, lh) || !std::isfinite(lh) || lh < 0.1 || lh > 10)) {
+                err = "bad text lineHeight";
+                return false;
+            }
+            t->lineHeight = lh;
+            const JValue* jtr = jtx->find("tracking");
+            double tr = 0;
+            if (jtr != nullptr &&
+                (!getDouble(*jtr, tr) || !std::isfinite(tr) || tr < -2000 || tr > 2000)) {
+                err = "bad text tracking";
+                return false;
+            }
+            t->tracking = tr;
+            const JValue* jbold = jtx->find("bold");
+            if (jbold != nullptr) {
+                if (jbold->type != JValue::Bool) {
+                    err = "bad text bold";
+                    return false;
+                }
+                t->bold = jbold->b;
+            }
+            const JValue* jitalic = jtx->find("italic");
+            if (jitalic != nullptr) {
+                if (jitalic->type != JValue::Bool) {
+                    err = "bad text italic";
+                    return false;
+                }
+                t->italic = jitalic->b;
+            }
+            const JValue* jcolor = jtx->find("color");
+            if (jcolor != nullptr) {
+                if (jcolor->type != JValue::Arr || jcolor->arr.size() != 3) {
+                    err = "bad text color";
+                    return false;
+                }
+                for (int ci = 0; ci < 3; ++ci) {
+                    double cv = 0;
+                    if (!getDouble(jcolor->arr[ci], cv) || !std::isfinite(cv) || cv < 0 || cv > 1) {
+                        err = "bad text color";
+                        return false;
+                    }
+                    t->color[ci] = static_cast<float>(cv);
+                }
+            }
+            const JValue* jalign = jtx->find("align");
+            double al = 0;
+            if (jalign != nullptr &&
+                (!getDouble(*jalign, al) || al != std::floor(al) || al < 0 || al > 2)) {
+                err = "bad text align";
+                return false;
+            }
+            t->align = static_cast<int32_t>(al);
+            const JValue* jwrap = jtx->find("wrapWidth");
+            double ww = 0;
+            if (jwrap != nullptr &&
+                (!getDouble(*jwrap, ww) || !std::isfinite(ww) || ww < 0 || ww > 1e7)) {
+                err = "bad text wrapWidth";
+                return false;
+            }
+            t->wrapWidth = ww;
+            l.text = std::move(t);
+        }
         layers.push_back(l);
     }
     if (totalPixels > kMaxTotalPixels) {
@@ -912,6 +1006,7 @@ bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
         l.blendMode = rec.blendMode;
         l.clipping = rec.clipping;
         l.adjustment = rec.adjustment;
+        l.text = rec.text;
         l.transform.originX = rec.originX;
         l.transform.originY = rec.originY;
         if (rec.hasImage) {

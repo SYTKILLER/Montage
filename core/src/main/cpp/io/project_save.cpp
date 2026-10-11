@@ -22,7 +22,7 @@ namespace {
 constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Save";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
-constexpr int kFormatVersion = 5;  // v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
+constexpr int kFormatVersion = 6;  // v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
 constexpr int kDeflateLevel = 6;
 // 04 §1.3 格式上限（沿用上游档位，与引擎运行预算分立）
 constexpr uint32_t kMaxSide = 30000;
@@ -438,6 +438,7 @@ struct LayerSnapshot {
     bool maskEnabled = true;
     bool clipping = false;  // M5b-2
     std::shared_ptr<LayerAdjustment> adjustment;  // M6a：null = 普通层
+    std::shared_ptr<TextLayerState> text;  // M12：null = 非文本层
 };
 
 struct ChannelSnapshot {
@@ -558,6 +559,53 @@ std::string buildManifest(const DocSnapshot& doc) {
             }
             fields.push_back(std::string("      \"adjustment\": {") + nl + fields2 + nl + "      }");
         }
+        if (l.text != nullptr) {
+            // v6 文本层：内容/样式持久化；像素仍存 PNG（缺字体回退时可显示旧栅格）
+            const TextLayerState& t = *l.text;
+            char num[32];
+            std::string tf;
+            tf += "      \"content\": ";
+            tf += jsonEscape(t.content);
+            tf += ",\n";
+            tf += "      \"fontFamily\": ";
+            tf += jsonEscape(t.fontFamily);
+            tf += ",\n";
+            std::snprintf(num, sizeof(num), "%.6g", t.fontSize);
+            tf += "      \"fontSize\": ";
+            tf += num;
+            tf += ",\n";
+            std::snprintf(num, sizeof(num), "%.6g", t.lineHeight);
+            tf += "      \"lineHeight\": ";
+            tf += num;
+            tf += ",\n";
+            std::snprintf(num, sizeof(num), "%.6g", t.tracking);
+            tf += "      \"tracking\": ";
+            tf += num;
+            tf += ",\n";
+            tf += "      \"bold\": ";
+            tf += (t.bold ? "true" : "false");
+            tf += ",\n";
+            tf += "      \"italic\": ";
+            tf += (t.italic ? "true" : "false");
+            tf += ",\n";
+            tf += "      \"color\": [";
+            std::snprintf(num, sizeof(num), "%.6g", t.color[0]);
+            tf += num;
+            tf += ", ";
+            std::snprintf(num, sizeof(num), "%.6g", t.color[1]);
+            tf += num;
+            tf += ", ";
+            std::snprintf(num, sizeof(num), "%.6g", t.color[2]);
+            tf += num;
+            tf += "],\n";
+            tf += "      \"align\": ";
+            tf += std::to_string(t.align);
+            tf += ",\n";
+            std::snprintf(num, sizeof(num), "%.6g", t.wrapWidth);
+            tf += "      \"wrapWidth\": ";
+            tf += num;
+            fields.push_back("      \"text\": {\n" + tf + "\n      }");
+        }
         if (l.pixels != nullptr) {
             // 图像以内容包围盒存出；originX/Y = 包围盒左上角在文档坐标系的落点（load 据此重建 Transform）
             fields.push_back("      \"originX\": " + std::to_string(static_cast<int64_t>(l.originX)));
@@ -652,6 +700,7 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
             }
             s.clipping = l.clipping;
             s.adjustment = l.adjustment;
+            s.text = l.text;
             snap.layers.push_back(std::move(s));
         }
     }

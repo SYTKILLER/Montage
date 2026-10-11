@@ -59,6 +59,19 @@ function narrowViewport(r: Record<string, Object>): ViewportData {
   return { zoom: num(r, 'zoom'), panX: num(r, 'panX'), panY: num(r, 'panY') };
 }
 
+function strArr(r: Record<string, Object>, key: string): string[] {
+  const v: Object = r[key];
+  const out: string[] = [];
+  if (Array.isArray(v)) {
+    for (const item of v as Object[]) {
+      if (typeof item === 'string') {
+        out.push(item);
+      }
+    }
+  }
+  return out;
+}
+
 function narrowStats(r: Record<string, Object>): EngineStats {
   return {
     fps: num(r, 'fps'),
@@ -146,6 +159,21 @@ function narrowLayer(r: Record<string, Object>): LayerDTO {
     adjP3: num(r, 'adjP3'),
     curveX: numArr(r, 'curveX'),
     curveY: numArr(r, 'curveY'),
+    isText: boolOf(r, 'isText'),
+    textContent: str(r, 'textContent'),
+    textFontFamily: str(r, 'textFontFamily'),
+    textFontSize: num(r, 'textFontSize'),
+    textLineHeight: num(r, 'textLineHeight'),
+    textTracking: num(r, 'textTracking'),
+    textBold: boolOf(r, 'textBold'),
+    textItalic: boolOf(r, 'textItalic'),
+    textColor: str(r, 'textColor'),
+    textAlign: num(r, 'textAlign'),
+    textWrapWidth: num(r, 'textWrapWidth'),
+    textX: num(r, 'textX'),
+    textY: num(r, 'textY'),
+    textW: num(r, 'textW'),
+    textH: num(r, 'textH'),
     thumbToken: num(r, 'thumbToken'),
   };
 }
@@ -270,6 +298,7 @@ export class CompositorEngine {
       width: num(r.data, 'width'),
       height: num(r.data, 'height'),
       layers: num(r.data, 'layers'),
+      notes: strArr(r.data, 'notes'),
     };
   }
 
@@ -385,6 +414,98 @@ export class CompositorEngine {
   }
 
   // M6a：添加 Levels 调整层，返回新图层 id（0 = 失败）
+  // ---------- M12 文字层 ----------
+
+  createTextLayer(x: number, y: number, wrapW: number): number {
+    const r = narrowResult(native.createTextLayer(x, y, wrapW) as Object);
+    if (!r.ok || r.data === null) {
+      hilog.error(DOMAIN, TAG, 'createTextLayer failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return 0;
+    }
+    return num(r.data, 'id');
+  }
+
+  setTextLayerContent(id: number, content: string, txn: boolean): boolean {
+    const r = narrowResult(native.setTextLayerContent(id, content, txn ? 1 : 0) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setTextLayerContent failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  setTextLayerStyle(id: number, family: string, fontSize: number, lineHeight: number,
+    tracking: number, bold: boolean, italic: boolean, colorR: number, colorG: number,
+    colorB: number, align: number, wrapWidth: number, txn: boolean): boolean {
+    const r = narrowResult(native.setTextLayerStyle(id, family, fontSize, lineHeight, tracking,
+      bold, italic, colorR, colorG, colorB, align, wrapWidth, txn ? 1 : 0) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setTextLayerStyle failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  rasterizeTextLayer(id: number): boolean {
+    const r = narrowResult(native.rasterizeTextLayer(id) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'rasterizeTextLayer failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  beginTextSession(id: number): boolean {
+    const r = narrowResult(native.beginTextSession(id) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'beginTextSession failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  endTextSession(): void {
+    const r = narrowResult(native.endTextSession() as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'endTextSession failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+  }
+
+  listSystemFonts(): string[] {
+    try {
+      const v: Object = native.listSystemFonts() as Object;
+      const out: string[] = [];
+      if (Array.isArray(v)) {
+        for (const item of v as Object[]) {
+          if (typeof item === 'string') {
+            out.push(item);
+          }
+        }
+      }
+      return out;
+    } catch (e) {
+      hilog.error(DOMAIN, TAG, 'listSystemFonts failed: %{public}s',
+        e instanceof Error ? e.message : String(e));
+      return [];
+    }
+  }
+
+  registerFontFile(alias: string, path: string): boolean {
+    const r = narrowResult(native.registerFontFile(alias, path) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'registerFontFile failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
   addAdjustmentLayer(kind?: number): number {
     const r = narrowResult(kind === undefined
       ? (native.addAdjustmentLayer() as Object)

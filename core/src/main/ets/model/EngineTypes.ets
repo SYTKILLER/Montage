@@ -69,6 +69,22 @@ export interface LayerDTO {
   adjP3: number;
   curveX: number[];  // Curves 控制点（0..1）
   curveY: number[];
+  // M12 文本层字段（非文本层为常量缺省）
+  isText: boolean;
+  textContent: string;
+  textFontFamily: string;
+  textFontSize: number;
+  textLineHeight: number;
+  textTracking: number;
+  textBold: boolean;
+  textItalic: boolean;
+  textColor: string;   // #RRGGBB
+  textAlign: number;   // 0=左 1=中 2=右
+  textWrapWidth: number;
+  textX: number;       // 文本框左上角（文档域）
+  textY: number;
+  textW: number;       // 最近栅格化像素尺寸（空内容 = 0）
+  textH: number;
   thumbToken: number;
 }
 
@@ -85,11 +101,12 @@ export interface SaveProjectData {
   bytes: number;
 }
 
-/** 工程打开结果（openProject 的 data，M4c）。 */
+/** 工程打开结果（openProject 的 data，M4c；M12 加 notes 文本层降级提示）。 */
 export interface OpenProjectData {
   width: number;
   height: number;
   layers: number;
+  notes: string[];
 }
 
 /** 缩略图结果（getLayerThumbnail 的 data；O3 跨桥实测）。 */

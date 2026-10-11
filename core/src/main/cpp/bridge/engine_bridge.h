@@ -142,6 +142,16 @@ napi_value BeginTransformOverlay(napi_env env, napi_callback_info info);
 napi_value SetTransformPreview(napi_env env, napi_callback_info info);
 napi_value BakeLayerMatrix(napi_env env, napi_callback_info info);
 napi_value CancelTransformOverlay(napi_env env, napi_callback_info info);
+// M12 文字层：创建（x,y,wrapW；wrapW>0 = 段落）/ 内容 / 样式全量 / 栅格化转普通层 /
+// 编辑会话（begin 持 history pending 槽，整会话一步撤销）/ 系统字体列表 / 注册用户字体
+napi_value CreateTextLayer(napi_env env, napi_callback_info info);
+napi_value SetTextLayerContent(napi_env env, napi_callback_info info);
+napi_value SetTextLayerStyle(napi_env env, napi_callback_info info);
+napi_value RasterizeTextLayer(napi_env env, napi_callback_info info);
+napi_value BeginTextSession(napi_env env, napi_callback_info info);
+napi_value EndTextSession(napi_env env, napi_callback_info info);
+napi_value ListSystemFonts(napi_env env, napi_callback_info info);
+napi_value RegisterFontFile(napi_env env, napi_callback_info info);
 // 页面销毁时释放回调与渲染线程
 napi_value Dispose(napi_env env, napi_callback_info info);
 

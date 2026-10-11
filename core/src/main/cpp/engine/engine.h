@@ -92,6 +92,12 @@ class Engine {
     // 不随 History 快照走（撤销不恢复"重新选择"来源）。
     std::shared_ptr<const TileGrid> lastSelection;
 
+    // M12 文本编辑会话（PS 语义：整个编辑会话 = 一步撤销）：begin 端 history.beginEdit，
+    // 内容/样式变更走无事务 relayout，end 端 endEdit（before==after 自动丢弃）。
+    // History 单 pending 槽——会话打开期间禁止其他事务命令（UI 纪律：runCommand 先退编辑）。
+    bool textEditOpen = false;
+    LayerId textEditLayerId = 0;
+
     // M10c 内部剪贴板（引擎内存；不随快照/持久化走，关闭文档保留——PS 同语义）
     ClipBuffer clipboard;
 

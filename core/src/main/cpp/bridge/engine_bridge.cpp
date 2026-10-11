@@ -15,6 +15,8 @@
 #include "engine/engine.h"
 #include "engine/gradient_ops.h"
 #include "engine/shape_ops.h"
+#include "engine/text_ops.h"
+#include "engine/text_raster.h"
 #include "engine/transform_ops.h"
 #include "engine/resample.h"
 #include "tiles/magic_wand.h"
@@ -503,6 +505,26 @@ void openProjectDoneJsCallback(napi_env env, napi_value /*jsCb*/, void* context,
         napi_set_named_property(env, d, "width", makeUint32(env, p->width));
         napi_set_named_property(env, d, "height", makeUint32(env, p->height));
         napi_set_named_property(env, d, "layers", makeUint32(env, static_cast<uint32_t>(p->layers)));
+        // M12 C-3：文本层字体缺失检测（回退默认字体显示旧栅格 + 提示；不崩溃不空层）
+        napi_value notes = nullptr;
+        napi_create_array(env, &notes);
+        uint32_t nn = 0;
+        {
+            auto& e = Engine::get();
+            std::lock_guard<std::mutex> lk(e.docMutex);
+            for (const Layer& l : e.doc.layers) {
+                if (l.text == nullptr || l.text->fontFamily.empty() ||
+                    fontFamilyAvailable(l.text->fontFamily)) {
+                    continue;
+                }
+                std::string note = "文本层「" + l.name + "」字体缺失：" + l.text->fontFamily +
+                                   "，已回退默认字体显示（编辑时生效）";
+                napi_value s = nullptr;
+                napi_create_string_utf8(env, note.c_str(), NAPI_AUTO_LENGTH, &s);
+                napi_set_element(env, notes, nn++, s);
+            }
+        }
+        napi_set_named_property(env, d, "notes", notes);
         result = makeOk(env, d);
     } else {
         result = makeError(env, kErrInternal, p != nullptr ? std::string(p->error) : "open project failed");
@@ -789,6 +811,31 @@ napi_value makeLayerDto(napi_env env, const Layer& l, bool isActive) {
         napi_set_named_property(env, obj, "adjP2", makeDouble(env, l.adjustment->p2));
         napi_set_named_property(env, obj, "adjP3", makeDouble(env, l.adjustment->p3));
     }
+    // M12 文本层字段（非文本层给常量缺省，DTO 形状稳定）
+    napi_set_named_property(env, obj, "isText", makeBool(env, l.text != nullptr));
+    napi_set_named_property(env, obj, "textContent", makeString(env, l.text ? l.text->content : ""));
+    napi_set_named_property(env, obj, "textFontFamily",
+                            makeString(env, l.text ? l.text->fontFamily : ""));
+    napi_set_named_property(env, obj, "textFontSize", makeDouble(env, l.text ? l.text->fontSize : 0));
+    napi_set_named_property(env, obj, "textLineHeight",
+                            makeDouble(env, l.text ? l.text->lineHeight : 0));
+    napi_set_named_property(env, obj, "textTracking", makeDouble(env, l.text ? l.text->tracking : 0));
+    napi_set_named_property(env, obj, "textBold", makeBool(env, l.text && l.text->bold));
+    napi_set_named_property(env, obj, "textItalic", makeBool(env, l.text && l.text->italic));
+    char textHex[8] = "#000000";
+    if (l.text != nullptr) {
+        std::snprintf(textHex, sizeof(textHex), "#%02X%02X%02X",
+                      static_cast<int>(std::lround(std::min(1.0f, std::max(0.0f, l.text->color[0])) * 255.0f)),
+                      static_cast<int>(std::lround(std::min(1.0f, std::max(0.0f, l.text->color[1])) * 255.0f)),
+                      static_cast<int>(std::lround(std::min(1.0f, std::max(0.0f, l.text->color[2])) * 255.0f)));
+    }
+    napi_set_named_property(env, obj, "textColor", makeString(env, textHex));
+    napi_set_named_property(env, obj, "textAlign", makeInt32(env, l.text ? l.text->align : 0));
+    napi_set_named_property(env, obj, "textWrapWidth", makeDouble(env, l.text ? l.text->wrapWidth : 0));
+    napi_set_named_property(env, obj, "textX", makeDouble(env, l.text ? l.transform.originX : 0));
+    napi_set_named_property(env, obj, "textY", makeDouble(env, l.text ? l.transform.originY : 0));
+    napi_set_named_property(env, obj, "textW", makeDouble(env, l.text ? l.text->rasterW : 0));
+    napi_set_named_property(env, obj, "textH", makeDouble(env, l.text ? l.text->rasterH : 0));
     napi_set_named_property(env, obj, "thumbToken",
                             makeDouble(env, static_cast<double>(l.pixels != nullptr ? l.pixels->revision : 0)));
     return obj;
@@ -2494,6 +2541,19 @@ napi_value BeginStroke(napi_env env, napi_callback_info info) {
         if (e.doc.activeId == 0) {
             return makeError(env, kErrNoDoc, "beginStroke: no active layer");
         }
+        // M12（PS 语义）：在文本层上作画自动栅格化（一步事务），此后按普通层走
+        {
+            Layer* al = findLayerLocked(e.doc, e.doc.activeId);
+            if (al != nullptr && al->text != nullptr) {
+                e.history.beginEdit(e.doc, "rasterize text (paint)",
+                                    static_cast<uint64_t>(e.docRevision));
+                rasterizeTextLayerToPixels(*al);
+                e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+                e.bumpRevisionLocked();
+                OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Text",
+                             "text layer auto rasterized (paint)");
+            }
+        }
         OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Brush",
                      "begin stroke at (%{public}f, %{public}f) layer=%{public}llu d=%{public}f erasing=%{public}d",
                      x, y, static_cast<unsigned long long>(e.doc.activeId),
@@ -3779,6 +3839,323 @@ napi_value FlattenToPixelMap(napi_env env, napi_callback_info /*info*/) {
     }
     napi_queue_async_work(env, ctx->work);
     return promise;
+}
+
+// ---------- M12 文字层 ----------
+
+namespace {
+bool getDoubleArg(napi_env env, napi_value v, double* out) {
+    return napi_get_value_double(env, v, out) == napi_ok;
+}
+}  // namespace
+
+// M12：创建文本层（x, y, wrapW；wrapW>0 = 段落文字换行宽）。颜色取前景色（PS 语义），
+// 内容空（无像素），插入活动层之上并激活；本身是一步撤销（"新增文本层"）。
+napi_value CreateTextLayer(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "createTextLayer(x, y, wrapW?) requires 2+ args");
+    }
+    double x = 0, y = 0, wrapW = 0;
+    if (!getDoubleArg(env, argv[0], &x) || !getDoubleArg(env, argv[1], &y) ||
+        (argc >= 3 && !getDoubleArg(env, argv[2], &wrapW))) {
+        return makeError(env, kErrBadParam, "createTextLayer: invalid args");
+    }
+    auto& e = Engine::get();
+    double newId = 0;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "createTextLayer: no document");
+        }
+        if (e.textEditOpen) {
+            return makeError(env, kErrBadParam, "createTextLayer: text edit session open");
+        }
+        e.history.beginEdit(e.doc, "add text", static_cast<uint64_t>(e.docRevision));
+        Layer layer;
+        layer.id = e.nextLayerId();
+        layer.name = "文本";
+        auto t = std::make_shared<TextLayerState>();
+        t->color[0] = e.fgColor[0];
+        t->color[1] = e.fgColor[1];
+        t->color[2] = e.fgColor[2];
+        t->wrapWidth = wrapW > 0.0 ? wrapW : 0.0;
+        layer.text = std::move(t);
+        layer.transform.originX = x;
+        layer.transform.originY = y;
+        size_t at = e.doc.layers.size();
+        for (size_t i = 0; i < e.doc.layers.size(); ++i) {
+            if (e.doc.layers[i].id == e.doc.activeId) {
+                at = i + 1;
+                break;
+            }
+        }
+        e.doc.layers.insert(e.doc.layers.begin() + static_cast<long>(at), std::move(layer));
+        e.doc.activeId = e.doc.layers[at].id;
+        newId = static_cast<double>(e.doc.layers[at].id);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "id", makeDouble(env, newId));
+    return makeOk(env, data);
+}
+
+// M12：设置文本内容（id, content, txn）。txn=1 独立撤销事务；txn=0 编辑会话内调用
+//（begin/endTextSession 包裹，整会话一步撤销）。层名跟随内容（PS 语义）。
+napi_value SetTextLayerContent(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam,
+                         "setTextLayerContent(id, content, txn?) requires 2+ args");
+    }
+    double id = 0;
+    size_t len = 0;
+    int32_t txn = 1;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok ||
+        napi_get_value_string_utf8(env, argv[1], nullptr, 0, &len) != napi_ok ||
+        (argc >= 3 && napi_get_value_int32(env, argv[2], &txn) != napi_ok)) {
+        return makeError(env, kErrBadParam, "setTextLayerContent: invalid args");
+    }
+    std::string content(len, '\0');
+    if (len > 0 &&
+        napi_get_value_string_utf8(env, argv[1], &content[0], len + 1, &len) != napi_ok) {
+        return makeError(env, kErrBadParam, "setTextLayerContent: read string failed");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        if (l == nullptr || l->text == nullptr) {
+            return makeError(env, kErrBadParam, "setTextLayerContent: text layer not found");
+        }
+        if (l->text->content == content) {
+            return makeOk(env, nullptr);  // 无变化（debounce 抖动）
+        }
+        if (txn != 0) {
+            e.history.beginEdit(e.doc, "text edit", static_cast<uint64_t>(e.docRevision));
+        }
+        auto nt = std::make_shared<TextLayerState>(*l->text);  // COW
+        nt->content = content;
+        l->text = std::move(nt);
+        std::string err;
+        relayoutTextLayer(*l, err);
+        l->name = textLayerDisplayName(*l->text);
+        if (txn != 0) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        }
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// M12：设置文本样式全量（id, fontFamily, fontSize, lineHeight, tracking, bold, italic,
+// r, g, b, align, wrapWidth, txn）。字符/段落面板变更入口；txn 语义同 setContent。
+napi_value SetTextLayerStyle(napi_env env, napi_callback_info info) {
+    size_t argc = 13;
+    napi_value argv[13];
+    for (size_t i = 0; i < 13; ++i) {
+        argv[i] = nullptr;
+    }
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 12) {
+        return makeError(env, kErrBadParam,
+                         "setTextLayerStyle(id, family, size, lh, tr, bold, italic, r, g, b, "
+                         "align, wrapW, txn?) requires 12+ args");
+    }
+    double id = 0, fontSize = 0, lineHeight = 0, tracking = 0;
+    double r = 0, g = 0, b = 0, align = 0, wrapW = 0;
+    size_t famLen = 0;
+    bool bold = false, italic = false;
+    int32_t txn = 1;
+    bool ok = getDoubleArg(env, argv[0], &id) &&
+              (napi_get_value_string_utf8(env, argv[1], nullptr, 0, &famLen) == napi_ok) &&
+              getDoubleArg(env, argv[2], &fontSize) && getDoubleArg(env, argv[3], &lineHeight) &&
+              getDoubleArg(env, argv[4], &tracking) &&
+              napi_get_value_bool(env, argv[5], &bold) == napi_ok &&
+              napi_get_value_bool(env, argv[6], &italic) == napi_ok &&
+              getDoubleArg(env, argv[7], &r) && getDoubleArg(env, argv[8], &g) &&
+              getDoubleArg(env, argv[9], &b) && getDoubleArg(env, argv[10], &align) &&
+              getDoubleArg(env, argv[11], &wrapW);
+    if (argc >= 13) {
+        ok = ok && napi_get_value_int32(env, argv[12], &txn) == napi_ok;
+    }
+    if (!ok) {
+        return makeError(env, kErrBadParam, "setTextLayerStyle: invalid args");
+    }
+    std::string family(famLen, '\0');
+    if (famLen > 0 &&
+        napi_get_value_string_utf8(env, argv[1], &family[0], famLen + 1, &famLen) != napi_ok) {
+        return makeError(env, kErrBadParam, "setTextLayerStyle: read family failed");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        if (l == nullptr || l->text == nullptr) {
+            return makeError(env, kErrBadParam, "setTextLayerStyle: text layer not found");
+        }
+        if (txn != 0) {
+            e.history.beginEdit(e.doc, "text style", static_cast<uint64_t>(e.docRevision));
+        }
+        auto nt = std::make_shared<TextLayerState>(*l->text);  // COW
+        nt->fontFamily = family;
+        nt->fontSize = std::min(800.0, std::max(4.0, fontSize));
+        nt->lineHeight = std::min(4.0, std::max(0.5, lineHeight));
+        nt->tracking = std::min(500.0, std::max(-500.0, tracking));
+        nt->bold = bold;
+        nt->italic = italic;
+        nt->color[0] = static_cast<float>(std::min(1.0, std::max(0.0, r)));
+        nt->color[1] = static_cast<float>(std::min(1.0, std::max(0.0, g)));
+        nt->color[2] = static_cast<float>(std::min(1.0, std::max(0.0, b)));
+        nt->align = static_cast<int32_t>(std::min(2.0, std::max(0.0, align)));
+        nt->wrapWidth = wrapW > 0.0 ? wrapW : 0.0;
+        l->text = std::move(nt);
+        std::string err;
+        relayoutTextLayer(*l, err);
+        if (txn != 0) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        }
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// M12：栅格化文本层 → 普通像素层（一步撤销；此后不可再编辑）
+napi_value RasterizeTextLayer(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double id = 0;
+    if (argc < 1 || napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "rasterizeTextLayer(id) requires 1 arg");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        if (l == nullptr || l->text == nullptr) {
+            return makeError(env, kErrBadParam, "rasterizeTextLayer: text layer not found");
+        }
+        if (e.textEditOpen && e.textEditLayerId == l->id) {
+            return makeError(env, kErrBadParam, "rasterizeTextLayer: edit session open");
+        }
+        e.history.beginEdit(e.doc, "rasterize text", static_cast<uint64_t>(e.docRevision));
+        rasterizeTextLayerToPixels(*l);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// M12：编辑会话（PS 语义：整个编辑会话 = 一步撤销）。begin 持 history pending 槽，
+// 期间内容/样式走 txn=0；end 提交（before==after 自动丢弃）。
+napi_value BeginTextSession(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double id = 0;
+    if (argc < 1 || napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "beginTextSession(id) requires 1 arg");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        if (l == nullptr || l->text == nullptr) {
+            return makeError(env, kErrBadParam, "beginTextSession: text layer not found");
+        }
+        if (e.textEditOpen) {
+            return makeError(env, kErrBadParam, "beginTextSession: already open");
+        }
+        e.textEditOpen = true;
+        e.textEditLayerId = l->id;
+        e.history.beginEdit(e.doc, "text edit", static_cast<uint64_t>(e.docRevision));
+        e.requestRender();  // 编辑层从 GL 隐藏（渲染快照按 textEditOpen 跳过）
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value EndTextSession(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.textEditOpen) {
+            e.textEditOpen = false;
+            e.textEditLayerId = 0;
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.historyVersion.fetch_add(1);
+            e.requestRender();  // 编辑层回 GL 显示
+        }
+    }
+    return makeOk(env, nullptr);
+}
+
+// M12：系统字体族名列表（去重排序；FontParser 系统字体列表，与排版解析同源）
+napi_value ListSystemFonts(napi_env env, napi_callback_info /*info*/) {
+    std::vector<std::string> fonts;
+    std::string err;
+    if (!systemFontFamilies(fonts, err)) {
+        return makeError(env, kErrInternal, "listSystemFonts: " + err);
+    }
+    napi_value arr = nullptr;
+    napi_create_array_with_length(env, fonts.size(), &arr);
+    for (size_t i = 0; i < fonts.size(); ++i) {
+        napi_value s = nullptr;
+        napi_create_string_utf8(env, fonts[i].c_str(), NAPI_AUTO_LENGTH, &s);
+        napi_set_element(env, arr, static_cast<uint32_t>(i), s);
+    }
+    return arr;
+}
+
+// M12：注册用户字体文件（alias = 工程内引用族名，path = 沙箱 ttf/otf 路径）。
+// 注册成功后全文档文本层重栅格（缺字体层即时恢复正确字形）。
+napi_value RegisterFontFile(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    size_t aliasLen = 0, pathLen = 0;
+    if (argc < 2 ||
+        napi_get_value_string_utf8(env, argv[0], nullptr, 0, &aliasLen) != napi_ok ||
+        napi_get_value_string_utf8(env, argv[1], nullptr, 0, &pathLen) != napi_ok) {
+        return makeError(env, kErrBadParam, "registerFontFile(alias, path) requires 2 args");
+    }
+    std::string alias(aliasLen, '\0');
+    std::string path(pathLen, '\0');
+    if ((aliasLen > 0 &&
+         napi_get_value_string_utf8(env, argv[0], &alias[0], aliasLen + 1, &aliasLen) != napi_ok) ||
+        (pathLen > 0 &&
+         napi_get_value_string_utf8(env, argv[1], &path[0], pathLen + 1, &pathLen) != napi_ok)) {
+        return makeError(env, kErrBadParam, "registerFontFile: read string failed");
+    }
+    std::string err;
+    if (!registerUserFont(alias, path, err)) {
+        return makeError(env, kErrInternal, "registerFontFile: " + err);
+    }
+    auto& e = Engine::get();
+    int n = 0;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        std::string relayoutErr;
+        n = relayoutDocumentText(e.doc, relayoutErr);
+        if (n > 0) {
+            e.bumpRevisionLocked();
+            e.requestRender();
+        }
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "relayouted", makeInt32(env, n));
+    return makeOk(env, data);
 }
 
 }  // namespace bridge

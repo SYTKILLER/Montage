@@ -15,6 +15,7 @@ import { ExportDialog } from '../editor/components/ExportDialog';
 import { TransformOverlay } from '../editor/components/TransformOverlay';
 import { AdjustPanel } from '../editor/components/AdjustPanel';
 import { ChannelsPanel } from '../editor/components/ChannelsPanel';
+import { TextPanel } from '../editor/components/TextPanel';
 import { ABOUT_TEXT, InfoDialog, SHORTCUT_ROWS } from '../editor/components/InfoDialog';
 
 const TAG: string = 'Montage.Shell';
@@ -123,6 +124,25 @@ struct Index {
   // M11e 效果工具（R 组：blur/sharpen/smudge；O 组：dodge/burn/sponge）
   @State effectTool: string = 'blur';
   @State historyBrushSteps: number = 1;  // M11f 历史画笔源步数（1=最近一次编辑前）
+  // M12 文字工具：拖框预览（视口 [x,y,w,h]）+ 编辑会话 + 字符/段落面板镜像
+  @State textDrag: number[] | null = null;   // 非空 = 拖框中
+  @State editingTextId: number = 0;          // 非 0 = overlay 编辑会话中（RichEditor 挂载）
+  @State panelFontList: string[] = [];       // 系统字体列表（懒加载一次）
+  @State userFonts: string[] = [];           // M12e 已导入用户字体（会话级；重启需重注册）
+  @State panelFontSel: number = -1;
+  @State textFontSize: number = 40;
+  @State textLineHeightPct: number = 120;    // %（引擎值 = /100）
+  @State textTracking: number = 0;           // 千分比（PS 语义）
+  @State textBold: boolean = false;
+  @State textItalic: boolean = false;
+  @State textColor: string = '#000000';
+  @State textAlignIdx: number = 0;
+  @State textPanelContent: string = '';      // 面板内容框镜像（blur 提交）
+  private textDragging: boolean = false;
+  private textStartDocX: number = 0;
+  private textStartDocY: number = 0;
+  private textEditTimer: number = -1;        // overlay 输入 debounce
+  private richController: RichEditorController = new RichEditorController();
 
   private effectModeOf(id: string): number {
     if (id === 'blur') {
@@ -280,6 +300,11 @@ struct Index {
     } else {
       this.blendSel = 0;
       this.layerOpacity = 100;
+    }
+    // M12：文本面板内容镜像跟随活动层（撤销/重做后回退，防旧内容残留）
+    if (this.editingTextId === 0) {
+      const at = this.layers.find((l: LayerDTO): boolean => l.isActive);
+      this.textPanelContent = (at !== undefined && at.isText) ? at.textContent : '';
     }
     this.refreshThumbs();
   }
@@ -494,6 +519,9 @@ struct Index {
         break;
       case 'shape':
         this.shapeTouch(e, docX, docY);
+        break;
+      case 'text':
+        this.textTouch(e, docX, docY);
         break;
       case 'stamp':
         if (e.type === TouchType.Down && (this.altHeld || this.clonePicking)) {
@@ -781,6 +809,234 @@ struct Index {
     }
   }
 
+  // ---------- M12 文字工具 ----------
+
+  // 点击 = 点文字（点击处建层进编辑）；拖框 = 段落文字（拖宽 = 换行宽）
+  private textTouch(e: TouchEvent, docX: number, docY: number): void {
+    const k = this.pxPerVp();
+    if (e.type === TouchType.Down) {
+      this.textDragging = true;
+      this.textStartDocX = docX;
+      this.textStartDocY = docY;
+      this.textDrag = [(docX - this.panX) * this.zoom / k, (docY - this.panY) * this.zoom / k, 0, 0];
+    } else if (e.type === TouchType.Move && this.textDragging) {
+      const x0 = (this.textStartDocX - this.panX) * this.zoom / k;
+      const y0 = (this.textStartDocY - this.panY) * this.zoom / k;
+      const x1 = (docX - this.panX) * this.zoom / k;
+      const y1 = (docY - this.panY) * this.zoom / k;
+      this.textDrag = [Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0)];
+    } else if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.textDragging) {
+      this.textDragging = false;
+      this.textDrag = null;
+      const wDoc = Math.abs(docX - this.textStartDocX);
+      const hDoc = Math.abs(docY - this.textStartDocY);
+      const dragVp = Math.hypot(wDoc, hDoc) * this.zoom / k;
+      if (dragVp < 8) {
+        this.enterTextEditingAt(this.textStartDocX, this.textStartDocY, 0);
+      } else {
+        this.enterTextEditingAt(Math.min(this.textStartDocX, docX),
+          Math.min(this.textStartDocY, docY), wDoc);
+      }
+    }
+  }
+
+  private enterTextEditingAt(docX: number, docY: number, wrapW: number): void {
+    if (!this.docOpen) {
+      return;
+    }
+    if (this.editingTextId !== 0) {
+      this.commitTextEditing();  // 已在编辑：先提交旧层
+    }
+    const id = this.engine.createTextLayer(docX, docY, wrapW);
+    if (id === 0) {
+      this.toast('创建文本层失败');
+      return;
+    }
+    this.refreshLayers();
+    this.log(`文本层已建 #${id} (${docX.toFixed(0)},${docY.toFixed(0)}) wrap=${wrapW.toFixed(0)}`);
+    this.beginTextEditing(id);
+  }
+
+  // 进入文本编辑会话（引擎 begin 持 history pending 槽；GL 隐藏该层，overlay 接管视觉）
+  private beginTextEditing(id: number): void {
+    const a = this.layers.find((l: LayerDTO): boolean => l.id === id);
+    if (a === undefined || !a.isText) {
+      return;
+    }
+    if (!this.engine.beginTextSession(id)) {
+      this.toast('进入文本编辑失败');
+      return;
+    }
+    this.ensureFontList();
+    this.syncTextPanel(a);
+    this.textPanelContent = a.textContent;
+    this.editingTextId = id;
+    this.log(`文本编辑开始 #${id}`);
+  }
+
+  // 提交编辑会话（endEdit：before==after 自动丢弃）
+  private commitTextEditing(): void {
+    if (this.editingTextId === 0) {
+      return;
+    }
+    if (this.textEditTimer >= 0) {
+      clearTimeout(this.textEditTimer);
+      this.textEditTimer = -1;
+    }
+    this.editingTextId = 0;
+    this.engine.endTextSession();
+    this.refreshLayers();
+    this.log('文本编辑提交');
+  }
+
+  // 面板镜像 ← 活动文本层 DTO
+  private syncTextPanel(a: LayerDTO): void {
+    if (!a.isText) {
+      return;
+    }
+    this.panelFontSel = a.textFontFamily === ''
+      ? -1 : this.fontOptions().indexOf(a.textFontFamily);
+    this.textFontSize = Math.round(a.textFontSize > 0 ? a.textFontSize : 40);
+    this.textLineHeightPct = Math.round((a.textLineHeight > 0 ? a.textLineHeight : 1.2) * 100);
+    this.textTracking = Math.round(a.textTracking);
+    this.textBold = a.textBold;
+    this.textItalic = a.textItalic;
+    this.textColor = a.textColor;
+    this.textAlignIdx = a.textAlign;
+  }
+
+  // 面板/样式改动 → 引擎（编辑会话中 txn=0，否则独立事务）
+  private pushTextStyle(txnOverride?: boolean): void {
+    const a = this.activeLayer();
+    if (a === undefined || !a.isText) {
+      return;
+    }
+    const txn = txnOverride !== undefined ? txnOverride : this.editingTextId === 0;
+    const rgb = this.hexToRgb(this.textColor);
+    const ok = this.engine.setTextLayerStyle(a.id, this.panelFontSel >= 0
+      ? this.fontOptions()[this.panelFontSel] : '', this.textFontSize,
+      this.textLineHeightPct / 100, this.textTracking, this.textBold, this.textItalic,
+      rgb[0], rgb[1], rgb[2], this.textAlignIdx,
+      a.textWrapWidth, txn);
+    this.log(`文本样式: ${ok ? '已应用' : '失败'} (size=${this.textFontSize} lh=${this.textLineHeightPct}%)`);
+  }
+
+  // 面板内容提交（编辑会话中 = 会话内改动 txn=0；否则独立事务 txn=1）
+  private pushTextContent(text: string): void {
+    const a = this.activeLayer();
+    if (a === undefined || !a.isText) {
+      return;
+    }
+    const txn = this.editingTextId !== a.id;
+    this.engine.setTextLayerContent(a.id, text, txn);
+    this.log(`文本内容提交: ${text.length} 字符 (txn=${txn ? 1 : 0})`);
+  }
+
+  // 字体列表懒加载（面板首次可见时拉一次）
+  private ensureFontList(): void {
+    if (this.panelFontList.length > 0) {
+      return;
+    }
+    this.panelFontList = this.engine.listSystemFonts();
+    this.log(`系统字体: ${this.panelFontList.length} 族`);
+  }
+
+  // M12e：字体下拉选项 = 系统 + 已导入用户字体
+  private fontOptions(): string[] {
+    return this.panelFontList.concat(this.userFonts);
+  }
+
+  // M12e：导入用户字体（picker 选 ttf/otf → 拷沙箱 fonts/ → 注册 FontCollection）
+  private doImportFont(): void {
+    const opt = new picker.DocumentSelectOptions();
+    opt.maxSelectNumber = 1;
+    opt.defaultFilePathUri = 'file://docs/storage/Users/currentUser/Download';
+    const dp = new picker.DocumentViewPicker();
+    dp.select(opt).then((uris: string[]): void => {
+      if (uris.length < 1) {
+        return;
+      }
+      const uri = uris[0];
+      const lower = uri.toLowerCase();
+      if (!lower.endsWith('.ttf') && !lower.endsWith('.otf') && !lower.endsWith('.ttc')) {
+        this.toast('请选择 .ttf / .otf / .ttc 字体文件');
+        return;
+      }
+      const seg = decodeURIComponent(uri.split('/').pop() ?? 'font.ttf');
+      const alias = seg.replace(/\.(ttf|otf|ttc)$/i, '');
+      const fontsDir = getContext(this).cacheDir + '/fonts';
+      if (!fs.accessSync(fontsDir)) {
+        fs.mkdirSync(fontsDir, true);
+      }
+      const dest = `${fontsDir}/${seg}`;
+      fs.copyFile(uri, dest).then((): void => {
+        if (this.engine.registerFontFile(alias, dest)) {
+          if (!this.userFonts.includes(alias)) {
+            this.userFonts = this.userFonts.concat([alias]);
+          }
+          this.toast(`字体已导入：${alias}`);
+          this.log(`用户字体注册: ${alias} <- ${dest}`);
+        } else {
+          this.toast('字体注册失败');
+        }
+      }).catch((e: BusinessError): void => {
+        this.log(`字体拷贝失败: ${e.message}`);
+        this.toast('字体文件拷贝失败');
+      });
+    }).catch((e: BusinessError): void => {
+      this.log(`字体 picker 失败: ${e.message}`);
+    });
+  }
+
+  // overlay RichEditor → 纯文本（span 值拼接；图片 span 无 value 字段自然跳过）
+  private collectOverlayText(): string {
+    let out = '';
+    for (const sp of this.richController.getSpans()) {
+      const ts = sp as RichEditorTextSpanResult;
+      if (typeof ts.value === 'string') {
+        out += ts.value;
+      }
+    }
+    return out;
+  }
+
+  // 编辑 overlay 视口框 [x,y,w,h]（vp）；非编辑态返回空数组
+  private editingBoxVp(): number[] {
+    if (this.editingTextId === 0) {
+      return [];
+    }
+    const a = this.layers.find((l: LayerDTO): boolean => l.id === this.editingTextId);
+    if (a === undefined || !a.isText) {
+      return [];
+    }
+    const k = this.pxPerVp();
+    const x = (a.textX - this.panX) * this.zoom / k;
+    const y = (a.textY - this.panY) * this.zoom / k;
+    const wDoc = a.textWrapWidth > 0 ? a.textWrapWidth : Math.max(a.textW, 320);
+    return [x, y, Math.max(140, wDoc * this.zoom / k), Math.max(48, (a.textH + 24) * this.zoom / k)];
+  }
+
+  // overlay 输入 → debounce 250ms → 引擎（会话内无事务，end 统一一步撤销）
+  private onOverlayChanged(): void {
+    if (this.editingTextId === 0) {
+      return;
+    }
+    if (this.textEditTimer >= 0) {
+      clearTimeout(this.textEditTimer);
+    }
+    const id = this.editingTextId;
+    this.textEditTimer = setTimeout((): void => {
+      this.textEditTimer = -1;
+      if (this.editingTextId !== id) {
+        return;
+      }
+      const text = this.collectOverlayText();
+      if (this.engine.setTextLayerContent(id, text, false)) {
+        this.textPanelContent = text;
+      }
+    }, 250);
+  }
+
   private shapeKindLabel(): string {
     const labels: string[] = ['矩形', '圆角矩形', '椭圆', '直线'];
     return labels[this.shapeKind] ?? '形状';
@@ -929,6 +1185,9 @@ struct Index {
   }
 
   private doCloseDocument(): void {
+    if (this.editingTextId !== 0) {
+      this.editingTextId = 0;  // 引擎 resetDocument 已清会话，UI 镜像同步
+    }
     const ok = this.engine.closeDocument();
     this.docOpen = false;
     this.saveUri = '';
@@ -997,6 +1256,13 @@ struct Index {
       const seg = uri.split('/');
       this.recents = this.prefs.addRecent(decodeURIComponent(seg[seg.length - 1]), uri);
       this.log(`工程已打开 ${d.width}x${d.height}，${d.layers} 层`);
+      // M12 C-3：文本层缺字体降级提示（引擎已回退默认字体显示旧栅格）
+      if (d.notes.length > 0) {
+        for (const n of d.notes) {
+          this.log(`降级提示: ${n}`);
+        }
+        this.toast(d.notes[0] + (d.notes.length > 1 ? `（等 ${d.notes.length} 条）` : ''));
+      }
     }).catch((e: BusinessError): void => {
       this.importing = false;
       this.busyText = '';
@@ -1208,10 +1474,20 @@ struct Index {
     if (this.tool === 'crop') {
       this.cropRect = null;  // 换工具即丢弃未提交裁剪框
     }
+    if (this.textDragging) {
+      this.textDragging = false;  // 换工具丢弃未完成拖框
+      this.textDrag = null;
+    }
+    if (this.editingTextId !== 0) {
+      this.commitTextEditing();  // 换工具退出文本编辑会话（PS 语义：提交）
+    }
     if (this.tool === 'polyLasso' && id !== 'polyLasso') {
       this.cancelPolygonSelection();  // 换工具丢弃未闭合多边形
     }
     this.tool = id;
+    if (id === 'text') {
+      this.ensureFontList();  // M12：字体列表懒加载（面板可见前就绪）
+    }
     if (id === 'stamp') {
       this.maskTarget = false;  // 图章与蒙版目标互斥（克隆优先走像素）
       this.engine.setBrushTarget(false);
@@ -1266,6 +1542,9 @@ struct Index {
 
   private runCommand(id: string): void {
     hilog.info(DOMAIN, TAG, 'cmd %{public}s', id);
+    if (this.editingTextId !== 0) {
+      this.commitTextEditing();  // 文本编辑会话独占 history pending 槽：任何命令先提交
+    }
     switch (id) {
       case 'file.new':
         this.doNewDocument();
@@ -1285,6 +1564,35 @@ struct Index {
       case 'file.close':
         this.doCloseDocument();
         break;
+      case 'file.saveSandbox': {
+        // 隐藏调试通道（模拟器 picker 保存缺陷的往返验证替代，M12 定案）：cacheDir/rt_check.montage
+        const path = getContext(this).cacheDir + '/rt_check.montage';
+        const f = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+        this.engine.saveProject(f.fd).then((d: SaveProjectData): void => {
+          this.log(`沙箱往返保存: ${d.layers} 层 ${d.bytes} 字节`);
+          this.toast(`沙箱保存完成（${d.layers} 层）`);
+        }).catch((e: BusinessError): void => {
+          this.log(`沙箱保存失败: ${e.message}`);
+        });
+        break;
+      }
+      case 'file.openSandbox': {
+        const p2 = getContext(this).cacheDir + '/rt_check.montage';
+        const f2 = fs.openSync(p2, fs.OpenMode.READ_ONLY);
+        this.engine.openProject(f2.fd).then((d: OpenProjectData): void => {
+          this.docW = d.width;
+          this.docH = d.height;
+          this.afterDocChanged();
+          this.log(`沙箱往返打开: ${d.width}x${d.height} ${d.layers} 层 notes=${d.notes.length}`);
+          for (const n of d.notes) {
+            this.log(`降级提示: ${n}`);
+          }
+          this.toast(`沙箱打开完成（${d.layers} 层）`);
+        }).catch((e: BusinessError): void => {
+          this.log(`沙箱打开失败: ${e.message}`);
+        });
+        break;
+      }
       case 'edit.undo':
         if (this.engine.undo()) {
           this.log('撤销');
@@ -1345,6 +1653,17 @@ struct Index {
       case 'layer.adjustAdd':
         this.engine.addAdjustmentLayer();
         break;
+      case 'layer.rasterizeText': {
+        const a = this.activeLayer();
+        if (a !== undefined && a.isText) {
+          const ok = this.engine.rasterizeTextLayer(a.id);
+          this.toast(ok ? '文字已栅格化（不可再编辑）' : '栅格化失败');
+          this.log(`栅格化文字层 #${a.id}: ${ok}`);
+        } else {
+          this.toast('活动图层不是文字层');
+        }
+        break;
+      }
       case 'select.deselect':
         this.engine.clearSelection();
         this.hasSelectionFlag = false;
@@ -1865,6 +2184,8 @@ struct Index {
       leafItem('layer.maskAdd', '添加图层蒙版（显示全部）', '', d),
       leafItem('layer.maskEnableToggle', '启用/停用蒙版', '', d && this.activeLayerHasMask()),
       leafItem('layer.adjustAdd', '新建调整图层（色阶）', '', d),
+      leafItem('layer.rasterizeText', '栅格化文字', '',
+        d && this.activeLayer()?.isText === true),
     ];
     const selReady: boolean = d && this.hasSelectionFlag;  // M10b：选区类命令使能态
     const select: MenuItemVM[] = [
@@ -1921,6 +2242,7 @@ struct Index {
       { id: 'crop', label: '裁剪', symbol: $r('sys.symbol.crop'), enabled: true },
       { id: '-', label: '', symbol: $r('sys.symbol.minus'), enabled: false },
       { id: 'eyedropper', label: '吸管', symbol: $r('sys.symbol.eyedropper'), enabled: true },
+      { id: 'text', label: '文字', symbol: $r('sys.symbol.textformat'), enabled: true },
       { id: 'brush', label: '画笔', symbol: $r('sys.symbol.paintbrush_pointed'), enabled: true },
       { id: 'pencil', label: '铅笔', symbol: $r('sys.symbol.pencil_line'), enabled: true },
       { id: 'eraser', label: '橡皮', symbol: $r('sys.symbol.eraser_line'), enabled: true },
@@ -2002,6 +2324,13 @@ struct Index {
       }
       return;
     }
+    // M12 文本编辑会话：Esc = 提交退出（PS Ctrl+Enter 语义的触屏等价）
+    if (this.editingTextId !== 0) {
+      if (e.keyCode === KC_ESC) {
+        this.commitTextEditing();
+      }
+      return;  // 编辑会话期间其余快捷键不抢（输入法优先）
+    }
     // 变换 overlay：Enter 确认 / Esc 取消
     if (this.overlayBox !== null) {
       if (e.keyCode === KC_ENTER) {
@@ -2059,10 +2388,18 @@ struct Index {
           this.runCommand('file.new');
           break;
         case KC_O:
-          this.runCommand('file.open');
+          if (this.altHeld) {
+            this.runCommand('file.openSandbox');  // 隐藏调试：打开沙箱往返包
+          } else {
+            this.runCommand('file.open');
+          }
           break;
         case KC_S:
-          this.runCommand('file.save');
+          if (this.altHeld) {
+            this.runCommand('file.saveSandbox');  // 隐藏调试：沙箱往返包（模拟器 save→open 验证通道）
+          } else {
+            this.runCommand('file.save');
+          }
           break;
         case KC_NUM0:
           this.runCommand('view.fit');
@@ -2189,6 +2526,9 @@ struct Index {
         break;
       case KC_W:
         this.pickTool('wand');
+        break;
+      case KC_T_KEY:
+        this.pickTool('text');  // M12 文字工具（PS T 语义）
         break;
       case KC_Q:
         this.runCommand('select.quickMask');  // M10d 快速蒙版 toggle（PS Q 语义）
@@ -2479,6 +2819,51 @@ struct Index {
                 .backgroundColor('#14000000')
                 .hitTestBehavior(HitTestMode.None)
             }
+            // M12 文字拖框预览：白色虚线框（拖宽 = 段落换行宽）
+            if (this.textDrag !== null) {
+              Column()
+                .position({ x: this.textDrag[0], y: this.textDrag[1] })
+                .width(this.textDrag[2])
+                .height(this.textDrag[3])
+                .border({ width: 1, color: '#FFFFFF' })
+                .backgroundColor('#14000000')
+                .hitTestBehavior(HitTestMode.None)
+            }
+            // M12 文本编辑 overlay：RichEditor 浮于文本框位置（编辑层 GL 隐藏防双影）。
+            // 字号按视口换算 px；内容变更 debounce 后走无事务 relayout（endTextSession 一步撤销）。
+            if (this.editingBoxVp().length === 4) {
+              RichEditor({ controller: this.richController })
+                .position({ x: this.editingBoxVp()[0], y: this.editingBoxVp()[1] })
+                .width(this.editingBoxVp()[2])
+                .height(this.editingBoxVp()[3])
+                .padding(0)
+                .backgroundColor('#0D000000')
+                .border({ width: 1, color: '#00E5FF' })
+                .onReady((): void => {
+                  const a = this.layers.find(
+                    (l: LayerDTO): boolean => l.id === this.editingTextId);
+                  if (a !== undefined && a.textContent.length > 0) {
+                    this.richController.addTextSpan(a.textContent, {
+                      style: {
+                        fontSize: `${Math.max(6, a.textFontSize * this.zoom / this.pxPerVp())}px`,
+                        fontColor: a.textColor
+                      }
+                    });
+                  }
+                })
+                .onDidChange((): void => {
+                  this.onOverlayChanged();
+                })
+                .onKeyEvent((ev: KeyEvent): void => {
+                  // 焦点在 overlay 时画布 onKey 收不到键（焦点链实证）：Esc/Ctrl+Enter 提交会话
+                  if (ev.type !== KeyType.Down) {
+                    return;
+                  }
+                  if (ev.keyCode === 2070 || (ev.keyCode === 2054 && this.ctrlHeld)) {
+                    this.commitTextEditing();
+                  }
+                })
+            }
             // 裁剪框（拖拽中 + 待提交常显）
             if (this.cropRect !== null) {
               Column()
@@ -2579,6 +2964,61 @@ struct Index {
                 ChannelsPanel({
                   engine: this.engine,
                   onChanged: (): void => this.refreshChannelCount(),
+                })
+              }
+              // M12 文字面板（T 工具激活或活动层为文本层时显示）
+              if (this.tool === 'text' || this.activeLayer()?.isText === true) {
+                TextPanel({
+                  fontList: this.fontOptions(),
+                  fontSel: this.panelFontSel,
+                  fontSize: this.textFontSize,
+                  lineHeightPct: this.textLineHeightPct,
+                  tracking: this.textTracking,
+                  bold: this.textBold,
+                  italic: this.textItalic,
+                  colorHex: this.textColor,
+                  alignIdx: this.textAlignIdx,
+                  wrapW: this.activeLayer()?.textWrapWidth ?? 0,
+                  content: this.textPanelContent,
+                  editing: this.editingTextId !== 0,
+                  isText: this.activeLayer()?.isText === true,
+                  onPickFont: (idx: number): void => {
+                    this.panelFontSel = idx;
+                    this.pushTextStyle();
+                  },
+                  onImportFont: (): void => this.doImportFont(),
+                  onFontSize: (v: number): void => {
+                    this.textFontSize = v;
+                    this.pushTextStyle();
+                  },
+                  onLineHeight: (v: number): void => {
+                    this.textLineHeightPct = v;
+                    this.pushTextStyle();
+                  },
+                  onTracking: (v: number): void => {
+                    this.textTracking = v;
+                    this.pushTextStyle();
+                  },
+                  onToggleBold: (): void => {
+                    this.textBold = !this.textBold;
+                    this.pushTextStyle();
+                  },
+                  onToggleItalic: (): void => {
+                    this.textItalic = !this.textItalic;
+                    this.pushTextStyle();
+                  },
+                  onPickColor: (c: string): void => {
+                    this.textColor = c;
+                    this.pushTextStyle();
+                  },
+                  onAlign: (al: number): void => {
+                    this.textAlignIdx = al;
+                    this.pushTextStyle();
+                  },
+                  onContent: (t: string): void => {
+                    this.pushTextContent(t);
+                  },
+                  onRasterize: (): void => this.runCommand('layer.rasterizeText'),
                 })
               }
               LayersPanel({

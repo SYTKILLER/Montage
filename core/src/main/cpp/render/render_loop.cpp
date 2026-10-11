@@ -1,5 +1,7 @@
 #include "render/render_loop.h"
 
+#include "engine/text_raster.h"
+
 #include <cstring>
 #include <sstream>
 #include <thread>
@@ -294,6 +296,16 @@ void RenderLoop::doFrame() {
         vp = e.viewport;
         strokeSnap = e.copyStrokeSnapshotLocked();
         transformPreview = e.transformPreview;
+        // M12：文本编辑会话中隐藏该层（RichEditor overlay 承担编辑态视觉，防 GL+overlay 双影）
+        if (e.textEditOpen && e.textEditLayerId != 0) {
+            for (Layer& l : docSnap.layers) {
+                if (l.id == e.textEditLayerId) {
+                    l.pixels = nullptr;
+                    l.render = nullptr;
+                    break;
+                }
+            }
+        }
     }
     TileRenderer::StrokeOverlay overlay;
     if (strokeSnap.active) {
@@ -305,6 +317,7 @@ void RenderLoop::doFrame() {
     }
 
     renderer_.ensureInit();
+    montage::warmUpTextRaster();  // M12：排版栈首帧预热（编辑期首触会撞 ArkUI 排版竞态）
     TileRenderer::LayerXformPreview xformPreview;
     if (transformPreview.active) {
         xformPreview.layerId = transformPreview.layerId;

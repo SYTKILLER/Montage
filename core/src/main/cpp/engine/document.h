@@ -172,7 +172,26 @@ struct LayerAdjustment {
     float p3 = 0.0f;
 };
 
-// 图层（值语义，对齐源 ImageLayer；M2 子集：蒙版/剪贴 M5、调整层 M6a、形状/文字后续补）。
+// 文本层状态（M12，路线 A：native OH_Drawing_Typography 栅格化）。随 Layer 走 History
+// 快照（COW 换指针）；pixels 网格 = 最近一次排版栅格结果（直 alpha），origin = 文本框
+// 左上角文档落点（PS 点文字锚点在首行基线左，v1 简化左上角，登记）。
+struct TextLayerState {
+    std::string content;      // UTF-8；\n 分行
+    std::string fontFamily;   // FontParser/系统字体族名；空 = 系统默认
+    double fontSize = 40.0;   // 文档 px
+    double lineHeight = 1.2;  // 行距倍数（行高 px = fontSize × lineHeight）
+    double tracking = 0.0;    // 字距（千分比 em，PS 语义）→ px = fontSize × tracking / 1000
+    bool bold = false;
+    bool italic = false;
+    float color[3] = {0.0f, 0.0f, 0.0f};  // 直 alpha 0..1
+    int32_t align = 0;        // 0=左 1=中 2=右（OH_Drawing_TextAlign LEFT/CENTER/RIGHT）
+    double wrapWidth = 0.0;   // >0 = 段落文字换行宽（文档 px）；0 = 点文字（不自动换行）
+    uint64_t styleHash = 0;   // 参数指纹（relayout 缓存键；0 = 从未栅格化）
+    double rasterW = 0.0;     // 最近栅格化实际像素尺寸（派生缓存，不入指纹；DTO/overlay 用）
+    double rasterH = 0.0;
+};
+
+// 图层（值语义，对齐源 ImageLayer；M2 子集：蒙版/剪贴 M5、调整层 M6a、文本层 M12）。
 struct Layer {
     LayerId id = 0;
     std::string name;
@@ -186,6 +205,7 @@ struct Layer {
                                                        // 变更点主动维护、随 History 快照走）
     bool clipping = false;  // M5b-2：剪贴蒙版——剪贴到下方最近非剪贴层（渲染期生效，PS 语义）
     std::shared_ptr<LayerAdjustment> adjustment = nullptr;  // M6a：非空 = 调整层（无像素）
+    std::shared_ptr<TextLayerState> text = nullptr;  // M12：非空 = 文本层（pixels = 栅格结果）
     // 渲染/缩略图取数：蒙版启用取合成结果，否则原像素
     std::shared_ptr<const TileGrid> effectivePixels() const {
         return (mask != nullptr && mask->enabled && render != nullptr) ? render : pixels;

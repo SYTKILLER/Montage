@@ -373,6 +373,8 @@ void Engine::resetDocument() {
     brushEffect = BrushEffect::None;
     historyBrushSteps = 0;
     cloneSource = CloneSource{};
+    textEditOpen = false;  // M12：编辑会话随文档清空（History 已 clear）
+    textEditLayerId = 0;
     needsRender.store(true);
     render.wake();
 }

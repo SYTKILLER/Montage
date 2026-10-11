@@ -14,6 +14,8 @@ add_library(compositor SHARED
         engine/gradient_ops.cpp
         engine/history.cpp
         engine/shape_ops.cpp
+        engine/text_ops.cpp
+        engine/text_raster_oh.cpp
         engine/transform_ops.cpp
         engine/resample.cpp
         io/image_import.cpp
@@ -44,4 +46,5 @@ target_link_libraries(compositor PUBLIC
         libimage_source.so
         libEGL.so
         libGLESv3.so
+        libnative_drawing.so
         z)

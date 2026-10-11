@@ -96,6 +96,14 @@ napi_value Init(napi_env env, napi_value exports) {
         {"setTransformPreview", nullptr, montage::bridge::SetTransformPreview, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"bakeLayerMatrix", nullptr, montage::bridge::BakeLayerMatrix, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"cancelTransformOverlay", nullptr, montage::bridge::CancelTransformOverlay, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"createTextLayer", nullptr, montage::bridge::CreateTextLayer, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setTextLayerContent", nullptr, montage::bridge::SetTextLayerContent, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setTextLayerStyle", nullptr, montage::bridge::SetTextLayerStyle, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"rasterizeTextLayer", nullptr, montage::bridge::RasterizeTextLayer, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"beginTextSession", nullptr, montage::bridge::BeginTextSession, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"endTextSession", nullptr, montage::bridge::EndTextSession, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"listSystemFonts", nullptr, montage::bridge::ListSystemFonts, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"registerFontFile", nullptr, montage::bridge::RegisterFontFile, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"dispose", nullptr, montage::bridge::Dispose, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props);
