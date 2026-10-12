@@ -122,6 +122,10 @@ bool TileRenderer::ensureFbos(int32_t vw, int32_t vh) {
     ok = makeFbo(&layerFbo_, &layerTex_) && ok;
     ok = makeFbo(&clipFbo_, &clipTex_) && ok;
     ok = makeFbo(&baseFbo_, &baseTex_) && ok;
+    for (int g = 0; g < kGroupDepth; ++g) {
+        ok = makeFbo(&groupAccFbo_[g][0], &groupAccTex_[g][0]) && ok;
+        ok = makeFbo(&groupAccFbo_[g][1], &groupAccTex_[g][1]) && ok;
+    }
     // 256×1 LUT 纹理（RGBA8；三通道同表，LINEAR 平滑插值）
     glGenTextures(1, &lutTex_);
     glBindTexture(GL_TEXTURE_2D, lutTex_);
@@ -267,6 +271,14 @@ void TileRenderer::invalidate() {
     if (vbo_ != 0) glDeleteBuffers(1, &vbo_);
     if (vao_ != 0) glDeleteVertexArrays(1, &vao_);
     vbo_ = vao_ = 0;
+    for (int g = 0; g < kGroupDepth; ++g) {
+        for (int i = 0; i < 2; ++i) {
+            if (groupAccFbo_[g][i] != 0) glDeleteFramebuffers(1, &groupAccFbo_[g][i]);
+            if (groupAccTex_[g][i] != 0) glDeleteTextures(1, &groupAccTex_[g][i]);
+            groupAccFbo_[g][i] = 0;
+            groupAccTex_[g][i] = 0;
+        }
+    }
     inited_ = false;
 }
 
@@ -642,37 +654,70 @@ void TileRenderer::drawQuickMask(const Document& doc, float zoom, float panX, fl
     }
 }
 
-void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw, int32_t vh,
-                             const StrokeOverlay* stroke, const LayerXformPreview* preview) {
-    frame_++;
-    glViewport(0, 0, vw, vh);
-    // 画布外背板：中性灰（05 §7：与主题解耦，对齐 PS 行为）
-    glClearColor(0.27f, 0.27f, 0.27f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    if (!inited_ || doc.width == 0 || doc.height == 0) {
-        return;
-    }
-    if (!ensureFbos(vw, vh)) {
-        return;
-    }
 
+
+// M14a：组子纹理缓冲按需就绪（ensureFbos 同尺寸）
+bool TileRenderer::ensureGroupFbos(int depth, int32_t vw, int32_t vh) {
+    return fboW_ == vw && fboH_ == vh && depth >= 0 && depth < kGroupDepth &&
+           groupAccFbo_[depth][0] != 0;
+}
+
+// M14a：合成一段层到当前 acc（组递归见分支；单层两趟与原 drawFrame 循环一致）
+int TileRenderer::composeLayerRange(const Document& doc, int from, int to, const Viewport& vp,
+                                    int32_t vw, int32_t vh, const StrokeOverlay* stroke,
+                                    const LayerXformPreview* preview, int accIdx,
+                                    bool baseTexValid, int depth, int& composited) {
     const float zoom = static_cast<float>(clampZoom(vp.zoom));
     const float panX = static_cast<float>(vp.panX);
     const float panY = static_cast<float>(vp.panY);
     const float vwF = static_cast<float>(vw);
     const float vhF = static_cast<float>(vh);
-
-    // ① 自底向上逐层两趟合成（03 §4）：assemble → layerFBO，blend → acc ping-pong
-    for (int i = 0; i < 2; ++i) {
-        glBindFramebuffer(GL_FRAMEBUFFER, accFbo_[i]);
-        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-    }
-    int accIdx = 0;
-    int composited = 0;
-    bool baseTexValid = false;  // M5b-2：baseTex_ 是否持有当前剪贴组的基 alpha
-    for (size_t li = 0; li < doc.layers.size(); ++li) {
+    for (int li = from; li < to; ++li) {
         const Layer& layer = doc.layers[li];
+        // M14a 组节点：collapsed → 跳过整段；穿透（Normal+不透明 1）→ 子层直接进当前
+        // acc（递归共享 ping-pong）；否则组子纹理合成后按组 blend/opacity 混入。
+        if (layer.isGroup) {
+            const int childEnd = groupChildEnd(doc.layers, li);
+            if (!layer.collapsed && childEnd > li + 1) {
+                if (layer.blendMode == BlendMode::Normal && layer.opacity >= 0.999) {
+                    accIdx = composeLayerRange(doc, li + 1, childEnd, vp, vw, vh, stroke,
+                                               preview, accIdx, false, depth, composited);
+                } else if (depth + 1 < kGroupDepth &&
+                           ensureGroupFbos(depth, vw, vh)) {
+                    glBindFramebuffer(GL_FRAMEBUFFER, groupAccFbo_[depth][0]);
+                    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                    glClear(GL_COLOR_BUFFER_BIT);
+                    glBindFramebuffer(GL_FRAMEBUFFER, groupAccFbo_[depth][1]);
+                    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                    glClear(GL_COLOR_BUFFER_BIT);
+                    int subAcc = composeLayerRange(doc, li + 1, childEnd, vp, vw, vh, stroke,
+                                                   preview, 0, false, depth + 1, composited);
+                    const int dstIdx = accIdx;
+                    const int outIdx = 1 - accIdx;
+                    glBindFramebuffer(GL_FRAMEBUFFER, accFbo_[outIdx]);
+                    glDisable(GL_BLEND);
+                    const int mode = static_cast<int>(layer.blendMode);
+                    GLuint blendProg = (mode >= 0 && mode < kBlendModeCount &&
+                                        blendProgs_[mode] != 0)
+                                           ? blendProgs_[mode]
+                                           : blendProgs_[0];
+                    glUseProgram(blendProg);
+                    glUniform1i(glGetUniformLocation(blendProg, "uSrc"), 0);
+                    glUniform1i(glGetUniformLocation(blendProg, "uDst"), 1);
+                    glUniform1f(glGetUniformLocation(blendProg, "uOpacity"),
+                                static_cast<float>(layer.opacity));
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(GL_TEXTURE_2D, groupAccTex_[depth][subAcc]);
+                    glActiveTexture(GL_TEXTURE1);
+                    glBindTexture(GL_TEXTURE_2D, accTex_[dstIdx]);
+                    drawQuad(blendProg, 0.0f, 0.0f, static_cast<float>(vw), static_cast<float>(vh),
+                             1.0f, 0.0f, 0.0f, static_cast<float>(vw), static_cast<float>(vh));
+                    accIdx = outIdx;
+                }
+                // 超深嵌套降级：组不可渲染（登记 kGroupDepth=8 上限）
+            }
+            continue;
+        }
         if (layer.adjustment != nullptr) {
             // M6a：调整层——acc 全帧经 LUT 调色（ping-pong），opacity lerp；忽略剪贴/混合模式（v1）
             if (!layer.visible) {
@@ -771,6 +816,39 @@ void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw
         drawQuad(blendProg, 0.0f, 0.0f, vwF, vhF, 1.0f, 0.0f, 0.0f, vwF, vhF);
         accIdx = outIdx;
     }
+    return accIdx;
+}
+
+void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw, int32_t vh,
+                             const StrokeOverlay* stroke, const LayerXformPreview* preview) {
+    frame_++;
+    glViewport(0, 0, vw, vh);
+    // 画布外背板：中性灰（05 §7：与主题解耦，对齐 PS 行为）
+    glClearColor(0.27f, 0.27f, 0.27f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (!inited_ || doc.width == 0 || doc.height == 0) {
+        return;
+    }
+    if (!ensureFbos(vw, vh)) {
+        return;
+    }
+
+    const float zoom = static_cast<float>(clampZoom(vp.zoom));
+    const float panX = static_cast<float>(vp.panX);
+    const float panY = static_cast<float>(vp.panY);
+    const float vwF = static_cast<float>(vw);
+    const float vhF = static_cast<float>(vh);
+
+    // ① 自底向上逐层两趟合成（03 §4）：assemble → layerFBO，blend → acc ping-pong
+    for (int i = 0; i < 2; ++i) {
+        glBindFramebuffer(GL_FRAMEBUFFER, accFbo_[i]);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
+    int accIdx = 0;
+    int composited = 0;
+    accIdx = composeLayerRange(doc, 0, static_cast<int>(doc.layers.size()), vp, vw, vh, stroke,
+                               preview, accIdx, false, 0, composited);
 
     // ② 屏幕：灰背板 → doc rect 棋盘格 → acc 终合成（按 doc rect 裁剪）
     glBindFramebuffer(GL_FRAMEBUFFER, 0);

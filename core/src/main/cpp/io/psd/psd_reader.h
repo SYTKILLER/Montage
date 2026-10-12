@@ -43,6 +43,11 @@ struct Record {
     uint8_t maskDefault = 255;
     bool maskEnabled = true;
     LayerKind kind = LayerKind::Raster;
+    // M14a 组嵌套（组装期临时组号；psd_import 映射为引擎 LayerId）：
+    // groupId = 组头记录的组号；parentGroup = 直接父组号（0 = 根）。bottom→top 序中
+    // 组尾 divider（section 3）先出现压栈、组头（1/2）弹栈——父组必然先于子层处理。
+    int groupId = 0;
+    int parentGroup = 0;
     std::vector<std::string> notes;  // 降级提示（逐层）
     // M9d：调整层数据（kind=Adjustment 时；levl/curv/nvrt 可映射非破坏，其余 payload 原样）
     std::string adjKey;

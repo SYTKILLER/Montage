@@ -26,7 +26,7 @@ constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Open";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
 constexpr int kMinVersion = 1;
-constexpr int kMaxVersion = 6;  // v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
+constexpr int kMaxVersion = 7;  // v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
 constexpr uint32_t kMaxSide = 30000;
 constexpr uint64_t kMaxTotalPixels = 100ull * 1000 * 1000;
 constexpr size_t kMaxLayers = 10000;
@@ -510,6 +510,10 @@ struct LayerRecord {
     bool clipping = false;  // v2
     std::shared_ptr<LayerAdjustment> adjustment;  // v3
     std::shared_ptr<TextLayerState> text;  // v6（M12）
+    // v7（M14a）
+    bool isGroup = false;
+    uint64_t parentId = 0;
+    bool collapsed = false;
 };
 
 bool getU64(const JValue& v, uint64_t& out) {
@@ -884,6 +888,32 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
             t->wrapWidth = ww;
             l.text = std::move(t);
         }
+        // v7 组字段（可选；旧版无此字段 = 普通根层）
+        const JValue* jig = item.find("isGroup");
+        if (jig != nullptr) {
+            if (jig->type != JValue::Bool) {
+                err = "bad isGroup";
+                return false;
+            }
+            l.isGroup = jig->b;
+        }
+        const JValue* jpg = item.find("parentId");
+        if (jpg != nullptr) {
+            uint64_t pid = 0;
+            if (!getU64(*jpg, pid)) {
+                err = "bad parentId";
+                return false;
+            }
+            l.parentId = pid;
+        }
+        const JValue* jcol = item.find("collapsed");
+        if (jcol != nullptr) {
+            if (jcol->type != JValue::Bool) {
+                err = "bad collapsed";
+                return false;
+            }
+            l.collapsed = jcol->b;
+        }
         layers.push_back(l);
     }
     if (totalPixels > kMaxTotalPixels) {
@@ -1007,6 +1037,9 @@ bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
         l.clipping = rec.clipping;
         l.adjustment = rec.adjustment;
         l.text = rec.text;
+        l.isGroup = rec.isGroup;
+        l.parentId = rec.parentId;
+        l.collapsed = rec.collapsed;
         l.transform.originX = rec.originX;
         l.transform.originY = rec.originY;
         if (rec.hasImage) {

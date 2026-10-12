@@ -206,6 +206,12 @@ struct Layer {
     bool clipping = false;  // M5b-2：剪贴蒙版——剪贴到下方最近非剪贴层（渲染期生效，PS 语义）
     std::shared_ptr<LayerAdjustment> adjustment = nullptr;  // M6a：非空 = 调整层（无像素）
     std::shared_ptr<TextLayerState> text = nullptr;  // M12：非空 = 文本层（pixels = 栅格结果）
+    // M14a 图层编组（平铺栈方案）：isGroup = 组节点（无像素/无蒙版/无调整/无文本）；
+    // parentId = 直接父组 id（0 = 根）；直接子层在 layers 平铺序中**连续**且位于组节点
+    // 之后（bottom→top）；collapsed = 面板折叠（渲染跳过子层段）。
+    bool isGroup = false;
+    LayerId parentId = 0;
+    bool collapsed = false;
     // 渲染/缩略图取数：蒙版启用取合成结果，否则原像素
     std::shared_ptr<const TileGrid> effectivePixels() const {
         return (mask != nullptr && mask->enabled && render != nullptr) ? render : pixels;
@@ -254,6 +260,10 @@ bool blendModeFromName(const std::string& name, BlendMode& out);  // 逆映射�
 // 调整层 RGB LUT 生成（M9a；从 tile_renderer 迁出以便宿主机单测）。
 // r/g/b 各 256 项输出 0..1；多数 kind 三通道同值，ColorBalance 按通道独立。
 void buildAdjustmentRgbLut(const LayerAdjustment& adj, float r[256], float g[256], float b[256]);
+
+// M14a 组辅助：组节点 layers[gi] 的直接子层连续段尾（gi+1 起 parentId==组 id 的连续区间；
+// 信任平铺连续不变式，UI/命令维护）。gi 非组节点返回 gi+1。
+int groupChildEnd(const std::vector<Layer>& layers, int gi);
 
 // 蒙版合成（M5a）：out.a = a × gray/255（直 alpha 域，rgb 不变）；patch 外取 mask.outside。
 // 无蒙版像素/网格外按语义共享或丢弃；返回的网格与 src 同维度。mask.pixels == null 时

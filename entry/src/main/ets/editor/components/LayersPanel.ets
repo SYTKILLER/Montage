@@ -1,3 +1,4 @@
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import { image } from '@kit.ImageKit';
 import { LayerDTO } from 'core';
 import { BLEND_LABELS } from '../MenuModel';
@@ -21,6 +22,7 @@ export struct LayersPanel {
   @Link adjWhite: number;
   @Link adjGamma: number;
   @Prop thumbVersion: number = 0;
+  @Prop panelVersion: number = 0;  // M14a：面板序变化强制整表重建（ForEach 同 key 复用不移位）
   @Prop docOpen: boolean = false;
   getThumb: (id: number) => Object | null = (_id: number): Object | null => null;
   onSelect: (id: number) => void = (_id: number) => {};
@@ -33,6 +35,10 @@ export struct LayersPanel {
   onAddMask: () => void = () => {};
   onAddAdjustment: () => void = () => {};
   onRequestRename: (l: LayerDTO) => void = (_l: LayerDTO) => {};
+  // M14a 图层编组
+  onToggleCollapse: (l: LayerDTO) => void = (_l: LayerDTO) => {};
+  onGroup: () => void = () => {};
+  onUngroup: () => void = () => {};
   onOpacityChange: (v: number) => void = (_v: number) => {};
   onBlendChange: (idx: number) => void = (_idx: number) => {};
   onAdjustChange: (b: number, w: number, g: number) => void =
@@ -183,11 +189,32 @@ export struct LayersPanel {
         ForEach(this.reversed(), (l: LayerDTO) => {
           ListItem() {
             Row({ space: 8 }) {
+              // M14a：组折叠箭头（组节点）/ 缩进（子层）
+              if (l.isGroup) {
+                SymbolGlyph(l.collapsed ? $r('sys.symbol.chevron_right') : $r('sys.symbol.chevron_down'))
+                  .fontSize(14)
+                  .fontColor([$r('app.color.text_primary')])
+                  .width(18)
+                  .onClick((): void => this.onToggleCollapse(l))
+              } else {
+                Row().width(18).height(1).margin({ left: this.depthOf(l) * 14 })
+              }
               SymbolGlyph(l.visible ? $r('sys.symbol.eye') : $r('sys.symbol.eye_slash'))
                 .fontSize(16)
                 .fontColor([l.visible ? $r('app.color.text_primary') : $r('app.color.icon_muted')])
                 .onClick((): void => this.onToggleVisible(l))
-              this.layerThumb(l)
+              if (l.isGroup) {
+                Column() {
+                  SymbolGlyph($r('sys.symbol.folder'))
+                    .fontSize(20)
+                    .fontColor([$r('app.color.accent')])
+                }
+                .width(42)
+                .height(42)
+                .justifyContent(FlexAlign.Center)
+              } else {
+                this.layerThumb(l)
+              }
               Column({ space: 2 }) {
                 Row({ space: 4 }) {
                   if (l.isAdjustment) {
@@ -236,7 +263,8 @@ export struct LayersPanel {
         }, (l: LayerDTO): string =>
           `${l.id}|${l.visible}|${l.isActive}|${l.blendMode}|${Math.round(l.opacity * 100)}|` +
           `${l.thumbToken}|${l.hasMask}|${l.maskEnabled}|${l.clipping}|${l.name}|` +
-          `${this.getThumb(l.id) !== null ? 'p' : 'n'}|${this.thumbVersion}`)
+          `${this.getThumb(l.id) !== null ? 'p' : 'n'}|${this.thumbVersion}|` +
+          `${l.isGroup ? 'g' : 'n'}|${l.collapsed ? 'c' : 'o'}|${l.parentId}|${this.panelVersion}`)
       }
       .layoutWeight(1)
       .scrollBar(BarState.Auto)
@@ -268,6 +296,24 @@ export struct LayersPanel {
         .backgroundColor(Color.Transparent)
         .enabled(this.active() !== undefined)
         .onClick((): void => this.onAddMask())
+        Button() {
+          SymbolGlyph($r('sys.symbol.folder_badge_plus')).fontSize(16)
+            .fontColor([$r('app.color.text_primary')])
+        }
+        .type(ButtonType.Circle)
+        .width(30).height(30)
+        .backgroundColor(Color.Transparent)
+        .enabled(this.active() !== undefined)
+        .onClick((): void => this.onGroup())
+        Button() {
+          SymbolGlyph($r('sys.symbol.folder_badge_arrow_left')).fontSize(16)
+            .fontColor([$r('app.color.text_primary')])
+        }
+        .type(ButtonType.Circle)
+        .width(30).height(30)
+        .backgroundColor(Color.Transparent)
+        .enabled(this.active()?.isGroup === true)
+        .onClick((): void => this.onUngroup())
         Blank()
         Button() {
           SymbolGlyph($r('sys.symbol.trash')).fontSize(16)
@@ -287,12 +333,102 @@ export struct LayersPanel {
     .backgroundColor($r('app.color.panel_background'))
   }
 
-  private reversed(): LayerDTO[] {
+  private byId(): Map<number, LayerDTO> {
+    const m = new Map<number, LayerDTO>();
+    for (const l of this.layers) {
+      m.set(l.id, l);
+    }
+    return m;
+  }
+
+  // M14a：父链深度（缩进）
+  private depthOf(l: LayerDTO): number {
+    const m = this.byId();
+    let d = 0;
+    let cur = l.parentId;
+    while (cur !== 0 && d < 8) {
+      const p = m.get(cur);
+      if (p === undefined) {
+        break;
+      }
+      d++;
+      cur = p.parentId;
+    }
+    return d;
+  }
+
+  // M14a：被折叠祖先隐藏
+  private hiddenByCollapse(l: LayerDTO): boolean {
+    const m = this.byId();
+    let cur = l.parentId;
+    while (cur !== 0) {
+      const p = m.get(cur);
+      if (p === undefined) {
+        break;
+      }
+      if (p.collapsed) {
+        return true;
+      }
+      cur = p.parentId;
+    }
+    return false;
+  }
+
+  // M14a：面板树序（PS 惯例）——兄弟按"上层先"（平铺逆序），组节点先于其子树；
+  // 折叠组的子层整段隐藏。
+  private panelTree(): LayerDTO[] {
+    const kids: Map<number, LayerDTO[]> = new Map();
+    const rootKids: LayerDTO[] = [];
+    for (const l of this.layers) {
+      if (l.parentId === 0) {
+        rootKids.push(l);
+      } else {
+        const arr = kids.get(l.parentId);
+        if (arr !== undefined) {
+          arr.push(l);
+        } else {
+          kids.set(l.parentId, [l]);
+        }
+      }
+    }
     const out: LayerDTO[] = [];
-    for (let i = this.layers.length - 1; i >= 0; i--) {
-      out.push(this.layers[i]);
+    kids.set(0, rootKids);  // 根层孩子统一走 kids（否则 walk(0) 立即 return，触发线性兜底）
+    const walk = (parent: number): void => {
+      const arr = kids.get(parent);
+      if (arr === undefined) {
+        return;
+      }
+      for (let i = arr.length - 1; i >= 0; i--) {
+        const c = arr[i];
+        out.push(c);
+        if (c.isGroup && !c.collapsed) {
+          walk(c.id);
+        }
+      }
+    };
+    walk(0);
+    // 兜底：仅补父 id 悬空（父层不存在）的层——被折叠隐藏的层不入列
+    if (out.length !== this.layers.length) {
+      const seen = new Set<number>();
+      for (const l of out) {
+        seen.add(l.id);
+      }
+      const ids = new Set<number>();
+      for (const l of this.layers) {
+        ids.add(l.id);
+      }
+      for (let i = this.layers.length - 1; i >= 0; i--) {
+        const l = this.layers[i];
+        if (!seen.has(l.id) && (l.parentId === 0 || !ids.has(l.parentId))) {
+          out.push(l);
+        }
+      }
     }
     return out;
+  }
+
+  private reversed(): LayerDTO[] {
+    return this.panelTree();
   }
 
   private blendOptions(): SelectOption[] {

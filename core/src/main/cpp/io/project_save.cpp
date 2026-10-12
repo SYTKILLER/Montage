@@ -22,7 +22,7 @@ namespace {
 constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Save";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
-constexpr int kFormatVersion = 6;  // v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
+constexpr int kFormatVersion = 7;  // v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
 constexpr int kDeflateLevel = 6;
 // 04 §1.3 格式上限（沿用上游档位，与引擎运行预算分立）
 constexpr uint32_t kMaxSide = 30000;
@@ -439,6 +439,10 @@ struct LayerSnapshot {
     bool clipping = false;  // M5b-2
     std::shared_ptr<LayerAdjustment> adjustment;  // M6a：null = 普通层
     std::shared_ptr<TextLayerState> text;  // M12：null = 非文本层
+    // M14a 组（平铺栈）
+    bool isGroup = false;
+    uint64_t parentId = 0;
+    bool collapsed = false;
 };
 
 struct ChannelSnapshot {
@@ -558,6 +562,18 @@ std::string buildManifest(const DocSnapshot& doc) {
                 fields2 += std::string(",") + nl + "      \"p" + std::to_string(pi) + "\": " + num;
             }
             fields.push_back(std::string("      \"adjustment\": {") + nl + fields2 + nl + "      }");
+        }
+        if (l.isGroup || l.parentId != 0 || l.collapsed) {
+            // v7 组字段（非默认才写；读取方按字段存在性兼容旧版）
+            if (l.isGroup) {
+                fields.push_back("      \"isGroup\": true");
+            }
+            if (l.parentId != 0) {
+                fields.push_back("      \"parentId\": " + std::to_string(l.parentId));
+            }
+            if (l.collapsed) {
+                fields.push_back("      \"collapsed\": true");
+            }
         }
         if (l.text != nullptr) {
             // v6 文本层：内容/样式持久化；像素仍存 PNG（缺字体回退时可显示旧栅格）
@@ -701,6 +717,9 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
             s.clipping = l.clipping;
             s.adjustment = l.adjustment;
             s.text = l.text;
+            s.isGroup = l.isGroup;
+            s.parentId = l.parentId;
+            s.collapsed = l.collapsed;
             snap.layers.push_back(std::move(s));
         }
     }

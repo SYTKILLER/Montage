@@ -14,6 +14,7 @@
 
 #include "engine/engine.h"
 #include "engine/filter_ops.h"
+#include "engine/group_ops.h"
 #include "engine/filters.h"
 #include "engine/gradient_ops.h"
 #include "engine/shape_ops.h"
@@ -783,8 +784,9 @@ napi_value makeLayerDto(napi_env env, const Layer& l, bool isActive) {
     napi_set_named_property(env, obj, "blendMode", makeInt32(env, static_cast<int32_t>(l.blendMode)));
     napi_set_named_property(env, obj, "isActive", makeBool(env, isActive));
     // 02 §5 DTO 形状保真：M2 无组，常量占位；hasMask 自 M5a 起为真值
-    napi_set_named_property(env, obj, "isGroup", makeBool(env, false));
-    napi_set_named_property(env, obj, "parentId", makeDouble(env, 0.0));
+    napi_set_named_property(env, obj, "isGroup", makeBool(env, l.isGroup));
+    napi_set_named_property(env, obj, "parentId", makeDouble(env, static_cast<double>(l.parentId)));
+    napi_set_named_property(env, obj, "collapsed", makeBool(env, l.collapsed));
     napi_set_named_property(env, obj, "hasMask", makeBool(env, l.mask != nullptr));
     napi_set_named_property(env, obj, "maskEnabled", makeBool(env, l.mask != nullptr && l.mask->enabled));
     napi_set_named_property(env, obj, "clipping", makeBool(env, l.clipping));
@@ -995,7 +997,14 @@ napi_value RemoveLayer(napi_env env, napi_callback_info info) {
         if (at == e.doc.layers.size()) {
             return makeError(env, kErrBadParam, "removeLayer: layer not found");
         }
-        e.doc.layers.erase(e.doc.layers.begin() + static_cast<long>(at));
+        // M14a：组级联删除（整棵子树）
+        if (e.doc.layers[at].isGroup) {
+            const int end = groupChildEnd(e.doc.layers, static_cast<int>(at));
+            e.doc.layers.erase(e.doc.layers.begin() + static_cast<long>(at),
+                               e.doc.layers.begin() + end);
+        } else {
+            e.doc.layers.erase(e.doc.layers.begin() + static_cast<long>(at));
+        }
         if (e.doc.activeId == static_cast<LayerId>(id)) {
             e.doc.activeId =
                 e.doc.layers.empty() ? 0 : e.doc.layers[std::min(at, e.doc.layers.size() - 1)].id;
@@ -4371,6 +4380,146 @@ napi_value EndFilterPreview(napi_env env, napi_callback_info info) {
             fp = Engine::FilterPreview{};
             e.requestRender();
         }
+    }
+    return makeOk(env, nullptr);
+}
+
+// ---------- M14a 图层编组 ----------
+
+// M14a：新建空组（插活动层上方，激活）
+napi_value AddGroup(napi_env env, napi_callback_info info) {
+    auto& e = Engine::get();
+    double newId = 0;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0) {
+            return makeError(env, kErrNoDoc, "addGroup: no document");
+        }
+        if (e.textEditOpen || e.filterPreview.active) {
+            return makeError(env, kErrBadParam, "addGroup: session open");
+        }
+        e.history.beginEdit(e.doc, "new group", static_cast<uint64_t>(e.docRevision));
+        std::string err;
+        const LayerId id = createGroup(e.doc, e.nextLayerId(), "", err);
+        if (id == 0) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, "addGroup: " + err);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        newId = static_cast<double>(id);
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "id", makeDouble(env, newId));
+    return makeOk(env, data);
+}
+
+// M14a：活动层包进新建组（PS Ctrl+G 单层语义）
+napi_value GroupLayer(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double id = 0;
+    if (argc < 1 || napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "groupLayer(id) requires 1 arg");
+    }
+    auto& e = Engine::get();
+    double newId = 0;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        e.history.beginEdit(e.doc, "group layer", static_cast<uint64_t>(e.docRevision));
+        std::string err;
+        const LayerId gid = groupLayer(e.doc, e.nextLayerId(), static_cast<LayerId>(id), err);
+        if (gid == 0) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, "groupLayer: " + err);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        newId = static_cast<double>(gid);
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "id", makeDouble(env, newId));
+    return makeOk(env, data);
+}
+
+// M14a：解散组（子层上提）
+napi_value UngroupLayer(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double id = 0;
+    if (argc < 1 || napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "ungroupLayer(id) requires 1 arg");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        e.history.beginEdit(e.doc, "ungroup", static_cast<uint64_t>(e.docRevision));
+        std::string err;
+        if (!ungroupLayer(e.doc, static_cast<LayerId>(id), err)) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, "ungroupLayer: " + err);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// M14a：移动层到父/索引（拖拽重排与入组/出组）
+napi_value SetLayerParent(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double id = 0, parent = 0, index = 0;
+    if (argc < 3 || napi_get_value_double(env, argv[0], &id) != napi_ok ||
+        napi_get_value_double(env, argv[1], &parent) != napi_ok ||
+        napi_get_value_double(env, argv[2], &index) != napi_ok) {
+        return makeError(env, kErrBadParam, "setLayerParent(id, parent, index) requires 3 args");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        e.history.beginEdit(e.doc, "reorder layer", static_cast<uint64_t>(e.docRevision));
+        std::string err;
+        if (!setLayerParent(e.doc, static_cast<LayerId>(id), static_cast<LayerId>(parent),
+                            static_cast<int>(index), err)) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, "setLayerParent: " + err);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// M14a：组折叠
+napi_value SetGroupCollapsed(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double id = 0;
+    int32_t collapsed = 0;
+    if (argc < 2 || napi_get_value_double(env, argv[0], &id) != napi_ok ||
+        napi_get_value_int32(env, argv[1], &collapsed) != napi_ok) {
+        return makeError(env, kErrBadParam, "setGroupCollapsed(id, collapsed) requires 2 args");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        std::string err;
+        if (!setGroupCollapsed(e.doc, static_cast<LayerId>(id), collapsed != 0, err)) {
+            return makeError(env, kErrBadParam, "setGroupCollapsed: " + err);
+        }
+        e.bumpRevisionLocked();
+        e.requestRender();
     }
     return makeOk(env, nullptr);
 }

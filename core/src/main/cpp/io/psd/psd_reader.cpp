@@ -747,18 +747,21 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
     }
     c.offset = layerSectionEnd;
 
-    // 组装（对拍 assemble：组 divider 配对/组 pass 语义/不透明度/蒙版/kind 提示）
+    // 组装（对拍 assemble：组 divider 配对/组 pass 语义/不透明度/蒙版/kind 提示）。
+    // M14a：bottom→top 序中组尾 divider（section 3）先出现压栈、组头（1/2）弹栈，
+    // 子层挂栈顶组 → 真编组层级（parentGroup/groupId），不再扁平化。
     std::vector<uint64_t> groupIds;
     uint64_t idGen = 1;
     for (const RawLayer& layer : raw) {
         if (layer.section == 3) {
-            groupIds.push_back(idGen++);
+            groupIds.push_back(static_cast<uint64_t>(idGen++));
             continue;
         }
         const bool isGroup = layer.section == 1 || layer.section == 2;
         Record rec;
         rec.name = layer.name;
         rec.isGroup = isGroup;
+        rec.parentGroup = groupIds.empty() ? 0 : static_cast<int>(groupIds.back());
         rec.visible = !layer.hidden;
         rec.blendKey = layer.blendKey;
         rec.blendMode = blendFromKey(layer.blendKey, &rec.blendExact);
@@ -774,15 +777,18 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
                           (static_cast<double>(layer.fill) / 255.0);
         }
         if (isGroup) {
-            // 组记录：M2 引擎无组层级 → 面板显示 + 提示扁平化
+            // 组记录（M14a）：groupId = pop 前栈顶（自己的号，子层经 parentGroup 引用）；
+            // parentGroup = pop 后栈顶（父组）。pass 键 = PS 穿透 → 引擎 Normal+不透明 1。
+            rec.groupId = groupIds.empty() ? 0 : static_cast<int>(groupIds.back());
+            rec.parentGroup = groupIds.size() >= 2
+                                  ? static_cast<int>(groupIds[groupIds.size() - 2])
+                                  : 0;
             rec.width = 0;
             rec.height = 0;
-            rec.notes.push_back("Group flattened; layers were kept.");
-            if (layer.blendKey != "pass" && layer.blendKey != "norm") {
-                rec.notes.push_back("Folder blend mode not supported; treated as pass-through.");
+            if (layer.blendKey == "pass") {
+                rec.blendMode = BlendMode::Normal;
+                rec.blendExact = true;
             }
-            rec.blendMode = BlendMode::Normal;
-            rec.blendExact = true;
             if (!groupIds.empty()) {
                 groupIds.pop_back();  // 配对 divider
             }

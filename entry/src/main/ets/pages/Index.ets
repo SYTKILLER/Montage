@@ -205,6 +205,7 @@ struct Index {
   @State adjP0: number = 0;
   @State adjP1: number = 0;
   @State adjP2: number = 0;
+  @State panelVersion: number = 0;  // M14a 面板树序版本（强制 ForEach 重建）
   private histTimer: number = -1;
   @State showTransform: boolean = false;
   @State overlayBox: TransformOverlayBox | null = null;  // M8.1 手柄 overlay 态
@@ -291,6 +292,7 @@ struct Index {
 
   private refreshLayers(): void {
     this.layers = this.engine.getLayerListSnapshot();
+    hilog.info(DOMAIN, TAG, 'layers: %{public}s', this.layers.map((l: LayerDTO): string => `${l.id}(${l.parentId})${l.isGroup ? "G" : ""}`).join(", "));
     const active = this.activeLayer();
     if (active !== undefined) {
       this.blendSel = active.blendMode;
@@ -312,6 +314,7 @@ struct Index {
       const at = this.layers.find((l: LayerDTO): boolean => l.isActive);
       this.textPanelContent = (at !== undefined && at.isText) ? at.textContent : '';
     }
+    this.panelVersion++;  // M14a：面板树序变化强制重建（同 key 复用不移位实测坑）
     this.refreshThumbs();
   }
 
@@ -1758,6 +1761,43 @@ struct Index {
       case 'layer.adjustAdd':
         this.engine.addAdjustmentLayer();
         break;
+      case 'layer.newGroup': {
+        const gid = this.engine.addGroup();
+        if (gid !== 0) {
+          this.log(`新建组 #${gid}`);
+        } else {
+          this.toast('新建组失败');
+        }
+        break;
+      }
+      case 'layer.group': {
+        const ga = this.activeLayer();
+        if (ga === undefined || ga.isGroup) {
+          this.toast('选中一个图层再编组');
+          break;
+        }
+        const ngid = this.engine.groupLayer(ga.id);
+        if (ngid !== 0) {
+          this.toast(`已归入新组`);
+          this.log(`图层 #${ga.id} → 新组 #${ngid}`);
+        } else {
+          this.toast('编组失败');
+        }
+        break;
+      }
+      case 'layer.ungroup': {
+        const ua = this.activeLayer();
+        if (ua === undefined || !ua.isGroup) {
+          this.toast('活动图层不是组');
+          break;
+        }
+        if (this.engine.ungroupLayer(ua.id)) {
+          this.log(`组 #${ua.id} 已解散`);
+        } else {
+          this.toast('解散组失败');
+        }
+        break;
+      }
       case 'layer.rasterizeText': {
         const a = this.activeLayer();
         if (a !== undefined && a.isText) {
@@ -2281,6 +2321,9 @@ struct Index {
       leafItem('layer.transform', '自由变换', 'Ctrl+T', d),
       leafItem('layer.transformNumeric', '数值变换…', '', d),
       leafItem('layer.new', '新建图层', '', d),
+      leafItem('layer.newGroup', '新建组…', '', d),
+      leafItem('layer.group', '图层编组', 'Ctrl+G', d && this.activeLayer()?.isGroup === false),
+      leafItem('layer.ungroup', '取消编组', '', d && this.activeLayer()?.isGroup === true),
       leafItem('layer.rename', '重命名…', '', this.activeLayer() !== undefined),
       leafItem('layer.delete', '删除图层', '', this.activeLayer() !== undefined),
       leafItem('layer.moveUp', '上移一层', '', d),
@@ -2550,6 +2593,9 @@ struct Index {
           break;
         case KC_A:
           this.runCommand('select.all');
+          break;
+        case KC_G:
+          this.runCommand('layer.group');  // M14a 编组（PS Ctrl+G）
           break;
         case KC_C:
           this.runCommand('edit.copy');
@@ -3154,6 +3200,7 @@ struct Index {
                 adjWhite: $adjWhite,
                 adjGamma: $adjGamma,
                 thumbVersion: this.thumbVersion,
+                panelVersion: this.panelVersion,
                 docOpen: this.docOpen,
                 getThumb: (id: number): Object | null => this.getThumb(id),
                 onSelect: (id: number): void => {
@@ -3174,6 +3221,11 @@ struct Index {
                 onAddMask: (): void => this.runCommand('layer.maskAdd'),
                 onAddAdjustment: (): void => this.runCommand('layer.adjustAdd'),
                 onRequestRename: (_l: LayerDTO): void => this.runCommand('layer.rename'),
+                onToggleCollapse: (l: LayerDTO): void => {
+                  this.engine.setGroupCollapsed(l.id, !l.collapsed);
+                },
+                onGroup: (): void => this.runCommand('layer.group'),
+                onUngroup: (): void => this.runCommand('layer.ungroup'),
                 onOpacityChange: (v: number): void => {
                   const a = this.activeLayer();
                   if (a !== undefined) {

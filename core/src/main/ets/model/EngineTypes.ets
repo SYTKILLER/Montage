@@ -55,6 +55,7 @@ export interface LayerDTO {
   isActive: boolean;
   isGroup: boolean;
   parentId: number;
+  collapsed: boolean;
   hasMask: boolean;
   maskEnabled: boolean;
   clipping: boolean;

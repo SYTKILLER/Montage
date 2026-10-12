@@ -145,6 +145,7 @@ function narrowLayer(r: Record<string, Object>): LayerDTO {
     isActive: boolOf(r, 'isActive'),
     isGroup: boolOf(r, 'isGroup'),
     parentId: num(r, 'parentId'),
+    collapsed: boolOf(r, 'collapsed'),
     hasMask: boolOf(r, 'hasMask'),
     maskEnabled: boolOf(r, 'maskEnabled'),
     clipping: boolOf(r, 'clipping'),
@@ -414,6 +415,58 @@ export class CompositorEngine {
   }
 
   // M6a：添加 Levels 调整层，返回新图层 id（0 = 失败）
+  // ---------- M14a 图层编组 ----------
+
+  addGroup(): number {
+    const r = narrowResult(native.addGroup() as Object);
+    if (!r.ok || r.data === null) {
+      hilog.error(DOMAIN, TAG, 'addGroup failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return 0;
+    }
+    return num(r.data, 'id');
+  }
+
+  groupLayer(id: number): number {
+    const r = narrowResult(native.groupLayer(id) as Object);
+    if (!r.ok || r.data === null) {
+      hilog.error(DOMAIN, TAG, 'groupLayer failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return 0;
+    }
+    return num(r.data, 'id');
+  }
+
+  ungroupLayer(id: number): boolean {
+    const r = narrowResult(native.ungroupLayer(id) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'ungroupLayer failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  setLayerParent(id: number, parent: number, index: number): boolean {
+    const r = narrowResult(native.setLayerParent(id, parent, index) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setLayerParent failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  setGroupCollapsed(id: number, collapsed: boolean): boolean {
+    const r = narrowResult(native.setGroupCollapsed(id, collapsed ? 1 : 0) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setGroupCollapsed failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
   // ---------- M13 滤镜 ----------
 
   applyFilter(layerId: number, kind: number, p0: number, p1: number, p2: number,

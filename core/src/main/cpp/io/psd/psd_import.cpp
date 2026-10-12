@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <unordered_map>
 #include <unistd.h>
 
 #include <hilog/log.h>
@@ -125,12 +126,32 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
     // 烘焙：蒙版 → 剪贴 → 直通 alpha；逐层切瓦片（M5b-2 起蒙版/剪贴均非破坏）
     std::vector<Layer> layers;
     layers.reserve(doc.layers.size());
+    std::unordered_map<int, uint64_t> groupIdMap;  // M14a：组装期组号 → 引擎 LayerId
     int done = 0;
     for (psd::Record& rec : doc.layers) {
         done++;
         notifyProgress(0.15 + 0.8 * static_cast<double>(done) /
                                    static_cast<double>(std::max<size_t>(doc.layers.size(), 1)));
-        const uint64_t parent = 0;  // M2 无组层级：全部视作根（组已扁平化）
+        // M14a：真编组——parentId = 父组引擎 id（bottom→top 序中父组先处理）
+        const uint64_t parent = rec.parentGroup != 0 && groupIdMap.count(rec.parentGroup)
+                                    ? groupIdMap[rec.parentGroup]
+                                    : 0;
+        if (rec.isGroup) {
+            Layer g;
+            g.id = engine.nextLayerId();
+            g.name = rec.name;
+            g.visible = rec.visible;
+            g.opacity = std::min(1.0, std::max(0.0, rec.opacity));
+            g.blendMode = rec.blendMode;
+            g.isGroup = true;
+            g.parentId = parent;
+            if (rec.groupId != 0) {
+                groupIdMap[rec.groupId] = g.id;
+            }
+            layers.push_back(std::move(g));
+            done++;
+            continue;
+        }
         if (rec.kind == psd::LayerKind::Adjustment) {
             // M9d：levl/curv/nvrt → 非破坏调整层（无像素内容）；其余仍跳过
             auto adj = std::make_shared<LayerAdjustment>();
@@ -192,6 +213,7 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
         layer.opacity = std::min(1.0, std::max(0.0, rec.opacity));
         layer.blendMode = rec.blendMode;
         layer.clipping = rec.clipping;
+        layer.parentId = parent;
         layer.transform.originX = rec.left;
         layer.transform.originY = rec.top;
         layer.transform.width = rec.width;

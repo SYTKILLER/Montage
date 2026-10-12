@@ -128,6 +128,44 @@ bool blendModeFromName(const std::string& name, BlendMode& out) {
     return false;
 }
 
+
+// 先序辅助：从 i 消费 parent 的一层（含组子树），返回消费层数
+static size_t groupConsumeAll(const std::vector<Layer>& layers, size_t i, LayerId parentId);
+
+static size_t groupConsumeOne(const std::vector<Layer>& layers, size_t i, LayerId parentId) {
+    if (i >= layers.size() || layers[i].parentId != parentId) {
+        return 0;
+    }
+    size_t consumed = 1;
+    if (layers[i].isGroup) {
+        consumed += groupConsumeAll(layers, i + 1, layers[i].id);
+    }
+    return consumed;
+}
+
+static size_t groupConsumeAll(const std::vector<Layer>& layers, size_t i, LayerId parentId) {
+    const size_t start = i;
+    while (true) {
+        const size_t c = groupConsumeOne(layers, i, parentId);
+        if (c == 0) {
+            break;
+        }
+        i += c;
+    }
+    return i - start;
+}
+
+// M14a：组节点 gi 的子树段尾（先序 DFS——嵌套子组的子树合法夹在祖先直接子层间，
+// 朴素线性计数会在嵌套处截断导致渲染丢层）。gi 非组节点返回 gi+1。
+int groupChildEnd(const std::vector<Layer>& layers, int gi) {
+    if (gi < 0 || gi >= static_cast<int>(layers.size()) || !layers[gi].isGroup) {
+        return gi + 1;
+    }
+    return static_cast<int>(gi + 1 +
+                            groupConsumeAll(layers, static_cast<size_t>(gi) + 1,
+                                            layers[gi].id));
+}
+
 uint8_t selectionGrayAt(const TileGrid& mask, int docX, int docY) {
     if (docX < 0 || docY < 0) {
         return 0;

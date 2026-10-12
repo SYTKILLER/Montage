@@ -100,10 +100,23 @@ class TileRenderer {
     GLuint baseFbo_ = 0;  // 剪贴基的 assemble alpha 快照
     GLuint baseTex_ = 0;
     GLuint lutTex_ = 0;   // M6a：调整层 256×1 LUT
+    // M14a 组子纹理缓冲（每深度一对 ping-pong；嵌套组递归按深度取用）
+    static constexpr int kGroupDepth = 8;
+    GLuint groupAccFbo_[kGroupDepth][2] = {};
+    GLuint groupAccTex_[kGroupDepth][2] = {};
     GLint fboW_ = 0;
     GLint fboH_ = 0;
     bool float16_ = false;
     bool float16Probed_ = false;
+
+    // M14a：合成 layers[from..to) 到当前 acc（递归处理组：穿透=直接递归，否则组子纹理
+    // 按 blend/opacity 混入）。accIdx/baseTexValid 引用进出（组边界保存恢复）。
+    // 返回新 accIdx。depth = 组缓冲深度（防超限）。
+    int composeLayerRange(const Document& doc, int from, int to, const Viewport& vp,
+                          int32_t vw, int32_t vh, const StrokeOverlay* stroke,
+                          const LayerXformPreview* preview, int accIdx, bool baseTexValid,
+                          int depth, int& composited);
+    bool ensureGroupFbos(int depth, int32_t vw, int32_t vh);
 
     std::unordered_map<uint64_t, CacheEntry> cache_;  // key = layerId<<32 | tileIndex
     uint64_t frame_ = 0;
