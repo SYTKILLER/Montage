@@ -14,6 +14,8 @@ add_library(compositor SHARED
         engine/gradient_ops.cpp
         engine/history.cpp
         engine/shape_ops.cpp
+        engine/filter_ops.cpp
+        engine/filters.cpp
         engine/text_ops.cpp
         engine/text_raster_oh.cpp
         engine/transform_ops.cpp

@@ -98,6 +98,23 @@ class Engine {
     bool textEditOpen = false;
     LayerId textEditLayerId = 0;
 
+    // M13 滤镜预览会话（对话框打开期间）：proxy = 1/4 核结果网格；渲染快照把该层
+    // pixels 换成 proxy 并复用 M8.1 xform 矩阵放大显示。endFilterPreview 后清理。
+    struct FilterPreview {
+        bool active = false;
+        LayerId layerId = 0;
+        std::shared_ptr<const TileGrid> proxy;
+        double originX = 0.0;   // proxy 域文档原点（bbox 缩小域）
+        double originY = 0.0;
+        uint32_t fullW = 0;     // 全分辨率域尺寸（proxy × scale 显示）
+        uint32_t fullH = 0;
+        double scale = 4.0;
+        std::vector<uint8_t> srcStrip;  // proxy 输入（1/4 降采样 strip）
+        uint32_t srcW = 0;
+        uint32_t srcH = 0;
+    };
+    FilterPreview filterPreview;
+
     // M10c 内部剪贴板（引擎内存；不随快照/持久化走，关闭文档保留——PS 同语义）
     ClipBuffer clipboard;
 

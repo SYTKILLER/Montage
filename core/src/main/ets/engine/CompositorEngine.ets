@@ -414,6 +414,50 @@ export class CompositorEngine {
   }
 
   // M6a：添加 Levels 调整层，返回新图层 id（0 = 失败）
+  // ---------- M13 滤镜 ----------
+
+  applyFilter(layerId: number, kind: number, p0: number, p1: number, p2: number,
+    p3: number, p4: number, p5: number, seed: number): boolean {
+    const r = narrowResult(native.applyFilter(layerId, kind, p0, p1, p2, p3, p4, p5, seed) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'applyFilter failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  beginFilterPreview(layerId: number): boolean {
+    const r = narrowResult(native.beginFilterPreview(layerId) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'beginFilterPreview failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  setFilterPreview(kind: number, p0: number, p1: number, p2: number, p3: number,
+    p4: number, p5: number, seed: number): boolean {
+    const r = narrowResult(native.setFilterPreview(kind, p0, p1, p2, p3, p4, p5, seed) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setFilterPreview failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  endFilterPreview(commit: boolean, kind: number, p0: number, p1: number, p2: number,
+    p3: number, p4: number, p5: number, seed: number): void {
+    const r = narrowResult(native.endFilterPreview(commit ? 1 : 0, kind, p0, p1, p2, p3, p4, p5,
+      seed) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'endFilterPreview failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+  }
+
   // ---------- M12 文字层 ----------
 
   createTextLayer(x: number, y: number, wrapW: number): number {

@@ -13,6 +13,8 @@
 #include <multimedia/image_framework/image/pixelmap_native.h>
 
 #include "engine/engine.h"
+#include "engine/filter_ops.h"
+#include "engine/filters.h"
 #include "engine/gradient_ops.h"
 #include "engine/shape_ops.h"
 #include "engine/text_ops.h"
@@ -4156,6 +4158,221 @@ napi_value RegisterFontFile(napi_env env, napi_callback_info info) {
     napi_create_object(env, &data);
     napi_set_named_property(env, data, "relayouted", makeInt32(env, n));
     return makeOk(env, data);
+}
+
+// ---------- M13 滤镜 ----------
+
+namespace {
+// argv[0]=kind, argv[1..6]=p0..p5, argv[7]=seed（相对偏移由调用侧决定）
+bool readFilterArgs(napi_env env, napi_value* argv, size_t argc, filters::FilterParams& p) {
+    double kind = 0, seed = 0;
+    if (argc < 1 || napi_get_value_double(env, argv[0], &kind) != napi_ok) {
+        return false;
+    }
+    for (int i = 0; i < 6 && 1 + i < static_cast<int>(argc); ++i) {
+        double v = 0;
+        if (napi_get_value_double(env, argv[1 + i], &v) != napi_ok) {
+            return false;
+        }
+        (&p.p0)[i] = static_cast<float>(v);
+    }
+    if (argc >= 8 && napi_get_value_double(env, argv[7], &seed) != napi_ok) {
+        return false;
+    }
+    p.kind = static_cast<int32_t>(kind);
+    p.seed = static_cast<uint32_t>(seed);
+    return p.kind >= 0 && p.kind < filters::kFilterKindCount;
+}
+}  // namespace
+
+// M13：应用滤镜（layerId, kind, p0..p5, seed；一步 History 事务；选区约束自动）
+napi_value ApplyFilter(napi_env env, napi_callback_info info) {
+    size_t argc = 9;
+    napi_value argv[9];
+    for (size_t i = 0; i < 9; ++i) {
+        argv[i] = nullptr;
+    }
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double id = 0;
+    if (argc < 2 || napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "applyFilter(layerId, kind, p0..p5, seed?) invalid");
+    }
+    filters::FilterParams p;
+    if (!readFilterArgs(env, argv + 1, argc - 1, p)) {
+        return makeError(env, kErrBadParam, "applyFilter: bad params");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0) {
+            return makeError(env, kErrNoDoc, "applyFilter: no document");
+        }
+        if (e.textEditOpen || e.filterPreview.active) {
+            return makeError(env, kErrBadParam, "applyFilter: edit/preview session open");
+        }
+        e.history.beginEdit(e.doc, "filter", static_cast<uint64_t>(e.docRevision));
+        std::string err;
+        if (!applyFilterToLayer(e.doc, static_cast<LayerId>(id), p, err)) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));  // before==after 丢弃
+            return makeError(env, kErrBadParam, "applyFilter: " + err);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// M13：开始预览（layerId）——建 1/4 proxy 源（4×4 块平均降采样）
+napi_value BeginFilterPreview(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double id = 0;
+    if (argc < 1 || napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "beginFilterPreview(layerId) invalid");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0) {
+            return makeError(env, kErrNoDoc, "beginFilterPreview: no document");
+        }
+        Layer* layer = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        if (layer == nullptr || layer->pixels == nullptr) {
+            return makeError(env, kErrBadParam, "beginFilterPreview: empty layer");
+        }
+        if (e.textEditOpen || e.filterPreview.active) {
+            return makeError(env, kErrBadParam, "beginFilterPreview: session open");
+        }
+        uint32_t gx = 0, gy = 0, w = 0, h = 0;
+        if (!layerContentBBox(*layer->pixels, gx, gy, w, h)) {
+            return makeError(env, kErrBadParam, "beginFilterPreview: no content");
+        }
+        std::vector<uint8_t> strip;
+        filterGridToStrip(*layer->pixels, gx, gy, w, h, strip);
+        auto& fp = e.filterPreview;
+        fp = Engine::FilterPreview{};
+        fp.active = true;
+        fp.layerId = static_cast<LayerId>(id);
+        fp.fullW = w;
+        fp.fullH = h;
+        fp.originX = layer->transform.originX + gx;
+        fp.originY = layer->transform.originY + gy;
+        const uint32_t qw = (w + 3u) / 4u;
+        const uint32_t qh = (h + 3u) / 4u;
+        fp.srcW = qw;
+        fp.srcH = qh;
+        fp.srcStrip.assign(static_cast<size_t>(qw) * qh * 4u, 0);
+        for (uint32_t y = 0; y < qh; ++y) {
+            for (uint32_t x = 0; x < qw; ++x) {
+                uint32_t acc[4] = {0, 0, 0, 0};
+                uint32_t cnt = 0;
+                for (uint32_t sy = y * 4u; sy < std::min(h, (y + 1u) * 4u); ++sy) {
+                    for (uint32_t sx = x * 4u; sx < std::min(w, (x + 1u) * 4u); ++sx) {
+                        const uint8_t* px = strip.data() + (static_cast<size_t>(sy) * w + sx) * 4u;
+                        for (int c = 0; c < 4; ++c) {
+                            acc[c] += px[c];
+                        }
+                        ++cnt;
+                    }
+                }
+                uint8_t* d = fp.srcStrip.data() + (static_cast<size_t>(y) * qw + x) * 4u;
+                for (int c = 0; c < 4; ++c) {
+                    d[c] = cnt > 0 ? static_cast<uint8_t>(acc[c] / cnt) : 0;
+                }
+            }
+        }
+        fp.scale = 4.0;
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Filter",
+                     "preview begin: layer %{public}llu domain (%{public}u,%{public}u) %{public}u x %{public}u proxy %{public}u x %{public}u",
+                     static_cast<unsigned long long>(fp.layerId), gx, gy, w, h, fp.srcW, fp.srcH);
+    }
+    return makeOk(env, nullptr);
+}
+
+// M13：预览跑核（kind, p0..p5, seed；proxy 网格发布 → GL 替换该层显示）
+napi_value SetFilterPreview(napi_env env, napi_callback_info info) {
+    size_t argc = 8;
+    napi_value argv[8];
+    for (size_t i = 0; i < 8; ++i) {
+        argv[i] = nullptr;
+    }
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    filters::FilterParams p;
+    if (!readFilterArgs(env, argv, argc, p)) {
+        return makeError(env, kErrBadParam, "setFilterPreview: bad params");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Engine::FilterPreview& fp = e.filterPreview;
+        if (!fp.active || fp.srcStrip.empty()) {
+            return makeError(env, kErrBadParam, "setFilterPreview: no preview session");
+        }
+        p.colorFg[0] = e.fgColor[0];
+        p.colorFg[1] = e.fgColor[1];
+        p.colorFg[2] = e.fgColor[2];
+        p.colorBg[0] = e.bgColor[0];
+        p.colorBg[1] = e.bgColor[1];
+        p.colorBg[2] = e.bgColor[2];
+        std::vector<uint8_t> out(fp.srcStrip.size(), 0);
+        std::string err;
+        if (!filters::applyFilter(fp.srcStrip.data(), out.data(), fp.srcW, fp.srcH, p, err)) {
+            return makeError(env, kErrBadParam, "setFilterPreview: " + err);
+        }
+        fp.proxy = filterStripToGrid(out, fp.srcW, fp.srcH,
+                                     fp.proxy != nullptr ? fp.proxy->revision + 1 : 1);
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Filter",
+                     "preview proxy published: %{public}u x %{public}u", fp.srcW, fp.srcH);
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// M13：结束预览（commit=true → 全分辨率核 + 一步事务；false → 丢弃）
+napi_value EndFilterPreview(napi_env env, napi_callback_info info) {
+    size_t argc = 9;
+    napi_value argv[9];
+    for (size_t i = 0; i < 9; ++i) {
+        argv[i] = nullptr;
+    }
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t commit = 0;
+    if (argc >= 1 && napi_get_value_int32(env, argv[0], &commit) != napi_ok) {
+        commit = 0;
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Engine::FilterPreview& fp = e.filterPreview;
+        if (fp.active) {
+            if (commit != 0) {
+                filters::FilterParams p;
+                if (readFilterArgs(env, argv + 1, argc - 1, p)) {
+                    p.colorFg[0] = e.fgColor[0];
+                    p.colorFg[1] = e.fgColor[1];
+                    p.colorFg[2] = e.fgColor[2];
+                    p.colorBg[0] = e.bgColor[0];
+                    p.colorBg[1] = e.bgColor[1];
+                    p.colorBg[2] = e.bgColor[2];
+                    e.history.beginEdit(e.doc, "filter", static_cast<uint64_t>(e.docRevision));
+                    std::string err;
+                    if (applyFilterToLayer(e.doc, fp.layerId, p, err)) {
+                        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+                        e.bumpRevisionLocked();
+                    } else {
+                        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+                        OH_LOG_Print(LOG_APP, LOG_WARN, 0x4D30, "Montage.Filter",
+                                     "commit failed: %{public}s", err.c_str());
+                    }
+                }
+            }
+            fp = Engine::FilterPreview{};
+            e.requestRender();
+        }
+    }
+    return makeOk(env, nullptr);
 }
 
 }  // namespace bridge

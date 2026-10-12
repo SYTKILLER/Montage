@@ -306,6 +306,40 @@ void RenderLoop::doFrame() {
                 }
             }
         }
+        // M13：滤镜预览——该层像素换 1/4 proxy 网格 + 复用 M8.1 xform 矩阵放大显示
+        if (e.filterPreview.active && e.filterPreview.proxy != nullptr) {
+            static std::atomic<int> fpLogCount{0};
+            if (fpLogCount.fetch_add(1) < 3) {
+                OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.FilterRender",
+                             "preview frame: layer=%{public}llu proxy %ux%u scale=%.1f",
+                             static_cast<unsigned long long>(e.filterPreview.layerId),
+                             e.filterPreview.proxy->cols * 256, e.filterPreview.proxy->rows * 256,
+                             e.filterPreview.scale);
+            }
+            for (Layer& l : docSnap.layers) {
+                if (l.id == e.filterPreview.layerId) {
+                    l.pixels = e.filterPreview.proxy;
+                    l.render = nullptr;  // 预览期不叠蒙版（登记）
+                    l.mask = nullptr;
+                    l.transform.originX = e.filterPreview.originX;
+                    l.transform.originY = e.filterPreview.originY;
+                    if (!transformPreview.active) {
+                        const double s = e.filterPreview.scale;
+                        const double ox = e.filterPreview.originX;
+                        const double oy = e.filterPreview.originY;
+                        transformPreview.active = true;
+                        transformPreview.layerId = l.id;
+                        transformPreview.m[0] = s;
+                        transformPreview.m[1] = 0.0;
+                        transformPreview.m[2] = ox - s * ox;
+                        transformPreview.m[3] = 0.0;
+                        transformPreview.m[4] = s;
+                        transformPreview.m[5] = oy - s * oy;
+                    }
+                    break;
+                }
+            }
+        }
     }
     TileRenderer::StrokeOverlay overlay;
     if (strokeSnap.active) {

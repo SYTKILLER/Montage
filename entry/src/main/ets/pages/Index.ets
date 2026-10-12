@@ -15,6 +15,7 @@ import { ExportDialog } from '../editor/components/ExportDialog';
 import { TransformOverlay } from '../editor/components/TransformOverlay';
 import { AdjustPanel } from '../editor/components/AdjustPanel';
 import { ChannelsPanel } from '../editor/components/ChannelsPanel';
+import { FILTER_CATALOG, FilterDef, FilterParamDef } from '../editor/FilterCatalog';
 import { TextPanel } from '../editor/components/TextPanel';
 import { ABOUT_TEXT, InfoDialog, SHORTCUT_ROWS } from '../editor/components/InfoDialog';
 
@@ -107,6 +108,11 @@ struct Index {
   @State gradientTarget: number = 0;    // 0=像素 1=图层蒙版
   @State gradientLine: number[] | null = null;  // 非空 = 拖线中（overlay 预览）
   @State showFill: boolean = false;     // M11a 填充对话框（Shift+F5）
+  @State showFilter: boolean = false;   // M13 滤镜对话框（proxy 预览）
+  @State filterDef: FilterDef | null = null;
+  @State filterP: number[] = [];        // 当前参数值（schema 序）
+  @State filterSeed: number = 1;
+  private filterDebounce: number = -1;
   @State fillSource: number = 0;        // 0=前景 1=背景 2=黑 3=白
   private gradDragging: boolean = false;
   // M11c 形状工具：种类/样式 + 拖拽预览（视口 [x,y,w,h]）
@@ -1000,6 +1006,93 @@ struct Index {
     return out;
   }
 
+  // ---------- M13 滤镜对话框 ----------
+
+  private openFilterDialog(def: FilterDef): void {
+    const a = this.activeLayer();
+    if (!this.docOpen || a === undefined) {
+      this.toast('无文档或无活动图层');
+      return;
+    }
+    if (a.isText) {
+      this.toast('文字层请先栅格化再应用滤镜');
+      return;
+    }
+    if (!this.engine.beginFilterPreview(a.id)) {
+      this.toast('滤镜预览创建失败（空图层？）');
+      return;
+    }
+    this.filterDef = def;
+    this.filterP = def.params.map((d: FilterParamDef): number => d.def);
+    this.filterSeed = 1;
+    this.showFilter = true;
+    this.log(`滤镜预览: ${def.label}`);
+    this.pushFilterPreview();
+  }
+
+  private pushFilterPreview(): void {
+    if (!this.showFilter || this.filterDef === null) {
+      return;
+    }
+    const p = this.filterP;
+    const vals: number[] = [p[0] ?? 0, p[1] ?? 0, p[2] ?? 0, p[3] ?? 0, p[4] ?? 0, p[5] ?? 0];
+    this.engine.setFilterPreview(this.filterDef.kind, vals[0], vals[1], vals[2], vals[3],
+      vals[4], vals[5], this.filterSeed);
+  }
+
+  // 滑条拖动 debounce 150ms → proxy 跑核（D-2 预算）
+  private onFilterParamChange(idx: number, v: number): void {
+    if (idx >= this.filterP.length) {
+      return;
+    }
+    this.filterP = this.filterP.map((old: number, i: number): number => i === idx ? v : old);
+    if (this.filterDebounce >= 0) {
+      clearTimeout(this.filterDebounce);
+    }
+    this.filterDebounce = setTimeout((): void => {
+      this.filterDebounce = -1;
+      this.pushFilterPreview();
+    }, 150);
+  }
+
+  private commitFilterDialog(): void {
+    if (!this.showFilter || this.filterDef === null) {
+      return;
+    }
+    const def = this.filterDef;
+    const p = this.filterP;
+    const vals: number[] = [p[0] ?? 0, p[1] ?? 0, p[2] ?? 0, p[3] ?? 0, p[4] ?? 0, p[5] ?? 0];
+    if (this.filterDebounce >= 0) {
+      clearTimeout(this.filterDebounce);
+      this.filterDebounce = -1;
+    }
+    this.showFilter = false;
+    this.engine.endFilterPreview(true, def.kind, vals[0], vals[1], vals[2], vals[3], vals[4],
+      vals[5], this.filterSeed);
+    this.log(`滤镜已应用: ${def.label}`);
+    this.filterDef = null;
+  }
+
+  private cancelFilterDialog(): void {
+    if (!this.showFilter) {
+      return;
+    }
+    if (this.filterDebounce >= 0) {
+      clearTimeout(this.filterDebounce);
+      this.filterDebounce = -1;
+    }
+    this.showFilter = false;
+    const def = this.filterDef;
+    if (def !== null) {
+      const p = this.filterP;
+      const vals: number[] = [p[0] ?? 0, p[1] ?? 0, p[2] ?? 0, p[3] ?? 0, p[4] ?? 0, p[5] ?? 0];
+      this.engine.endFilterPreview(false, def.kind, vals[0], vals[1], vals[2], vals[3], vals[4],
+        vals[5], this.filterSeed);
+    }
+    this.filterDef = null;
+    this.log('滤镜已取消');
+  }
+
   // 编辑 overlay 视口框 [x,y,w,h]（vp）；非编辑态返回空数组
   private editingBoxVp(): number[] {
     if (this.editingTextId === 0) {
@@ -1187,6 +1280,10 @@ struct Index {
   private doCloseDocument(): void {
     if (this.editingTextId !== 0) {
       this.editingTextId = 0;  // 引擎 resetDocument 已清会话，UI 镜像同步
+    }
+    if (this.showFilter) {
+      this.showFilter = false;  // M13：预览会话随文档清空（引擎 resetDocument 已清）
+      this.filterDef = null;
     }
     const ok = this.engine.closeDocument();
     this.docOpen = false;
@@ -1544,6 +1641,14 @@ struct Index {
     hilog.info(DOMAIN, TAG, 'cmd %{public}s', id);
     if (this.editingTextId !== 0) {
       this.commitTextEditing();  // 文本编辑会话独占 history pending 槽：任何命令先提交
+    }
+    // M13 滤镜命令：'filter.<id>' → 查目录开对话框（proxy 预览）
+    if (id.startsWith('filter.')) {
+      const def = FILTER_CATALOG.find((f: FilterDef): boolean => f.id === id.substring(7));
+      if (def !== undefined) {
+        this.openFilterDialog(def);
+      }
+      return;
     }
     switch (id) {
       case 'file.new':
@@ -2202,6 +2307,24 @@ struct Index {
       leafItem('select.expand', '修改：扩展…', '', selReady),
       leafItem('select.contract', '修改：收缩…', '', selReady),
     ];
+    // M13 滤镜菜单（分类子菜单；docs 未启用项不列）
+    const filterMenus: MenuItemVM[] = [];
+    const groups: Record<string, MenuItemVM[]> = {};
+    for (const f of FILTER_CATALOG) {
+      if (groups[f.menu] === undefined) {
+        groups[f.menu] = [];
+      }
+      groups[f.menu].push(leafItem(`filter.${f.id}`, `${f.label}…`, '', d));
+    }
+    const menuOf = (key: string, label: string): MenuItemVM =>
+      subItem(`filterGroup.${key}`, label, d, groups[key] ?? []);
+    filterMenus.push(menuOf('blur', '模糊'));
+    filterMenus.push(menuOf('sharpen', '锐化'));
+    filterMenus.push(menuOf('noise', '杂色'));
+    filterMenus.push(menuOf('pixelate', '像素化'));
+    filterMenus.push(menuOf('stylize', '风格化'));
+    filterMenus.push(menuOf('render', '渲染'));
+    filterMenus.push(menuOf('other', '其他'));
     const view: MenuItemVM[] = [
       leafItem('view.zoomIn', '放大', 'Ctrl+=', d),
       leafItem('view.zoomOut', '缩小', 'Ctrl+-', d),
@@ -2226,6 +2349,7 @@ struct Index {
       { id: 'image', label: '图像', items: imageMenu },
       { id: 'layer', label: '图层', items: layer },
       { id: 'select', label: '选择', items: select },
+      { id: 'filter', label: '滤镜', items: filterMenus },
       { id: 'view', label: '视图', items: view },
       { id: 'window', label: '窗口', items: win },
       { id: 'help', label: '帮助', items: help },
@@ -2309,7 +2433,7 @@ struct Index {
       return;
     }
     // 对话框打开时：Esc 关闭，其余不抢
-    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform || this.showModify || this.showStoreSel || this.showLoadSel || this.showFill) {
+    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform || this.showModify || this.showStoreSel || this.showLoadSel || this.showFill || this.showFilter) {
       if (e.keyCode === KC_ESC) {
         this.showTransform = false;
         this.showExport = false;
@@ -2321,6 +2445,7 @@ struct Index {
         this.showStoreSel = false;
         this.showLoadSel = false;
         this.showFill = false;
+        this.cancelFilterDialog();
       }
       return;
     }
@@ -3211,6 +3336,55 @@ struct Index {
             }.justifyContent(FlexAlign.End).width('100%')
           }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
             .border({ width: 1, color: $r('app.color.border') }).width(360)
+        }.width('100%').height('100%')
+      }
+      if (this.showFilter && this.filterDef !== null) {
+        Stack() {
+          Column().width('100%').height('100%').backgroundColor('#66000000')
+            .onClick((): void => { this.cancelFilterDialog(); })
+          Column({ space: 14 }) {
+            Text(this.filterDef.label)
+              .fontSize(16).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+            Text('1/4 代理实时预览；选区约束自动生效')
+              .fontSize(11).fontColor($r('app.color.text_secondary'))
+            ForEach(this.filterDef.params, (d: FilterParamDef, idx: number) => {
+              Row({ space: 10 }) {
+                Text(d.label).fontSize(13).fontColor($r('app.color.text_secondary')).width(84)
+                Slider({ value: this.filterP[idx] ?? d.def, min: d.min, max: d.max, step: d.step })
+                  .layoutWeight(1)
+                  .onChange((v: number): void => { this.onFilterParamChange(idx, v); })
+                Text(`${Math.round((this.filterP[idx] ?? d.def) * 10) / 10}${d.unit}`)
+                  .fontSize(12).fontColor($r('app.color.text_primary')).width(64)
+                  .textAlign(TextAlign.End)
+              }.width('100%')
+            }, (d: FilterParamDef, idx: number): string => `${idx}|${d.label}`)
+            if (this.filterDef.hasSeed) {
+              Row({ space: 10 }) {
+                Text('随机种子').fontSize(13).fontColor($r('app.color.text_secondary')).width(84)
+                Slider({ value: this.filterSeed, min: 1, max: 9999, step: 1 })
+                  .layoutWeight(1)
+                  .onChange((v: number): void => {
+                    this.filterSeed = Math.round(v);
+                    this.onFilterParamChange(-1, 0);
+                  })
+                Text(`${this.filterSeed}`).fontSize(12).fontColor($r('app.color.text_primary')).width(64)
+                  .textAlign(TextAlign.End)
+              }.width('100%')
+            }
+            Row({ space: 12 }) {
+              Button('取消').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.surface'))
+                .fontColor($r('app.color.text_primary'))
+                .border({ width: 1, color: $r('app.color.border') })
+                .onClick((): void => { this.cancelFilterDialog(); })
+              Button('确定').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.accent'))
+                .fontColor($r('app.color.on_accent'))
+                .onClick((): void => this.commitFilterDialog())
+            }.justifyContent(FlexAlign.End).width('100%')
+          }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
+            .border({ width: 1, color: $r('app.color.border') }).width(400)
         }.width('100%').height('100%')
       }
       if (this.showFill) {

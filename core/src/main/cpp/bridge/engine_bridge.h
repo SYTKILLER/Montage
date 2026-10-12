@@ -142,6 +142,12 @@ napi_value BeginTransformOverlay(napi_env env, napi_callback_info info);
 napi_value SetTransformPreview(napi_env env, napi_callback_info info);
 napi_value BakeLayerMatrix(napi_env env, napi_callback_info info);
 napi_value CancelTransformOverlay(napi_env env, napi_callback_info info);
+// M13 滤镜：直接应用（一步事务）/ 预览三件套（begin 建 1/4 proxy 源、set 跑核、
+// end commit = 全分辨率事务应用并清理）
+napi_value ApplyFilter(napi_env env, napi_callback_info info);
+napi_value BeginFilterPreview(napi_env env, napi_callback_info info);
+napi_value SetFilterPreview(napi_env env, napi_callback_info info);
+napi_value EndFilterPreview(napi_env env, napi_callback_info info);
 // M12 文字层：创建（x,y,wrapW；wrapW>0 = 段落）/ 内容 / 样式全量 / 栅格化转普通层 /
 // 编辑会话（begin 持 history pending 槽，整会话一步撤销）/ 系统字体列表 / 注册用户字体
 napi_value CreateTextLayer(napi_env env, napi_callback_info info);

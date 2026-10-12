@@ -375,6 +375,7 @@ void Engine::resetDocument() {
     cloneSource = CloneSource{};
     textEditOpen = false;  // M12：编辑会话随文档清空（History 已 clear）
     textEditLayerId = 0;
+    filterPreview = FilterPreview{};  // M13：预览会话随文档清空
     needsRender.store(true);
     render.wake();
 }
