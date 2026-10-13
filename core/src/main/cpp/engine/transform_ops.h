@@ -24,6 +24,12 @@ bool rotateDocument90(Document& doc, bool clockwise);
 // 选区掩码平移（出界裁剪；无选区返回 false）
 bool translateSelection(Document& doc, int dx, int dy);
 
+// M14b 对齐/分布（多选层；纯 origin 移动，像素零改动，一步事务由调用方包裹）。
+// mode：0=左 1=水平居中 2=右 3=顶 4=垂直居中 5=底。组/调整层/空层跳过；
+// 对齐需 ≥2 可用层（对齐到选中集包围盒），分布需 ≥3（选定边/中心等距插值，首尾锚定）。
+bool alignLayers(Document& doc, const std::vector<LayerId>& ids, int mode, std::string& err);
+bool distributeLayers(Document& doc, const std::vector<LayerId>& ids, int mode, std::string& err);
+
 }  // namespace montage
 
 #endif  // MONTAGE_ENGINE_TRANSFORM_OPS_H

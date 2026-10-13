@@ -13,6 +13,7 @@ add_library(compositor SHARED
         engine/engine.cpp
         engine/gradient_ops.cpp
         engine/group_ops.cpp
+        engine/layer_ops.cpp
         engine/history.cpp
         engine/shape_ops.cpp
         engine/filter_ops.cpp

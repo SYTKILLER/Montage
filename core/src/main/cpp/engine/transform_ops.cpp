@@ -1,10 +1,13 @@
 #include "engine/transform_ops.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <utility>
 #include <vector>
+
+#include "engine/filter_ops.h"
 
 namespace montage {
 
@@ -365,6 +368,158 @@ bool translateSelection(Document& doc, int dx, int dy) {
         }
     }
     doc.selection = builder.publish(g.revision + 1);
+    return true;
+}
+
+// ---------- M14b 对齐/分布（多选层；纯 origin 移动，像素零改动） ----------
+
+namespace {
+
+// 可用层 doc 域内容包围盒（组/调整层/空层/无内容层返回 false 由调用方跳过）
+bool alignBBoxOf(const Layer& l, int& x, int& y, int& w, int& h) {
+    if (l.isGroup || l.adjustment != nullptr) {
+        return false;
+    }
+    const std::shared_ptr<const TileGrid> px = l.effectivePixels();
+    if (px == nullptr) {
+        return false;
+    }
+    uint32_t ux = 0, uy = 0, uw = 0, uh = 0;
+    if (!layerContentBBox(*px, ux, uy, uw, uh)) {
+        return false;
+    }
+    x = static_cast<int>(std::lround(l.transform.originX)) + static_cast<int>(ux);
+    y = static_cast<int>(std::lround(l.transform.originY)) + static_cast<int>(uy);
+    w = static_cast<int>(uw);
+    h = static_cast<int>(uh);
+    return true;
+}
+
+Layer* findLayerForAlign(Document& doc, LayerId id) {
+    for (Layer& e : doc.layers) {
+        if (e.id == id) {
+            return &e;
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+bool alignLayers(Document& doc, const std::vector<LayerId>& ids, int mode, std::string& err) {
+    if (mode < 0 || mode > 5) {
+        err = "align: bad mode";
+        return false;
+    }
+    // 收集可用层及其包围盒（对齐目标 = 选中集包围盒，PS 多选同语义）
+    struct Box {
+        Layer* l;
+        int x, y, w, h;
+    };
+    std::vector<Box> boxes;
+    int ux0 = 0, uy0 = 0, ux1 = 0, uy1 = 0;
+    for (LayerId id : ids) {
+        Layer* l = findLayerForAlign(doc, id);
+        if (l == nullptr) {
+            continue;
+        }
+        int x = 0, y = 0, w = 0, h = 0;
+        if (!alignBBoxOf(*l, x, y, w, h)) {
+            continue;
+        }
+        if (boxes.empty()) {
+            ux0 = x;
+            uy0 = y;
+            ux1 = x + w;
+            uy1 = y + h;
+        } else {
+            ux0 = std::min(ux0, x);
+            uy0 = std::min(uy0, y);
+            ux1 = std::max(ux1, x + w);
+            uy1 = std::max(uy1, y + h);
+        }
+        boxes.push_back({l, x, y, w, h});
+    }
+    if (boxes.size() < 2) {
+        err = "align: needs at least 2 layers with content";
+        return false;
+    }
+    const bool horizontal = mode <= 2;
+    for (const Box& b : boxes) {
+        if (horizontal) {
+            double dx = 0.0;
+            if (mode == 0) {
+                dx = ux0 - b.x;
+            } else if (mode == 2) {
+                dx = ux1 - (b.x + b.w);
+            } else {
+                dx = (ux0 + ux1) / 2.0 - (b.x + b.w / 2.0);
+            }
+            b.l->transform.originX += dx;
+        } else {
+            double dy = 0.0;
+            if (mode == 3) {
+                dy = uy0 - b.y;
+            } else if (mode == 5) {
+                dy = uy1 - (b.y + b.h);
+            } else {
+                dy = (uy0 + uy1) / 2.0 - (b.y + b.h / 2.0);
+            }
+            b.l->transform.originY += dy;
+        }
+    }
+    return true;
+}
+
+bool distributeLayers(Document& doc, const std::vector<LayerId>& ids, int mode, std::string& err) {
+    if (mode < 0 || mode > 5) {
+        err = "distribute: bad mode";
+        return false;
+    }
+    struct Item {
+        Layer* l;
+        double metric;
+    };
+    std::vector<Item> items;
+    for (LayerId id : ids) {
+        Layer* l = findLayerForAlign(doc, id);
+        if (l == nullptr) {
+            continue;
+        }
+        int x = 0, y = 0, w = 0, h = 0;
+        if (!alignBBoxOf(*l, x, y, w, h)) {
+            continue;
+        }
+        double m = 0.0;
+        switch (mode) {
+            case 0: m = x; break;
+            case 1: m = x + w / 2.0; break;
+            case 2: m = x + w; break;
+            case 3: m = y; break;
+            case 4: m = y + h / 2.0; break;
+            default: m = y + h; break;
+        }
+        items.push_back({l, m});
+    }
+    if (items.size() < 3) {
+        err = "distribute: needs at least 3 layers with content";
+        return false;
+    }
+    std::sort(items.begin(), items.end(),
+              [](const Item& a, const Item& b) { return a.metric < b.metric; });
+    // 选定边/中心线性等距插值；首尾锚定不动（PS 分布语义）
+    const double first = items.front().metric;
+    const double span = items.back().metric - first;
+    const size_t n = items.size();
+    for (size_t k = 1; k + 1 < n; ++k) {
+        const double target = first + span * static_cast<double>(k) / static_cast<double>(n - 1);
+        const double delta = target - items[k].metric;
+        if (mode <= 2) {
+            items[k].l->transform.originX += delta;
+        } else {
+            items[k].l->transform.originY += delta;
+        }
+    }
     return true;
 }
 

@@ -58,6 +58,7 @@ const KC_ESC: number = 2070;
 const KC_F6: number = 2095;  // @ohos.multimodalInput.keyCode KEYCODE_F6（SDK 核验）
 const KC_F5: number = 2094;  // KEYCODE_F5（SDK 核验，2026-10-11）
 const KC_G: number = 2023;   // KEYCODE_G（SDK 核验，2026-10-11）
+const KC_J: number = 2026;   // KEYCODE_J（A=2017 起序列；KC_X=2040/KC_G=2023 双锚点核对，2026-10-13）
 const KC_T_KEY: number = 2036;
 const KC_U: number = 2037;  // KEYCODE_U（SDK 核验，2026-10-11）
 const KC_R: number = 2034;  // KEYCODE_R（SDK 核验，2026-10-11；KC_O=2031 见上）
@@ -206,6 +207,7 @@ struct Index {
   @State adjP1: number = 0;
   @State adjP2: number = 0;
   @State panelVersion: number = 0;  // M14a 面板树序版本（强制 ForEach 重建）
+  @State multiSelected: number[] = [];  // M14b 图层多选（面板 Ctrl/Shift+点击；对齐/分布/链接驱动）
   private histTimer: number = -1;
   @State showTransform: boolean = false;
   @State overlayBox: TransformOverlayBox | null = null;  // M8.1 手柄 overlay 态
@@ -293,6 +295,20 @@ struct Index {
   private refreshLayers(): void {
     this.layers = this.engine.getLayerListSnapshot();
     hilog.info(DOMAIN, TAG, 'layers: %{public}s', this.layers.map((l: LayerDTO): string => `${l.id}(${l.parentId})${l.isGroup ? "G" : ""}`).join(", "));
+    // M14b：多选集清理（层被合并/删除后剔除失效 id）
+    const liveIds = new Set<number>();
+    for (const l of this.layers) {
+      liveIds.add(l.id);
+    }
+    const pruned: number[] = [];
+    for (const mid of this.multiSelected) {
+      if (liveIds.has(mid)) {
+        pruned.push(mid);
+      }
+    }
+    if (pruned.length !== this.multiSelected.length) {
+      this.multiSelected = pruned;
+    }
     const active = this.activeLayer();
     if (active !== undefined) {
       this.blendSel = active.blendMode;
@@ -1798,6 +1814,78 @@ struct Index {
         }
         break;
       }
+      case 'layer.duplicate': {
+        const da = this.activeLayer();
+        if (da === undefined) {
+          break;
+        }
+        const nid = this.engine.duplicateLayer(da.id);
+        if (nid !== 0) {
+          this.toast(`已复制图层 → ${da.name} 副本`);
+          this.log(`duplicate #${da.id} → #${nid}`);
+        } else {
+          this.toast('复制图层失败');
+        }
+        break;
+      }
+      case 'layer.mergeDown': {
+        if (this.engine.mergeDown()) {
+          this.toast('已向下合并');
+          this.log('merge down');
+        } else {
+          this.toast('合并向下失败（下方需为相邻像素层）');
+        }
+        break;
+      }
+      case 'layer.mergeVisible': {
+        if (this.engine.mergeVisible()) {
+          this.toast('已合并可见图层');
+          this.log('merge visible');
+        } else {
+          this.toast('合并可见失败（可见层 ≥2）');
+        }
+        break;
+      }
+      case 'layer.stamp': {
+        const sid = this.engine.stampVisible();
+        if (sid !== 0) {
+          this.toast(`已盖印 → 图层 #${sid}`);
+          this.log(`stamp visible → #${sid}`);
+        } else {
+          this.toast('盖印失败（无可见图层）');
+        }
+        break;
+      }
+      case 'layer.flatten': {
+        if (this.engine.flattenImage()) {
+          this.toast('已拼合图像');
+          this.log('flatten image');
+        } else {
+          this.toast('拼合失败');
+        }
+        break;
+      }
+      case 'layer.alignLeft':
+      case 'layer.alignHCenter':
+      case 'layer.alignRight':
+      case 'layer.alignTop':
+      case 'layer.alignVCenter':
+      case 'layer.alignBottom':
+      case 'layer.distLeft':
+      case 'layer.distHCenter':
+      case 'layer.distRight':
+      case 'layer.distTop':
+      case 'layer.distVCenter':
+      case 'layer.distBottom': {
+        const alignModes: Record<string, number> = {
+          'layer.alignLeft': 0, 'layer.alignHCenter': 1, 'layer.alignRight': 2,
+          'layer.alignTop': 3, 'layer.alignVCenter': 4, 'layer.alignBottom': 5,
+          'layer.distLeft': 0, 'layer.distHCenter': 1, 'layer.distRight': 2,
+          'layer.distTop': 3, 'layer.distVCenter': 4, 'layer.distBottom': 5,
+        };
+        this.onAlignPick(alignModes[id] ?? 0, id.startsWith('layer.align'));
+        break;
+      }
       case 'layer.rasterizeText': {
         const a = this.activeLayer();
         if (a !== undefined && a.isText) {
@@ -2324,6 +2412,30 @@ struct Index {
       leafItem('layer.newGroup', '新建组…', '', d),
       leafItem('layer.group', '图层编组', 'Ctrl+G', d && this.activeLayer()?.isGroup === false),
       leafItem('layer.ungroup', '取消编组', '', d && this.activeLayer()?.isGroup === true),
+      leafItem('layer.duplicate', '复制图层', 'Ctrl+J', this.activeLayer() !== undefined),
+      leafItem('layer.mergeDown', '合并向下', 'Ctrl+E', d && this.activeLayer()?.isGroup === false),
+      leafItem('layer.mergeVisible', '合并可见', 'Shift+Ctrl+E', d),
+      leafItem('layer.stamp', '盖印', 'Shift+Ctrl+Alt+E', d),
+      leafItem('layer.flatten', '拼合图像', '', d),
+      leafItem('layer.linkToggle', '链接图层 / 解除链接', '',
+        d && (this.alignTargetIds().length >= 2 || this.layers.some((l: LayerDTO): boolean =>
+          l.isActive && l.linkId !== 0))),
+      subItem('layer.alignSub', '对齐', d && this.alignTargetIds().length >= 2, [
+        leafItem('layer.alignLeft', '左边', '', d),
+        leafItem('layer.alignHCenter', '水平居中', '', d),
+        leafItem('layer.alignRight', '右边', '', d),
+        leafItem('layer.alignTop', '顶边', '', d),
+        leafItem('layer.alignVCenter', '垂直居中', '', d),
+        leafItem('layer.alignBottom', '底边', '', d),
+      ]),
+      subItem('layer.distributeSub', '分布', d && this.alignTargetIds().length >= 3, [
+        leafItem('layer.distLeft', '左', '', d),
+        leafItem('layer.distHCenter', '水平居中', '', d),
+        leafItem('layer.distRight', '右', '', d),
+        leafItem('layer.distTop', '顶', '', d),
+        leafItem('layer.distVCenter', '垂直居中', '', d),
+        leafItem('layer.distBottom', '底', '', d),
+      ]),
       leafItem('layer.rename', '重命名…', '', this.activeLayer() !== undefined),
       leafItem('layer.delete', '删除图层', '', this.activeLayer() !== undefined),
       leafItem('layer.moveUp', '上移一层', '', d),
@@ -2597,6 +2709,18 @@ struct Index {
         case KC_G:
           this.runCommand('layer.group');  // M14a 编组（PS Ctrl+G）
           break;
+        case KC_J:
+          this.runCommand('layer.duplicate');  // M14b 复制图层（PS Ctrl+J）
+          break;
+        case KC_E:
+          if (this.shiftHeld && this.altHeld) {
+            this.runCommand('layer.stamp');  // Shift+Ctrl+Alt+E 盖印
+          } else if (this.shiftHeld) {
+            this.runCommand('layer.mergeVisible');  // Shift+Ctrl+E 合并可见
+          } else {
+            this.runCommand('layer.mergeDown');  // Ctrl+E 合并向下
+          }
+          break;
         case KC_C:
           this.runCommand('edit.copy');
           break;
@@ -2756,6 +2880,149 @@ struct Index {
     this.engine.reorderLayer(l.id, target);
   }
 
+  // ---------- M14b 图层深化动作 ----------
+
+  // 面板行点击：无修饰 = 单选（清多选）；Ctrl = 加减选；Shift = 活动层到该行的范围多选
+  private onLayerRowSelect(id: number, e: ClickEvent): void {
+    let ctrl = false;
+    let shift = false;
+    if (e.getModifierKeyState !== undefined) {
+      try {
+        ctrl = e.getModifierKeyState(['Ctrl']);
+        shift = e.getModifierKeyState(['Shift']);
+      } catch (_err) {
+        hilog.warn(DOMAIN, TAG, 'getModifierKeyState failed');
+      }
+    }
+    if (ctrl) {
+      const cur: number[] = this.multiSelected.slice();
+      const at = cur.indexOf(id);
+      if (at >= 0) {
+        cur.splice(at, 1);
+      } else {
+        cur.push(id);
+      }
+      this.multiSelected = cur;
+      this.engine.selectLayer(id);
+      return;
+    }
+    if (shift) {
+      const a = this.activeLayer();
+      if (a === undefined) {
+        this.multiSelected = [id];
+        this.engine.selectLayer(id);
+        return;
+      }
+      // 面板可见序（自顶向下）内取范围
+      const rows = this.panelRows();
+      const i0 = rows.findIndex((l: LayerDTO): boolean => l.id === a.id);
+      const i1 = rows.findIndex((l: LayerDTO): boolean => l.id === id);
+      if (i0 < 0 || i1 < 0) {
+        return;
+      }
+      const lo = Math.min(i0, i1);
+      const hi = Math.max(i0, i1);
+      const sel: number[] = [];
+      for (let k = lo; k <= hi; k++) {
+        sel.push(rows[k].id);
+      }
+      this.multiSelected = sel;
+      this.engine.selectLayer(id);
+      return;
+    }
+    this.multiSelected = [];
+    this.engine.selectLayer(id);
+  }
+
+  // 面板可见行序（自顶向下；与 LayersPanel.panelTree 同规则——兄弟逆序 + 组先于子树 + 折叠过滤）
+  private panelRows(): LayerDTO[] {
+    const kids: Map<number, LayerDTO[]> = new Map();
+    const rootKids: LayerDTO[] = [];
+    for (const l of this.layers) {
+      if (l.parentId === 0) {
+        rootKids.push(l);
+      } else {
+        const arr = kids.get(l.parentId);
+        if (arr !== undefined) {
+          arr.push(l);
+        } else {
+          kids.set(l.parentId, [l]);
+        }
+      }
+    }
+    kids.set(0, rootKids);
+    const out: LayerDTO[] = [];
+    const walk = (parent: number): void => {
+      const arr = kids.get(parent);
+      if (arr === undefined) {
+        return;
+      }
+      for (let i = arr.length - 1; i >= 0; i--) {
+        const c = arr[i];
+        out.push(c);
+        if (c.isGroup && !c.collapsed) {
+          walk(c.id);
+        }
+      }
+    };
+    walk(0);
+    return out;
+  }
+
+  // 多选集（含活动层）→ 命令 ids
+  private alignTargetIds(): number[] {
+    const ids: number[] = [];
+    const a = this.activeLayer();
+    if (a !== undefined) {
+      ids.push(a.id);
+    }
+    for (const mid of this.multiSelected) {
+      if (a === undefined || mid !== a.id) {
+        ids.push(mid);
+      }
+    }
+    return ids;
+  }
+
+  private onAlignPick(mode: number, isAlign: boolean): void {
+    const ids = this.alignTargetIds();
+    const usable = ids.filter((id: number): boolean => {
+      const l = this.layers.find((x: LayerDTO): boolean => x.id === id);
+      return l !== undefined && !l.isGroup && !l.isAdjustment;
+    });
+    if (isAlign && usable.length < 2) {
+      this.toast('对齐需多选 ≥2 个图层（Ctrl/Shift+点击）');
+      return;
+    }
+    if (!isAlign && usable.length < 3) {
+      this.toast('分布需多选 ≥3 个图层');
+      return;
+    }
+    const ok = isAlign ? this.engine.alignLayers(usable, mode)
+      : this.engine.distributeLayers(usable, mode);
+    this.log(`${isAlign ? '对齐' : '分布'} mode=${mode}: ${ok}`);
+  }
+
+  private onLayerLinkToggle(): void {
+    const a = this.activeLayer();
+    if (a === undefined) {
+      return;
+    }
+    const ids = this.alignTargetIds();
+    // 任一选中层已链接 → 解除整组；否则给全部选中层分配同一链接组
+    const anyLinked = this.layers.some((l: LayerDTO): boolean =>
+      ids.indexOf(l.id) >= 0 && l.linkId !== 0);
+    const ok = this.engine.setLayerLink(ids, !anyLinked);
+    this.toast(ok ? (anyLinked ? '已解除链接' : '已链接图层') : '链接失败');
+    this.log(`linkToggle ids=[${ids.join(',')}]: ${ok}`);
+  }
+
+  private onMoveToParent(id: number, newParent: number, flatIndex: number): void {
+    if (!this.engine.setLayerParent(id, newParent, flatIndex)) {
+      this.toast('移动会破坏组结构，已拒绝');
+    }
+  }
+
   private commitRename(): void {
     const a = this.activeLayer();
     const name = this.renameText.trim();
@@ -2884,6 +3151,8 @@ struct Index {
           },
           onZoom: (cmd: string): void => this.runCommand(`view.${cmd === 'fit' ? 'fit' : cmd === '100' ? 'zoom100' : cmd === 'in' ? 'zoomIn' : 'zoomOut'}`),
           onCropCommand: (cmd: string): void => this.runCommand(`crop.${cmd}`),
+          multiSelectCount: this.alignTargetIds().length,
+          onAlignPick: (mode: number, isAlign: boolean): void => this.onAlignPick(mode, isAlign),
         })
         Row() {
           Toolbox({ tools: this.buildTools(),
@@ -3202,10 +3471,9 @@ struct Index {
                 thumbVersion: this.thumbVersion,
                 panelVersion: this.panelVersion,
                 docOpen: this.docOpen,
+                selectedIds: this.multiSelected,
                 getThumb: (id: number): Object | null => this.getThumb(id),
-                onSelect: (id: number): void => {
-                  this.engine.selectLayer(id);
-                },
+                onSelect: (id: number, e: ClickEvent): void => this.onLayerRowSelect(id, e),
                 onToggleVisible: (l: LayerDTO): void => {
                   this.engine.setLayerVisible(l.id, !l.visible);
                 },
@@ -3226,6 +3494,10 @@ struct Index {
                 },
                 onGroup: (): void => this.runCommand('layer.group'),
                 onUngroup: (): void => this.runCommand('layer.ungroup'),
+                onDuplicate: (): void => this.runCommand('layer.duplicate'),
+                onLinkToggle: (): void => this.onLayerLinkToggle(),
+                onMoveToParent: (id: number, newParent: number, flatIndex: number): void =>
+                  this.onMoveToParent(id, newParent, flatIndex),
                 onOpacityChange: (v: number): void => {
                   const a = this.activeLayer();
                   if (a !== undefined) {

@@ -56,6 +56,7 @@ export interface LayerDTO {
   isGroup: boolean;
   parentId: number;
   collapsed: boolean;
+  linkId: number;    // M14b 链接层（非零 = 同号层联动移动；会话态不持久化）
   hasMask: boolean;
   maskEnabled: boolean;
   clipping: boolean;

@@ -146,6 +146,7 @@ function narrowLayer(r: Record<string, Object>): LayerDTO {
     isGroup: boolOf(r, 'isGroup'),
     parentId: num(r, 'parentId'),
     collapsed: boolOf(r, 'collapsed'),
+    linkId: num(r, 'linkId'),
     hasMask: boolOf(r, 'hasMask'),
     maskEnabled: boolOf(r, 'maskEnabled'),
     clipping: boolOf(r, 'clipping'),
@@ -461,6 +462,88 @@ export class CompositorEngine {
     const r = narrowResult(native.setGroupCollapsed(id, collapsed ? 1 : 0) as Object);
     if (!r.ok) {
       hilog.error(DOMAIN, TAG, 'setGroupCollapsed failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  // ---------- M14b 合并族 / 复制 / 链接 / 对齐分布 ----------
+
+  mergeDown(): boolean {
+    const r = narrowResult(native.mergeDown() as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'mergeDown failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  mergeVisible(): boolean {
+    const r = narrowResult(native.mergeVisible() as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'mergeVisible failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  flattenImage(): boolean {
+    const r = narrowResult(native.flattenImage() as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'flattenImage failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  stampVisible(): number {
+    const r = narrowResult(native.stampVisible() as Object);
+    if (!r.ok || r.data === null) {
+      hilog.error(DOMAIN, TAG, 'stampVisible failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return 0;
+    }
+    return num(r.data, 'id');
+  }
+
+  duplicateLayer(id: number): number {
+    const r = narrowResult(native.duplicateLayer(id) as Object);
+    if (!r.ok || r.data === null) {
+      hilog.error(DOMAIN, TAG, 'duplicateLayer failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return 0;
+    }
+    return num(r.data, 'id');
+  }
+
+  setLayerLink(ids: number[], link: boolean): boolean {
+    const r = narrowResult(native.setLayerLink(ids, link ? 1 : 0) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setLayerLink failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  alignLayers(ids: number[], mode: number): boolean {
+    const r = narrowResult(native.alignLayers(ids, mode) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'alignLayers failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  distributeLayers(ids: number[], mode: number): boolean {
+    const r = narrowResult(native.distributeLayers(ids, mode) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'distributeLayers failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }

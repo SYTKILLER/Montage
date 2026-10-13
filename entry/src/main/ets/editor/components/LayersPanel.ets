@@ -24,8 +24,9 @@ export struct LayersPanel {
   @Prop thumbVersion: number = 0;
   @Prop panelVersion: number = 0;  // M14a：面板序变化强制整表重建（ForEach 同 key 复用不移位）
   @Prop docOpen: boolean = false;
+  @Prop selectedIds: number[] = [];  // M14b 多选（含活动层；面板行高亮 + 对齐/分布/链接驱动）
   getThumb: (id: number) => Object | null = (_id: number): Object | null => null;
-  onSelect: (id: number) => void = (_id: number) => {};
+  onSelect: (id: number, event: ClickEvent) => void = (_id: number, _e: ClickEvent) => {};
   onToggleVisible: (l: LayerDTO) => void = (_l: LayerDTO) => {};
   onToggleMaskEnabled: (l: LayerDTO) => void = (_l: LayerDTO) => {};
   onToggleClipping: (l: LayerDTO) => void = (_l: LayerDTO) => {};
@@ -39,13 +40,49 @@ export struct LayersPanel {
   onToggleCollapse: (l: LayerDTO) => void = (_l: LayerDTO) => {};
   onGroup: () => void = () => {};
   onUngroup: () => void = () => {};
+  // M14b 图层深化
+  onDuplicate: () => void = () => {};
+  onLinkToggle: () => void = () => {};
+  onMoveToParent: (id: number, newParent: number, flatIndex: number) => void =
+    (_id: number, _newParent: number, _flatIndex: number) => {};
   onOpacityChange: (v: number) => void = (_v: number) => {};
   onBlendChange: (idx: number) => void = (_idx: number) => {};
   onAdjustChange: (b: number, w: number, g: number) => void =
     (_b: number, _w: number, _g: number) => {};
 
+  private dragFromId: number = 0;  // 拖拽起手行 id（onItemDragStart 记录）
+
   private active(): LayerDTO | undefined {
     return this.layers.find((l: LayerDTO): boolean => l.isActive);
+  }
+
+  private isSelected(l: LayerDTO): boolean {
+    return l.isActive || this.selectedIds.indexOf(l.id) >= 0;
+  }
+
+  // M14b 多选集大小（活动层恒在集合内）
+  private selectionSize(): number {
+    const ids = new Set<number>();
+    for (const l of this.layers) {
+      if (l.isActive) {
+        ids.add(l.id);
+      }
+    }
+    for (const id of this.selectedIds) {
+      if (this.layers.some((l: LayerDTO): boolean => l.id === id)) {
+        ids.add(id);
+      }
+    }
+    return ids.size;
+  }
+
+  private anySelectedLinked(): boolean {
+    for (const l of this.layers) {
+      if ((l.isActive || this.selectedIds.indexOf(l.id) >= 0) && l.linkId !== 0) {
+        return true;
+      }
+    }
+    return false;
   }
 
   @Builder
@@ -81,6 +118,10 @@ export struct LayersPanel {
         .onClick((): void => this.onMove(l, true))
       MenuItem({ content: '下移一层' })
         .onClick((): void => this.onMove(l, false))
+      if (l.parentId !== 0) {
+        MenuItem({ content: '移出所在组' })
+          .onClick((): void => this.onMoveOut(l))
+      }
       if (l.hasMask) {
         MenuItem({ content: l.maskEnabled ? '停用蒙版' : '启用蒙版' })
           .onClick((): void => this.onToggleMaskEnabled(l))
@@ -90,6 +131,68 @@ export struct LayersPanel {
       MenuItem({ content: '删除图层' })
         .onClick((): void => this.onDelete())
     }
+  }
+
+  // M14b 拖拽落点 → 平铺位（目标父组 + flat 插入序）。落点语义 = 插到可见行序
+  // insertIndex 处的行上方（跨父子边界天然成立：目标行的 parentId 即新父）；
+  // insertIndex 越尾 = 根栈底。组节点行作为落点 = 变为其上方兄弟（入组用 Ctrl+G/菜单）。
+  private handleDrop(draggedId: number, insertIndex: number): void {
+    if (draggedId === 0) {
+      return;
+    }
+    const rows = this.panelTree();
+    const others: LayerDTO[] = [];
+    for (const r of rows) {
+      if (r.id !== draggedId) {
+        others.push(r);
+      }
+    }
+    let newParent = 0;
+    let flatIndex = this.layers.length;
+    if (insertIndex >= 0 && insertIndex < others.length) {
+      const t = others[insertIndex];
+      newParent = t.parentId;
+      flatIndex = this.flatIndexOf(t.id) + 1;  // flat 序 = 目标行之上（z 高一层）
+    }
+    this.onMoveToParent(draggedId, newParent, flatIndex);
+  }
+
+  private flatIndexOf(id: number): number {
+    for (let i = 0; i < this.layers.length; i++) {
+      if (this.layers[i].id === id) {
+        return i;
+      }
+    }
+    return this.layers.length;
+  }
+
+  // 移出所在组：插到父组整棵子树之上（flat 序 = 子树末尾，保持 z 序在组之上）
+  private onMoveOut(l: LayerDTO): void {
+    if (l.parentId === 0) {
+      return;
+    }
+    const gid = l.parentId;
+    const parentOf = new Map<number, number>();
+    for (const lay of this.layers) {
+      parentOf.set(lay.id, lay.parentId);
+    }
+    const insideGroup = (id: number): boolean => {
+      let cur = parentOf.get(id) ?? 0;
+      let guard = 0;
+      while (cur !== 0 && guard++ < 32) {
+        if (cur === gid) {
+          return true;
+        }
+        cur = parentOf.get(cur) ?? 0;
+      }
+      return false;
+    };
+    const gi = this.flatIndexOf(gid);
+    let end = gi + 1;
+    while (end < this.layers.length && insideGroup(this.layers[end].id)) {
+      end++;
+    }
+    this.onMoveToParent(l.id, 0, end);
   }
 
   build() {
@@ -184,7 +287,7 @@ export struct LayersPanel {
         .backgroundColor($r('app.color.accent_container'))
       }
 
-      // 图层列表（自顶向下 = PS 惯例）
+      // 图层列表（自顶向下 = PS 惯例；绑定 onItemDragStart 后长按 170ms 起拖——SDK d.ts）
       List({ space: 4 }) {
         ForEach(this.reversed(), (l: LayerDTO) => {
           ListItem() {
@@ -227,6 +330,11 @@ export struct LayersPanel {
                       .fontSize(11)
                       .fontColor([$r('app.color.accent')])
                   }
+                  if (l.linkId !== 0) {
+                    SymbolGlyph($r('sys.symbol.link'))
+                      .fontSize(11)
+                      .fontColor([$r('app.color.accent')])
+                  }
                   Text(l.name)
                     .fontSize(12)
                     .fontColor($r('app.color.text_primary'))
@@ -250,24 +358,41 @@ export struct LayersPanel {
               }
               .alignItems(HorizontalAlign.Start)
               .layoutWeight(1)
-              .onClick((): void => this.onSelect(l.id))
+              .onClick((e: ClickEvent): void => this.onSelect(l.id, e))
             }
             .width('100%')
             .padding(6)
             .borderRadius(8)
-            .backgroundColor(l.isActive ? $r('app.color.accent_container') : Color.Transparent)
-            .border({ width: 1, color: l.isActive ? $r('app.color.accent') : Color.Transparent })
+            .backgroundColor(this.isSelected(l) ? $r('app.color.accent_container') : Color.Transparent)
+            .border({
+              width: 1,
+              color: l.isActive ? $r('app.color.accent') :
+                (this.isSelected(l) ? $r('app.color.icon_muted') : Color.Transparent)
+            })
             .bindContextMenu(this.rowMenu(l), ResponseType.RightClick)
-            .onClick((): void => this.onSelect(l.id))
+            .onClick((e: ClickEvent): void => this.onSelect(l.id, e))
           }
         }, (l: LayerDTO): string =>
           `${l.id}|${l.visible}|${l.isActive}|${l.blendMode}|${Math.round(l.opacity * 100)}|` +
           `${l.thumbToken}|${l.hasMask}|${l.maskEnabled}|${l.clipping}|${l.name}|` +
           `${this.getThumb(l.id) !== null ? 'p' : 'n'}|${this.thumbVersion}|` +
-          `${l.isGroup ? 'g' : 'n'}|${l.collapsed ? 'c' : 'o'}|${l.parentId}|${this.panelVersion}`)
+          `${l.isGroup ? 'g' : 'n'}|${l.collapsed ? 'c' : 'o'}|${l.parentId}|${this.panelVersion}|` +
+          `${this.isSelected(l) ? 's' : 'n'}|${l.linkId}`)
       }
       .layoutWeight(1)
       .scrollBar(BarState.Auto)
+      .onItemDragStart((event: ItemDragInfo, itemIndex: number): CustomBuilder => {
+        const rows = this.panelTree();
+        this.dragFromId = itemIndex >= 0 && itemIndex < rows.length ? rows[itemIndex].id : 0;
+        hilog.info(0x4D30, 'LayersPanel', `drag start row=${itemIndex} id=${this.dragFromId}`);
+        return (): void => {};
+      })
+      .onItemDrop((_event: ItemDragInfo, _itemIndex: number, insertIndex: number,
+        _isSuccess: boolean): void => {
+        hilog.info(0x4D30, 'LayersPanel', `drop id=${this.dragFromId} insertIndex=${insertIndex}`);
+        this.handleDrop(this.dragFromId, insertIndex);
+        this.dragFromId = 0;
+      })
 
       // 操作条
       Row({ space: 6 }) {
@@ -314,6 +439,26 @@ export struct LayersPanel {
         .backgroundColor(Color.Transparent)
         .enabled(this.active()?.isGroup === true)
         .onClick((): void => this.onUngroup())
+        // M14b：复制图层（M7.5 欠账）+ 链接/解除链接
+        Button() {
+          SymbolGlyph($r('sys.symbol.plus_square_on_square')).fontSize(16)
+            .fontColor([$r('app.color.text_primary')])
+        }
+        .type(ButtonType.Circle)
+        .width(30).height(30)
+        .backgroundColor(Color.Transparent)
+        .enabled(this.active() !== undefined)
+        .onClick((): void => this.onDuplicate())
+        Button() {
+          SymbolGlyph(this.anySelectedLinked() ? $r('sys.symbol.link_slash') : $r('sys.symbol.link'))
+            .fontSize(16)
+            .fontColor([$r('app.color.text_primary')])
+        }
+        .type(ButtonType.Circle)
+        .width(30).height(30)
+        .backgroundColor(Color.Transparent)
+        .enabled(this.selectionSize() >= 2 || this.anySelectedLinked())
+        .onClick((): void => this.onLinkToggle())
         Blank()
         Button() {
           SymbolGlyph($r('sys.symbol.trash')).fontSize(16)

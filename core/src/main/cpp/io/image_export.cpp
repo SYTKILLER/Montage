@@ -1,12 +1,15 @@
 #include "io/image_export.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
 
 #include <unistd.h>
 #include <zlib.h>
+
+#include "engine/filter_ops.h"
 
 namespace montage {
 namespace io {
@@ -336,16 +339,131 @@ bool writeChunk(int fd, const char* type, const uint8_t* data, size_t n) {
 }  // namespace
 
 FlattenJob BuildFlattenJob(const Document& doc, int regionX, int regionY, int regionW, int regionH) {
-    FlattenJob job;
-    job.docWidth = doc.width;
-    job.docHeight = doc.height;
     (void)regionX;
     (void)regionY;
     (void)regionW;
     (void)regionH;  // region 在 FlattenVisible 阶段生效
-    const size_t n = doc.layers.size();
-    for (size_t i = 0; i < n; ++i) {
-        const Layer& l = doc.layers[i];
+    return BuildFlattenJobRange(doc, 0, static_cast<int>(doc.layers.size()));
+}
+
+// 层段内容包围盒并集（组递归计可见子层；全段无可见像素返回 false）
+bool rangeContentBBox(const Document& doc, int start, int end, int& bx, int& by, int& bw, int& bh) {
+    bool any = false;
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    const auto grow = [&](int lx, int ly, int lw, int lh) -> void {
+        const int rx0 = std::max(0, lx);
+        const int ry0 = std::max(0, ly);
+        const int rx1 = std::min(static_cast<int>(doc.width), lx + lw);
+        const int ry1 = std::min(static_cast<int>(doc.height), ly + lh);
+        if (rx1 <= rx0 || ry1 <= ry0) {
+            return;
+        }
+        if (!any) {
+            x0 = rx0;
+            y0 = ry0;
+            x1 = rx1;
+            y1 = ry1;
+            any = true;
+            return;
+        }
+        x0 = std::min(x0, rx0);
+        y0 = std::min(y0, ry0);
+        x1 = std::max(x1, rx1);
+        y1 = std::max(y1, ry1);
+    };
+    for (int i = start; i < end; ++i) {
+        const Layer& l = doc.layers[static_cast<size_t>(i)];
+        if (l.isGroup) {
+            if (!l.visible) {
+                continue;  // 隐藏组整棵子树跳过（渲染同语义）
+            }
+            const int ce = groupChildEnd(doc.layers, i);
+            int gx = 0, gy = 0, gw = 0, gh = 0;
+            if (rangeContentBBox(doc, i + 1, ce, gx, gy, gw, gh)) {
+                grow(gx, gy, gw, gh);
+            }
+            continue;
+        }
+        if (!l.visible || l.adjustment != nullptr) {
+            continue;
+        }
+        const std::shared_ptr<const TileGrid> px = l.effectivePixels();
+        if (px == nullptr) {
+            continue;
+        }
+        uint32_t ux = 0, uy = 0, uw = 0, uh = 0;
+        if (!layerContentBBox(*px, ux, uy, uw, uh)) {
+            continue;
+        }
+        grow(static_cast<int>(std::lround(l.transform.originX)) + static_cast<int>(ux),
+             static_cast<int>(std::lround(l.transform.originY)) + static_cast<int>(uy),
+             static_cast<int>(uw), static_cast<int>(uh));
+    }
+    if (!any) {
+        return false;
+    }
+    bx = x0;
+    by = y0;
+    bw = x1 - x0;
+    bh = y1 - y0;
+    return true;
+}
+
+namespace {
+
+// 组子纹理发布序号（进程内单调；组纹理不入文档，只求唯一缓存键）
+std::atomic<uint64_t> g_groupTexRev{1};
+
+// 递归追加层段 [start, end)（bottom→top）。组节点：折叠 → 整段跳过；
+// 穿透（Normal + opacity≥1）→ 子层直入主栈（PS 默认语义，与 GL composeLayerRange 同构）；
+// 其余组 → 子段先合成组子纹理（子段内容 bbox 域），再以组 blend/opacity 作为一层混入。
+void appendLayerRange(const Document& doc, int start, int end, FlattenJob& job, int depth) {
+    if (depth > 16) {
+        return;  // 嵌套上限防御（GL 渲染同款深度 8；此处放更宽）
+    }
+    for (int i = start; i < end; ++i) {
+        const Layer& l = doc.layers[static_cast<size_t>(i)];
+        if (l.isGroup) {
+            if (!l.visible) {
+                i = groupChildEnd(doc.layers, i) - 1;  // 隐藏组整棵子树跳过
+                continue;
+            }
+            const int ce = groupChildEnd(doc.layers, i);
+            if (l.collapsed || ce <= i + 1) {
+                i = ce - 1;  // 折叠/空组：整段跳过
+                continue;
+            }
+            const bool passThrough = l.blendMode == BlendMode::Normal && l.opacity >= 1.0;
+            if (passThrough) {
+                appendLayerRange(doc, i + 1, ce, job, depth + 1);
+            } else {
+                int gx = 0, gy = 0, gw = 0, gh = 0;
+                if (!rangeContentBBox(doc, i + 1, ce, gx, gy, gw, gh)) {
+                    i = ce - 1;
+                    continue;
+                }
+                FlattenJob sub;
+                sub.docWidth = doc.width;
+                sub.docHeight = doc.height;
+                appendLayerRange(doc, i + 1, ce, sub, depth + 1);
+                FlattenResult res = FlattenVisible(sub, gx, gy, gw, gh);
+                if (!res.ok) {
+                    i = ce - 1;
+                    continue;
+                }
+                FlatLayer tex;
+                tex.blend = l.blendMode;
+                tex.opacity = l.opacity;
+                tex.visible = true;
+                tex.pixels = filterStripToGrid(res.rgba, res.width, res.height,
+                                               g_groupTexRev.fetch_add(1));
+                tex.originX = gx;
+                tex.originY = gy;
+                job.layers.push_back(std::move(tex));
+            }
+            i = ce - 1;  // 子树已整体消费（穿透递归/组纹理），外层循环不可再访
+            continue;
+        }
         if (!l.visible) {
             continue;
         }
@@ -365,14 +483,12 @@ FlattenJob BuildFlattenJob(const Document& doc, int regionX, int regionY, int re
                 continue;  // 空图层跳过
             }
             if (fl.clipping) {
-                // 剪贴基 = 下方最近可见非剪贴层（无有效基 → 剪贴组隐藏，PS 语义）
-                for (size_t j = i; j-- > 0;) {
-                    const Layer& b = doc.layers[j];
-                    if (!b.visible || b.clipping) {
+                // 剪贴基 = 段内下方最近可见非剪贴层（剪贴不跨组/段边界，PS 语义；
+                // 无有效基 → 剪贴组隐藏）。调整层不可作剪贴基（v1）。
+                for (int j = i; j-- > start;) {
+                    const Layer& b = doc.layers[static_cast<size_t>(j)];
+                    if (b.isGroup || !b.visible || b.clipping || b.adjustment != nullptr) {
                         continue;
-                    }
-                    if (b.adjustment != nullptr) {
-                        continue;  // v1：调整层不可作剪贴基
                     }
                     fl.clipBasePixels = b.effectivePixels();
                     fl.clipBaseOriginX = b.transform.originX;
@@ -383,6 +499,15 @@ FlattenJob BuildFlattenJob(const Document& doc, int regionX, int regionY, int re
         }
         job.layers.push_back(std::move(fl));
     }
+}
+
+}  // namespace
+
+FlattenJob BuildFlattenJobRange(const Document& doc, int start, int end) {
+    FlattenJob job;
+    job.docWidth = doc.width;
+    job.docHeight = doc.height;
+    appendLayerRange(doc, start, end, job, 0);
     return job;
 }
 
@@ -409,7 +534,14 @@ FlattenResult FlattenVisible(const FlattenJob& job, int regionX, int regionY, in
     res.ok = true;
     res.width = static_cast<uint32_t>(x1 - x0);
     res.height = static_cast<uint32_t>(y1 - y0);
-    res.rgba.assign(static_cast<size_t>(res.width) * res.height * 4, 0);
+    // 拼合语义（opaqueWhite）：透明区填白（PS 拼合图像），其余场合从透明起合成
+    res.rgba.assign(static_cast<size_t>(res.width) * res.height * 4,
+                    job.opaqueWhite ? 255 : 0);
+    if (job.opaqueWhite) {
+        for (size_t k = 3; k < res.rgba.size(); k += 4) {
+            res.rgba[k] = 255;
+        }
+    }
 
     const int w = static_cast<int>(res.width);
     float lut[256];

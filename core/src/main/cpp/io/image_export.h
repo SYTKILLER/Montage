@@ -35,10 +35,21 @@ struct FlattenJob {
     uint32_t docWidth = 0;
     uint32_t docHeight = 0;
     std::vector<FlatLayer> layers;  // bottom → top，仅可见层
+    bool opaqueWhite = false;       // true = 合成前白底垫底（拼合图像 PS 语义：透明区填白）
 };
 
-// docMutex 内构建扁平化快照（region = 文档坐标矩形；全文档传 0/0/0/0 → 自动取全图）
+// docMutex 内构建扁平化快照（region = 文档坐标矩形；全文档传 0/0/0/0 → 自动取全图）。
+// M14b 起组感知：折叠组整段跳过；穿透组（Normal+opacity1）子层直入主栈；其余组先合成
+// 组子纹理（子段内容 bbox 域）再以组 blend/opacity 混入（与 GL composeLayerRange 同构）；
+// 剪贴基搜索约束在本层段内（剪贴不跨组边界）。
 FlattenJob BuildFlattenJob(const Document& doc, int regionX, int regionY, int regionW, int regionH);
+
+// 层段变体（合并族用）：只取平铺序 [start, end) 段；段内有组时同样组感知递归。
+FlattenJob BuildFlattenJobRange(const Document& doc, int start, int end);
+
+// 层段内容包围盒并集（doc 坐标，已裁剪进文档域；段内无可见像素返回 false）。
+// 组递归计其可见子层——组纹理域与合并族 region 共用此几何。
+bool rangeContentBBox(const Document& doc, int start, int end, int& x, int& y, int& w, int& h);
 
 struct FlattenResult {
     bool ok = false;

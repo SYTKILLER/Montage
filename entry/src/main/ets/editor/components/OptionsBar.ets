@@ -82,6 +82,61 @@ export struct OptionsBar {
   onColorPick: (hex: string) => void = (_hex: string) => {};
   onZoom: (cmd: string) => void = (_cmd: string) => {};
   onCropCommand: (cmd: string) => void = (_cmd: string) => {};
+  // M14b 对齐/分布（move 工具选项条；PS 同布局）
+  @Prop multiSelectCount: number = 1;
+  onAlignPick: (mode: number, isAlign: boolean) => void =
+    (_mode: number, _isAlign: boolean) => {};
+
+  @Builder
+  alignButton(symbol: string, mode: number, isAlign: boolean) {
+    Column() {
+      SymbolGlyph($r(`sys.symbol.${symbol}`))
+        .fontSize(17)
+        .fontColor([$r('app.color.text_primary')])
+    }
+    .justifyContent(FlexAlign.Center)
+    .width(30)
+    .height(28)
+    .borderRadius(6)
+    .opacity(isAlign ? (this.multiSelectCount >= 2 ? 1.0 : 0.4) :
+      (this.multiSelectCount >= 3 ? 1.0 : 0.4))
+    .onClick((): void => this.onAlignPick(mode, isAlign))
+  }
+
+  // M14b 对齐/分布按钮组（mode 0..5 = 左/水平中/右/顶/垂直中/底）
+  @Builder
+  moveAlignOptions() {
+    Row({ space: 6 }) {
+      Text('对齐')
+        .fontSize(11)
+        .fontColor($r('app.color.text_secondary'))
+      Row({ space: 2 }) {
+        this.alignButton('align_left', 0, true)
+        this.alignButton('align_center', 1, true)
+        this.alignButton('align_right', 2, true)
+        this.alignButton('align_top', 3, true)
+        this.alignButton('align_middle', 4, true)
+        this.alignButton('align_bottom', 5, true)
+      }
+      .height(28)
+      Text('分布')
+        .fontSize(11)
+        .fontColor($r('app.color.text_secondary'))
+      Row({ space: 2 }) {
+        this.alignButton('align_left', 0, false)
+        this.alignButton('align_center', 1, false)
+        this.alignButton('align_right', 2, false)
+        this.alignButton('align_top', 3, false)
+        this.alignButton('align_middle', 4, false)
+        this.alignButton('align_bottom', 5, false)
+      }
+      .height(28)
+      Text('图层面板 Ctrl/Shift+点击多选')
+        .fontSize(11)
+        .fontColor($r('app.color.text_secondary'))
+    }
+    .height(36)
+  }
 
   // M10a 布尔四态按钮（新/加/减/交；PS 选项条语义，Shift/Alt 临时修饰在引擎入口生效）
   @Builder
@@ -542,9 +597,13 @@ export struct OptionsBar {
           .fontSize(12)
           .fontColor($r('app.color.text_secondary'))
       } else if (this.tool === 'move') {
-        Text('拖拽移动图层 · 方向键微调（Shift=10px）')
-          .fontSize(12)
-          .fontColor($r('app.color.text_secondary'))
+        Row({ space: 10 }) {
+          this.moveAlignOptions()
+          Text('拖拽移动图层 · 方向键微调（Shift=10px）')
+            .fontSize(11)
+            .fontColor($r('app.color.text_secondary'))
+        }
+        .height(36)
       } else if (this.tool === 'lasso') {
         Row({ space: 10 }) {
           this.selOpButtons()

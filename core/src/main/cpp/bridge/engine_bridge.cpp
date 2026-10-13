@@ -15,6 +15,7 @@
 #include "engine/engine.h"
 #include "engine/filter_ops.h"
 #include "engine/group_ops.h"
+#include "engine/layer_ops.h"
 #include "engine/filters.h"
 #include "engine/gradient_ops.h"
 #include "engine/shape_ops.h"
@@ -787,6 +788,7 @@ napi_value makeLayerDto(napi_env env, const Layer& l, bool isActive) {
     napi_set_named_property(env, obj, "isGroup", makeBool(env, l.isGroup));
     napi_set_named_property(env, obj, "parentId", makeDouble(env, static_cast<double>(l.parentId)));
     napi_set_named_property(env, obj, "collapsed", makeBool(env, l.collapsed));
+    napi_set_named_property(env, obj, "linkId", makeDouble(env, static_cast<double>(l.linkId)));
     napi_set_named_property(env, obj, "hasMask", makeBool(env, l.mask != nullptr));
     napi_set_named_property(env, obj, "maskEnabled", makeBool(env, l.mask != nullptr && l.mask->enabled));
     napi_set_named_property(env, obj, "clipping", makeBool(env, l.clipping));
@@ -2904,7 +2906,7 @@ napi_value FlipDocument(napi_env env, napi_callback_info info) {
 }
 
 // 移动工具：三段事务（0=begin 快照 / 1=move 实时平移 / 2=end 提交），拖拽过程实时渲染、
-// 撤销粒度 = 一次拖拽。id=0 表示活动图层。
+// 撤销粒度 = 一次拖拽。id=0 表示活动图层。M14b：活动层 linkId 非零时联动平移同组全部层。
 napi_value TranslateLayer(napi_env env, napi_callback_info info) {
     size_t argc = 4;
     napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
@@ -2937,12 +2939,21 @@ napi_value TranslateLayer(napi_env env, napi_callback_info info) {
         if (l == nullptr) {
             return makeError(env, kErrNoDoc, "translateLayer: no active layer");
         }
+        // M14b 链接联动：拖拽目标 linkId 非零 → 同组全部层一起动（每组拖拽一次事务）
+        std::vector<LayerId> linked = collectLinkedIds(e.doc, l->id);
         const int p = static_cast<int>(phase);
         if (p == 0) {
-            e.history.beginEdit(e.doc, "move layer", static_cast<uint64_t>(e.docRevision));
+            e.history.beginEdit(e.doc, linked.size() > 1 ? "move linked layers" : "move layer",
+                                static_cast<uint64_t>(e.docRevision));
         }
-        l->transform.originX += dx;
-        l->transform.originY += dy;
+        for (LayerId lid : linked) {
+            Layer* t = findLayerLocked(e.doc, lid);
+            if (t == nullptr) {
+                continue;
+            }
+            t->transform.originX += dx;
+            t->transform.originY += dy;
+        }
         if (p == 2) {
             e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
             e.bumpRevisionLocked();
@@ -4518,6 +4529,264 @@ napi_value SetGroupCollapsed(napi_env env, napi_callback_info info) {
         if (!setGroupCollapsed(e.doc, static_cast<LayerId>(id), collapsed != 0, err)) {
             return makeError(env, kErrBadParam, "setGroupCollapsed: " + err);
         }
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// ---------- M14b 合并族 / 复制 / 链接 / 对齐分布 ----------
+
+// id 数组参数（@State 代理数组跨桥 is_array 失败——M10a 实证，逐元素探测长度）
+bool readLayerIdArray(napi_env env, napi_value v, std::vector<LayerId>& out) {
+    uint32_t n = 0;
+    napi_get_array_length(env, v, &n);
+    if (n == 0) {
+        const uint32_t kMaxProbe = 4096;
+        for (uint32_t i = 0; i < kMaxProbe; ++i) {
+            napi_value e = nullptr;
+            if (napi_get_element(env, v, i, &e) != napi_ok || e == nullptr) {
+                break;
+            }
+            napi_valuetype vt = napi_undefined;
+            napi_typeof(env, e, &vt);
+            if (vt != napi_number) {
+                break;
+            }
+            n = i + 1;
+        }
+    }
+    out.clear();
+    out.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        napi_value e = nullptr;
+        if (napi_get_element(env, v, i, &e) != napi_ok) {
+            return false;
+        }
+        double d = 0;
+        if (napi_get_value_double(env, e, &d) != napi_ok) {
+            return false;
+        }
+        out.push_back(static_cast<LayerId>(d));
+    }
+    return true;
+}
+
+// 合并族共用骨架：session 守卫 + history 事务 + 刷新
+napi_value runLayerMergeCommand(napi_env env, const char* what,
+                                bool (*fn)(Document&, std::string&)) {
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, std::string(what) + ": no document");
+        }
+        if (e.textEditOpen || e.filterPreview.active) {
+            return makeError(env, kErrBadParam, std::string(what) + ": session open");
+        }
+        e.history.beginEdit(e.doc, what, static_cast<uint64_t>(e.docRevision));
+        std::string err;
+        if (!fn(e.doc, err)) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, std::string(what) + ": " + err);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value MergeDown(napi_env env, napi_callback_info /*info*/) {
+    return runLayerMergeCommand(env, "merge down", mergeDown);
+}
+
+napi_value MergeVisible(napi_env env, napi_callback_info /*info*/) {
+    return runLayerMergeCommand(env, "merge visible", mergeVisible);
+}
+
+napi_value FlattenImage(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "flattenImage: no document");
+        }
+        if (e.textEditOpen || e.filterPreview.active) {
+            return makeError(env, kErrBadParam, "flattenImage: session open");
+        }
+        e.history.beginEdit(e.doc, "flatten image", static_cast<uint64_t>(e.docRevision));
+        std::string err;
+        if (!flattenImage(e.doc, e.nextLayerId(), err)) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, "flattenImage: " + err);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value StampVisible(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    double newId = 0;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "stampVisible: no document");
+        }
+        if (e.textEditOpen || e.filterPreview.active) {
+            return makeError(env, kErrBadParam, "stampVisible: session open");
+        }
+        e.history.beginEdit(e.doc, "stamp visible", static_cast<uint64_t>(e.docRevision));
+        std::string err;
+        const LayerId id = e.nextLayerId();
+        const std::string name = "图层 " + std::to_string(id);
+        const LayerId got = stampVisible(e.doc, id, name, err);
+        if (got == 0) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, "stampVisible: " + err);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        newId = static_cast<double>(got);
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "id", makeDouble(env, newId));
+    return makeOk(env, data);
+}
+
+napi_value DuplicateLayer(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double id = 0;
+    if (argc >= 1 && napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "duplicateLayer(id?) invalid");
+    }
+    auto& e = Engine::get();
+    double newId = 0;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "duplicateLayer: no document");
+        }
+        if (e.textEditOpen || e.filterPreview.active) {
+            return makeError(env, kErrBadParam, "duplicateLayer: session open");
+        }
+        LayerId src = static_cast<LayerId>(id);
+        if (src == 0) {
+            src = e.doc.activeId;
+        }
+        e.history.beginEdit(e.doc, "duplicate layer", static_cast<uint64_t>(e.docRevision));
+        std::string err;
+        const LayerId got = duplicateLayer(e.doc, src, e.nextLayerId(), err);
+        if (got == 0) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, "duplicateLayer: " + err);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        newId = static_cast<double>(got);
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "id", makeDouble(env, newId));
+    return makeOk(env, data);
+}
+
+napi_value SetLayerLink(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t link = 0;
+    if (argc < 2 || napi_get_value_int32(env, argv[1], &link) != napi_ok) {
+        return makeError(env, kErrBadParam, "setLayerLink(ids, link) requires 2 args");
+    }
+    std::vector<LayerId> ids;
+    if (!readLayerIdArray(env, argv[0], ids)) {
+        return makeError(env, kErrBadParam, "setLayerLink: bad ids");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "setLayerLink: no document");
+        }
+        e.history.beginEdit(e.doc, link ? "link layers" : "unlink layers",
+                            static_cast<uint64_t>(e.docRevision));
+        std::string err;
+        if (!setLayerLink(e.doc, ids, link != 0, err)) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, "setLayerLink: " + err);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value AlignLayers(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t mode = 0;
+    if (argc < 2 || napi_get_value_int32(env, argv[1], &mode) != napi_ok) {
+        return makeError(env, kErrBadParam, "alignLayers(ids, mode) requires 2 args");
+    }
+    std::vector<LayerId> ids;
+    if (!readLayerIdArray(env, argv[0], ids)) {
+        return makeError(env, kErrBadParam, "alignLayers: bad ids");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "alignLayers: no document");
+        }
+        e.history.beginEdit(e.doc, "align layers", static_cast<uint64_t>(e.docRevision));
+        std::string err;
+        if (!alignLayers(e.doc, ids, mode, err)) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, "alignLayers: " + err);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value DistributeLayers(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t mode = 0;
+    if (argc < 2 || napi_get_value_int32(env, argv[1], &mode) != napi_ok) {
+        return makeError(env, kErrBadParam, "distributeLayers(ids, mode) requires 2 args");
+    }
+    std::vector<LayerId> ids;
+    if (!readLayerIdArray(env, argv[0], ids)) {
+        return makeError(env, kErrBadParam, "distributeLayers: bad ids");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "distributeLayers: no document");
+        }
+        e.history.beginEdit(e.doc, "distribute layers", static_cast<uint64_t>(e.docRevision));
+        std::string err;
+        if (!distributeLayers(e.doc, ids, mode, err)) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, "distributeLayers: " + err);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();
         e.requestRender();
     }

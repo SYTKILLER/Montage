@@ -212,6 +212,9 @@ struct Layer {
     bool isGroup = false;
     LayerId parentId = 0;
     bool collapsed = false;
+    // M14b 链接层：同一非零 linkId 的层随移动工具联动平移（对齐 PS 链接语义）。
+    // 会话态 v1：.montage 不持久化（PSD 链接导出随 M15 评估），随 History 快照走。
+    uint64_t linkId = 0;
     // 渲染/缩略图取数：蒙版启用取合成结果，否则原像素
     std::shared_ptr<const TileGrid> effectivePixels() const {
         return (mask != nullptr && mask->enabled && render != nullptr) ? render : pixels;

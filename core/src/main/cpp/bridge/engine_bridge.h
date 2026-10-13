@@ -148,6 +148,16 @@ napi_value GroupLayer(napi_env env, napi_callback_info info);
 napi_value UngroupLayer(napi_env env, napi_callback_info info);
 napi_value SetLayerParent(napi_env env, napi_callback_info info);
 napi_value SetGroupCollapsed(napi_env env, napi_callback_info info);
+// M14b 图层深化：合并向下 / 合并可见 / 拼合图像 / 盖印 / 复制图层 / 链接（ids 数组+布尔）/
+// 对齐·分布（ids 数组 + mode 0..5：左/水平中/右/顶/垂直中/底）
+napi_value MergeDown(napi_env env, napi_callback_info info);
+napi_value MergeVisible(napi_env env, napi_callback_info info);
+napi_value FlattenImage(napi_env env, napi_callback_info info);
+napi_value StampVisible(napi_env env, napi_callback_info info);
+napi_value DuplicateLayer(napi_env env, napi_callback_info info);
+napi_value SetLayerLink(napi_env env, napi_callback_info info);
+napi_value AlignLayers(napi_env env, napi_callback_info info);
+napi_value DistributeLayers(napi_env env, napi_callback_info info);
 // M13 滤镜：直接应用（一步事务）/ 预览三件套（begin 建 1/4 proxy 源、set 跑核、
 // end commit = 全分辨率事务应用并清理）
 napi_value ApplyFilter(napi_env env, napi_callback_info info);
