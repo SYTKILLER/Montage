@@ -1,8 +1,10 @@
 #include "bridge/engine_bridge.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -16,6 +18,7 @@
 #include "engine/filter_ops.h"
 #include "engine/group_ops.h"
 #include "engine/layer_ops.h"
+#include "engine/style_ops.h"
 #include "engine/filters.h"
 #include "engine/gradient_ops.h"
 #include "engine/shape_ops.h"
@@ -50,6 +53,11 @@ enum : int32_t {
     kErrBusy = 4,
     kErrNoDoc = 5,
 };
+
+// M14c：几何/重采样操作后重算带样式/填充层的派生渲染（像素已重排，styledRender 陈旧）
+void restyleAllLocked(Engine& e) {
+    restyleDocument(e.doc);
+}
 
 // ---------- Result 对象工具 ----------
 
@@ -789,6 +797,8 @@ napi_value makeLayerDto(napi_env env, const Layer& l, bool isActive) {
     napi_set_named_property(env, obj, "parentId", makeDouble(env, static_cast<double>(l.parentId)));
     napi_set_named_property(env, obj, "collapsed", makeBool(env, l.collapsed));
     napi_set_named_property(env, obj, "linkId", makeDouble(env, static_cast<double>(l.linkId)));
+    napi_set_named_property(env, obj, "hasStyle", makeBool(env, l.style != nullptr));
+    napi_set_named_property(env, obj, "isFill", makeBool(env, l.fill != nullptr));
     napi_set_named_property(env, obj, "hasMask", makeBool(env, l.mask != nullptr));
     napi_set_named_property(env, obj, "maskEnabled", makeBool(env, l.mask != nullptr && l.mask->enabled));
     napi_set_named_property(env, obj, "clipping", makeBool(env, l.clipping));
@@ -1992,6 +2002,7 @@ napi_value ApplyGradient(napi_env env, napi_callback_info info) {
             e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
             return makeError(env, kErrBadParam, err);
         }
+        restyleAllLocked(e);
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();
         e.requestRender();
@@ -2024,6 +2035,7 @@ napi_value FillSelection(napi_env env, napi_callback_info info) {
             e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
             return makeError(env, kErrBadParam, err);
         }
+        restyleAllLocked(e);
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();
         e.requestRender();
@@ -2055,6 +2067,7 @@ napi_value StrokeSelection(napi_env env, napi_callback_info info) {
             e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
             return makeError(env, kErrBadParam, err);
         }
+        restyleAllLocked(e);
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();
         e.requestRender();
@@ -2163,6 +2176,7 @@ napi_value RasterizeShape(napi_env env, napi_callback_info info) {
             e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
             return makeError(env, kErrBadParam, err);
         }
+        restyleAllLocked(e);
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();
         e.requestRender();
@@ -2496,6 +2510,9 @@ napi_value DeleteSelectionPixels(napi_env env, napi_callback_info /*info*/) {
         }
         e.history.beginEdit(e.doc, "clear", static_cast<uint64_t>(e.docRevision));
         const bool changed = eraseSelectionPixels(e.doc);
+        if (changed) {
+            restyleAllLocked(e);
+        }
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         if (changed) {
             e.bumpRevisionLocked();
@@ -2518,6 +2535,7 @@ napi_value PasteClipboard(napi_env env, napi_callback_info /*info*/) {
         e.history.beginEdit(e.doc, "paste", static_cast<uint64_t>(e.docRevision));
         const LayerId newId = e.nextLayerId();
         pasteClipboardAsLayer(e.doc, e.clipboard, newId);
+        restyleAllLocked(e);
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();
         e.requestRender();
@@ -2874,6 +2892,7 @@ napi_value RotateDocument90(napi_env env, napi_callback_info info) {
         e.history.beginEdit(e.doc, clockwise ? "rotate 90 CW" : "rotate 90 CCW",
                             static_cast<uint64_t>(e.docRevision));
         rotateDocument90(e.doc, clockwise);
+        restyleAllLocked(e);
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();
         e.requestRender();
@@ -2898,6 +2917,7 @@ napi_value FlipDocument(napi_env env, napi_callback_info info) {
         e.history.beginEdit(e.doc, horizontal ? "flip horizontal" : "flip vertical",
                             static_cast<uint64_t>(e.docRevision));
         flipDocument(e.doc, horizontal);
+        restyleAllLocked(e);
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();
         e.requestRender();
@@ -2951,8 +2971,7 @@ napi_value TranslateLayer(napi_env env, napi_callback_info info) {
             if (t == nullptr) {
                 continue;
             }
-            t->transform.originX += dx;
-            t->transform.originY += dy;
+            shiftLayerOrigins(*t, dx, dy);  // M14c：styledOrigin 随层平移
         }
         if (p == 2) {
             e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
@@ -3221,6 +3240,9 @@ napi_value BakeLayerTransform(napi_env env, napi_callback_info info) {
         e.history.beginEdit(e.doc, "free transform", static_cast<uint64_t>(e.docRevision));
         ok = bakeLayerTransform(e.doc, static_cast<LayerId>(id), p[0], p[1], p[2], p[3], p[4], p[5]);
         if (ok) {
+            restyleAllLocked(e);
+        }
+        if (ok) {
             e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
             e.bumpRevisionLocked();
             e.requestRender();
@@ -3362,6 +3384,7 @@ napi_value BakeLayerMatrix(napi_env env, napi_callback_info info) {
             e.history.endEdit(c->docSnap, static_cast<uint64_t>(e.docRevision));
             if (c->ok) {
                 e.doc = c->docSnap;
+                restyleAllLocked(e);
                 e.bumpRevisionLocked();
                 e.requestRender();
             }
@@ -3636,6 +3659,9 @@ napi_value ResampleDocument(napi_env env, napi_callback_info info) {
         e.history.beginEdit(e.doc, "image size", static_cast<uint64_t>(e.docRevision));
         changed = resampleDocument(e.doc, static_cast<uint32_t>(w), static_cast<uint32_t>(h));
         if (changed) {
+            restyleAllLocked(e);
+        }
+        if (changed) {
             e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
             e.bumpRevisionLocked();
             e.requestRender();
@@ -3669,6 +3695,7 @@ napi_value RotateDocumentArbitrary(napi_env env, napi_callback_info info) {
         }
         e.history.beginEdit(e.doc, "rotate arbitrary", static_cast<uint64_t>(e.docRevision));
         rotateDocumentArbitrary(e.doc, deg);
+        restyleAllLocked(e);
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();
         e.requestRender();
@@ -4379,6 +4406,7 @@ napi_value EndFilterPreview(napi_env env, napi_callback_info info) {
                     e.history.beginEdit(e.doc, "filter", static_cast<uint64_t>(e.docRevision));
                     std::string err;
                     if (applyFilterToLayer(e.doc, fp.layerId, p, err)) {
+                        restyleAllLocked(e);
                         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
                         e.bumpRevisionLocked();
                     } else {
@@ -4785,6 +4813,304 @@ napi_value DistributeLayers(napi_env env, napi_callback_info info) {
         if (!distributeLayers(e.doc, ids, mode, err)) {
             e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
             return makeError(env, kErrBadParam, "distributeLayers: " + err);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// ---------- M14c 图层样式 / 填充图层 ----------
+
+std::atomic<uint64_t> g_styleGridRev{1};
+
+// 样式命令共用：定位层（0=活动）+ session 守卫 + 事务 + restyle + 刷新
+napi_value runStyleCommand(napi_env env, const char* what, LayerId id,
+                           const std::function<bool(Document&, Layer&, std::string&)>& apply) {
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, std::string(what) + ": no document");
+        }
+        if (e.textEditOpen || e.filterPreview.active) {
+            return makeError(env, kErrBadParam, std::string(what) + ": session open");
+        }
+        Layer* l = id > 0 ? findLayerLocked(e.doc, id) : nullptr;
+        if (l == nullptr) {
+            for (Layer& li : e.doc.layers) {
+                if (li.id == e.doc.activeId) {
+                    l = &li;
+                    break;
+                }
+            }
+        }
+        if (l == nullptr) {
+            return makeError(env, kErrNoDoc, std::string(what) + ": no active layer");
+        }
+        if (l->isGroup) {
+            return makeError(env, kErrBadParam, std::string(what) + ": group has no style");
+        }
+        e.history.beginEdit(e.doc, what, static_cast<uint64_t>(e.docRevision));
+        std::string err;
+        if (!apply(e.doc, *l, err)) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, std::string(what) + ": " + err);
+        }
+        if (!restyleLayer(e.doc, *l, g_styleGridRev.fetch_add(1), err)) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, std::string(what) + ": " + err);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// 投影：setDropShadow(id, enabled, angleDeg, dist, size, opacity, r, g, b)（色 0..255）
+napi_value SetDropShadow(napi_env env, napi_callback_info info) {
+    size_t argc = 9;
+    napi_value argv[9];
+    for (size_t i = 0; i < 9; ++i) {
+        argv[i] = nullptr;
+    }
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double v[9] = {0};
+    if (argc < 9) {
+        return makeError(env, kErrBadParam,
+                         "setDropShadow(id,enabled,angle,dist,size,opacity,r,g,b) requires 9");
+    }
+    for (size_t i = 0; i < 9; ++i) {
+        if (napi_get_value_double(env, argv[i], &v[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "setDropShadow: invalid args");
+        }
+    }
+    const LayerId id = static_cast<LayerId>(v[0]);
+    return runStyleCommand(env, "drop shadow", id,
+                           [v](Document&, Layer& l, std::string&) -> bool {
+        if (l.style == nullptr) {
+            l.style = std::make_shared<LayerStyle>();
+        } else {
+            l.style = std::make_shared<LayerStyle>(*l.style);  // COW：快照共享指针不可原地改
+        }
+        l.style->dropShadow = v[1] != 0;
+        l.style->shadowAngleDeg = v[2];
+        l.style->shadowDistance = v[3];
+        l.style->shadowSize = v[4];
+        l.style->shadowOpacity = std::clamp(v[5], 0.0, 1.0);
+        l.style->shadowColor[0] = static_cast<float>(v[6] / 255.0);
+        l.style->shadowColor[1] = static_cast<float>(v[7] / 255.0);
+        l.style->shadowColor[2] = static_cast<float>(v[8] / 255.0);
+        l.style->shadowColor[3] = 1.0f;
+        return true;
+    });
+}
+
+// 描边：setLayerStroke(id, enabled, width, r, g, b)
+napi_value SetLayerStroke(napi_env env, napi_callback_info info) {
+    size_t argc = 6;
+    napi_value argv[6];
+    for (size_t i = 0; i < 6; ++i) {
+        argv[i] = nullptr;
+    }
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double v[6] = {0};
+    if (argc < 6) {
+        return makeError(env, kErrBadParam, "setLayerStroke(id,enabled,width,r,g,b) requires 6");
+    }
+    for (size_t i = 0; i < 6; ++i) {
+        if (napi_get_value_double(env, argv[i], &v[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "setLayerStroke: invalid args");
+        }
+    }
+    const LayerId id = static_cast<LayerId>(v[0]);
+    return runStyleCommand(env, "layer stroke", id,
+                           [v](Document&, Layer& l, std::string&) -> bool {
+        if (l.style == nullptr) {
+            l.style = std::make_shared<LayerStyle>();
+        } else {
+            l.style = std::make_shared<LayerStyle>(*l.style);  // COW：快照共享指针不可原地改
+        }
+        l.style->stroke = v[1] != 0;
+        l.style->strokeWidth = v[2];
+        l.style->strokeColor[0] = static_cast<float>(v[3] / 255.0);
+        l.style->strokeColor[1] = static_cast<float>(v[4] / 255.0);
+        l.style->strokeColor[2] = static_cast<float>(v[5] / 255.0);
+        l.style->strokeColor[3] = 1.0f;
+        return true;
+    });
+}
+
+// 颜色叠加：setColorOverlay(id, enabled, r, g, b, opacity)
+napi_value SetColorOverlay(napi_env env, napi_callback_info info) {
+    size_t argc = 7;
+    napi_value argv[7];
+    for (size_t i = 0; i < 7; ++i) {
+        argv[i] = nullptr;
+    }
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double v[7] = {0};
+    if (argc < 7) {
+        return makeError(env, kErrBadParam,
+                         "setColorOverlay(id,enabled,r,g,b,opacity) requires 7");
+    }
+    for (size_t i = 0; i < 7; ++i) {
+        if (napi_get_value_double(env, argv[i], &v[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "setColorOverlay: invalid args");
+        }
+    }
+    const LayerId id = static_cast<LayerId>(v[0]);
+    return runStyleCommand(env, "color overlay", id,
+                           [v](Document&, Layer& l, std::string&) -> bool {
+        if (l.style == nullptr) {
+            l.style = std::make_shared<LayerStyle>();
+        } else {
+            l.style = std::make_shared<LayerStyle>(*l.style);  // COW：快照共享指针不可原地改
+        }
+        l.style->colorOverlay = v[1] != 0;
+        l.style->overlayColor[0] = static_cast<float>(v[2] / 255.0);
+        l.style->overlayColor[1] = static_cast<float>(v[3] / 255.0);
+        l.style->overlayColor[2] = static_cast<float>(v[4] / 255.0);
+        l.style->overlayColor[3] = 1.0f;
+        l.style->overlayOpacity = std::clamp(v[5], 0.0, 1.0);
+        return true;
+    });
+}
+
+// 清样式：clearLayerStyle(id)
+napi_value ClearLayerStyle(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double id = 0;
+    if (argc >= 1 && napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "clearLayerStyle(id?) invalid");
+    }
+    return runStyleCommand(env, "clear style", static_cast<LayerId>(id),
+                           [](Document&, Layer& l, std::string&) -> bool {
+        l.style = nullptr;
+        l.styledRender = nullptr;
+        return true;
+    });
+}
+
+// 新建填充图层：addFillLayer(kind, r, g, b, angle)（kind 0=纯色 1=线性渐变 fg→bg）
+napi_value AddFillLayer(napi_env env, napi_callback_info info) {
+    size_t argc = 5;
+    napi_value argv[5];
+    for (size_t i = 0; i < 5; ++i) {
+        argv[i] = nullptr;
+    }
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double v[5] = {0};
+    if (argc < 5) {
+        return makeError(env, kErrBadParam, "addFillLayer(kind,r,g,b,angle) requires 5");
+    }
+    for (size_t i = 0; i < 5; ++i) {
+        if (napi_get_value_double(env, argv[i], &v[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "addFillLayer: invalid args");
+        }
+    }
+    auto& e = Engine::get();
+    double newId = 0;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "addFillLayer: no document");
+        }
+        if (e.textEditOpen || e.filterPreview.active) {
+            return makeError(env, kErrBadParam, "addFillLayer: session open");
+        }
+        e.history.beginEdit(e.doc, "new fill layer", static_cast<uint64_t>(e.docRevision));
+        Layer layer;
+        layer.id = e.nextLayerId();
+        const int kind = static_cast<int>(v[0]);
+        layer.name = kind == 1 ? "渐变填充 " + std::to_string(layer.id)
+                               : "纯色填充 " + std::to_string(layer.id);
+        layer.fill = std::make_shared<FillLayerState>();
+        layer.fill->kind = kind == 1 ? 1 : 0;
+        layer.fill->color[0] = static_cast<float>(v[1] / 255.0);
+        layer.fill->color[1] = static_cast<float>(v[2] / 255.0);
+        layer.fill->color[2] = static_cast<float>(v[3] / 255.0);
+        layer.fill->color[3] = 1.0f;
+        layer.fill->angleDeg = v[4];
+        layer.transform.originX = 0.0;
+        layer.transform.originY = 0.0;
+        std::string err;
+        if (!restyleLayer(e.doc, layer, g_styleGridRev.fetch_add(1), err)) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, "addFillLayer: " + err);
+        }
+        // 插到活动层上方（addLayer 同语义）
+        size_t at = e.doc.layers.size();
+        for (size_t i = 0; i < e.doc.layers.size(); ++i) {
+            if (e.doc.layers[i].id == e.doc.activeId) {
+                at = i + 1;
+                break;
+            }
+        }
+        e.doc.layers.insert(e.doc.layers.begin() + static_cast<long>(at), std::move(layer));
+        e.doc.activeId = e.doc.layers[at].id;
+        newId = static_cast<double>(e.doc.layers[at].id);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "id", makeDouble(env, newId));
+    return makeOk(env, data);
+}
+
+// 填充层改参：setFillLayerParams(id, kind, r, g, b, angle)
+napi_value SetFillLayerParams(napi_env env, napi_callback_info info) {
+    size_t argc = 6;
+    napi_value argv[6];
+    for (size_t i = 0; i < 6; ++i) {
+        argv[i] = nullptr;
+    }
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double v[6] = {0};
+    if (argc < 6) {
+        return makeError(env, kErrBadParam, "setFillLayerParams(id,kind,r,g,b,angle) requires 6");
+    }
+    for (size_t i = 0; i < 6; ++i) {
+        if (napi_get_value_double(env, argv[i], &v[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "setFillLayerParams: invalid args");
+        }
+    }
+    const LayerId id = static_cast<LayerId>(v[0]);
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "setFillLayerParams: no document");
+        }
+        Layer* l = id > 0 ? findLayerLocked(e.doc, id) : nullptr;
+        if (l == nullptr) {
+            for (Layer& li : e.doc.layers) {
+                if (li.id == e.doc.activeId) {
+                    l = &li;
+                    break;
+                }
+            }
+        }
+        if (l == nullptr || l->fill == nullptr) {
+            return makeError(env, kErrBadParam, "setFillLayerParams: not a fill layer");
+        }
+        e.history.beginEdit(e.doc, "fill layer params", static_cast<uint64_t>(e.docRevision));
+        l->fill->kind = static_cast<int>(v[1]) == 1 ? 1 : 0;
+        l->fill->color[0] = static_cast<float>(v[2] / 255.0);
+        l->fill->color[1] = static_cast<float>(v[3] / 255.0);
+        l->fill->color[2] = static_cast<float>(v[4] / 255.0);
+        l->fill->color[3] = 1.0f;
+        l->fill->angleDeg = v[5];
+        std::string err;
+        if (!restyleLayer(e.doc, *l, g_styleGridRev.fetch_add(1), err)) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, "setFillLayerParams: " + err);
         }
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();

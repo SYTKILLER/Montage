@@ -172,6 +172,36 @@ struct LayerAdjustment {
     float p3 = 0.0f;
 };
 
+// M14c 图层样式第一批（PS 语义子集）：投影 / 描边（v1 外部）/ 颜色叠加。
+// 参数直存（角度+距离由 UI 换算 offset？——直存角度/距离保持 PS 参数语义，渲染核换算）。
+// 随 Layer 走 History 快照（COW 换指针）；渲染 = styledRender 派生网格（蒙版 composeMasked
+// 同架构：GL/缩略图/CPU flatten 统一走 effectivePixels，渲染器零感知）。
+struct LayerStyle {
+    bool enabled = true;  // fx 总开关（PS「效果」眼睛）
+    // 投影：角度（度，PS 120=右下）+ 距离 + 大小（σ = size，M13 三 box 高斯）+ 颜色 + 不透明度
+    bool dropShadow = false;
+    double shadowAngleDeg = 120.0;
+    double shadowDistance = 10.0;
+    double shadowSize = 8.0;
+    float shadowColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};  // 直 alpha
+    double shadowOpacity = 0.5;
+    // 描边：外部（dilate − 原始 alpha 环带，M10 van Herk 方形 SE）+ 宽 + 颜色
+    bool stroke = false;
+    double strokeWidth = 3.0;
+    float strokeColor[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+    // 颜色叠加：本体之上 × alpha 覆盖
+    bool colorOverlay = false;
+    float overlayColor[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+    double overlayOpacity = 1.0;
+};
+
+// M14c 填充图层（非破坏内容层）：无像素，渲染 = 全文档域派生网格（改参重生成）。
+struct FillLayerState {
+    int kind = 0;  // 0=纯色 1=线性渐变（fg→bg，角度 deg，M11 渐变核）
+    float color[4] = {1.0f, 0.0f, 0.0f, 1.0f};  // 纯色（直 alpha）
+    double angleDeg = 90.0;  // 渐变方向（90 = 上→下）
+};
+
 // 文本层状态（M12，路线 A：native OH_Drawing_Typography 栅格化）。随 Layer 走 History
 // 快照（COW 换指针）；pixels 网格 = 最近一次排版栅格结果（直 alpha），origin = 文本框
 // 左上角文档落点（PS 点文字锚点在首行基线左，v1 简化左上角，登记）。
@@ -206,6 +236,13 @@ struct Layer {
     bool clipping = false;  // M5b-2：剪贴蒙版——剪贴到下方最近非剪贴层（渲染期生效，PS 语义）
     std::shared_ptr<LayerAdjustment> adjustment = nullptr;  // M6a：非空 = 调整层（无像素）
     std::shared_ptr<TextLayerState> text = nullptr;  // M12：非空 = 文本层（pixels = 栅格结果）
+    std::shared_ptr<LayerStyle> style = nullptr;     // M14c：非空 = 带样式（渲染走 styledRender）
+    std::shared_ptr<FillLayerState> fill = nullptr;  // M14c：非空 = 填充层（渲染走 styledRender）
+    // M14c 样式/填充派生渲染结果（域可超出原网格——投影/描边扩展；origin 独立于 transform）。
+    // 样式参数/像素/蒙版变更点重算；随 History 快照走（undo 即恢复）。
+    std::shared_ptr<const TileGrid> styledRender = nullptr;
+    double styledOriginX = 0.0;
+    double styledOriginY = 0.0;
     // M14a 图层编组（平铺栈方案）：isGroup = 组节点（无像素/无蒙版/无调整/无文本）；
     // parentId = 直接父组 id（0 = 根）；直接子层在 layers 平铺序中**连续**且位于组节点
     // 之后（bottom→top）；collapsed = 面板折叠（渲染跳过子层段）。
@@ -215,9 +252,24 @@ struct Layer {
     // M14b 链接层：同一非零 linkId 的层随移动工具联动平移（对齐 PS 链接语义）。
     // 会话态 v1：.montage 不持久化（PSD 链接导出随 M15 评估），随 History 快照走。
     uint64_t linkId = 0;
-    // 渲染/缩略图取数：蒙版启用取合成结果，否则原像素
+    // M14c 渲染/缩略图取数优先级：样式/填充派生（含独立 origin，经 effectiveRenderOrigin）
+    // → 蒙版合成 → 原像素
     std::shared_ptr<const TileGrid> effectivePixels() const {
+        if ((style != nullptr || fill != nullptr) && styledRender != nullptr &&
+            (style == nullptr || style->enabled)) {
+            return styledRender;
+        }
         return (mask != nullptr && mask->enabled && render != nullptr) ? render : pixels;
+    }
+
+    // 派生渲染生效时的文档落点（与 transform.origin 分离——投影/描边扩展域偏移）
+    double effectiveOriginX() const {
+        return (style != nullptr && style->enabled && styledRender != nullptr) ? styledOriginX
+                                                                               : transform.originX;
+    }
+    double effectiveOriginY() const {
+        return (style != nullptr && style->enabled && styledRender != nullptr) ? styledOriginY
+                                                                               : transform.originY;
     }
 };
 

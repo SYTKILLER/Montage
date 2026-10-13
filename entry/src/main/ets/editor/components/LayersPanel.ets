@@ -43,6 +43,7 @@ export struct LayersPanel {
   // M14b 图层深化
   onDuplicate: () => void = () => {};
   onLinkToggle: () => void = () => {};
+  onStyle: () => void = () => {};
   onMoveToParent: (id: number, newParent: number, flatIndex: number) => void =
     (_id: number, _newParent: number, _flatIndex: number) => {};
   onOpacityChange: (v: number) => void = (_v: number) => {};
@@ -335,6 +336,23 @@ export struct LayersPanel {
                       .fontSize(11)
                       .fontColor([$r('app.color.accent')])
                   }
+                  if (l.hasStyle) {
+                    Text('fx')
+                      .fontSize(9)
+                      .width(16).height(16).borderRadius(3)
+                      .textAlign(TextAlign.Center)
+                      .fontColor($r('app.color.on_accent'))
+                      .backgroundColor($r('app.color.accent'))
+                      .onClick((): void => this.onStyle())
+                  }
+                  if (l.isFill) {
+                    Text('填')
+                      .fontSize(9)
+                      .width(16).height(16).borderRadius(3)
+                      .textAlign(TextAlign.Center)
+                      .fontColor($r('app.color.on_accent'))
+                      .backgroundColor($r('app.color.icon_muted'))
+                  }
                   Text(l.name)
                     .fontSize(12)
                     .fontColor($r('app.color.text_primary'))
@@ -377,7 +395,7 @@ export struct LayersPanel {
           `${l.thumbToken}|${l.hasMask}|${l.maskEnabled}|${l.clipping}|${l.name}|` +
           `${this.getThumb(l.id) !== null ? 'p' : 'n'}|${this.thumbVersion}|` +
           `${l.isGroup ? 'g' : 'n'}|${l.collapsed ? 'c' : 'o'}|${l.parentId}|${this.panelVersion}|` +
-          `${this.isSelected(l) ? 's' : 'n'}|${l.linkId}`)
+          `${this.isSelected(l) ? 's' : 'n'}|${l.linkId}|${l.hasStyle ? 'f' : 'n'}|${l.isFill ? 'i' : 'n'}`)
       }
       .layoutWeight(1)
       .scrollBar(BarState.Auto)
@@ -459,6 +477,15 @@ export struct LayersPanel {
         .backgroundColor(Color.Transparent)
         .enabled(this.selectionSize() >= 2 || this.anySelectedLinked())
         .onClick((): void => this.onLinkToggle())
+        Button() {
+          SymbolGlyph($r('sys.symbol.slider_horizontal_2')).fontSize(16)
+            .fontColor([$r('app.color.text_primary')])
+        }
+        .type(ButtonType.Circle)
+        .width(30).height(30)
+        .backgroundColor(Color.Transparent)
+        .enabled(this.active() !== undefined && this.active()?.isGroup === false)
+        .onClick((): void => this.onStyle())
         Blank()
         Button() {
           SymbolGlyph($r('sys.symbol.trash')).fontSize(16)

@@ -1,4 +1,4 @@
-const SWATCHES: string[] = ['#D93025', '#1A6BD9', '#188038', '#F9AB00', '#111111', '#FFFFFF'];
+export const SWATCHES: string[] = ['#D93025', '#1A6BD9', '#188038', '#F9AB00', '#111111', '#FFFFFF'];
 
 /** 数值滑条行（@Link 双向，规避 @Builder 参数冻结坑）。onCommitted 在拖动结束/点击时回调。 */
 @Component

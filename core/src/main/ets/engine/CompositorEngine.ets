@@ -147,6 +147,8 @@ function narrowLayer(r: Record<string, Object>): LayerDTO {
     parentId: num(r, 'parentId'),
     collapsed: boolOf(r, 'collapsed'),
     linkId: num(r, 'linkId'),
+    hasStyle: boolOf(r, 'hasStyle'),
+    isFill: boolOf(r, 'isFill'),
     hasMask: boolOf(r, 'hasMask'),
     maskEnabled: boolOf(r, 'maskEnabled'),
     clipping: boolOf(r, 'clipping'),
@@ -535,6 +537,73 @@ export class CompositorEngine {
     if (!r.ok) {
       hilog.error(DOMAIN, TAG, 'alignLayers failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  // ---------- M14c 图层样式 / 填充图层 ----------
+
+  setDropShadow(id: number, enabled: boolean, angle: number, dist: number, size: number,
+    opacity: number, r: number, g: number, b: number): boolean {
+    const r2 = narrowResult(native.setDropShadow(id, enabled ? 1 : 0, angle, dist, size, opacity,
+      r, g, b) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'setDropShadow failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  setLayerStroke(id: number, enabled: boolean, width: number, r: number, g: number,
+    b: number): boolean {
+    const r2 = narrowResult(native.setLayerStroke(id, enabled ? 1 : 0, width, r, g, b) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'setLayerStroke failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  setColorOverlay(id: number, enabled: boolean, r: number, g: number, b: number,
+    opacity: number): boolean {
+    const r2 = narrowResult(native.setColorOverlay(id, enabled ? 1 : 0, r, g, b, opacity) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'setColorOverlay failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  clearLayerStyle(id: number): boolean {
+    const r2 = narrowResult(native.clearLayerStyle(id) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'clearLayerStyle failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  addFillLayer(kind: number, r: number, g: number, b: number, angle: number): number {
+    const r2 = narrowResult(native.addFillLayer(kind, r, g, b, angle) as Object);
+    if (!r2.ok || r2.data === null) {
+      hilog.error(DOMAIN, TAG, 'addFillLayer failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return 0;
+    }
+    return num(r2.data, 'id');
+  }
+
+  setFillLayerParams(id: number, kind: number, r: number, g: number, b: number,
+    angle: number): boolean {
+    const r2 = narrowResult(native.setFillLayerParams(id, kind, r, g, b, angle) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'setFillLayerParams failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
       return false;
     }
     return true;

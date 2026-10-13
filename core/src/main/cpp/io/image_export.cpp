@@ -473,8 +473,8 @@ void appendLayerRange(const Document& doc, int start, int end, FlattenJob& job, 
         fl.clipping = l.clipping;
         fl.visible = true;
         fl.isAdjustment = l.adjustment != nullptr;
-        fl.originX = l.transform.originX;
-        fl.originY = l.transform.originY;
+        fl.originX = l.effectiveOriginX();
+        fl.originY = l.effectiveOriginY();
         if (fl.isAdjustment) {
             fl.adjustment = *l.adjustment;
         } else {

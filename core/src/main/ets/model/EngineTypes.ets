@@ -57,6 +57,8 @@ export interface LayerDTO {
   parentId: number;
   collapsed: boolean;
   linkId: number;    // M14b 链接层（非零 = 同号层联动移动；会话态不持久化）
+  hasStyle: boolean; // M14c 图层样式（投影/描边/颜色叠加任一）
+  isFill: boolean;   // M14c 填充图层（纯色/渐变参数化内容）
   hasMask: boolean;
   maskEnabled: boolean;
   clipping: boolean;

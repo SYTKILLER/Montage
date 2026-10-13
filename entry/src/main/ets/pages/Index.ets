@@ -6,6 +6,7 @@ import { window } from '@kit.ArkUI';
 import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, SaveProjectData, ViewportData } from 'core';
 import { AppPrefs, RecentProject, ThemeMode } from '../editor/AppPrefs';
 import { leafItem, MenuGroupVM, MenuItemVM, subItem, ToolVM } from '../editor/MenuModel';
+import { SWATCHES } from '../editor/components/OptionsBar';
 import { Toolbox } from '../editor/components/Toolbox';
 import { OptionsBar } from '../editor/components/OptionsBar';
 import { StatusBar } from '../editor/components/StatusBar';
@@ -109,6 +110,22 @@ struct Index {
   @State gradientTarget: number = 0;    // 0=像素 1=图层蒙版
   @State gradientLine: number[] | null = null;  // 非空 = 拖线中（overlay 预览）
   @State showFill: boolean = false;     // M11a 填充对话框（Shift+F5）
+  @State showStyle: boolean = false;    // M14c 图层样式对话框（投影/描边/颜色叠加 + 填充层参数）
+  @State styShadowOn: boolean = true;
+  @State styAngle: number = 120;
+  @State styDist: number = 10;
+  @State stySize: number = 8;
+  @State styShadowOp: number = 50;
+  @State styShadowColor: string = '#000000';
+  @State styStrokeOn: boolean = true;
+  @State styStrokeW: number = 3;
+  @State styStrokeColor: string = '#D93025';
+  @State styOverlayOn: boolean = false;
+  @State styOverlayOp: number = 100;
+  @State styOverlayColor: string = '#1A6BD9';
+  @State fillKind: number = 0;          // 填充层参数（活动层 isFill 时在样式对话框编辑）
+  @State fillColor: string = '#D93025';
+  @State fillAngle: number = 90;
   @State showFilter: boolean = false;   // M13 滤镜对话框（proxy 预览）
   @State filterDef: FilterDef | null = null;
   @State filterP: number[] = [];        // 当前参数值（schema 序）
@@ -1636,6 +1653,52 @@ struct Index {
     this.engine.setColors(f[0], f[1], f[2], b[0], b[1], b[2]);
   }
 
+  // ---------- M14c 图层样式/填充层参数应用（滑条/色板实时生效，一步撤销/命令） ----------
+
+  private applyDropShadow(): void {
+    const a = this.activeLayer();
+    if (a === undefined) {
+      return;
+    }
+    const c = this.hexToRgb(this.styShadowColor);
+    const ok = this.engine.setDropShadow(a.id, this.styShadowOn, this.styAngle, this.styDist,
+      this.stySize, this.styShadowOp / 100, c[0], c[1], c[2]);
+    this.log(`drop shadow on=${this.styShadowOn}: ${ok}`);
+  }
+
+  private applyStroke(): void {
+    const a = this.activeLayer();
+    if (a === undefined) {
+      return;
+    }
+    const c = this.hexToRgb(this.styStrokeColor);
+    const ok = this.engine.setLayerStroke(a.id, this.styStrokeOn, this.styStrokeW,
+      c[0], c[1], c[2]);
+    this.log(`stroke on=${this.styStrokeOn}: ${ok}`);
+  }
+
+  private applyOverlay(): void {
+    const a = this.activeLayer();
+    if (a === undefined) {
+      return;
+    }
+    const c = this.hexToRgb(this.styOverlayColor);
+    const ok = this.engine.setColorOverlay(a.id, this.styOverlayOn, c[0], c[1], c[2],
+      this.styOverlayOp / 100);
+    this.log(`overlay on=${this.styOverlayOn}: ${ok}`);
+  }
+
+  private applyFillParams(): void {
+    const a = this.activeLayer();
+    if (a === undefined || !a.isFill) {
+      return;
+    }
+    const c = this.hexToRgb(this.fillColor);
+    const ok = this.engine.setFillLayerParams(a.id, this.fillKind, c[0], c[1], c[2],
+      this.fillAngle);
+    this.log(`fill params kind=${this.fillKind}: ${ok}`);
+  }
+
   private activeLayerHasMask(): boolean {
     const a = this.activeLayer();
     return a !== undefined && a.hasMask;
@@ -1862,6 +1925,32 @@ struct Index {
           this.log('flatten image');
         } else {
           this.toast('拼合失败');
+        }
+        break;
+      }
+      case 'layer.style': {
+        this.showStyle = true;
+        break;
+      }
+      case 'layer.fillSolid': {
+        const f = this.hexToRgb(this.brushColor);
+        const nid = this.engine.addFillLayer(0, f[0], f[1], f[2], 90);
+        if (nid !== 0) {
+          this.toast('已新建纯色填充图层');
+          this.log(`fill layer solid #${nid}`);
+        } else {
+          this.toast('新建填充图层失败');
+        }
+        break;
+      }
+      case 'layer.fillGrad': {
+        const f = this.hexToRgb(this.brushColor);
+        const nid = this.engine.addFillLayer(1, f[0], f[1], f[2], 90);
+        if (nid !== 0) {
+          this.toast('已新建渐变填充图层');
+          this.log(`fill layer grad #${nid}`);
+        } else {
+          this.toast('新建填充图层失败');
         }
         break;
       }
@@ -2417,6 +2506,9 @@ struct Index {
       leafItem('layer.mergeVisible', '合并可见', 'Shift+Ctrl+E', d),
       leafItem('layer.stamp', '盖印', 'Shift+Ctrl+Alt+E', d),
       leafItem('layer.flatten', '拼合图像', '', d),
+      leafItem('layer.style', '图层样式…', '', d && this.activeLayer()?.isGroup === false),
+      leafItem('layer.fillSolid', '新建纯色填充图层', '', d),
+      leafItem('layer.fillGrad', '新建渐变填充图层', '', d),
       leafItem('layer.linkToggle', '链接图层 / 解除链接', '',
         d && (this.alignTargetIds().length >= 2 || this.layers.some((l: LayerDTO): boolean =>
           l.isActive && l.linkId !== 0))),
@@ -2588,7 +2680,7 @@ struct Index {
       return;
     }
     // 对话框打开时：Esc 关闭，其余不抢
-    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform || this.showModify || this.showStoreSel || this.showLoadSel || this.showFill || this.showFilter) {
+    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform || this.showModify || this.showStoreSel || this.showLoadSel || this.showFill || this.showStyle || this.showFilter) {
       if (e.keyCode === KC_ESC) {
         this.showTransform = false;
         this.showExport = false;
@@ -2600,6 +2692,7 @@ struct Index {
         this.showStoreSel = false;
         this.showLoadSel = false;
         this.showFill = false;
+        this.showStyle = false;
         this.cancelFilterDialog();
       }
       return;
@@ -3496,6 +3589,7 @@ struct Index {
                 onUngroup: (): void => this.runCommand('layer.ungroup'),
                 onDuplicate: (): void => this.runCommand('layer.duplicate'),
                 onLinkToggle: (): void => this.onLayerLinkToggle(),
+                onStyle: (): void => this.runCommand('layer.style'),
                 onMoveToParent: (id: number, newParent: number, flatIndex: number): void =>
                   this.onMoveToParent(id, newParent, flatIndex),
                 onOpacityChange: (v: number): void => {
@@ -3750,6 +3844,254 @@ struct Index {
             }.justifyContent(FlexAlign.End).width('100%')
           }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
             .border({ width: 1, color: $r('app.color.border') }).width(420)
+        }.width('100%').height('100%')
+      }
+      if (this.showStyle) {
+        Stack() {
+          Column().width('100%').height('100%').backgroundColor('#66000000')
+            .onClick((): void => { this.showStyle = false; })
+          Scroll() {
+            Column({ space: 12 }) {
+              Text('图层样式').fontSize(16).fontWeight(FontWeight.Bold)
+                .fontColor($r('app.color.text_primary'))
+              // 填充层参数段（活动层为填充层时）
+              if (this.activeLayer()?.isFill === true) {
+                Column({ space: 8 }) {
+                  Text('填充层').fontSize(13).fontWeight(FontWeight.Medium)
+                    .fontColor($r('app.color.text_primary'))
+                  Row({ space: 8 }) {
+                    Button('纯色')
+                      .fontSize(12).height(30)
+                      .backgroundColor(this.fillKind === 0
+                        ? $r('app.color.accent_container') : $r('app.color.surface'))
+                      .fontColor(this.fillKind === 0
+                        ? $r('app.color.accent') : $r('app.color.text_primary'))
+                      .onClick((): void => { this.fillKind = 0; this.applyFillParams(); })
+                    Button('线性渐变')
+                      .fontSize(12).height(30)
+                      .backgroundColor(this.fillKind === 1
+                        ? $r('app.color.accent_container') : $r('app.color.surface'))
+                      .fontColor(this.fillKind === 1
+                        ? $r('app.color.accent') : $r('app.color.text_primary'))
+                      .onClick((): void => { this.fillKind = 1; this.applyFillParams(); })
+                  }
+                  Row({ space: 6 }) {
+                    Text('颜色').fontSize(12).fontColor($r('app.color.text_secondary'))
+                    ForEach(SWATCHES, (sw: string) => {
+                      Column()
+                        .width(22).height(22).borderRadius(4)
+                        .backgroundColor(sw)
+                        .border({
+                          width: this.fillColor === sw ? 2 : 1,
+                          color: this.fillColor === sw
+                            ? $r('app.color.accent') : $r('app.color.border')
+                        })
+                        .onClick((): void => { this.fillColor = sw; this.applyFillParams(); })
+                    }, (sw: string): string => sw)
+                  }
+                  if (this.fillKind === 1) {
+                    Row({ space: 6 }) {
+                      Text('角度').fontSize(12).fontColor($r('app.color.text_secondary'))
+                      Slider({ value: this.fillAngle, min: 0, max: 360, step: 5 })
+                        .layoutWeight(1).height(24)
+                        .onChange((v: number, mode: SliderChangeMode): void => {
+                          if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                            this.fillAngle = v;
+                            this.applyFillParams();
+                          }
+                        })
+                      Text(`${Math.round(this.fillAngle)}°`).fontSize(11).width(36)
+                        .fontColor($r('app.color.text_primary'))
+                    }.width('100%')
+                  }
+                }
+                .width('100%').padding(10).borderRadius(8)
+                .backgroundColor($r('app.color.accent_container'))
+              }
+              // 投影
+              Column({ space: 6 }) {
+                Row({ space: 8 }) {
+                  Toggle({ type: ToggleType.Checkbox, isOn: this.styShadowOn })
+                    .onChange((on: boolean): void => {
+                      this.styShadowOn = on;
+                      this.applyDropShadow();
+                    })
+                  Text('投影').fontSize(13).fontColor($r('app.color.text_primary'))
+                }
+                Row({ space: 6 }) {
+                  Text('角度').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styAngle, min: 0, max: 360, step: 5 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styAngle = v;
+                        this.applyDropShadow();
+                      }
+                    })
+                  Text(`${Math.round(this.styAngle)}°`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('距离').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styDist, min: 0, max: 100, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styDist = v;
+                        this.applyDropShadow();
+                      }
+                    })
+                  Text(`${Math.round(this.styDist)}`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('大小').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.stySize, min: 0, max: 50, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.stySize = v;
+                        this.applyDropShadow();
+                      }
+                    })
+                  Text(`${Math.round(this.stySize)}`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('不透明度').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styShadowOp, min: 0, max: 100, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styShadowOp = v;
+                        this.applyDropShadow();
+                      }
+                    })
+                  Text(`${Math.round(this.styShadowOp)}%`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('颜色').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  ForEach(SWATCHES, (sw: string) => {
+                    Column()
+                      .width(22).height(22).borderRadius(4)
+                      .backgroundColor(sw)
+                      .border({
+                        width: this.styShadowColor === sw ? 2 : 1,
+                        color: this.styShadowColor === sw
+                          ? $r('app.color.accent') : $r('app.color.border')
+                      })
+                      .onClick((): void => { this.styShadowColor = sw; this.applyDropShadow(); })
+                  }, (sw: string): string => sw)
+                }
+              }
+              .width('100%').padding(10).borderRadius(8)
+              .backgroundColor($r('app.color.surface'))
+              .border({ width: 1, color: $r('app.color.border') })
+              // 描边
+              Column({ space: 6 }) {
+                Row({ space: 8 }) {
+                  Toggle({ type: ToggleType.Checkbox, isOn: this.styStrokeOn })
+                    .onChange((on: boolean): void => {
+                      this.styStrokeOn = on;
+                      this.applyStroke();
+                    })
+                  Text('描边（外部）').fontSize(13).fontColor($r('app.color.text_primary'))
+                }
+                Row({ space: 6 }) {
+                  Text('宽度').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styStrokeW, min: 1, max: 30, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styStrokeW = v;
+                        this.applyStroke();
+                      }
+                    })
+                  Text(`${Math.round(this.styStrokeW)}px`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('颜色').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  ForEach(SWATCHES, (sw: string) => {
+                    Column()
+                      .width(22).height(22).borderRadius(4)
+                      .backgroundColor(sw)
+                      .border({
+                        width: this.styStrokeColor === sw ? 2 : 1,
+                        color: this.styStrokeColor === sw
+                          ? $r('app.color.accent') : $r('app.color.border')
+                      })
+                      .onClick((): void => { this.styStrokeColor = sw; this.applyStroke(); })
+                  }, (sw: string): string => sw)
+                }
+              }
+              .width('100%').padding(10).borderRadius(8)
+              .backgroundColor($r('app.color.surface'))
+              .border({ width: 1, color: $r('app.color.border') })
+              // 颜色叠加
+              Column({ space: 6 }) {
+                Row({ space: 8 }) {
+                  Toggle({ type: ToggleType.Checkbox, isOn: this.styOverlayOn })
+                    .onChange((on: boolean): void => {
+                      this.styOverlayOn = on;
+                      this.applyOverlay();
+                    })
+                  Text('颜色叠加').fontSize(13).fontColor($r('app.color.text_primary'))
+                }
+                Row({ space: 6 }) {
+                  Text('不透明度').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styOverlayOp, min: 0, max: 100, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styOverlayOp = v;
+                        this.applyOverlay();
+                      }
+                    })
+                  Text(`${Math.round(this.styOverlayOp)}%`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('颜色').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  ForEach(SWATCHES, (sw: string) => {
+                    Column()
+                      .width(22).height(22).borderRadius(4)
+                      .backgroundColor(sw)
+                      .border({
+                        width: this.styOverlayColor === sw ? 2 : 1,
+                        color: this.styOverlayColor === sw
+                          ? $r('app.color.accent') : $r('app.color.border')
+                      })
+                      .onClick((): void => { this.styOverlayColor = sw; this.applyOverlay(); })
+                  }, (sw: string): string => sw)
+                }
+              }
+              .width('100%').padding(10).borderRadius(8)
+              .backgroundColor($r('app.color.surface'))
+              .border({ width: 1, color: $r('app.color.border') })
+              Row({ space: 12 }) {
+                Button('清除样式').fontSize(14).height(40).width(110)
+                  .backgroundColor($r('app.color.surface'))
+                  .fontColor($r('app.color.danger'))
+                  .border({ width: 1, color: $r('app.color.border') })
+                  .onClick((): void => {
+                    const a = this.activeLayer();
+                    if (a !== undefined && this.engine.clearLayerStyle(a.id)) {
+                      this.toast('样式已清除');
+                      this.showStyle = false;
+                    }
+                  })
+                Blank()
+                Button('关闭').fontSize(14).height(40).width(96)
+                  .backgroundColor($r('app.color.accent'))
+                  .fontColor($r('app.color.on_accent'))
+                  .onClick((): void => { this.showStyle = false; })
+              }.justifyContent(FlexAlign.End).width('100%')
+              Text('滑条实时生效（一步撤销）· Esc 关闭').fontSize(11)
+                .fontColor($r('app.color.text_secondary'))
+            }.padding(20)
+          }.width(440).height(520)
         }.width('100%').height('100%')
       }
       if (this.showStoreSel) {

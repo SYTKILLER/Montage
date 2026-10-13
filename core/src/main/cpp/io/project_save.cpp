@@ -22,7 +22,7 @@ namespace {
 constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Save";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
-constexpr int kFormatVersion = 7;  // v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
+constexpr int kFormatVersion = 8;  // v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
 constexpr int kDeflateLevel = 6;
 // 04 §1.3 格式上限（沿用上游档位，与引擎运行预算分立）
 constexpr uint32_t kMaxSide = 30000;
@@ -443,6 +443,9 @@ struct LayerSnapshot {
     bool isGroup = false;
     uint64_t parentId = 0;
     bool collapsed = false;
+    // M14c 图层样式 / 填充图层（null = 无）
+    std::shared_ptr<LayerStyle> style;
+    std::shared_ptr<FillLayerState> fill;
 };
 
 struct ChannelSnapshot {
@@ -574,6 +577,77 @@ std::string buildManifest(const DocSnapshot& doc) {
             if (l.collapsed) {
                 fields.push_back("      \"collapsed\": true");
             }
+        }
+        if (l.style != nullptr) {
+            // v8 图层样式（M14c）：效果参数全量写出（色 = 0..1 三元组）
+            const LayerStyle& st = *l.style;
+            char num[32];
+            std::string sf;
+            sf += "      \"enabled\": ";
+            sf += (st.enabled ? "true" : "false");
+            sf += ",\n      \"dropShadow\": ";
+            sf += (st.dropShadow ? "true" : "false");
+            if (st.dropShadow) {
+                std::snprintf(num, sizeof(num), "%.6g", st.shadowAngleDeg);
+                sf += std::string(",\n      \"shAngle\": ") + num;
+                std::snprintf(num, sizeof(num), "%.6g", st.shadowDistance);
+                sf += std::string(",\n      \"shDist\": ") + num;
+                std::snprintf(num, sizeof(num), "%.6g", st.shadowSize);
+                sf += std::string(",\n      \"shSize\": ") + num;
+                std::snprintf(num, sizeof(num), "%.6g", st.shadowOpacity);
+                sf += std::string(",\n      \"shOpacity\": ") + num;
+                sf += ",\n      \"shColor\": [";
+                for (int ci = 0; ci < 3; ++ci) {
+                    std::snprintf(num, sizeof(num), "%.6g", st.shadowColor[ci]);
+                    sf += num;
+                    if (ci < 2) sf += ", ";
+                }
+                sf += "]";
+            }
+            sf += ",\n      \"stroke\": ";
+            sf += (st.stroke ? "true" : "false");
+            if (st.stroke) {
+                std::snprintf(num, sizeof(num), "%.6g", st.strokeWidth);
+                sf += std::string(",\n      \"stWidth\": ") + num;
+                sf += ",\n      \"stColor\": [";
+                for (int ci = 0; ci < 3; ++ci) {
+                    std::snprintf(num, sizeof(num), "%.6g", st.strokeColor[ci]);
+                    sf += num;
+                    if (ci < 2) sf += ", ";
+                }
+                sf += "]";
+            }
+            sf += ",\n      \"colorOverlay\": ";
+            sf += (st.colorOverlay ? "true" : "false");
+            if (st.colorOverlay) {
+                sf += ",\n      \"ovColor\": [";
+                for (int ci = 0; ci < 3; ++ci) {
+                    std::snprintf(num, sizeof(num), "%.6g", st.overlayColor[ci]);
+                    sf += num;
+                    if (ci < 2) sf += ", ";
+                }
+                sf += "]";
+                std::snprintf(num, sizeof(num), "%.6g", st.overlayOpacity);
+                sf += std::string(",\n      \"ovOpacity\": ") + num;
+            }
+            fields.push_back(std::string("      \"style\": {\n") + sf + "\n      }");
+        }
+        if (l.fill != nullptr) {
+            // v8 填充图层（M14c）：kind/颜色/角度
+            const FillLayerState& fl = *l.fill;
+            char num[32];
+            std::string ff;
+            ff += "      \"kind\": " + std::to_string(fl.kind);
+            ff += ",\n      \"color\": [";
+            for (int ci = 0; ci < 3; ++ci) {
+                std::snprintf(num, sizeof(num), "%.6g", fl.color[ci]);
+                ff += num;
+                if (ci < 2) ff += ", ";
+            }
+            ff += "]";
+            std::snprintf(num, sizeof(num), "%.6g", fl.angleDeg);
+            ff += std::string(",\n      \"angle\": ") + num;
+            fields.push_back(std::string("      \"fill\": {\n") + ff + "\n      }");
         }
         if (l.text != nullptr) {
             // v6 文本层：内容/样式持久化；像素仍存 PNG（缺字体回退时可显示旧栅格）
@@ -720,6 +794,8 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
             s.isGroup = l.isGroup;
             s.parentId = l.parentId;
             s.collapsed = l.collapsed;
+            s.style = l.style;
+            s.fill = l.fill;
             snap.layers.push_back(std::move(s));
         }
     }

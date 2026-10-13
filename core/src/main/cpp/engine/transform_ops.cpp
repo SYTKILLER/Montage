@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "engine/filter_ops.h"
+#include "engine/style_ops.h"
 
 namespace montage {
 
@@ -269,8 +270,7 @@ bool resizeCanvas(Document& doc, int x, int y, int w, int h) {
     }
     for (Layer& l : doc.layers) {
         // origin 平移（新文档原点 = 旧 (x,y)）；蒙版 offset 是图层局部坐标，随层走不动
-        l.transform.originX -= x;
-        l.transform.originY -= y;
+        shiftLayerOrigins(l, -static_cast<double>(x), -static_cast<double>(y));
     }
     doc.width = static_cast<uint32_t>(w);
     doc.height = static_cast<uint32_t>(h);
@@ -302,6 +302,9 @@ bool flipDocument(Document& doc, bool horizontal) {
         }
     }
     doc.selection = nullptr;
+    for (Layer& l : doc.layers) {
+        invalidateStyled(l);  // M14c：像素重排后样式派生失效（bridge 收尾重算）
+    }
     return true;
 }
 
@@ -334,6 +337,9 @@ bool rotateDocument90(Document& doc, bool clockwise) {
     doc.width = oldH;
     doc.height = oldW;
     doc.selection = nullptr;
+    for (Layer& l : doc.layers) {
+        invalidateStyled(l);  // M14c：像素重排后样式派生失效（bridge 收尾重算）
+    }
     return true;
 }
 
@@ -455,7 +461,7 @@ bool alignLayers(Document& doc, const std::vector<LayerId>& ids, int mode, std::
             } else {
                 dx = (ux0 + ux1) / 2.0 - (b.x + b.w / 2.0);
             }
-            b.l->transform.originX += dx;
+            shiftLayerOrigins(*b.l, dx, 0.0);
         } else {
             double dy = 0.0;
             if (mode == 3) {
@@ -465,7 +471,7 @@ bool alignLayers(Document& doc, const std::vector<LayerId>& ids, int mode, std::
             } else {
                 dy = (uy0 + uy1) / 2.0 - (b.y + b.h / 2.0);
             }
-            b.l->transform.originY += dy;
+            shiftLayerOrigins(*b.l, 0.0, dy);
         }
     }
     return true;
@@ -515,9 +521,9 @@ bool distributeLayers(Document& doc, const std::vector<LayerId>& ids, int mode, 
         const double target = first + span * static_cast<double>(k) / static_cast<double>(n - 1);
         const double delta = target - items[k].metric;
         if (mode <= 2) {
-            items[k].l->transform.originX += delta;
+            shiftLayerOrigins(*items[k].l, delta, 0.0);
         } else {
-            items[k].l->transform.originY += delta;
+            shiftLayerOrigins(*items[k].l, 0.0, delta);
         }
     }
     return true;

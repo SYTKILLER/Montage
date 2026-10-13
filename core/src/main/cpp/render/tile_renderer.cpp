@@ -330,8 +330,8 @@ void TileRenderer::drawTiles(const Layer& layer, float zoom, float panX, float p
     if (grid.cols == 0 || grid.rows == 0) {
         return;
     }
-    const float ox = static_cast<float>(layer.transform.originX);
-    const float oy = static_cast<float>(layer.transform.originY);
+    const float ox = static_cast<float>(layer.effectiveOriginX());
+    const float oy = static_cast<float>(layer.effectiveOriginY());
 
     // 视口求交（03 §6 瓦片剔除）：doc 可见范围 ∩ 图层变换范围
     const float docX0 = panX;

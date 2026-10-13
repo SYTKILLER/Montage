@@ -1,5 +1,6 @@
 #include "io/project_open.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -15,6 +16,7 @@
 #include <hilog/log.h>
 
 #include "engine/document.h"
+#include "engine/style_ops.h"
 #include "engine/engine.h"
 #include "io/png_decode.h"
 
@@ -26,7 +28,7 @@ constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Open";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
 constexpr int kMinVersion = 1;
-constexpr int kMaxVersion = 7;  // v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
+constexpr int kMaxVersion = 8;  // v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
 constexpr uint32_t kMaxSide = 30000;
 constexpr uint64_t kMaxTotalPixels = 100ull * 1000 * 1000;
 constexpr size_t kMaxLayers = 10000;
@@ -510,6 +512,8 @@ struct LayerRecord {
     bool clipping = false;  // v2
     std::shared_ptr<LayerAdjustment> adjustment;  // v3
     std::shared_ptr<TextLayerState> text;  // v6（M12）
+    std::shared_ptr<LayerStyle> style;  // v8（M14c）
+    std::shared_ptr<FillLayerState> fill;  // v8（M14c）
     // v7（M14a）
     bool isGroup = false;
     uint64_t parentId = 0;
@@ -914,6 +918,126 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
             }
             l.collapsed = jcol->b;
         }
+        // v8 图层样式（M14c，可选字段——旧版无此字段 = 无样式）
+        const JValue* jst = item.find("style");
+        if (jst != nullptr) {
+            if (jst->type != JValue::Obj) {
+                err = "bad style";
+                return false;
+            }
+            auto st = std::make_shared<LayerStyle>();
+            const JValue* je = jst->find("enabled");
+            if (je != nullptr && je->type == JValue::Bool) {
+                st->enabled = je->b;
+            }
+            const JValue* jds = jst->find("dropShadow");
+            if (jds != nullptr && jds->type == JValue::Bool && jds->b) {
+                double ang = 0, dist = 0, size = 0, op = 0;
+                const JValue* jn = jst->find("shAngle");
+                if (jn == nullptr || !getDouble(*jn, ang)) { err = "bad shAngle"; return false; }
+                jn = jst->find("shDist");
+                if (jn == nullptr || !getDouble(*jn, dist)) { err = "bad shDist"; return false; }
+                jn = jst->find("shSize");
+                if (jn == nullptr || !getDouble(*jn, size)) { err = "bad shSize"; return false; }
+                jn = jst->find("shOpacity");
+                if (jn == nullptr || !getDouble(*jn, op)) { err = "bad shOpacity"; return false; }
+                const JValue* jc = jst->find("shColor");
+                if (jc == nullptr || jc->type != JValue::Arr || jc->arr.size() != 3) {
+                    err = "bad shColor";
+                    return false;
+                }
+                for (size_t ci = 0; ci < 3; ++ci) {
+                    double cv = 0;
+                    if (!getDouble(jc->arr[ci], cv) || !std::isfinite(cv) || cv < 0 || cv > 1) {
+                        err = "bad shColor value";
+                        return false;
+                    }
+                    st->shadowColor[ci] = static_cast<float>(cv);
+                }
+                st->dropShadow = true;
+                st->shadowAngleDeg = ang;
+                st->shadowDistance = dist;
+                st->shadowSize = size;
+                st->shadowOpacity = std::clamp(op, 0.0, 1.0);
+                st->shadowColor[3] = 1.0f;
+            }
+            const JValue* jsk = jst->find("stroke");
+            if (jsk != nullptr && jsk->type == JValue::Bool && jsk->b) {
+                double w = 0;
+                const JValue* jn = jst->find("stWidth");
+                if (jn == nullptr || !getDouble(*jn, w)) { err = "bad stWidth"; return false; }
+                const JValue* jc = jst->find("stColor");
+                if (jc == nullptr || jc->type != JValue::Arr || jc->arr.size() != 3) {
+                    err = "bad stColor";
+                    return false;
+                }
+                for (size_t ci = 0; ci < 3; ++ci) {
+                    double cv = 0;
+                    if (!getDouble(jc->arr[ci], cv) || !std::isfinite(cv) || cv < 0 || cv > 1) {
+                        err = "bad stColor value";
+                        return false;
+                    }
+                    st->strokeColor[ci] = static_cast<float>(cv);
+                }
+                st->stroke = true;
+                st->strokeWidth = w;
+                st->strokeColor[3] = 1.0f;
+            }
+            const JValue* jco = jst->find("colorOverlay");
+            if (jco != nullptr && jco->type == JValue::Bool && jco->b) {
+                double op = 0;
+                const JValue* jc = jst->find("ovColor");
+                if (jc == nullptr || jc->type != JValue::Arr || jc->arr.size() != 3) {
+                    err = "bad ovColor";
+                    return false;
+                }
+                for (size_t ci = 0; ci < 3; ++ci) {
+                    double cv = 0;
+                    if (!getDouble(jc->arr[ci], cv) || !std::isfinite(cv) || cv < 0 || cv > 1) {
+                        err = "bad ovColor value";
+                        return false;
+                    }
+                    st->overlayColor[ci] = static_cast<float>(cv);
+                }
+                const JValue* jn = jst->find("ovOpacity");
+                if (jn == nullptr || !getDouble(*jn, op)) { err = "bad ovOpacity"; return false; }
+                st->colorOverlay = true;
+                st->overlayColor[3] = 1.0f;
+                st->overlayOpacity = std::clamp(op, 0.0, 1.0);
+            }
+            l.style = std::move(st);
+        }
+        // v8 填充图层（M14c，可选字段）
+        const JValue* jfl = item.find("fill");
+        if (jfl != nullptr) {
+            if (jfl->type != JValue::Obj) {
+                err = "bad fill";
+                return false;
+            }
+            auto fl = std::make_shared<FillLayerState>();
+            double kind = 0, angle = 90;
+            const JValue* jn = jfl->find("kind");
+            if (jn == nullptr || !getDouble(*jn, kind)) { err = "bad fill kind"; return false; }
+            const JValue* jc = jfl->find("color");
+            if (jc == nullptr || jc->type != JValue::Arr || jc->arr.size() != 3) {
+                err = "bad fill color";
+                return false;
+            }
+            for (size_t ci = 0; ci < 3; ++ci) {
+                double cv = 0;
+                if (!getDouble(jc->arr[ci], cv) || !std::isfinite(cv) || cv < 0 || cv > 1) {
+                    err = "bad fill color value";
+                    return false;
+                }
+                fl->color[ci] = static_cast<float>(cv);
+            }
+            jn = jfl->find("angle");
+            if (jn != nullptr && !getDouble(*jn, angle)) { err = "bad fill angle"; return false; }
+            fl->kind = static_cast<int>(kind) == 1 ? 1 : 0;
+            fl->color[3] = 1.0f;
+            fl->angleDeg = angle;
+            l.fill = std::move(fl);
+        }
         layers.push_back(l);
     }
     if (totalPixels > kMaxTotalPixels) {
@@ -1040,6 +1164,8 @@ bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
         l.isGroup = rec.isGroup;
         l.parentId = rec.parentId;
         l.collapsed = rec.collapsed;
+        l.style = rec.style;
+        l.fill = rec.fill;
         l.transform.originX = rec.originX;
         l.transform.originY = rec.originY;
         if (rec.hasImage) {
@@ -1141,6 +1267,8 @@ bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
         engine.doc.layers = std::move(layers);
         engine.doc.activeId = doc.activeId;
         engine.doc.channels = std::move(doc.channels);
+        // M14c：样式/填充派生渲染重建（styledRender 不入库，读入后按参数重生成）
+        restyleDocument(engine.doc);
         engine.history.clear();
         engine.bumpRevisionLocked();
         engine.requestRender();

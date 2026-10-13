@@ -1,5 +1,7 @@
 #include "engine/engine.h"
 
+#include "engine/style_ops.h"
+
 #include <algorithm>
 
 #include <hilog/log.h>
@@ -224,6 +226,8 @@ void Engine::strokeThreadMain() {
                             }
                         }
                     }
+                    // M14c：提交像素变更后重算带样式/填充层派生渲染（样式实时跟随笔画）
+                    restyleDocument(doc);
                     const int64_t rev = docRevision + 1;
                     history.endEdit(doc, static_cast<uint64_t>(rev));
                     bumpRevisionLocked();

@@ -158,6 +158,14 @@ napi_value DuplicateLayer(napi_env env, napi_callback_info info);
 napi_value SetLayerLink(napi_env env, napi_callback_info info);
 napi_value AlignLayers(napi_env env, napi_callback_info info);
 napi_value DistributeLayers(napi_env env, napi_callback_info info);
+// M14c 图层样式第一批 / 填充图层：投影 / 描边（v1 外部）/ 颜色叠加 / 清样式 /
+// 新建填充图层（kind 0=纯色 1=线性渐变 fg→bg）/ 填充层改参
+napi_value SetDropShadow(napi_env env, napi_callback_info info);
+napi_value SetLayerStroke(napi_env env, napi_callback_info info);
+napi_value SetColorOverlay(napi_env env, napi_callback_info info);
+napi_value ClearLayerStyle(napi_env env, napi_callback_info info);
+napi_value AddFillLayer(napi_env env, napi_callback_info info);
+napi_value SetFillLayerParams(napi_env env, napi_callback_info info);
 // M13 滤镜：直接应用（一步事务）/ 预览三件套（begin 建 1/4 proxy 源、set 跑核、
 // end commit = 全分辨率事务应用并清理）
 napi_value ApplyFilter(napi_env env, napi_callback_info info);

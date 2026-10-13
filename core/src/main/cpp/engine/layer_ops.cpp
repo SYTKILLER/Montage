@@ -138,7 +138,10 @@ bool mergeVisible(Document& doc, std::string& err) {
         return false;
     }
     const int lowest = visibleIdx.front();
-    const Layer& base = doc.layers[static_cast<size_t>(lowest)];
+    // base 的 id/name/parentId 先拷出（doc.layers 在下方重建，引用会悬空——M14c 单测暴露）
+    const LayerId baseId = doc.layers[static_cast<size_t>(lowest)].id;
+    const std::string baseName = doc.layers[static_cast<size_t>(lowest)].name;
+    const LayerId baseParent = doc.layers[static_cast<size_t>(lowest)].parentId;
     std::shared_ptr<const TileGrid> grid;
     int ox = 0, oy = 0;
     if (!flattenRangeToGrid(doc, 0, static_cast<int>(doc.layers.size()), false, grid, ox, oy,
@@ -146,12 +149,12 @@ bool mergeVisible(Document& doc, std::string& err) {
         return false;
     }
     Layer merged;
-    merged.id = base.id;
-    merged.name = base.name;
+    merged.id = baseId;
+    merged.name = baseName;
     merged.blendMode = BlendMode::Normal;
     merged.opacity = 1.0;
     merged.visible = true;
-    merged.parentId = base.parentId;
+    merged.parentId = baseParent;
     merged.pixels = grid;
     merged.transform.originX = ox;
     merged.transform.originY = oy;
@@ -198,7 +201,7 @@ bool mergeVisible(Document& doc, std::string& err) {
             cur = p->parentId;
         }
     }
-    doc.activeId = base.id;
+    doc.activeId = baseId;
     return true;
 }
 
