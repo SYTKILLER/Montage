@@ -92,6 +92,7 @@ class TileRenderer {
     GLuint vbo_ = 0;
     GLuint vao_ = 0;
     bool inited_ = false;
+    bool initFailed_ = false;  // P1-6：初始化失败置位（不再逐帧重试 30+ 次 program 编译）
 
     // 合成 FBO（视口分辨率；acc 双缓冲 ping-pong + 单层 assemble）
     GLuint accFbo_[2] = {0, 0};

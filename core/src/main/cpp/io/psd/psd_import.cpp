@@ -266,9 +266,10 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
         layers.push_back(std::move(layer));
     }
 
+    // 整档替换：统一走 resetDocument（清撤销/会话态，撤销不跨文档；未持锁调用）
+    engine.resetDocument();
     {
         std::lock_guard<std::mutex> lk(engine.docMutex);
-        engine.doc = Document{};
         engine.doc.width = doc.width;
         engine.doc.height = doc.height;
         engine.doc.name = "PSD";
@@ -276,7 +277,6 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
         engine.doc.activeId = engine.doc.layers.empty()
                                   ? 0
                                   : engine.doc.layers[engine.doc.layers.size() - 1].id;
-        engine.history.clear();  // 整档替换：撤销不跨文档
         engine.bumpRevisionLocked();
         engine.requestRender();
     }

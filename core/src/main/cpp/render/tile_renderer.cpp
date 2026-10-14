@@ -169,7 +169,7 @@ void TileRenderer::destroyFbos() {
 }
 
 void TileRenderer::ensureInit() {
-    if (inited_) {
+    if (inited_ || initFailed_) {
         return;
     }
     checkerProg_ = buildProgram(shaders::kQuadVert, shaders::kCheckerFrag);
@@ -187,6 +187,9 @@ void TileRenderer::ensureInit() {
     }
     if (checkerProg_ == 0 || tileProg_ == 0 || plainProg_ == 0 || clipProg_ == 0 ||
         adjustProg_ == 0 || antsProg_ == 0 || qmProg_ == 0 || blendProgs_[0] == 0) {
+        // P1-6：失败置位不再逐帧重试（否则每帧重编 30+ program + ERROR 日志洪水）；
+        // drawFrame 经 !inited_ 早退，画面保持背板。invalidate（上下文重建）时复位重试。
+        initFailed_ = true;
         return;
     }
     if (antsVao_ == 0) {
@@ -280,6 +283,7 @@ void TileRenderer::invalidate() {
         }
     }
     inited_ = false;
+    initFailed_ = false;
 }
 
 void TileRenderer::drawQuad(GLuint program, float rx, float ry, float rw, float rh, float zoom,
@@ -344,6 +348,9 @@ void TileRenderer::drawTiles(const Layer& layer, float zoom, float panX, float p
         std::max(0.0f, std::floor((docX1 - ox) / kTileSize))));
     uint32_t ty1 = std::min(grid.rows - 1u, static_cast<uint32_t>(
         std::max(0.0f, std::floor((docY1 - oy) / kTileSize))));
+    if (xform == nullptr && (docX1 <= ox || docY1 <= oy)) {
+        return;  // P2-3：图层整体在视口左/上方——clamp 会把 tx/ty 钳到 0 白画屏外瓦片
+    }
     const bool wantNearest = zoom >= 2.0f;  // 03 §6：≥200% 切 NEAREST（crispZoom）
     // M8.1 变换预览：xform 层不做视口剔除（变换后 bbox 计算复杂且预览层瓦片有限），
     // 稀疏网格空白瓦片循环内天然跳过
@@ -823,11 +830,25 @@ void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw
                              const StrokeOverlay* stroke, const LayerXformPreview* preview,
                              bool overlayOnly) {
     frame_++;
+    if (!inited_) {
+        return;
+    }
+    // 笔画草稿纹理生命周期 = 当前笔画（P0-2：此前只在 invalidate 清理——笔画每触碰
+    // 一个新瓦片就留一张 256KB 纹理，长期编辑泄漏显存直至 glGenTextures 失败静默不绘。
+    // 对齐 drawQuickMask 对 qmStrokeTex_ 的写法：无活跃笔画即整表清空）
+    if (stroke == nullptr || !stroke->active) {
+        for (auto& kv : strokeTex_) {
+            if (kv.second != 0) {
+                glDeleteTextures(1, &kv.second);
+            }
+        }
+        strokeTex_.clear();
+    }
     glViewport(0, 0, vw, vh);
     // 画布外背板：中性灰（05 §7：与主题解耦，对齐 PS 行为）
     glClearColor(0.27f, 0.27f, 0.27f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
-    if (!inited_ || doc.width == 0 || doc.height == 0) {
+    if (doc.width == 0 || doc.height == 0) {
         return;
     }
     if (!ensureFbos(vw, vh)) {
@@ -900,7 +921,8 @@ void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw
                      fboW_, fboH_, float16_ ? 1 : 0);
     }
 
-    // LRU 逐出（超预算时最久未用先走）
+    // LRU 逐出（超预算时最久未用先走；稳态 ≤ kCacheCap，帧内瞬时可超——受当帧
+    // 实际绘制瓦片数约束）
     if (cache_.size() > kCacheCap) {
         std::vector<uint64_t> victims;
         for (auto& kv : cache_) {
@@ -909,7 +931,7 @@ void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw
             }
         }
         std::sort(victims.begin(), victims.end(), [this](uint64_t a, uint64_t b) {
-            return cache_[a].lastFrame < cache_[b].lastFrame;
+            return cache_.find(a)->second.lastFrame < cache_.find(b)->second.lastFrame;
         });
         const size_t target = kCacheCap / 2;
         for (size_t i = 0; i < victims.size() && cache_.size() > target; ++i) {

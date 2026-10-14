@@ -184,6 +184,8 @@ bool resampleDocument(Document& doc, uint32_t newW, uint32_t newH) {
     doc.width = newW;
     doc.height = newH;
     doc.selection = nullptr;
+    doc.quickMask = nullptr;  // P1-4：像素重排后通道错位
+    doc.channels.clear();     // 通道掩码与文档尺寸强绑定 → 尺寸变化即弃（v1 登记）
     return true;
 }
 
@@ -277,6 +279,8 @@ bool rotateDocumentArbitrary(Document& doc, double degreesCw) {
     doc.width = newW;
     doc.height = newH;
     doc.selection = nullptr;
+    doc.quickMask = nullptr;  // P1-4：像素重排后通道错位
+    doc.channels.clear();     // 通道掩码与文档尺寸强绑定 → 尺寸变化即弃（v1 登记）
     return true;
 }
 

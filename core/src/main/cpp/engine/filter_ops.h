@@ -29,6 +29,10 @@ void filterGridToStrip(const TileGrid& grid, uint32_t gx, uint32_t gy, uint32_t 
 std::shared_ptr<const TileGrid> filterStripToGrid(const std::vector<uint8_t>& strip, uint32_t w,
                                                   uint32_t h, uint64_t revision);
 
+// 发布网格缓存键 revision：进程级单调计数（P2-10 合并原 g_mergeGridRev/g_styleGridRev）。
+// 无因果语义——仅保证新发布网格的 revision 唯一（渲染侧 Tile* 身份键之外的缓存判据）。
+uint64_t nextGridRevision();
+
 }  // namespace montage
 
 #endif  // MONTAGE_ENGINE_FILTER_OPS_H

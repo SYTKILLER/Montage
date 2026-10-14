@@ -362,6 +362,9 @@ ImportCompletion* runImport(int fd) {
     }
 
     // 图层落位：无文档 → 建文档（尺寸=图片）；有文档 → 居中放置
+    // 不变式：width==0（建档）时 History 必已为空——把 doc 清到零尺寸的路径只有
+    // Engine::resetDocument（新建/关闭/打开工程/PSD），其内已清撤销并作废在途笔画。
+    // 此处不可调 resetDocument：会置 import.cancel 自我取消（导入线程内禁止）。
     const LayerId layerId = engine.nextLayerId();
     bool createsDoc = false;
     Transform transform;

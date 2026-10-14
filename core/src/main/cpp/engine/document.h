@@ -335,6 +335,11 @@ std::shared_ptr<const TileGrid> composeMasked(std::shared_ptr<const TileGrid> sr
 // 图层局部坐标 (gx,gy) 处的蒙版灰度（patch 内查网格，patch 外取 outside）
 uint8_t layerMaskGrayAt(const LayerMask& mask, int gx, int gy);
 
+// 网格墨迹精确包围盒（alpha > 0 逐像素扫描；返回网格局部坐标）。与瓦片粒度的
+// layerContentBBox（filter_ops.h）分工：trim/对齐分布等需要贴墨迹的语义用它，
+// 滤镜 strip 域保留瓦片对齐（卷积核边界余量）。
+bool gridInkBBox(const TileGrid& grid, uint32_t& x, uint32_t& y, uint32_t& w, uint32_t& h);
+
 }  // namespace montage
 
 #endif  // MONTAGE_ENGINE_DOCUMENT_H

@@ -54,6 +54,7 @@ private:
     void releaseGl();
     void failInit(const std::string& reason);
     void requestFrameLocked();
+    void selfContinueFrame();  // P2-5：doFrame 尾部自续（持 vsyncMtx_ + stop 复查）
 
     std::thread thread_;
     std::mutex lifecycleMtx_;

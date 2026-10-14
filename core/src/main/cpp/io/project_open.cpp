@@ -1297,11 +1297,11 @@ bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
         doc.channels[i].mask = std::move(cgrid);
     }
 
-    // 整档替换（02 §5 语义）+ History 清空（撤销不跨文档）
+    // 整档替换（02 §5 语义）：统一走 resetDocument（清撤销/会话态，撤销不跨文档）
     auto& engine = Engine::get();
+    engine.resetDocument();
     {
         std::lock_guard<std::mutex> lk(engine.docMutex);
-        engine.doc = Document{};
         engine.doc.width = doc.width;
         engine.doc.height = doc.height;
         engine.doc.name = doc.name;
@@ -1315,7 +1315,6 @@ bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
         engine.doc.guidesVisible = doc.guidesVisible;
         // M14c：样式/填充派生渲染重建（styledRender 不入库，读入后按参数重生成）
         restyleDocument(engine.doc);
-        engine.history.clear();
         engine.bumpRevisionLocked();
         engine.requestRender();
     }

@@ -1,7 +1,6 @@
 #include "bridge/engine_bridge.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <functional>
@@ -248,15 +247,20 @@ napi_value NewDocument(napi_env env, napi_callback_info info) {
         napi_get_value_int32(env, argv[1], &h) != napi_ok || w <= 0 || h <= 0) {
         return makeError(env, kErrBadParam, "newDocument: invalid size");
     }
+    // 画布总像素上限（与存档 kMaxTotalPixels 对齐）：30000² 无上限可选区修改族
+    // 会按全图平面分配冲到 GB 级（P1-7 源头治理）
+    constexpr uint64_t kMaxNewDocPixels = 100ull * 1000 * 1000;
+    if (static_cast<uint64_t>(w) * static_cast<uint64_t>(h) > kMaxNewDocPixels) {
+        return makeError(env, kErrBadParam, "newDocument: size exceeds 100MP limit");
+    }
     auto& e = Engine::get();
     io::cancelImageImport();
+    e.resetDocument();  // 统一入口：清撤销/会话态（撤销不许跨文档）
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        e.doc = Document{};
         e.doc.width = static_cast<uint32_t>(w);
         e.doc.height = static_cast<uint32_t>(h);
         e.doc.name = "Untitled";
-        e.viewport = Viewport{};
         // M7.5：PS 语义——新建文档自带初始图层（此前零图层，首笔直接画会 no active layer）
         Layer initial;
         initial.id = e.nextLayerId();
@@ -273,10 +277,9 @@ napi_value NewDocument(napi_env env, napi_callback_info info) {
 napi_value CloseDocument(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
     io::cancelImageImport();
+    e.resetDocument();  // 统一入口：清撤销/会话态
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        e.doc = Document{};
-        e.viewport = Viewport{};
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -3341,11 +3344,14 @@ napi_value BakeLayerMatrix(napi_env env, napi_callback_info info) {
         return makeError(env, kErrBadParam, "bakeLayerMatrix(id,m0..m5) requires 7 args");
     }
     auto* ctx = new BakeCtx();
-    for (int i = 0; i < 7; ++i) {
-        if (napi_get_value_double(env, argv[i], &ctx->id) != napi_ok && i > 0) {
-            // id 用 argv[0]；m 用 argv[1..6]，逐个回填
-        }
+    // id 只取 argv[0]（审查修复 P2-6：原空转循环对 i=0..6 每次成功解析都覆写 ctx->id，
+    // 最终 id = argv[6] = m[5]（Y 平移分量）→ 烘焙找错层/静默失败，M8.1 起即坏）
+    double idVal = 0;
+    if (napi_get_value_double(env, argv[0], &idVal) != napi_ok || idVal < 0) {
+        delete ctx;
+        return makeError(env, kErrBadParam, "bakeLayerMatrix: invalid layer id");
     }
+    ctx->id = idVal;
     {
         double m6[6] = {0};
         for (int i = 1; i < 7; ++i) {
@@ -4729,7 +4735,8 @@ napi_value DuplicateLayer(napi_env env, napi_callback_info info) {
         }
         e.history.beginEdit(e.doc, "duplicate layer", static_cast<uint64_t>(e.docRevision));
         std::string err;
-        const LayerId got = duplicateLayer(e.doc, src, e.nextLayerId(), err);
+        const LayerId got = duplicateLayer(e.doc, src, e.nextLayerId(),
+                                           [&e] { return e.nextLayerId(); }, err);
         if (got == 0) {
             e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
             return makeError(env, kErrBadParam, "duplicateLayer: " + err);
@@ -4841,8 +4848,6 @@ napi_value DistributeLayers(napi_env env, napi_callback_info info) {
 
 // ---------- M14c 图层样式 / 填充图层 ----------
 
-std::atomic<uint64_t> g_styleGridRev{1};
-
 // 样式命令共用：定位层（0=活动）+ session 守卫 + 事务 + restyle + 刷新
 napi_value runStyleCommand(napi_env env, const char* what, LayerId id,
                            const std::function<bool(Document&, Layer&, std::string&)>& apply) {
@@ -4876,7 +4881,7 @@ napi_value runStyleCommand(napi_env env, const char* what, LayerId id,
             e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
             return makeError(env, kErrBadParam, std::string(what) + ": " + err);
         }
-        if (!restyleLayer(e.doc, *l, g_styleGridRev.fetch_add(1), err)) {
+        if (!restyleLayer(e.doc, *l, nextGridRevision(), err)) {
             e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
             return makeError(env, kErrBadParam, std::string(what) + ": " + err);
         }
@@ -5057,7 +5062,7 @@ napi_value AddFillLayer(napi_env env, napi_callback_info info) {
         layer.transform.originX = 0.0;
         layer.transform.originY = 0.0;
         std::string err;
-        if (!restyleLayer(e.doc, layer, g_styleGridRev.fetch_add(1), err)) {
+        if (!restyleLayer(e.doc, layer, nextGridRevision(), err)) {
             e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
             return makeError(env, kErrBadParam, "addFillLayer: " + err);
         }
@@ -5126,7 +5131,7 @@ napi_value SetFillLayerParams(napi_env env, napi_callback_info info) {
         l->fill->color[3] = 1.0f;
         l->fill->angleDeg = v[5];
         std::string err;
-        if (!restyleLayer(e.doc, *l, g_styleGridRev.fetch_add(1), err)) {
+        if (!restyleLayer(e.doc, *l, nextGridRevision(), err)) {
             e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
             return makeError(env, kErrBadParam, "setFillLayerParams: " + err);
         }

@@ -1,6 +1,7 @@
 #include "engine/filter_ops.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 
@@ -68,6 +69,11 @@ std::shared_ptr<const TileGrid> filterStripToGrid(const std::vector<uint8_t>& st
     return builder.publish(revision);
 }
 
+uint64_t nextGridRevision() {
+    static std::atomic<uint64_t> rev{1};
+    return rev.fetch_add(1);
+}
+
 namespace {
 
 // 选区灰度查表（doc.selection 域 = 文档坐标；strip 域 = 层局部 + bbox 原点）
@@ -86,6 +92,8 @@ struct SelSampler {
 
 }  // namespace
 
+// 瓦片粒度内容包围盒。与墨迹精确的 gridInkBBox（document.h）分工：滤镜/样式域刻意
+// 保持瓦片对齐（strip 原点 256 对齐，卷积/采样核在墨迹边缘留边界余量，P1-5 登记）。
 bool layerContentBBox(const TileGrid& grid, uint32_t& x, uint32_t& y, uint32_t& w, uint32_t& h) {
     uint32_t tx0 = UINT32_MAX, ty0 = UINT32_MAX, tx1 = 0, ty1 = 0;
     for (const auto& [key, tile] : grid.tiles) {

@@ -211,13 +211,13 @@ void Engine::strokeThreadMain() {
                             }
                         }
                     } else {
-                        // 提交（对拍 commit：工作瓦片合并入图层 grid）
+                        // 提交（对拍 commit：工作瓦片合并入图层 grid）。
+                        // P2-1：原实现先 commitGrid(nullptr) 判空再真合并——两次全量
+                        // 构建（paintTile + 逐瓦片拷贝），第一次结果整体丢弃
                         const LayerId lid = draft->layerId();
-                        auto grid = draft->commitGrid(nullptr);
                         for (Layer& l : doc.layers) {
-                            if (l.id == lid && grid != nullptr) {
-                                auto merged = draft->commitGrid(l.pixels.get());
-                                l.pixels = merged;
+                            if (l.id == lid) {
+                                l.pixels = draft->commitGrid(l.pixels.get());
                                 // M5a：蒙版启用图层提交后重合成派生网格
                                 if (l.mask != nullptr && l.mask->enabled) {
                                     l.render = composeMasked(l.pixels, *l.mask);
@@ -358,29 +358,45 @@ Engine::StrokeSnapshot Engine::copyStrokeSnapshotLocked() {
     return snap;
 }
 
+// 关闭/新建/整档替换（打开工程/PSD）统一入口。调用方不得持 docMutex 进入。
+// 审查修复（P0-1/P0-3/P1-3）：此前仅 project_open/psd_import 清 history，新建/关闭/
+// 导入图片三条路径都不清——Ctrl+Z 会把上一文档整档恢复（撤销跨文档）；且在途笔画
+// 残留会用旧档 before + 新档 after 造出跨文档撤销条目，必须连同队列与 draft 一并作废。
+// 锁序与笔画线程处理段一致（cycle → doc），与 cv.wait 无交互，无死锁环。
 void Engine::resetDocument() {
     {
         std::lock_guard<std::mutex> lk(strokeMtx);
         strokeQuit = true;
+        strokeQueue.clear();  // 在途点/end 标记作废（跨文档笔画不落新档）
         strokeCv.notify_all();
     }
     {
         std::lock_guard<std::mutex> lk(import.mtx);
         import.cancel = true;
     }
-    std::lock_guard<std::mutex> lk(docMutex);
-    doc = Document{};
-    viewport = Viewport{};
-    // 落笔目标标志随文档清空（否则新文档上蒙版目标笔画静默拒绝——连带修复潜伏 bug）
-    brushOnMask = false;
-    brushIsClone = false;
-    brushEffect = BrushEffect::None;
-    historyBrushSteps = 0;
-    cloneSource = CloneSource{};
-    textEditOpen = false;  // M12：编辑会话随文档清空（History 已 clear）
-    textEditLayerId = 0;
-    filterPreview = FilterPreview{};  // M13：预览会话随文档清空
-    needsRender.store(true);
+    {
+        // 与笔画线程 batch 处理段互斥：等其在途 batch 落完再清（线程随后见 quit 空队列退出，
+        // 下次 BeginStroke 经 ensureStrokeThreadLocked 重建）
+        std::lock_guard<std::mutex> cycle(strokeCycleMtx);
+        std::lock_guard<std::mutex> lk(docMutex);
+        draft.reset();
+        doc = Document{};
+        viewport = Viewport{};
+        history.clear();  // 撤销不许跨文档回退（连带复位 pendingFlag_，堵跨文档事务）
+        // 落笔目标标志随文档清空（否则新文档上蒙版目标笔画静默拒绝）
+        brushOnMask = false;
+        brushIsClone = false;
+        brushEffect = BrushEffect::None;
+        historyBrushSteps = 0;
+        cloneSource = CloneSource{};
+        textEditOpen = false;  // M12：编辑会话随文档清空
+        textEditLayerId = 0;
+        filterPreview = FilterPreview{};  // M13：预览会话随文档清空
+        lastSelection.reset();  // M10a：重新选择来源不跨文档
+        transformPreview = TransformPreview{};
+        historyVersion.fetch_add(1);  // 历史面板随清空刷新（M15b）
+        needsRender.store(true);
+    }
     render.wake();
 }
 

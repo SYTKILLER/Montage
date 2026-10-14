@@ -5,17 +5,18 @@
 // （region = 参与层内容 bbox 并集，避免全画布缓冲）。
 
 #include <algorithm>
-#include <atomic>
+#include <functional>
+#include <map>
 #include <memory>
+#include <utility>
 
 #include "engine/filter_ops.h"
+#include "engine/group_ops.h"
 #include "io/image_export.h"
 
 namespace montage {
 
 namespace {
-
-std::atomic<uint64_t> g_mergeGridRev{1};
 
 int indexOf(const Document& doc, LayerId id) {
     for (size_t i = 0; i < doc.layers.size(); ++i) {
@@ -66,7 +67,7 @@ bool flattenRangeToGrid(const Document& doc, int start, int end, bool opaqueWhit
         err = "flatten failed: " + res.error;
         return false;
     }
-    outGrid = filterStripToGrid(res.rgba, res.width, res.height, g_mergeGridRev.fetch_add(1));
+    outGrid = filterStripToGrid(res.rgba, res.width, res.height, nextGridRevision());
     ox = rx;
     oy = ry;
     return true;
@@ -181,7 +182,11 @@ bool mergeVisible(Document& doc, std::string& err) {
         out.push_back(std::move(l));
     }
     doc.layers = std::move(out);
-    // 隐藏层的祖先被移除（曾在可见组内）→ 挂到合并结果的父级，保持平铺连续
+    // 隐藏层的祖先被移除（曾在可见组内）→ 先试挂到合并结果的父级，保持嵌套。
+    // 审查修复 P1-2：重挂层未必落在 mergedParent 的连续子段内（中间可能隔着幸存的
+    // 根层/他组子树）——先序 DFS 会把段截断。试挂后跑连续性校验，破坏则整体回退根层
+    // （根层任意位置合法）。
+    std::vector<LayerId> reattached;
     for (Layer& l : doc.layers) {
         if (l.parentId == 0) {
             continue;
@@ -191,14 +196,24 @@ bool mergeVisible(Document& doc, std::string& err) {
         while (cur != 0 && guard++ < 256) {
             if (std::find(dropped.begin(), dropped.end(), cur) != dropped.end()) {
                 l.parentId = mergedParent;
+                reattached.push_back(l.id);
                 break;
             }
             const Layer* p = findConst(doc, cur);
             if (p == nullptr) {
                 l.parentId = mergedParent;  // 父链悬空（防御）
+                reattached.push_back(l.id);
                 break;
             }
             cur = p->parentId;
+        }
+    }
+    if (!reattached.empty() && !groupsContiguous(doc)) {
+        for (LayerId rid : reattached) {
+            Layer* l = findById(doc, rid);
+            if (l != nullptr) {
+                l->parentId = 0;
+            }
         }
     }
     doc.activeId = baseId;
@@ -220,7 +235,7 @@ bool flattenImage(Document& doc, LayerId newId, std::string& err) {
         for (size_t k = 3; k < bytes; k += 4) {
             white[k] = 255;  // 直 alpha 域（assign 已全 255，保留清晰表达）
         }
-        grid = filterStripToGrid(white, doc.width, doc.height, g_mergeGridRev.fetch_add(1));
+        grid = filterStripToGrid(white, doc.width, doc.height, nextGridRevision());
         ox = 0;
         oy = 0;
         err.clear();
@@ -278,22 +293,46 @@ LayerId stampVisible(Document& doc, LayerId newId, const std::string& name, std:
     return doc.layers[at].id;
 }
 
-LayerId duplicateLayer(Document& doc, LayerId id, LayerId newId, std::string& err) {
+LayerId duplicateLayer(Document& doc, LayerId id, LayerId newId,
+                       const std::function<LayerId()>& idGen, std::string& err) {
     const int idx = indexOf(doc, id);
     if (idx < 0) {
         err = "layer not found";
         return 0;
     }
-    Layer dup = doc.layers[static_cast<size_t>(idx)];
-    dup.id = newId;
-    dup.name = doc.layers[static_cast<size_t>(idx)].name + " 副本";
-    dup.linkId = 0;  // PS 语义：副本不继承链接
-    dup.collapsed = false;
-    // 像素/蒙版/文本/调整 = 不可变共享指针值拷贝（编辑侧 COW，天然隔离）
-    const size_t at = static_cast<size_t>(idx) + 1;
-    doc.layers.insert(doc.layers.begin() + static_cast<long>(at), std::move(dup));
-    doc.activeId = doc.layers[at].id;
-    return doc.layers[at].id;
+    // 组节点整组深拷贝（审查修复 P1-1：旧实现整体值拷贝单节点——新组 id 变了但子层
+    // parentId 仍指旧组，groupChildEnd 先序 DFS 把子层段判给旧组，新组成空壳且树遍历错乱）
+    const bool isGroup = doc.layers[static_cast<size_t>(idx)].isGroup;
+    const int end = isGroup ? groupChildEnd(doc.layers, idx) : idx + 1;
+    std::vector<Layer> clones;
+    clones.reserve(static_cast<size_t>(end - idx));
+    std::map<LayerId, LayerId> idMap;  // 旧 id → 新 id（段内先序）
+    for (int i = idx; i < end; ++i) {
+        Layer dup = doc.layers[static_cast<size_t>(i)];
+        // 像素/蒙版/文本/调整 = 不可变共享指针值拷贝（编辑侧 COW，天然隔离）
+        const LayerId mapped = (i == idx) ? newId : idGen();
+        idMap[doc.layers[static_cast<size_t>(i)].id] = mapped;
+        dup.id = mapped;
+        if (i == idx) {
+            dup.name += " 副本";
+        }
+        dup.linkId = 0;  // PS 语义：副本不继承链接
+        dup.collapsed = false;
+        clones.push_back(std::move(dup));
+    }
+    // parentId 重映射：段内父（含嵌套组）接新 id；段外父（顶层组复制）保持不变
+    for (Layer& dup : clones) {
+        const auto it = idMap.find(dup.parentId);
+        if (it != idMap.end()) {
+            dup.parentId = it->second;
+        }
+    }
+    // 整块插到原子树段尾之后（与原段同父相邻，平铺连续不变式天然保持）
+    doc.layers.insert(doc.layers.begin() + static_cast<long>(end),
+                      std::make_move_iterator(clones.begin()),
+                      std::make_move_iterator(clones.end()));
+    doc.activeId = newId;
+    return newId;
 }
 
 bool setLayerLink(Document& doc, const std::vector<LayerId>& ids, bool link, std::string& err) {

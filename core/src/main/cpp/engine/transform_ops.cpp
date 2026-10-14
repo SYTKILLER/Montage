@@ -7,7 +7,6 @@
 #include <utility>
 #include <vector>
 
-#include "engine/filter_ops.h"
 #include "engine/style_ops.h"
 
 namespace montage {
@@ -230,25 +229,18 @@ bool visibleContentBBox(const Document& doc, int& x, int& y, int& w, int& h) {
         if (g == nullptr || g->tiles.empty()) {
             continue;
         }
-        uint32_t tx0 = UINT32_MAX;
-        uint32_t ty0 = UINT32_MAX;
-        uint32_t tx1 = 0;
-        uint32_t ty1 = 0;
-        for (const auto& [idx, tile] : g->tiles) {
-            (void)tile;
-            tx0 = std::min(tx0, idx % g->cols);
-            ty0 = std::min(ty0, idx / g->cols);
-            tx1 = std::max(tx1, idx % g->cols);
-            ty1 = std::max(ty1, idx / g->cols);
+        // 墨迹精确 bbox（审查修复 P1-5：旧实现取瓦片索引 min/max——trim 后画布永远
+        // 是 256 倍数，四周多出大片透明边；PS 语义 = 裁到墨迹）
+        uint32_t ux = 0, uy = 0, uw = 0, uh = 0;
+        if (!gridInkBBox(*g, ux, uy, uw, uh)) {
+            continue;
         }
-        const int lx = static_cast<int>(l.transform.originX) + static_cast<int>(tx0 * kTile);
-        const int ly = static_cast<int>(l.transform.originY) + static_cast<int>(ty0 * kTile);
-        const int lw = static_cast<int>((tx1 - tx0 + 1) * kTile);
-        const int lh = static_cast<int>((ty1 - ty0 + 1) * kTile);
+        const int lx = static_cast<int>(l.transform.originX) + static_cast<int>(ux);
+        const int ly = static_cast<int>(l.transform.originY) + static_cast<int>(uy);
         bx0 = std::min(bx0, lx);
         by0 = std::min(by0, ly);
-        bx1 = std::max(bx1, lx + lw);
-        by1 = std::max(by1, ly + lh);
+        bx1 = std::max(bx1, lx + static_cast<int>(uw));
+        by1 = std::max(by1, ly + static_cast<int>(uh));
     }
     if (bx0 == INT32_MAX) {
         return false;
@@ -274,7 +266,12 @@ bool resizeCanvas(Document& doc, int x, int y, int w, int h) {
     }
     doc.width = static_cast<uint32_t>(w);
     doc.height = static_cast<uint32_t>(h);
-    doc.selection = nullptr;  // 会话态语义：画布重设即清除（M8a 简化登记）
+    // 会话态语义：画布重设即清除（M8a 简化登记）。审查修复 P1-4：quickMask 网格与
+    // 文档尺寸/位置强绑定，尺寸变了不复位会在退出 Q 键时把错位通道转成选区；
+    // 通道掩码与文档尺寸强绑定（读档侧同规格校验）→ 尺寸变化即弃（v1 登记）
+    doc.selection = nullptr;
+    doc.quickMask = nullptr;
+    doc.channels.clear();
     return true;
 }
 
@@ -302,6 +299,7 @@ bool flipDocument(Document& doc, bool horizontal) {
         }
     }
     doc.selection = nullptr;
+    doc.quickMask = nullptr;  // P1-4：像素重排后通道错位（尺寸不变，通道掩码保留——内容不随镜像，v1 登记）
     for (Layer& l : doc.layers) {
         invalidateStyled(l);  // M14c：像素重排后样式派生失效（bridge 收尾重算）
     }
@@ -337,6 +335,8 @@ bool rotateDocument90(Document& doc, bool clockwise) {
     doc.width = oldH;
     doc.height = oldW;
     doc.selection = nullptr;
+    doc.quickMask = nullptr;  // P1-4：像素重排后通道错位
+    doc.channels.clear();     // 通道掩码与文档尺寸强绑定 → 维度互换即弃（v1 登记）
     for (Layer& l : doc.layers) {
         invalidateStyled(l);  // M14c：像素重排后样式派生失效（bridge 收尾重算）
     }
@@ -390,8 +390,10 @@ bool alignBBoxOf(const Layer& l, int& x, int& y, int& w, int& h) {
     if (px == nullptr) {
         return false;
     }
+    // 墨迹精确 bbox（P1-5 连带：旧 layerContentBBox 瓦片粒度——同瓦片内两个小图形
+    // bbox 相同，对齐完全失效）
     uint32_t ux = 0, uy = 0, uw = 0, uh = 0;
-    if (!layerContentBBox(*px, ux, uy, uw, uh)) {
+    if (!gridInkBBox(*px, ux, uy, uw, uh)) {
         return false;
     }
     x = static_cast<int>(std::lround(l.transform.originX)) + static_cast<int>(ux);

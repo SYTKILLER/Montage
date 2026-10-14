@@ -214,6 +214,47 @@ uint8_t layerMaskGrayAt(const LayerMask& mask, int gx, int gy) {
                 static_cast<size_t>(mx % kTileSize)) * 4u];
 }
 
+// 网格墨迹精确包围盒（alpha > 0 逐像素扫描；瓦片恒 kTileSize 见方、行距 rowBytes）
+bool gridInkBBox(const TileGrid& grid, uint32_t& x, uint32_t& y, uint32_t& w, uint32_t& h) {
+    uint32_t bx0 = UINT32_MAX, by0 = UINT32_MAX, bx1 = 0, by1 = 0;
+    for (const auto& [key, tile] : grid.tiles) {
+        const uint32_t tx = key % grid.cols;
+        const uint32_t ty = key / grid.cols;
+        const uint8_t* p = tile->pixels->mapCpu();
+        if (p == nullptr) {
+            continue;
+        }
+        const uint32_t rb = tile->pixels->rowBytes();
+        uint32_t lx0 = kTileSize, ly0 = kTileSize, lx1 = 0, ly1 = 0;
+        for (uint32_t py = 0; py < kTileSize; ++py) {
+            const uint8_t* row = p + static_cast<size_t>(py) * rb;
+            for (uint32_t px = 0; px < kTileSize; ++px) {
+                if (row[px * 4 + 3] != 0) {
+                    lx0 = std::min(lx0, px);
+                    ly0 = std::min(ly0, py);
+                    lx1 = std::max(lx1, px);
+                    ly1 = std::max(ly1, py);
+                }
+            }
+        }
+        if (lx0 == kTileSize) {
+            continue;  // 瓦片全透明
+        }
+        bx0 = std::min(bx0, tx * kTileSize + lx0);
+        by0 = std::min(by0, ty * kTileSize + ly0);
+        bx1 = std::max(bx1, tx * kTileSize + lx1);
+        by1 = std::max(by1, ty * kTileSize + ly1);
+    }
+    if (bx0 == UINT32_MAX) {
+        return false;
+    }
+    x = bx0;
+    y = by0;
+    w = bx1 - bx0 + 1;
+    h = by1 - by0 + 1;
+    return true;
+}
+
 std::shared_ptr<const TileGrid> composeMasked(std::shared_ptr<const TileGrid> src,
                                               const LayerMask& mask) {
     if (src == nullptr) {

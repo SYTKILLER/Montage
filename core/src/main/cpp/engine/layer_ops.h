@@ -9,6 +9,7 @@
 // 简化登记（v1）：蒙版/文字在合并时烘焙为像素（结果无蒙版/不可编辑文本）；
 // 下方为调整层/组/剪贴层的 mergeDown 拒绝执行（PS 深语义登记后续）。
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -29,8 +30,10 @@ bool flattenImage(Document& doc, LayerId newId, std::string& err);
 LayerId stampVisible(Document& doc, LayerId newId, const std::string& name, std::string& err);
 
 // 复制图层：像素/蒙版/文本共享不可变指针（编辑时 COW），名加「副本」，链接不继承；
-// 插到原层上方并激活。
-LayerId duplicateLayer(Document& doc, LayerId id, LayerId newId, std::string& err);
+// 插到原层上方并激活。id 为组节点时整组深拷贝（先序子树段全部层换新 id、parentId
+// 经映射重接；组内子层名不变）——idGen 为新 id 生成器（组需多个，桥接侧传 Engine::nextLayerId）。
+LayerId duplicateLayer(Document& doc, LayerId id, LayerId newId,
+                       const std::function<LayerId()>& idGen, std::string& err);
 
 // 链接层（联动移动）：link=true 给全部 id 分配同一新 linkId（≥2 层、均非组）；
 // link=false 清除这些层所在链接组（全体成员解除）。

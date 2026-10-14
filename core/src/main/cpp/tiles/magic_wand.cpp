@@ -56,6 +56,11 @@ class TileSource : public WandSource {
                 std::memcpy(loaded.bytes.data() + static_cast<size_t>(r) * kTileSize * 4u,
                             src + static_cast<size_t>(r) * rb, static_cast<size_t>(kTileSize) * 4u);
             }
+            // P2-4：非连续全图扫描会逐瓦片缓存整层（256KB×瓦片数驻留）。at() 返回指针
+            // 仅当次调用内消费（withinTolerance 即弃，无跨调用持有），超限清空安全
+            if (cache_.size() >= 256) {
+                cache_.clear();
+            }
             it = cache_.emplace(key, std::move(loaded)).first;
         }
         if (!it->second.loaded) {

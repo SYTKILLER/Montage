@@ -11,6 +11,14 @@ namespace {
 
 constexpr uint32_t kTile = kTileSize;
 
+// 选区修改族全图平面内存预算（审查修复 P1-7，与滤镜 64MP 对齐）：
+// 修改族按 w×h 逐平面展开（feather 需 out + uint16×2 ≈ 5 倍、border 3 份），无预算时
+// 30000² 画布一次羽化可冲 4.5GB；fullSelection 满瓦片网格亦 4 字节/像素。
+constexpr uint64_t kMaxSelPlanePixels = 64ull * 1000 * 1000;
+inline bool selPlaneBudgetOk(uint32_t w, uint32_t h) {
+    return static_cast<uint64_t>(w) * static_cast<uint64_t>(h) <= kMaxSelPlanePixels;
+}
+
 // 2×2 覆盖采样的子采样偏移（像素中心系：采样点 = 像素原点 + 偏移）
 constexpr double kSubOff[4][2] = {{0.25, 0.25}, {0.75, 0.25}, {0.25, 0.75}, {0.75, 0.75}};
 
@@ -291,7 +299,7 @@ std::shared_ptr<const TileGrid> invertSelection(const Document& doc) {
 }
 
 std::shared_ptr<const TileGrid> fullSelection(uint32_t docW, uint32_t docH) {
-    if (docW == 0 || docH == 0) {
+    if (docW == 0 || docH == 0 || !selPlaneBudgetOk(docW, docH)) {
         return nullptr;
     }
     TileGridBuilder builder((docW + kTile - 1u) / kTile, (docH + kTile - 1u) / kTile);
@@ -426,7 +434,8 @@ std::vector<uint8_t> morphPlane(std::vector<uint8_t> plane, uint32_t w, uint32_t
 }
 
 std::shared_ptr<const TileGrid> morphSelection(const Document& doc, int radius, bool dilation) {
-    if (doc.width == 0 || doc.height == 0 || doc.selection == nullptr || radius <= 0) {
+    if (doc.width == 0 || doc.height == 0 || doc.selection == nullptr || radius <= 0 ||
+        !selPlaneBudgetOk(doc.width, doc.height)) {
         return nullptr;
     }
     std::vector<uint8_t> plane = maskToPlane(*doc.selection, doc.width, doc.height);
@@ -437,7 +446,8 @@ std::shared_ptr<const TileGrid> morphSelection(const Document& doc, int radius, 
 }  // namespace
 
 std::shared_ptr<const TileGrid> featherSelection(const Document& doc, double radius) {
-    if (doc.width == 0 || doc.height == 0 || doc.selection == nullptr || radius <= 0) {
+    if (doc.width == 0 || doc.height == 0 || doc.selection == nullptr || radius <= 0 ||
+        !selPlaneBudgetOk(doc.width, doc.height)) {
         return nullptr;
     }
     const uint32_t w = doc.width;
@@ -483,7 +493,8 @@ std::shared_ptr<const TileGrid> contractSelection(const Document& doc, int radiu
 }
 
 std::shared_ptr<const TileGrid> borderSelection(const Document& doc, int radius) {
-    if (doc.width == 0 || doc.height == 0 || doc.selection == nullptr || radius <= 0) {
+    if (doc.width == 0 || doc.height == 0 || doc.selection == nullptr || radius <= 0 ||
+        !selPlaneBudgetOk(doc.width, doc.height)) {
         return nullptr;
     }
     const std::vector<uint8_t> base = maskToPlane(*doc.selection, doc.width, doc.height);
@@ -498,7 +509,8 @@ std::shared_ptr<const TileGrid> borderSelection(const Document& doc, int radius)
 }
 
 std::shared_ptr<const TileGrid> smoothSelection(const Document& doc) {
-    if (doc.width == 0 || doc.height == 0 || doc.selection == nullptr) {
+    if (doc.width == 0 || doc.height == 0 || doc.selection == nullptr ||
+        !selPlaneBudgetOk(doc.width, doc.height)) {
         return nullptr;
     }
     const uint32_t w = doc.width;

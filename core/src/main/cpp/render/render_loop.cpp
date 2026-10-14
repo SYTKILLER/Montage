@@ -291,7 +291,7 @@ void RenderLoop::doFrame() {
         }
     }
     if (!dirty && !overlayOnly) {
-        OH_NativeVSync_RequestFrame(vsync_, &RenderLoop::frameCallback, this);
+        selfContinueFrame();  // P2-5：持 vsyncMtx_（与 threadMain 的 Destroy 互斥）
         return;
     }
 
@@ -400,7 +400,17 @@ void RenderLoop::doFrame() {
             statOverlayFrames_ = 0;
         }
     }
-    OH_NativeVSync_RequestFrame(vsync_, &RenderLoop::frameCallback, this);  // 回调线程内自续
+    selfContinueFrame();  // 回调线程内自续（P2-5：持 vsyncMtx_ + stop 检查）
+}
+
+// P2-5：帧尾自续统一走这里——持 vsyncMtx_ 与 threadMain 停止路径的
+// OH_NativeVSync_Destroy 互斥，并复查 stop_（消除「检查后销毁」竞态窗口下的
+// 悬垂 vsync_ 访问）。回调线程内调用，不涉及 M1 记录的跨线程注册失效问题。
+void RenderLoop::selfContinueFrame() {
+    std::lock_guard<std::mutex> lk(vsyncMtx_);
+    if (!stop_.load() && vsync_ != nullptr) {
+        OH_NativeVSync_RequestFrame(vsync_, &RenderLoop::frameCallback, this);
+    }
 }
 
 void RenderLoop::releaseGl() {
