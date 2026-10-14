@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <numeric>
+#include <unordered_map>
 #include <vector>
 
 #include <unistd.h>
@@ -273,6 +275,11 @@ struct EncodedLayer {
     uint8_t mDefault = 255;
     uint8_t mFlags = 0;
     Plane maskPlane;
+    // M15c（PSD-2）：记录类型 0=普通 1=组（展开）2=组（折叠）3=组尾 divider；
+    // 组/divider/调整层 = 空矩形 + 4 条零长通道
+    int recordType = 0;
+    std::string adjKey;             // "levl"/"curv"/"nvrt"；空 = 无
+    std::vector<uint8_t> adjPayload;
 };
 
 }  // namespace
@@ -285,48 +292,165 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
         return res;
     }
 
-    // ---- Pass 1：层编码（bottom→top 遍历；写出时逆序 top-first） ----
+    // ---- Pass 1：层编码（bottom→top 树序发射；写出时逆序 top-first） ----
+    // PSD-2 组序（与 reader M14a 组装互逆）：文件 bottom→top = [子层..., 组尾 divider(3),
+    // 组头(1/2)]——子层先于组记录、组尾 divider 在组头之前。
     std::vector<EncodedLayer> layers;
     res.notes.clear();
-    for (const PsdLayerSnap& l : snap.layers) {
-        if (l.isAdjustment) {
-            res.notes.push_back("调整层 \"" + l.name + "\" 不支持 PSD 导出，已跳过。");
-            continue;
+    std::unordered_map<uint64_t, std::vector<size_t>> kids;
+    std::vector<size_t> roots;
+    for (size_t i = 0; i < snap.layers.size(); ++i) {
+        const PsdLayerSnap& l = snap.layers[i];
+        if (l.parentId != 0 && l.parentId != l.id) {
+            kids[l.parentId].push_back(i);
+        } else {
+            roots.push_back(i);
         }
+    }
+    const auto encodePixel = [&](const PsdLayerSnap& l, EncodedLayer* el) -> bool {
         if (l.pixels == nullptr || l.pixels->tiles.empty()) {
-            continue;
+            return false;
         }
         uint32_t px = 0, py = 0, pw = 0, ph = 0;
         if (!gridBBox(*l.pixels, px, py, pw, ph)) {
-            continue;
+            return false;
         }
-        EncodedLayer el;
-        el.name = l.name;
-        el.left = static_cast<int>(l.originX) + static_cast<int>(px);
-        el.top = static_cast<int>(l.originY) + static_cast<int>(py);
-        el.right = el.left + static_cast<int>(pw);
-        el.bottom = el.top + static_cast<int>(ph);
-        el.key = blendToKey(l.blendMode);
-        el.opacity = static_cast<uint8_t>(
+        el->name = l.name;
+        el->left = static_cast<int>(l.originX) + static_cast<int>(px);
+        el->top = static_cast<int>(l.originY) + static_cast<int>(py);
+        el->right = el->left + static_cast<int>(pw);
+        el->bottom = el->top + static_cast<int>(ph);
+        el->key = blendToKey(l.blendMode);
+        el->opacity = static_cast<uint8_t>(
             std::lround(std::min(1.0, std::max(0.0, l.opacity)) * 255.0));
-        el.clipping = l.clipping ? 1 : 0;
-        el.flags = l.visible ? 0 : 2;
-        el.red = encodePlaneFromGrid(*l.pixels, px, py, pw, ph, 0);
-        el.green = encodePlaneFromGrid(*l.pixels, px, py, pw, ph, 1);
-        el.blue = encodePlaneFromGrid(*l.pixels, px, py, pw, ph, 2);
-        el.alpha = encodePlaneFromGrid(*l.pixels, px, py, pw, ph, 3);
+        el->clipping = l.clipping ? 1 : 0;
+        el->flags = l.visible ? 0 : 2;
+        el->red = encodePlaneFromGrid(*l.pixels, px, py, pw, ph, 0);
+        el->green = encodePlaneFromGrid(*l.pixels, px, py, pw, ph, 1);
+        el->blue = encodePlaneFromGrid(*l.pixels, px, py, pw, ph, 2);
+        el->alpha = encodePlaneFromGrid(*l.pixels, px, py, pw, ph, 3);
         if (l.maskGrid != nullptr && l.maskW > 0 && l.maskH > 0) {
-            el.hasMask = true;
-            el.mLeft = static_cast<int>(l.originX) + l.maskOffsetX;
-            el.mTop = static_cast<int>(l.originY) + l.maskOffsetY;
-            el.mRight = el.mLeft + static_cast<int>(l.maskW);
-            el.mBottom = el.mTop + static_cast<int>(l.maskH);
-            el.mDefault = static_cast<uint8_t>(l.maskOutside);
-            el.mFlags = l.maskEnabled ? 0 : 2;
-            el.maskPlane = encodePlaneFromMask(*l.maskGrid, l.maskW, l.maskH);
+            el->hasMask = true;
+            el->mLeft = static_cast<int>(l.originX) + l.maskOffsetX;
+            el->mTop = static_cast<int>(l.originY) + l.maskOffsetY;
+            el->mRight = el->mLeft + static_cast<int>(l.maskW);
+            el->mBottom = el->mTop + static_cast<int>(l.maskH);
+            el->mDefault = static_cast<uint8_t>(l.maskOutside);
+            el->mFlags = l.maskEnabled ? 0 : 2;
+            el->maskPlane = encodePlaneFromMask(*l.maskGrid, l.maskW, l.maskH);
         }
-        layers.push_back(std::move(el));
-    }
+        return true;
+    };
+    const auto encodeEmpty = [&](EncodedLayer* el) -> void {
+        // 组/divider/调整层记录：空矩形 + 4 条零长通道（reader 按长度跳过）
+        el->top = el->left = el->bottom = el->right = 0;
+        el->key = "norm";
+        el->opacity = 255;
+        el->clipping = 0;
+        el->flags = 0;
+    };
+    std::function<void(const std::vector<size_t>&, uint64_t)> emitRange =
+        [&](const std::vector<size_t>& idxs, uint64_t /*parent*/) -> void {
+        for (size_t i : idxs) {
+            const PsdLayerSnap& l = snap.layers[i];
+            if (l.isGroup) {
+                // PSD 规范组块（bottom→top 文件序）= [组底 divider(3)，成员…，组头(1/2)]：
+                // divider 在成员之前（reader M14a 装配契约同构；调色板顶部组头 = 文件最后）
+                EncodedLayer d;
+                encodeEmpty(&d);
+                d.recordType = 3;
+                d.name = "</Layer group>";
+                layers.push_back(std::move(d));
+                auto it = kids.find(l.id);
+                if (it != kids.end()) {
+                    emitRange(it->second, l.id);
+                }
+                EncodedLayer g;
+                encodeEmpty(&g);
+                g.recordType = l.collapsed ? 2 : 1;
+                g.name = l.name;
+                // 穿透（引擎 Normal+不透明 1）写 pass 键；否则写实际混合键
+                g.key = (l.blendMode == BlendMode::Normal && l.opacity >= 0.999)
+                            ? "pass" : blendToKey(l.blendMode);
+                g.opacity = static_cast<uint8_t>(
+                    std::lround(std::min(1.0, std::max(0.0, l.opacity)) * 255.0));
+                g.clipping = l.clipping ? 1 : 0;
+                g.flags = l.visible ? 0 : 2;
+                layers.push_back(std::move(g));
+                continue;
+            }
+            if (l.isAdjustment) {
+                const bool supported = l.adjKind == 0 || l.adjKind == 1 || l.adjKind == 3;
+                if (!supported) {
+                    res.notes.push_back("调整层 \"" + l.name +
+                                        "\" 的类型不支持 PSD 导出，已跳过。");
+                    continue;
+                }
+                EncodedLayer a;
+                encodeEmpty(&a);
+                a.name = l.name;
+                a.key = blendToKey(l.blendMode);
+                a.opacity = static_cast<uint8_t>(
+                    std::lround(std::min(1.0, std::max(0.0, l.opacity)) * 255.0));
+                a.clipping = l.clipping ? 1 : 0;
+                a.flags = l.visible ? 0 : 2;
+                if (l.adjKind == 0) {
+                    // levl：u32 ver + inB/inW/gamma(×100)/outB/outW i16（reader M9d 同构）
+                    a.adjKey = "levl";
+                    const auto push16 = [&a](int v) -> void {
+                        a.adjPayload.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+                        a.adjPayload.push_back(static_cast<uint8_t>(v & 0xFF));
+                    };
+                    const auto clamp255 = [](double v) -> int {
+                        return static_cast<int>(std::lround(
+                            std::min(1.0, std::max(0.0, v)) * 255.0));
+                    };
+                    a.adjPayload.insert(a.adjPayload.end(), 4, 0);  // ver u32
+                    push16(clamp255(l.adjInBlack));
+                    push16(clamp255(l.adjInWhite));
+                    push16(static_cast<int>(std::lround(
+                        std::min(10.0f, std::max(0.1f, l.adjGamma)) * 100.0f)));
+                    push16(0);     // outB
+                    push16(255);   // outW
+                } else if (l.adjKind == 1) {
+                    // curv：u32 ver=1 + u16 count + count×(x,y) 字节（0..255）
+                    a.adjKey = "curv";
+                    const size_t n = std::min(l.adjCurveX.size(), l.adjCurveY.size());
+                    a.adjPayload.insert(a.adjPayload.end(), {0, 0, 0, 1});
+                    a.adjPayload.push_back(static_cast<uint8_t>((n >> 8) & 0xFF));
+                    a.adjPayload.push_back(static_cast<uint8_t>(n & 0xFF));
+                    for (size_t p2 = 0; p2 < n; ++p2) {
+                        const auto bx = [](float v) -> uint8_t {
+                            return static_cast<uint8_t>(
+                                std::lround(std::min(1.0f, std::max(0.0f, v)) * 255.0f));
+                        };
+                        a.adjPayload.push_back(bx(l.adjCurveX[p2]));
+                        a.adjPayload.push_back(bx(l.adjCurveY[p2]));
+                    }
+                } else {
+                    a.adjKey = "nvrt";  // 空 payload
+                }
+                layers.push_back(std::move(a));
+                continue;
+            }
+            // 普通层（文本/填充/样式 = 栅格化像素导出 + note）
+            if (l.isText) {
+                res.notes.push_back("文字层 \"" + l.name + "\" 已栅格化为像素导出。");
+            }
+            if (l.isFill) {
+                res.notes.push_back("填充图层 \"" + l.name + "\" 已栅格化为像素导出。");
+            }
+            if (l.hasStyle) {
+                res.notes.push_back("图层 \"" + l.name +
+                                    "\" 的样式效果已合成进像素导出（非破坏样式不保留）。");
+            }
+            EncodedLayer el;
+            if (encodePixel(l, &el)) {
+                layers.push_back(std::move(el));
+            }
+        }
+    };
+    emitRange(roots, 0);
     res.layers = static_cast<uint32_t>(layers.size());
 
     // ---- 合成图（ImageData；快照未携带时现场扁平化） ----
@@ -424,26 +548,41 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
     const size_t countAt = w.size();
     w.i16(static_cast<int16_t>(layers.size()));  // 正数 = 透明度不含合并图
 
-    // 层记录（top-first）
-    for (auto it = layers.rbegin(); it != layers.rend(); ++it) {
-        const EncodedLayer& el = *it;
+    // 层记录（PSD 规范 = bottom-first 存储；组装配与 PS 堆叠语义均依赖此序）
+    for (const EncodedLayer& el : layers) {
         w.i32(el.top);
         w.i32(el.left);
         w.i32(el.bottom);
         w.i32(el.right);
-        const int chanCount = el.hasMask ? 5 : 4;
-        w.u16(static_cast<uint16_t>(chanCount));
-        w.i16(0);
-        w.u32(el.red.totalLen());
-        w.i16(1);
-        w.u32(el.green.totalLen());
-        w.i16(2);
-        w.u32(el.blue.totalLen());
-        w.i16(-1);
-        w.u32(el.alpha.totalLen());
-        if (el.hasMask) {
-            w.i16(-2);
-            w.u32(el.maskPlane.totalLen());
+        if (el.recordType != 0) {
+            // M15c：组/divider/调整层 = 4 条零长通道（reader 按长度跳过）
+            w.u16(4);
+            w.i16(0);
+            w.u32(0);
+            w.i16(1);
+            w.u32(0);
+            w.i16(2);
+            w.u32(0);
+            w.i16(-1);
+            w.u32(0);
+        } else {
+            // 通道表 = [nch u16][每通道 id i16 + len u32]（reader/PSD 规范同构）。
+            // 396d006 起此处多写了一个 i16(0) 且 len/id 逆序——单层往返侥幸对齐、
+            // 多记录（M15c 组/divider）起整体 2 字节/记录漂移，readPsd truncated。
+            const int chanCount = el.hasMask ? 5 : 4;
+            w.u16(static_cast<uint16_t>(chanCount));
+            w.i16(0);
+            w.u32(el.red.totalLen());
+            w.i16(1);
+            w.u32(el.green.totalLen());
+            w.i16(2);
+            w.u32(el.blue.totalLen());
+            w.i16(-1);
+            w.u32(el.alpha.totalLen());
+            if (el.hasMask) {
+                w.i16(-2);
+                w.u32(el.maskPlane.totalLen());
+            }
         }
         w.ascii("8BIM", 4);
         w.ascii(el.key, 4);
@@ -454,8 +593,8 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
         // extra data
         const size_t extraAt = w.size();
         w.u32(0);
-        // mask section
-        if (el.hasMask) {
+        // mask section（组/divider/调整层无 mask 段）
+        if (el.recordType == 0 && el.hasMask) {
             const size_t mAt = w.size();
             w.u32(0);
             w.i32(el.mTop);
@@ -524,12 +663,30 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
             w.pad2In(payloadAt);
             w.patchU32(lenAt, static_cast<uint32_t>(w.size() - payloadAt));
         }
+        // M15c：组/divider → lsct（dividerType u32 + filler u32）；调整层 → levl/curv/nvrt
+        if (el.recordType != 0) {
+            w.ascii("8BIM", 4);
+            w.ascii("lsct", 4);
+            w.u32(8);
+            w.u32(static_cast<uint32_t>(el.recordType));
+            w.u32(0);
+        }
+        if (!el.adjKey.empty()) {
+            w.ascii("8BIM", 4);
+            w.ascii(el.adjKey.c_str(), 4);
+            w.u32(static_cast<uint32_t>(el.adjPayload.size()));
+            w.raw(el.adjPayload);
+            w.pad2In(w.size() - el.adjPayload.size());
+        }
         w.patchU32(extraAt, static_cast<uint32_t>(w.size() - extraAt - 4));
     }
 
-    // 通道数据（与记录同序：top-first）
-    for (auto it = layers.rbegin(); it != layers.rend(); ++it) {
-        const EncodedLayer& el = *it;
+    // 通道数据（与记录同序 bottom-first）。空记录（组/divider/调整层）跳过——
+    // 其通道长度写 0，若仍 writeTo 会多出 2B/平面的压缩头使数据段整体漂移。
+    for (const EncodedLayer& el : layers) {
+        if (el.recordType != 0) {
+            continue;
+        }
         el.red.writeTo(w);
         el.green.writeTo(w);
         el.blue.writeTo(w);

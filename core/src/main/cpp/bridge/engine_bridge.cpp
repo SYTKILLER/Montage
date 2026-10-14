@@ -3738,8 +3738,9 @@ napi_value ExportPsd(napi_env env, napi_callback_info info) {
             pl.blendMode = l.blendMode;
             pl.clipping = l.clipping;
             pl.pixels = l.effectivePixels();
-            pl.originX = l.transform.originX;
-            pl.originY = l.transform.originY;
+            // M15c：样式派生域 origin 独立于 transform（投影/描边扩展），导出须对齐像素
+            pl.originX = l.effectiveOriginX();
+            pl.originY = l.effectiveOriginY();
             if (l.mask != nullptr) {
                 pl.maskGrid = l.mask->pixels;
                 pl.maskW = l.mask->width;
@@ -3750,6 +3751,22 @@ napi_value ExportPsd(napi_env env, napi_callback_info info) {
                 pl.maskEnabled = l.mask->enabled;
             }
             pl.isAdjustment = l.adjustment != nullptr;
+            // M15c（PSD-2）：组树 + 降级标记 + 调整层参数
+            pl.id = l.id;
+            pl.parentId = l.parentId;
+            pl.isGroup = l.isGroup;
+            pl.collapsed = l.collapsed;
+            pl.isText = l.text != nullptr;
+            pl.isFill = l.fill != nullptr;
+            pl.hasStyle = l.style != nullptr;
+            if (l.adjustment != nullptr) {
+                pl.adjKind = static_cast<int32_t>(l.adjustment->kind);
+                pl.adjInBlack = l.adjustment->inBlack;
+                pl.adjInWhite = l.adjustment->inWhite;
+                pl.adjGamma = l.adjustment->gamma;
+                pl.adjCurveX = l.adjustment->curveX;
+                pl.adjCurveY = l.adjustment->curveY;
+            }
             snap.layers.push_back(std::move(pl));
         }
         ctx->psdSnap = std::move(snap);
