@@ -28,6 +28,7 @@ add_library(compositor SHARED
         io/image_export.cpp
         io/psd_export.cpp
         io/png_decode.cpp
+        io/dng_decode.cpp
         io/project_open.cpp
         io/project_save.cpp
         io/psd/psd_reader.cpp

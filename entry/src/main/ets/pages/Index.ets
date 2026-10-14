@@ -1,4 +1,5 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { util } from '@kit.ArkTS';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
@@ -2079,6 +2080,26 @@ struct Index {
         });
         break;
       }
+      case 'file.openSandboxDng': {
+        // M15d：DNG RAW 显影设备验证通道（内嵌合成 DNG base64 → cacheDir → 显影打开；
+        // 模拟器 picker/沙箱写入受限，自包含可复跑）
+        const B64_DNG = 'SUkqAAgAAAAOAAABBAABAAAACAAAAAEBBAABAAAACAAAAAIBAwABAAAAEAAAAAMBAwABAAAAAQAAAAYBAwABAAAAI4AAABEBBAABAAAAzgAAABUBAwABAAAAAQAAABcBBAABAAAAgAAAAI2CAwACAAAAAgACAI6CAQAEAAAAAAEBAhLGAQAEAAAAAQQAABrGAwABAAAAyAAAAB3GBAABAAAADDAAACjGBQADAAAAtgAAAAAAAAD0AQAA6AMAAOgDAADoAwAA6AMAAOgDAABwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwFw==';
+        const pd = getContext(this).cacheDir + '/raw_test.dng';
+        const bin: Uint8Array = new util.Base64Helper().decodeSync(B64_DNG);
+        const fw = fs.openSync(pd, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+        fs.writeSync(fw.fd, bin.buffer);
+        fs.closeSync(fw);
+        const fd2 = fs.openSync(pd, fs.OpenMode.READ_ONLY);
+        this.engine.openFileFromFd(fd2.fd).then((dd: OpenFileData): void => {
+          this.docW = dd.width;
+          this.docH = dd.height;
+          this.docOpen = true;
+          this.log(`沙箱 DNG 显影: ${dd.width}x${dd.height}`);
+        }).catch((e: BusinessError): void => {
+          this.log(`沙箱 DNG 打开失败: ${e.message}`);
+        });
+        break;
+      }
       case 'edit.undo':
         if (this.engine.undo()) {
           this.log('撤销');
@@ -2995,6 +3016,7 @@ struct Index {
       subItem('help.debugSub', '调试（沙箱往返）', true, [
         leafItem('file.saveSandbox', '保存往返包到沙箱', '', d),
         leafItem('file.openSandbox', '打开沙箱往返包', '', d),
+        leafItem('file.openSandboxDng', '打开沙箱 DNG（RAW 显影）', '', d),
       ]),
     ];
     return [

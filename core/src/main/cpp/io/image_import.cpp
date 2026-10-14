@@ -14,6 +14,7 @@
 
 #include "engine/engine.h"
 #include "io/png_decode.h"
+#include "io/dng_decode.h"
 
 namespace montage {
 namespace io {
@@ -241,6 +242,62 @@ bool decodeBand(OH_ImageSourceNative* source, uint32_t imgW, uint32_t imgY, uint
 ImportCompletion* runImport(int fd) {
     FdGuard fdGuard(fd);
     auto& engine = Engine::get();
+
+    // M15d：DNG RAW 显影链（内容探测在系统解码器之前——ImageSource 不识别 RAW）
+    {
+        lseek(fd, 0, SEEK_SET);
+        const off_t sz = lseek(fd, 0, SEEK_END);
+        lseek(fd, 0, SEEK_SET);
+        if (sz > 0 && sz <= 512ll * 1024 * 1024) {
+            std::vector<uint8_t> bytes(static_cast<size_t>(sz));
+            size_t got = 0;
+            while (got < bytes.size()) {
+                const ssize_t n = read(fd, bytes.data() + got, bytes.size() - got);
+                if (n <= 0) {
+                    break;
+                }
+                got += static_cast<size_t>(n);
+            }
+            if (got == bytes.size() && looksLikeDng(bytes)) {
+                std::shared_ptr<const TileGrid> grid;
+                uint32_t w = 0, h = 0;
+                std::string derr;
+                if (developDngToGrid(bytes, grid, w, h, derr)) {
+                    // 以显影结果为内容建层（复用引擎导入收尾语义：追加为普通像素层）
+                    Layer layer;
+                    layer.id = engine.nextLayerId();
+                    layer.name = "RAW";
+                    layer.transform.width = w;
+                    layer.transform.height = h;
+                    layer.pixels = grid;
+                    {
+                        std::lock_guard<std::mutex> lk(engine.docMutex);
+                        if (engine.doc.width == 0) {
+                            engine.doc.width = w;
+                            engine.doc.height = h;
+                        }
+                        if (engine.doc.layers.empty()) {
+                            engine.doc.layers.push_back(std::move(layer));
+                            engine.doc.activeId = engine.doc.layers.back().id;
+                        } else {
+                            const LayerId nid = layer.id;
+                            engine.doc.layers.push_back(std::move(layer));
+                            engine.doc.activeId = nid;
+                        }
+                        engine.bumpRevisionLocked();
+                    }
+                    engine.requestRender();
+                    OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Dng",
+                                 "imported developed dng %ux%u", w, h);
+                    return makePayload(true, w, h, engine.doc.activeId, "");
+                }
+                OH_LOG_Print(LOG_APP, LOG_WARN, 0x4D30, "Montage.Dng",
+                             "dng develop failed: %{public}s", derr.c_str());
+                return makePayload(false, 0, 0, 0, derr);
+            }
+        }
+        lseek(fd, 0, SEEK_SET);
+    }
 
     OH_ImageSourceNative* rawSource = nullptr;
     if (OH_ImageSourceNative_CreateFromFd(fd, &rawSource) != IMAGE_SUCCESS || rawSource == nullptr) {
