@@ -27,6 +27,18 @@ class History {
     // 整档替换（打开工程/PSD）时清空：撤销不许跨文档回退
     void clear();
 
+    // M15b 历史面板：线性状态列表 + 当前指针。
+    // 列表 = [初始态, undo_[0].label, ..., undo_[n-1].label, redo 倒序标签...]；
+    // current = undo_.size()（0 = 初始态）。labels[0] 为空串，由 UI 渲染「打开/新建」。
+    struct Info {
+        std::vector<std::string> labels;
+        size_t current = 0;
+    };
+    Info getInfo() const;
+    // 跳转到线性索引 target（PS 历史面板点选语义 = 连续 undo/redo；整步快照精确）。
+    // 返回 false = 目标越界（不打断当前状态）。
+    bool jumpTo(Document& doc, uint64_t& revision, size_t target, std::string& label);
+
     // M11f 历史画笔：取 steps 步前（1 = 最近一次编辑的 before）快照中指定层的像素
     // （shared_ptr 共享，trim 不影响持有者）。越界/层不存在返回 nullptr。
     std::shared_ptr<const TileGrid> layerPixelsStepsBack(int steps, LayerId layerId) const;
@@ -41,11 +53,17 @@ class History {
         Snapshot before;
         Snapshot after;
     };
+    // M15b：redo 侧携带原条目标签（修复 redo() 重建 Entry 误用 pendingLabel_
+    // 导致重做步骤名全丢的存量缺陷——历史面板依赖真实标签）
+    struct RedoEntry {
+        Snapshot snap;
+        std::string label;
+    };
     void trim();
 
     mutable std::mutex mtx_;
     std::vector<Entry> undo_;
-    std::vector<Snapshot> redo_;
+    std::vector<RedoEntry> redo_;
     Snapshot pendingSnap_;     // beginEdit 后、endEdit 前的 before
     std::string pendingLabel_;
     bool pendingFlag_ = false;

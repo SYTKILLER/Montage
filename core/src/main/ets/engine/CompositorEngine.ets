@@ -1,7 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
-import { EngineStats, ExportPngData, HistogramData, QuickMaskState, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData } from '../model/EngineTypes';
+import { EngineStats, ExportPngData, HistogramData, QuickMaskState, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -1509,6 +1509,42 @@ export class CompositorEngine {
   // 精确内容包围盒（文档域 px）；id=0 = 活动层。失败（组/调整层/空层）ok=false。
   getLayerBounds(id: number): LayerBoundsData {
     const r = narrowResult(native.getLayerBounds(id) as Object);
+    if (!r.ok || r.data === null) {
+      return { ok: false, x: 0, y: 0, w: 0, h: 0 };
+    }
+    const d = r.data;
+    return { ok: boolOf(d, 'ok'), x: num(d, 'x'), y: num(d, 'y'), w: num(d, 'w'), h: num(d, 'h') };
+  }
+
+  // ---------- M15b 面板：历史列表 / 历史跳转 / 选区包围盒 ----------
+
+  getHistoryList(): HistoryListData {
+    const r = narrowResult(native.getHistoryList() as Object);
+    if (!r.ok || r.data === null) {
+      return { labels: [''], current: 0 };
+    }
+    const d = r.data;
+    const raw: Object = d['labels'];
+    const labels: string[] = [];
+    if (Array.isArray(raw)) {
+      for (const item of raw as Object[]) {
+        labels.push(typeof item === 'string' ? item : '');
+      }
+    }
+    return { labels: labels, current: num(d, 'current') };
+  }
+
+  setHistoryState(index: number): boolean {
+    const r = narrowResult(native.setHistoryState(index) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setHistoryState rejected: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  getSelectionBounds(): LayerBoundsData {
+    const r = narrowResult(native.getSelectionBounds() as Object);
     if (!r.ok || r.data === null) {
       return { ok: false, x: 0, y: 0, w: 0, h: 0 };
     }

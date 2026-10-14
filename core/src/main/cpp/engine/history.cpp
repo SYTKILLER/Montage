@@ -94,7 +94,10 @@ bool History::undo(Document& doc, uint64_t& revision, std::string& label) {
     Snapshot current;
     current.doc = doc;
     current.revision = revision;
-    redo_.push_back(std::move(current));
+    RedoEntry re;
+    re.snap = std::move(current);
+    re.label = entry.label;
+    redo_.push_back(std::move(re));
     doc = entry.before.doc;
     revision = entry.before.revision;
     label = entry.label;
@@ -106,18 +109,18 @@ bool History::redo(Document& doc, uint64_t& revision, std::string& label) {
     if (redo_.empty()) {
         return false;
     }
-    Snapshot next = std::move(redo_.back());
+    RedoEntry next = std::move(redo_.back());
     redo_.pop_back();
     Snapshot current;
     current.doc = doc;
     current.revision = revision;
     Entry entry;
-    entry.label = pendingLabel_.empty() ? std::string("edit") : pendingLabel_;
+    entry.label = next.label;
     entry.before = std::move(current);
-    entry.after = next;
+    entry.after = next.snap;
     undo_.push_back(std::move(entry));
-    doc = next.doc;
-    revision = next.revision;
+    doc = next.snap.doc;
+    revision = next.snap.revision;
     label = entry.label;
     return true;
 }
@@ -137,6 +140,61 @@ void History::clear() {
 bool History::canRedo() const {
     std::lock_guard<std::mutex> lk(mtx_);
     return !redo_.empty();
+}
+
+// M15b 历史面板数据：线性状态列表（undo 从老到新 + redo 从新到老拼接）+ 当前指针
+History::Info History::getInfo() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    Info info;
+    info.current = undo_.size();
+    info.labels.push_back(std::string());  // 初始态（UI 渲染「打开/新建」）
+    for (const Entry& e : undo_) {
+        info.labels.push_back(e.label);
+    }
+    for (auto it = redo_.rbegin(); it != redo_.rend(); ++it) {
+        info.labels.push_back(it->label);
+    }
+    return info;
+}
+
+// 跳转到线性索引（PS 历史面板点选语义）：连续 undo/redo 至 target；
+// 中途任一步失败（栈耗尽）即停，返回实际是否到达
+bool History::jumpTo(Document& doc, uint64_t& revision, size_t target, std::string& label) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    const size_t total = undo_.size() + redo_.size();
+    if (target > total) {
+        return false;
+    }
+    while (undo_.size() > target) {
+        Entry entry = std::move(undo_.back());
+        undo_.pop_back();
+        Snapshot current;
+        current.doc = doc;
+        current.revision = revision;
+        RedoEntry re;
+        re.snap = std::move(current);
+        re.label = entry.label;
+        redo_.push_back(std::move(re));
+        doc = entry.before.doc;
+        revision = entry.before.revision;
+        label = entry.label;
+    }
+    while (undo_.size() < target && !redo_.empty()) {
+        RedoEntry next = std::move(redo_.back());
+        redo_.pop_back();
+        Snapshot current;
+        current.doc = doc;
+        current.revision = revision;
+        Entry entry;
+        entry.label = next.label;
+        entry.before = std::move(current);
+        entry.after = next.snap;
+        undo_.push_back(std::move(entry));
+        doc = next.snap.doc;
+        revision = next.snap.revision;
+        label = entry.label;
+    }
+    return true;
 }
 
 // M11f 历史画笔源：steps 步前的层像素快照（shared_ptr 共享；调用方持 docMutex 亦可并行，

@@ -5271,5 +5271,66 @@ napi_value GetLayerBounds(napi_env env, napi_callback_info info) {
     return makeOk(env, data);
 }
 
+
+// ---------- M15b 面板：历史列表 / 历史跳转 / 选区包围盒 ----------
+
+// getHistoryList() → data {labels: string[], current: number}
+napi_value GetHistoryList(napi_env env, napi_callback_info info) {
+    auto& e = Engine::get();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    const History::Info hist = e.history.getInfo();
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_value arr = nullptr;
+    napi_create_array_with_length(env, hist.labels.size(), &arr);
+    for (size_t i = 0; i < hist.labels.size(); ++i) {
+        napi_set_element(env, arr, static_cast<uint32_t>(i), makeString(env, hist.labels[i]));
+    }
+    napi_set_named_property(env, data, "labels", arr);
+    napi_set_named_property(env, data, "current", makeDouble(env, static_cast<double>(hist.current)));
+    return makeOk(env, data);
+}
+
+// setHistoryState(index)：跳转到线性历史索引（连续 undo/redo；一步或多步整快照替换）
+napi_value SetHistoryState(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double idx = -1;
+    if (argc < 1 || napi_get_value_double(env, argv[0], &idx) != napi_ok || idx < 0) {
+        return makeError(env, kErrBadParam, "setHistoryState(index) requires index >= 0");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        std::string label;
+        uint64_t rev = static_cast<uint64_t>(e.docRevision);
+        if (!e.history.jumpTo(e.doc, rev, static_cast<size_t>(idx), label)) {
+            return makeError(env, kErrBadParam, "setHistoryState: index out of range");
+        }
+        e.docRevision = static_cast<int64_t>(rev);
+        e.fireRevisionLocked();  // 广播版本（不递增——撤销族同语义）
+        e.requestRender();
+    }
+    e.historyVersion.fetch_add(1);
+    return makeOk(env, nullptr);
+}
+
+// getSelectionBounds() → data {ok,x,y,w,h}（文档域精确 alpha 包围盒）
+napi_value GetSelectionBounds(napi_env env, napi_callback_info info) {
+    auto& e = Engine::get();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    double x = 0, y = 0, w = 0, h = 0;
+    const bool ok = selectionBBox(e.doc, x, y, w, h);
+    napi_set_named_property(env, data, "ok", makeBool(env, ok));
+    napi_set_named_property(env, data, "x", makeDouble(env, x));
+    napi_set_named_property(env, data, "y", makeDouble(env, y));
+    napi_set_named_property(env, data, "w", makeDouble(env, w));
+    napi_set_named_property(env, data, "h", makeDouble(env, h));
+    return makeOk(env, data);
+}
+
 }  // namespace bridge
 }  // namespace montage

@@ -3,7 +3,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
 import { window } from '@kit.ArkUI';
-import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData } from 'core';
+import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData } from 'core';
 import { AppPrefs, RecentProject, ThemeMode } from '../editor/AppPrefs';
 import { leafItem, MenuGroupVM, MenuItemVM, subItem, ToolVM } from '../editor/MenuModel';
 import { SWATCHES } from '../editor/components/OptionsBar';
@@ -20,6 +20,9 @@ import { FILTER_CATALOG, FilterDef, FilterParamDef } from '../editor/FilterCatal
 import { TextPanel } from '../editor/components/TextPanel';
 import { ABOUT_TEXT, InfoDialog, SHORTCUT_ROWS } from '../editor/components/InfoDialog';
 import { RulerStrip, GridGuidesOverlay, RULER_BG, RULER_VP } from '../editor/components/ViewOverlays';
+import { HistoryPanel } from '../editor/components/HistoryPanel';
+import { HistogramPanel } from '../editor/components/HistogramPanel';
+import { InfoPanel } from '../editor/components/InfoPanel';
 
 const TAG: string = 'Montage.Shell';
 const DOMAIN: number = 0x4D30;
@@ -101,6 +104,18 @@ struct Index {
   @State screenMode: number = 0;        // 0 = 标准、1 = 带菜单栏全屏、2 = 全屏
   @State guidesMirror: GuidesData = { h: [], v: [], locked: false, visible: true };
   @State guidePreview: number[] = [];   // 标尺拖拽预览 [orient, posDocPx]；空 = 无
+  // M15b 面板（历史/直方图/信息）：可见性偏好持久化（C-1）+ 数据镜像
+  @State historyVisible: boolean = true;
+  @State histogramVisible: boolean = false;
+  @State infoVisible: boolean = false;
+  @State historyLabels: string[] = [''];
+  @State historyCurrent: number = 0;
+  @State infoPointerX: number = -1;
+  @State infoPointerY: number = -1;
+  @State infoColor: string = '';
+  @State infoSelOk: boolean = false;
+  @State infoSelW: number = 0;
+  @State infoSelH: number = 0;
   @State importing: boolean = false;
   @State busyText: string = '';
   @State layers: LayerDTO[] = [];
@@ -289,6 +304,7 @@ struct Index {
   private rulerDragOrient: number = -2;  // >=0 = 标尺拖拽中（0 = 水平、1 = 垂直）
   private rulerDragIndex: number = -1;
   private rulerDragMove: boolean = false;
+  private lastInfoSampleMs: number = 0;  // 信息面板取色节流
   private cropDrag: boolean = false;
   private cropX0: number = 0;
   private cropY0: number = 0;
@@ -309,8 +325,13 @@ struct Index {
     this.gridSpacing = this.prefs.getNumber('view_grid_spacing', 100);
     this.snapGuidesOn = this.prefs.getBool('view_snap_guides', true);
     this.snapGridOn = this.prefs.getBool('view_snap_grid', false);
-    // 屏幕模式持久化（C-1）；全屏（2）恢复时降为带菜单栏全屏（1）——无菜单栏态不可作为启动态
-    this.screenMode = Math.min(this.prefs.getNumber('view_screen_mode', 0), 1);
+    // 屏幕模式为会话态（启动恒标准）：1/2 是查看模式而非工作区状态，持久化会造成
+    // 「重启即无工具箱/菜单栏」的陷阱；C-1 面板布局持久化由标尺/网格/吸附/面板开关承担
+    // M15b：面板布局持久化（C-1）
+    this.layersVisible = this.prefs.getBool('panel_layers', true);
+    this.historyVisible = this.prefs.getBool('panel_history', true);
+    this.histogramVisible = this.prefs.getBool('panel_histogram', false);
+    this.infoVisible = this.prefs.getBool('panel_info', false);
     this.engine.bindRevisionListener((revision: number): void => {
       hilog.info(DOMAIN, TAG, 'docVersion → %{public}d', revision);
     });
@@ -343,6 +364,53 @@ struct Index {
     this.refreshStats();  // M10d：撤销跨 Q 边界时同步快速蒙版镜像（canUndo/Redo 同步受益）
     this.scheduleHistogram();
     this.refreshGuides();  // M15a：打开工程/撤销到其他文档状态时同步参考线镜像
+    this.refreshHistory();      // M15b：历史面板镜像（撤销/重做/跳转/编辑后同步）
+    this.refreshSelectionInfo();  // M15b：选区尺寸镜像
+  }
+
+  // ---------- M15b 面板 ----------
+
+  private refreshHistory(): void {
+    const h: HistoryListData = this.engine.getHistoryList();
+    this.historyLabels = h.labels;
+    this.historyCurrent = h.current;
+  }
+
+  private pickHistoryState(idx: number): void {
+    if (this.engine.setHistoryState(idx)) {
+      this.refreshHistory();
+      this.log(`历史跳转 → ${idx === 0 ? '初始' : this.historyLabels[idx]}`);
+    }
+  }
+
+  private refreshSelectionInfo(): void {
+    const b = this.engine.getSelectionBounds();
+    this.infoSelOk = b.ok;
+    this.infoSelW = b.w;
+    this.infoSelH = b.h;
+  }
+
+  // 指针信息推送（触摸 Move 节流 150ms、Down/Up 与鼠标悬停即时）
+  private updatePointerInfo(docX: number, docY: number, final: boolean): void {
+    this.infoPointerX = docX;
+    this.infoPointerY = docY;
+    const now = Date.now();
+    if (!final && now - this.lastInfoSampleMs < 150) {
+      return;
+    }
+    this.lastInfoSampleMs = now;
+    this.engine.samplePixel(Math.round(docX), Math.round(docY)).then((s): void => {
+      if (s.ok) {
+        const hex = (v: number): string => {
+          const t = Math.max(0, Math.min(255, Math.round(v)));
+          const h16 = t.toString(16);
+          return h16.length === 1 ? `0${h16}` : h16;
+        };
+        this.infoColor = `#${hex(s.red)}${hex(s.green)}${hex(s.blue)}`;
+      }
+    }).catch((_e: BusinessError): void => {
+      // 采样失败静默（空文档/越界）
+    });
   }
 
   // ---------- M15a 视图：参考线 / 标尺 / 网格 / 吸附 ----------
@@ -720,6 +788,8 @@ struct Index {
     const k = this.pxPerVp();
     const docX = this.panX + (t.x * k) / this.zoom;
     const docY = this.panY + (t.y * k) / this.zoom;
+    // M15b 信息面板：指针坐标/颜色（Up 即时采样，Move 节流）
+    this.updatePointerInfo(docX, docY, e.type === TouchType.Up || e.type === TouchType.Down);
 
     if (this.navActive()) {
       return;  // 抓手/临时抓手：Pan 手势负责
@@ -2458,11 +2528,26 @@ struct Index {
       case 'view.screenFullMenu':
       case 'view.screenFull':
         this.screenMode = id === 'view.screenStd' ? 0 : id === 'view.screenFullMenu' ? 1 : 2;
-        this.prefs.setNumber('view_screen_mode', this.screenMode);
         this.log(`屏幕模式: ${this.screenMode === 0 ? '标准' : this.screenMode === 1 ? '带菜单栏全屏' : '全屏'}`);
         break;
       case 'window.toggleLayers':
         this.layersVisible = !this.layersVisible;
+        this.prefs.setBool('panel_layers', this.layersVisible);
+        break;
+      case 'window.toggleHistory':
+        this.historyVisible = !this.historyVisible;
+        this.prefs.setBool('panel_history', this.historyVisible);
+        break;
+      case 'window.toggleHistogram':
+        this.histogramVisible = !this.histogramVisible;
+        this.prefs.setBool('panel_histogram', this.histogramVisible);
+        if (this.histogramVisible) {
+          this.scheduleHistogram();  // 开启即拉一次
+        }
+        break;
+      case 'window.toggleInfo':
+        this.infoVisible = !this.infoVisible;
+        this.prefs.setBool('panel_info', this.infoVisible);
         break;
       case 'help.about':
         this.showAbout = true;
@@ -2690,7 +2775,8 @@ struct Index {
     return [m0, m1, m2, m3, m4, m5];
   }
   private scheduleHistogram(): void {
-    if (!this.docOpen || this.activeLayer()?.isAdjustment !== true) {
+    // M15b：直方图面板可见时任意文档都拉取；否则仅调整层（曲线编辑器背景）
+    if (!this.docOpen || (this.activeLayer()?.isAdjustment !== true && !this.histogramVisible)) {
       return;
     }
     if (this.histTimer >= 0) {
@@ -2886,13 +2972,16 @@ struct Index {
       leafItem('view.snapGuides', '对齐参考线', '', true, this.snapGuidesOn),
       leafItem('view.snapGrid', '对齐网格', "Shift+Ctrl+'", true, this.snapGridOn),
       subItem('view.screenModeSub', '屏幕模式', true, [
-        leafItem('view.screenStd', '标准屏幕模式', 'F', this.screenMode === 0),
-        leafItem('view.screenFullMenu', '带菜单栏的全屏模式', '', this.screenMode === 1),
-        leafItem('view.screenFull', '全屏模式', '', this.screenMode === 2),
+        leafItem('view.screenStd', '标准屏幕模式', 'F', true, this.screenMode === 0),
+        leafItem('view.screenFullMenu', '带菜单栏的全屏模式', '', true, this.screenMode === 1),
+        leafItem('view.screenFull', '全屏模式', '', true, this.screenMode === 2),
       ]),
     ];
     const win: MenuItemVM[] = [
       leafItem('window.toggleLayers', '图层面板', '', true, this.layersVisible),
+      leafItem('window.toggleHistory', '历史面板', '', true, this.historyVisible),
+      leafItem('window.toggleHistogram', '直方图面板', '', true, this.histogramVisible),
+      leafItem('window.toggleInfo', '信息面板', '', true, this.infoVisible),
     ];
     const help: MenuItemVM[] = [
       subItem('help.themeSub', '主题', true, [
@@ -3522,7 +3611,9 @@ struct Index {
         `${this.hasSelectionFlag ? 1 : 0}${this.quickMaskActive ? 1 : 0}` +
         `${this.rulersVisible ? 1 : 0}${this.rulerUnit}${this.gridVisible ? 1 : 0}` +
         `${this.gridSpacing}${this.snapGuidesOn ? 1 : 0}${this.snapGridOn ? 1 : 0}` +
-        `${this.screenMode}${this.guidesMirror.visible ? 1 : 0}${this.guidesMirror.locked ? 1 : 0}`)
+        `${this.screenMode}${this.guidesMirror.visible ? 1 : 0}${this.guidesMirror.locked ? 1 : 0}` +
+        `${this.historyVisible ? 1 : 0}${this.histogramVisible ? 1 : 0}${this.infoVisible ? 1 : 0}` +
+        `${this.historyCurrent}${this.historyLabels.length}`)
     }
     .width('100%')
     .height(36)
@@ -3655,6 +3746,14 @@ struct Index {
               })
               .onAxisEvent((e: AxisEvent): void => {
                 this.onWheel(e);
+              })
+              .onMouse((e: MouseEvent): void => {
+                // M15b 信息面板：鼠标悬停读数（A-4；节流在 updatePointerInfo 内）
+                if (e.action === MouseAction.Move && this.docOpen) {
+                  const k = this.pxPerVp();
+                  this.updatePointerInfo(this.panX + (e.x * k) / this.zoom,
+                    this.panY + (e.y * k) / this.zoom, false);
+                }
               })
               .onTouch((e: TouchEvent): void => {
                 this.onTouchEvent(e);
@@ -4026,6 +4125,40 @@ struct Index {
               })
             }
             .width(280)
+            .border({ width: { left: 1 }, color: { left: $r('app.color.divider') } })
+          }
+
+          // M15b 面板坞第二列（历史/直方图/信息；PS 多列面板语义）
+          if (this.screenMode === 0 &&
+            (this.historyVisible || this.histogramVisible || this.infoVisible)) {
+            Column({ space: 6 }) {
+              if (this.historyVisible) {
+                HistoryPanel({
+                  labels: this.historyLabels,
+                  current: this.historyCurrent,
+                  onPick: (idx: number): void => this.pickHistoryState(idx),
+                })
+                  .layoutWeight(1)
+              }
+              if (this.histogramVisible) {
+                HistogramPanel({ luma: this.histLuma })
+              }
+              if (this.infoVisible) {
+                InfoPanel({
+                  docW: this.docW,
+                  docH: this.docH,
+                  pointerX: this.infoPointerX,
+                  pointerY: this.infoPointerY,
+                  colorHex: this.infoColor,
+                  hasSelection: this.infoSelOk,
+                  selW: this.infoSelW,
+                  selH: this.infoSelH,
+                })
+              }
+            }
+            .width(240)
+            .height('100%')
+            .padding(4)
             .border({ width: { left: 1 }, color: { left: $r('app.color.divider') } })
           }
         }

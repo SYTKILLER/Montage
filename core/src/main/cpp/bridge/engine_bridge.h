@@ -191,6 +191,10 @@ napi_value SetGuidesLocked(napi_env env, napi_callback_info info);
 napi_value SetGuidesVisible(napi_env env, napi_callback_info info);
 napi_value GetGuides(napi_env env, napi_callback_info info);
 napi_value GetLayerBounds(napi_env env, napi_callback_info info);
+// M15b 面板：历史列表/跳转（连续 undo/redo 至目标）+ 选区包围盒（信息面板）
+napi_value GetHistoryList(napi_env env, napi_callback_info info);
+napi_value SetHistoryState(napi_env env, napi_callback_info info);
+napi_value GetSelectionBounds(napi_env env, napi_callback_info info);
 // 页面销毁时释放回调与渲染线程
 napi_value Dispose(napi_env env, napi_callback_info info);
 

@@ -39,13 +39,19 @@ export interface GuidesData {
   visible: boolean;
 }
 
-/** 图层内容精确包围盒（getLayerBounds 的 data，M15a；ok=false 时数值无意义）。 */
+/** 图层内容精确包围盒（getLayerBounds/getSelectionBounds 的 data，M15a/b；ok=false 时数值无意义）。 */
 export interface LayerBoundsData {
   ok: boolean;
   x: number;
   y: number;
   w: number;
   h: number;
+}
+
+/** 历史线性状态列表（getHistoryList 的 data，M15b；labels[0] 为空串 = 初始态）。 */
+export interface HistoryListData {
+  labels: string[];
+  current: number;
 }
 
 /** 视口（pan = 视口左上角文档坐标，doc px）。 */

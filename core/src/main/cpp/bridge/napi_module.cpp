@@ -135,6 +135,9 @@ napi_value Init(napi_env env, napi_value exports) {
         {"setGuidesVisible", nullptr, montage::bridge::SetGuidesVisible, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getGuides", nullptr, montage::bridge::GetGuides, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getLayerBounds", nullptr, montage::bridge::GetLayerBounds, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getHistoryList", nullptr, montage::bridge::GetHistoryList, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setHistoryState", nullptr, montage::bridge::SetHistoryState, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getSelectionBounds", nullptr, montage::bridge::GetSelectionBounds, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"dispose", nullptr, montage::bridge::Dispose, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props);

@@ -23,6 +23,9 @@ void setGuidesVisible(Document& doc, bool visible);
 bool layerContentBBox(const Document& doc, LayerId id,
                       double& x, double& y, double& w, double& h, std::string& err);
 
+// M15b 信息面板：主选区精确包围盒（文档域；无选区/空选区 = false）
+bool selectionBBox(const Document& doc, double& x, double& y, double& w, double& h);
+
 }  // namespace montage
 
 #endif  // MONTAGE_ENGINE_VIEW_OPS_H

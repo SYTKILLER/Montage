@@ -173,4 +173,19 @@ bool layerContentBBox(const Document& doc, LayerId id,
     return true;
 }
 
+bool selectionBBox(const Document& doc, double& x, double& y, double& w, double& h) {
+    if (doc.selection == nullptr) {
+        return false;
+    }
+    uint32_t bx = 0, by = 0, bw = 0, bh = 0;
+    if (!gridInkBBox(*doc.selection, bx, by, bw, bh)) {
+        return false;
+    }
+    x = bx;
+    y = by;
+    w = bw;
+    h = bh;
+    return true;
+}
+
 }  // namespace montage
