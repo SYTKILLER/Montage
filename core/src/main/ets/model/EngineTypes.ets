@@ -31,6 +31,23 @@ export interface QuickMaskState {
   hasSelection: boolean;  // toggle 后主选区是否存在（退出时通道内容非零）
 }
 
+/** 参考线集合（getGuides 的 data，M15a；h = 水平参考线 y、v = 垂直参考线 x，文档 px 升序）。 */
+export interface GuidesData {
+  h: number[];
+  v: number[];
+  locked: boolean;
+  visible: boolean;
+}
+
+/** 图层内容精确包围盒（getLayerBounds 的 data，M15a；ok=false 时数值无意义）。 */
+export interface LayerBoundsData {
+  ok: boolean;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 /** 视口（pan = 视口左上角文档坐标，doc px）。 */
 export interface ViewportData {
   zoom: number;

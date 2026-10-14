@@ -294,6 +294,13 @@ struct Document {
     std::shared_ptr<const TileGrid> quickMask;
     // M10c Alpha 通道（存储选区；主选区保持会话态不持久化，通道经 .montage v5 持久化）
     std::vector<AlphaChannel> channels;
+    // M15a 参考线（会话态：不随 History 快照走撤销；经 .montage v9 可选块持久化）。
+    // guidesH = 水平参考线的 y（文档 px，升序）；guidesV = 垂直参考线的 x；锁定 = 全局
+    // 开关（PS「锁定参考线」语义，锁定后 add/move/remove 拒绝）；吸附几何在 UI 层算。
+    std::vector<float> guidesH;
+    std::vector<float> guidesV;
+    bool guidesLocked = false;
+    bool guidesVisible = true;
 };
 
 // 视口：pan = 视口左上角的文档坐标（doc px），screen = (doc - pan) * zoom。

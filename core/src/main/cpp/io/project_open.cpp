@@ -28,7 +28,7 @@ constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Open";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
 constexpr int kMinVersion = 1;
-constexpr int kMaxVersion = 8;  // v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
+constexpr int kMaxVersion = 9;  // v9：+参考线 guides 块（M15a，可选字段读兼容 v1–v8）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
 constexpr uint32_t kMaxSide = 30000;
 constexpr uint64_t kMaxTotalPixels = 100ull * 1000 * 1000;
 constexpr size_t kMaxLayers = 10000;
@@ -1088,6 +1088,47 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
             channelFiles.push_back(f);
         }
     }
+    // v9：参考线（可选块；v8 及以下无此字段 = 空参考线全默认）
+    const JValue* jgd = root.find("guides");
+    if (jgd != nullptr) {
+        if (jgd->type != JValue::Obj) {
+            err = "bad guides record";
+            return false;
+        }
+        const auto parseAxis = [&](const char* key, std::vector<float>& out,
+                                   double limit) -> bool {
+            const JValue* ja = jgd->find(key);
+            if (ja == nullptr) {
+                return true;
+            }
+            if (ja->type != JValue::Arr || ja->arr.size() > 256) {
+                return false;
+            }
+            for (const JValue& item : ja->arr) {
+                double v = 0;
+                if (!getDouble(item, v) || !std::isfinite(v) || v < 0.0 || v > limit) {
+                    return false;
+                }
+                out.push_back(static_cast<float>(v));
+            }
+            return true;
+        };
+        if (!parseAxis("h", doc.guidesH, static_cast<double>(doc.width)) ||
+            !parseAxis("v", doc.guidesV, static_cast<double>(doc.height))) {
+            err = "bad guides record";
+            return false;
+        }
+        std::sort(doc.guidesH.begin(), doc.guidesH.end());
+        std::sort(doc.guidesV.begin(), doc.guidesV.end());
+        const JValue* jl = jgd->find("locked");
+        if (jl != nullptr && jl->type == JValue::Bool) {
+            doc.guidesLocked = jl->b;
+        }
+        const JValue* jv = jgd->find("visible");
+        if (jv != nullptr && jv->type == JValue::Bool) {
+            doc.guidesVisible = jv->b;
+        }
+    }
     // activeLayerId 必须在集合内（对齐上游 validate）
     const JValue* jactive = root.find("activeLayerId");
     if (jactive != nullptr && jactive->type == JValue::Num && jactive->num > 0) {
@@ -1267,6 +1308,11 @@ bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
         engine.doc.layers = std::move(layers);
         engine.doc.activeId = doc.activeId;
         engine.doc.channels = std::move(doc.channels);
+        // M15a：参考线随工程恢复（会话态持久化）
+        engine.doc.guidesH = std::move(doc.guidesH);
+        engine.doc.guidesV = std::move(doc.guidesV);
+        engine.doc.guidesLocked = doc.guidesLocked;
+        engine.doc.guidesVisible = doc.guidesVisible;
         // M14c：样式/填充派生渲染重建（styledRender 不入库，读入后按参数重生成）
         restyleDocument(engine.doc);
         engine.history.clear();

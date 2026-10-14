@@ -182,6 +182,15 @@ napi_value BeginTextSession(napi_env env, napi_callback_info info);
 napi_value EndTextSession(napi_env env, napi_callback_info info);
 napi_value ListSystemFonts(napi_env env, napi_callback_info info);
 napi_value RegisterFontFile(napi_env env, napi_callback_info info);
+// M15a 视图：参考线（会话态，无历史事务）/ 图层内容精确包围盒（移动吸附 + 信息面板）
+napi_value AddGuide(napi_env env, napi_callback_info info);
+napi_value MoveGuide(napi_env env, napi_callback_info info);
+napi_value RemoveGuide(napi_env env, napi_callback_info info);
+napi_value ClearGuides(napi_env env, napi_callback_info info);
+napi_value SetGuidesLocked(napi_env env, napi_callback_info info);
+napi_value SetGuidesVisible(napi_env env, napi_callback_info info);
+napi_value GetGuides(napi_env env, napi_callback_info info);
+napi_value GetLayerBounds(napi_env env, napi_callback_info info);
 // 页面销毁时释放回调与渲染线程
 napi_value Dispose(napi_env env, napi_callback_info info);
 

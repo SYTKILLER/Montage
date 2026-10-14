@@ -59,6 +59,56 @@ export class AppPrefs {
     }
   }
 
+  // ---------- M15a：通用视图偏好（标尺/网格/吸附/屏幕模式；重启恢复，C-1） ----------
+
+  getBool(key: string, def: boolean): boolean {
+    if (this.store === null) {
+      return def;
+    }
+    try {
+      const v = this.store.getSync(key, def) as boolean;
+      return typeof v === 'boolean' ? v : def;
+    } catch (e) {
+      return def;
+    }
+  }
+
+  setBool(key: string, v: boolean): void {
+    if (this.store === null) {
+      return;
+    }
+    try {
+      this.store.putSync(key, v);
+      this.store.flush();
+    } catch (e) {
+      hilog.error(0x4D30, TAG, 'setBool %{public}s failed', key);
+    }
+  }
+
+  getNumber(key: string, def: number): number {
+    if (this.store === null) {
+      return def;
+    }
+    try {
+      const v = this.store.getSync(key, def) as number;
+      return typeof v === 'number' ? v : def;
+    } catch (e) {
+      return def;
+    }
+  }
+
+  setNumber(key: string, v: number): void {
+    if (this.store === null) {
+      return;
+    }
+    try {
+      this.store.putSync(key, v);
+      this.store.flush();
+    } catch (e) {
+      hilog.error(0x4D30, TAG, 'setNumber %{public}s failed', key);
+    }
+  }
+
   /** 应用主题到系统（ConfigurationConstant.ColorMode；与 resourceManager.ColorMode 不兼容，勿混用）。 */
   applyTheme(mode: ThemeMode, context: common.Context): void {
     try {

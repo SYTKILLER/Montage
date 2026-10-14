@@ -23,6 +23,7 @@
 #include "engine/gradient_ops.h"
 #include "engine/shape_ops.h"
 #include "engine/text_ops.h"
+#include "engine/view_ops.h"
 #include "engine/text_raster.h"
 #include "engine/transform_ops.h"
 #include "engine/resample.h"
@@ -5117,6 +5118,157 @@ napi_value SetFillLayerParams(napi_env env, napi_callback_info info) {
         e.requestRender();
     }
     return makeOk(env, nullptr);
+}
+
+
+// ---------- M15a 视图：参考线（会话态，无历史事务）+ 图层内容包围盒 ----------
+
+// addGuide(orient, pos)：orient 0 = 水平（pos=y）、1 = 垂直（pos=x）；文档域 px
+napi_value AddGuide(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t orient = 0;
+    double pos = 0;
+    if (argc < 2 || napi_get_value_int32(env, argv[0], &orient) != napi_ok ||
+        napi_get_value_double(env, argv[1], &pos) != napi_ok) {
+        return makeError(env, kErrBadParam, "addGuide(orient, pos) requires 2 args");
+    }
+    auto& e = Engine::get();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    std::string err;
+    if (!addGuide(e.doc, orient, pos, err)) {
+        return makeError(env, kErrBadParam, "addGuide: " + err);
+    }
+    return makeOk(env, nullptr);
+}
+
+// moveGuide(orient, index, pos)
+napi_value MoveGuide(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t orient = 0, index = 0;
+    double pos = 0;
+    if (argc < 3 || napi_get_value_int32(env, argv[0], &orient) != napi_ok ||
+        napi_get_value_int32(env, argv[1], &index) != napi_ok ||
+        napi_get_value_double(env, argv[2], &pos) != napi_ok) {
+        return makeError(env, kErrBadParam, "moveGuide(orient, index, pos) requires 3 args");
+    }
+    auto& e = Engine::get();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    std::string err;
+    if (!moveGuide(e.doc, orient, index, pos, err)) {
+        return makeError(env, kErrBadParam, "moveGuide: " + err);
+    }
+    return makeOk(env, nullptr);
+}
+
+// removeGuide(orient, index)
+napi_value RemoveGuide(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t orient = 0, index = 0;
+    if (argc < 2 || napi_get_value_int32(env, argv[0], &orient) != napi_ok ||
+        napi_get_value_int32(env, argv[1], &index) != napi_ok) {
+        return makeError(env, kErrBadParam, "removeGuide(orient, index) requires 2 args");
+    }
+    auto& e = Engine::get();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    std::string err;
+    if (!removeGuide(e.doc, orient, index, err)) {
+        return makeError(env, kErrBadParam, "removeGuide: " + err);
+    }
+    return makeOk(env, nullptr);
+}
+
+// clearGuides()：锁定态也允许（显式菜单命令）
+napi_value ClearGuides(napi_env env, napi_callback_info info) {
+    auto& e = Engine::get();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    clearGuides(e.doc);
+    return makeOk(env, nullptr);
+}
+
+// setGuidesLocked(locked)
+napi_value SetGuidesLocked(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t locked = 0;
+    if (argc < 1 || napi_get_value_int32(env, argv[0], &locked) != napi_ok) {
+        return makeError(env, kErrBadParam, "setGuidesLocked(locked) requires 1 arg");
+    }
+    auto& e = Engine::get();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    setGuidesLocked(e.doc, locked != 0);
+    return makeOk(env, nullptr);
+}
+
+// setGuidesVisible(visible)
+napi_value SetGuidesVisible(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t visible = 0;
+    if (argc < 1 || napi_get_value_int32(env, argv[0], &visible) != napi_ok) {
+        return makeError(env, kErrBadParam, "setGuidesVisible(visible) requires 1 arg");
+    }
+    auto& e = Engine::get();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    setGuidesVisible(e.doc, visible != 0);
+    return makeOk(env, nullptr);
+}
+
+// getGuides() → data {h:number[], v:number[], locked:bool, visible:bool}
+napi_value GetGuides(napi_env env, napi_callback_info info) {
+    auto& e = Engine::get();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    const auto pushArr = [&](napi_env env2, napi_value obj, const char* key,
+                             const std::vector<float>& v) -> void {
+        napi_value arr = nullptr;
+        napi_create_array_with_length(env2, v.size(), &arr);
+        for (size_t i = 0; i < v.size(); ++i) {
+            napi_set_element(env2, arr, static_cast<uint32_t>(i), makeDouble(env2, v[i]));
+        }
+        napi_set_named_property(env2, obj, key, arr);
+    };
+    pushArr(env, data, "h", e.doc.guidesH);
+    pushArr(env, data, "v", e.doc.guidesV);
+    napi_set_named_property(env, data, "locked", makeBool(env, e.doc.guidesLocked));
+    napi_set_named_property(env, data, "visible", makeBool(env, e.doc.guidesVisible));
+    return makeOk(env, data);
+}
+
+// getLayerBounds(id) → data {ok,x,y,w,h}（文档域精确 alpha 包围盒；id=0 = 活动层）
+napi_value GetLayerBounds(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double id = 0;
+    if (argc >= 1 && napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        id = 0;
+    }
+    auto& e = Engine::get();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    LayerId lid = static_cast<LayerId>(id);
+    if (lid == 0) {
+        lid = e.doc.activeId;
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    double x = 0, y = 0, w = 0, h = 0;
+    std::string err;
+    const bool ok = layerContentBBox(e.doc, lid, x, y, w, h, err);
+    napi_set_named_property(env, data, "ok", makeBool(env, ok));
+    napi_set_named_property(env, data, "x", makeDouble(env, x));
+    napi_set_named_property(env, data, "y", makeDouble(env, y));
+    napi_set_named_property(env, data, "w", makeDouble(env, w));
+    napi_set_named_property(env, data, "h", makeDouble(env, h));
+    return makeOk(env, data);
 }
 
 }  // namespace bridge

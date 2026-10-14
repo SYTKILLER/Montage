@@ -1,7 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
-import { EngineStats, ExportPngData, HistogramData, QuickMaskState, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData } from '../model/EngineTypes';
+import { EngineStats, ExportPngData, HistogramData, QuickMaskState, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -1432,6 +1432,88 @@ export class CompositorEngine {
       throw new Error(`runPixelTest failed: ${msg}`);
     }
     return narrowPixelData(r.data);
+  }
+
+
+  // ---------- M15a 视图：参考线 + 图层包围盒 ----------
+
+  addGuide(orient: number, pos: number): boolean {
+    const r = narrowResult(native.addGuide(orient, pos) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'addGuide rejected: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  moveGuide(orient: number, index: number, pos: number): boolean {
+    const r = narrowResult(native.moveGuide(orient, index, pos) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'moveGuide rejected: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  removeGuide(orient: number, index: number): boolean {
+    const r = narrowResult(native.removeGuide(orient, index) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'removeGuide rejected: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  clearGuides(): boolean {
+    const r = narrowResult(native.clearGuides() as Object);
+    return r.ok;
+  }
+
+  setGuidesLocked(locked: boolean): boolean {
+    const r = narrowResult(native.setGuidesLocked(locked ? 1 : 0) as Object);
+    return r.ok;
+  }
+
+  setGuidesVisible(visible: boolean): boolean {
+    const r = narrowResult(native.setGuidesVisible(visible ? 1 : 0) as Object);
+    return r.ok;
+  }
+
+  getGuides(): GuidesData {
+    const r = narrowResult(native.getGuides() as Object);
+    if (!r.ok || r.data === null) {
+      return { h: [], v: [], locked: false, visible: true };
+    }
+    const d = r.data;
+    const hv: Object = d['h'];
+    const vv: Object = d['v'];
+    const h: number[] = [];
+    const v: number[] = [];
+    if (Array.isArray(hv)) {
+      for (const item of hv as Object[]) {
+        if (typeof item === 'number') {
+          h.push(item);
+        }
+      }
+    }
+    if (Array.isArray(vv)) {
+      for (const item of vv as Object[]) {
+        if (typeof item === 'number') {
+          v.push(item);
+        }
+      }
+    }
+    return { h: h, v: v, locked: boolOf(d, 'locked'), visible: boolOf(d, 'visible') };
+  }
+
+  // 精确内容包围盒（文档域 px）；id=0 = 活动层。失败（组/调整层/空层）ok=false。
+  getLayerBounds(id: number): LayerBoundsData {
+    const r = narrowResult(native.getLayerBounds(id) as Object);
+    if (!r.ok || r.data === null) {
+      return { ok: false, x: 0, y: 0, w: 0, h: 0 };
+    }
+    const d = r.data;
+    return { ok: boolOf(d, 'ok'), x: num(d, 'x'), y: num(d, 'y'), w: num(d, 'w'), h: num(d, 'h') };
   }
 
   dispose(): void {

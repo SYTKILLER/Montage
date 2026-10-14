@@ -22,7 +22,7 @@ namespace {
 constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Save";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
-constexpr int kFormatVersion = 8;  // v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
+constexpr int kFormatVersion = 9;  // v9：+参考线 guides 块（M15a，空则不写兼容 v8 包）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
 constexpr int kDeflateLevel = 6;
 // 04 §1.3 格式上限（沿用上游档位，与引擎运行预算分立）
 constexpr uint32_t kMaxSide = 30000;
@@ -460,6 +460,11 @@ struct DocSnapshot {
     LayerId activeId = 0;
     std::vector<LayerSnapshot> layers;
     std::vector<ChannelSnapshot> channels;  // v5：Alpha 通道（存储选区）
+    // v9：参考线（M15a 会话态；空且全默认则整块不写——v8 及以下包字节不变）
+    std::vector<float> guidesH;
+    std::vector<float> guidesV;
+    bool guidesLocked = false;
+    bool guidesVisible = true;
 };
 
 std::string jsonEscape(const std::string& in) {
@@ -739,6 +744,29 @@ std::string buildManifest(const DocSnapshot& doc) {
     } else {
         j += "\n";
     }
+    // v9：参考线（M15a 会话态；空且全默认不写 = v8 及以下包字节不变）
+    const bool hasGuides = !doc.guidesH.empty() || !doc.guidesV.empty() ||
+                           doc.guidesLocked || !doc.guidesVisible;
+    if (hasGuides) {
+        j += ",\n  \"guides\": {\n";
+        char num[32];
+        auto pushAxis = [&](const char* key, const std::vector<float>& v, bool last) {
+            j += std::string("    \"") + key + "\": [";
+            for (size_t i = 0; i < v.size(); ++i) {
+                std::snprintf(num, sizeof(num), "%.6g", v[i]);
+                j += num;
+                if (i + 1 < v.size()) {
+                    j += ", ";
+                }
+            }
+            j += last ? "]\n" : "],\n";
+        };
+        pushAxis("h", doc.guidesH, false);
+        pushAxis("v", doc.guidesV, false);
+        j += std::string("    \"locked\": ") + (doc.guidesLocked ? "true" : "false") + ",\n";
+        j += std::string("    \"visible\": ") + (doc.guidesVisible ? "true" : "false") + "\n";
+        j += "  }\n";
+    }
     j += "}\n";
     return j;
 }
@@ -768,6 +796,10 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
                 snap.channels.push_back(std::move(cs));
             }
         }
+        snap.guidesH = e.doc.guidesH;
+        snap.guidesV = e.doc.guidesV;
+        snap.guidesLocked = e.doc.guidesLocked;
+        snap.guidesVisible = e.doc.guidesVisible;
         snap.layers.reserve(e.doc.layers.size());
         for (const Layer& l : e.doc.layers) {
             LayerSnapshot s;

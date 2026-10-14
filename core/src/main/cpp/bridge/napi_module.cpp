@@ -127,6 +127,14 @@ napi_value Init(napi_env env, napi_value exports) {
         {"endTextSession", nullptr, montage::bridge::EndTextSession, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"listSystemFonts", nullptr, montage::bridge::ListSystemFonts, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"registerFontFile", nullptr, montage::bridge::RegisterFontFile, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"addGuide", nullptr, montage::bridge::AddGuide, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"moveGuide", nullptr, montage::bridge::MoveGuide, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"removeGuide", nullptr, montage::bridge::RemoveGuide, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"clearGuides", nullptr, montage::bridge::ClearGuides, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setGuidesLocked", nullptr, montage::bridge::SetGuidesLocked, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setGuidesVisible", nullptr, montage::bridge::SetGuidesVisible, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getGuides", nullptr, montage::bridge::GetGuides, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getLayerBounds", nullptr, montage::bridge::GetLayerBounds, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"dispose", nullptr, montage::bridge::Dispose, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props);

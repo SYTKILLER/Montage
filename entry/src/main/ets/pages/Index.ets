@@ -3,7 +3,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
 import { window } from '@kit.ArkUI';
-import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, SaveProjectData, ViewportData } from 'core';
+import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData } from 'core';
 import { AppPrefs, RecentProject, ThemeMode } from '../editor/AppPrefs';
 import { leafItem, MenuGroupVM, MenuItemVM, subItem, ToolVM } from '../editor/MenuModel';
 import { SWATCHES } from '../editor/components/OptionsBar';
@@ -19,6 +19,7 @@ import { ChannelsPanel } from '../editor/components/ChannelsPanel';
 import { FILTER_CATALOG, FilterDef, FilterParamDef } from '../editor/FilterCatalog';
 import { TextPanel } from '../editor/components/TextPanel';
 import { ABOUT_TEXT, InfoDialog, SHORTCUT_ROWS } from '../editor/components/InfoDialog';
+import { RulerStrip, GridGuidesOverlay, RULER_BG, RULER_VP } from '../editor/components/ViewOverlays';
 
 const TAG: string = 'Montage.Shell';
 const DOMAIN: number = 0x4D30;
@@ -69,6 +70,9 @@ const KC_UP: number = 2012;
 const KC_DOWN: number = 2013;
 const KC_LEFT: number = 2014;
 const KC_RIGHT: number = 2015;
+const KC_F_KEY: number = 2022;         // KEYCODE_F（SDK keyCode.d.ts 核验，2026-10-13）
+const KC_SEMICOLON: number = 2062;     // KEYCODE_SEMICOLON（SDK 核验，2026-10-13）
+const KC_APOSTROPHE: number = 2063;    // KEYCODE_APOSTROPHE（SDK 核验，2026-10-13）
 
 /**
  * M7.5 编辑器外壳（06 规划 §4）：菜单栏 + 选项条 + 工具箱 + 画布 + 面板 + 状态栏。
@@ -87,6 +91,16 @@ struct Index {
   @State panY: number = 0;
   @State canvasVpW: number = 0;
   @State canvasVpH: number = 0;
+  // M15a 视图状态（标尺/网格/吸附/屏幕模式；除参考线镜像外均为应用偏好，重启恢复）
+  @State rulersVisible: boolean = true;
+  @State rulerUnit: number = 0;         // 0 = px、1 = 百分比（A-2）
+  @State gridVisible: boolean = false;
+  @State gridSpacing: number = 100;
+  @State snapGuidesOn: boolean = true;
+  @State snapGridOn: boolean = false;
+  @State screenMode: number = 0;        // 0 = 标准、1 = 带菜单栏全屏、2 = 全屏
+  @State guidesMirror: GuidesData = { h: [], v: [], locked: false, visible: true };
+  @State guidePreview: number[] = [];   // 标尺拖拽预览 [orient, posDocPx]；空 = 无
   @State importing: boolean = false;
   @State busyText: string = '';
   @State layers: LayerDTO[] = [];
@@ -263,6 +277,18 @@ struct Index {
   private moveActive: boolean = false;
   private moveLastX: number = 0;
   private moveLastY: number = 0;
+  // M15a 吸附基准与累计位移（移动工具；吸附修正几何全在 UI 层算，引擎收增量）
+  private moveSnapBase: LayerBoundsData | null = null;
+  private moveAccX: number = 0;
+  private moveAccY: number = 0;
+  private moveAppliedX: number = 0;
+  private moveAppliedY: number = 0;
+  // M15a 参考线交互态（画布内拖动 + 标尺拖拽创建）
+  private guideMoveOrient: number = -2;  // >=0 = 画布内拖动中
+  private guideMoveIndex: number = -1;
+  private rulerDragOrient: number = -2;  // >=0 = 标尺拖拽中（0 = 水平、1 = 垂直）
+  private rulerDragIndex: number = -1;
+  private rulerDragMove: boolean = false;
   private cropDrag: boolean = false;
   private cropX0: number = 0;
   private cropY0: number = 0;
@@ -276,6 +302,15 @@ struct Index {
     this.themeMode = this.prefs.getThemeMode();
     this.prefs.applyTheme(this.themeMode, getContext(this));
     this.recents = this.prefs.getRecents();
+    // M15a：视图偏好恢复（C-1）
+    this.rulersVisible = this.prefs.getBool('view_rulers', true);
+    this.rulerUnit = this.prefs.getNumber('view_ruler_unit', 0);
+    this.gridVisible = this.prefs.getBool('view_grid', false);
+    this.gridSpacing = this.prefs.getNumber('view_grid_spacing', 100);
+    this.snapGuidesOn = this.prefs.getBool('view_snap_guides', true);
+    this.snapGridOn = this.prefs.getBool('view_snap_grid', false);
+    // 屏幕模式持久化（C-1）；全屏（2）恢复时降为带菜单栏全屏（1）——无菜单栏态不可作为启动态
+    this.screenMode = Math.min(this.prefs.getNumber('view_screen_mode', 0), 1);
     this.engine.bindRevisionListener((revision: number): void => {
       hilog.info(DOMAIN, TAG, 'docVersion → %{public}d', revision);
     });
@@ -307,6 +342,152 @@ struct Index {
     this.refreshLayers();
     this.refreshStats();  // M10d：撤销跨 Q 边界时同步快速蒙版镜像（canUndo/Redo 同步受益）
     this.scheduleHistogram();
+    this.refreshGuides();  // M15a：打开工程/撤销到其他文档状态时同步参考线镜像
+  }
+
+  // ---------- M15a 视图：参考线 / 标尺 / 网格 / 吸附 ----------
+
+  private refreshGuides(): void {
+    this.guidesMirror = this.engine.getGuides();
+  }
+
+  // 命中测试：最近参考线（文档域容差），返回 [orient, index] 或 null
+  private hitGuide(docX: number, docY: number, tolDoc: number): number[] | null {
+    let best: number[] | null = null;
+    let bestD = tolDoc;
+    const hs = this.guidesMirror.h;
+    const vs = this.guidesMirror.v;
+    for (let i = 0; i < hs.length; ++i) {
+      const d = Math.abs(hs[i] - docY);
+      if (d <= bestD) {
+        bestD = d;
+        best = [0, i];
+      }
+    }
+    for (let i = 0; i < vs.length; ++i) {
+      const d = Math.abs(vs[i] - docX);
+      if (d <= bestD) {
+        bestD = d;
+        best = [1, i];
+      }
+    }
+    return best;
+  }
+
+  // 标尺拖拽（标尺组件 onTouch）：近邻抓已有参考线 / 空白处拖出创建；拖回标尺 = 删除/取消
+  private onRulerTouch(e: TouchEvent, horizontal: boolean): void {
+    if (!this.docOpen || (e.touches.length < 1 && e.changedTouches.length < 1)) {
+      return;
+    }
+    const t: TouchObject = e.changedTouches.length > 0 ? e.changedTouches[0] : e.touches[0];
+    const k = this.pxPerVp();
+    const orient = horizontal ? 0 : 1;
+    // 标尺组件局部 cross 坐标 − 标尺宽 = 画布内坐标（负 = 仍在标尺上）
+    const docAlong = orient === 0
+      ? this.panY + ((t.y - RULER_VP) * k) / this.zoom
+      : this.panX + ((t.x - RULER_VP) * k) / this.zoom;
+    const limit = orient === 0 ? this.docH : this.docW;
+    if (e.type === TouchType.Down) {
+      const list = orient === 0 ? this.guidesMirror.h : this.guidesMirror.v;
+      const tolDoc = 8 * k / this.zoom;
+      let idx = -1;
+      for (let i = 0; i < list.length; ++i) {
+        if (Math.abs(list[i] - docAlong) <= tolDoc) {
+          idx = i;
+          break;
+        }
+      }
+      this.rulerDragOrient = orient;
+      this.rulerDragIndex = idx;
+      this.rulerDragMove = idx >= 0;
+      this.guidePreview = [orient, Math.max(0, Math.min(docAlong, limit))];
+      hilog.info(DOMAIN, TAG, 'ruler drag start orient=%{public}d grab=%{public}s',
+        orient, idx >= 0 ? 'move' : 'create');
+    } else if (e.type === TouchType.Move && this.rulerDragOrient >= 0) {
+      const pos = Math.max(0, Math.min(docAlong, limit));
+      if (this.rulerDragMove) {
+        this.engine.moveGuide(this.rulerDragOrient, this.rulerDragIndex, pos);
+        this.refreshGuides();
+      }
+      this.guidePreview = [this.rulerDragOrient, pos];
+    } else if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.rulerDragOrient >= 0) {
+      const backOnRuler = (horizontal ? t.y : t.x) < RULER_VP - 2;
+      if (backOnRuler) {
+        if (this.rulerDragMove) {
+          this.engine.removeGuide(this.rulerDragOrient, this.rulerDragIndex);
+          this.log('参考线已删除（拖回标尺）');
+        }
+      } else if (!this.rulerDragMove) {
+        const pos = Math.round(Math.max(0, Math.min(docAlong, limit)));
+        if (!this.engine.addGuide(this.rulerDragOrient, pos)) {
+          this.toast('参考线创建失败（越界/重复/锁定）');
+        } else {
+          this.log(`参考线已创建 ${horizontal ? 'y' : 'x'}=${pos}`);
+        }
+      }
+      this.rulerDragOrient = -2;
+      this.rulerDragIndex = -1;
+      this.rulerDragMove = false;
+      this.guidePreview = [];
+      this.refreshGuides();
+    }
+  }
+
+  // 移动工具吸附修正量 [sx, sy]（文档域）：参考线优先、网格兜底；±4vp 容差（A-1）
+  private computeMoveSnap(): number[] {
+    const b = this.moveSnapBase;
+    if (b === null || !b.ok) {
+      return [0, 0];
+    }
+    const tolDoc = 4 * this.pxPerVp() / this.zoom;
+    let sx = 0;
+    let sy = 0;
+    const candX: number[] = [b.x + this.moveAccX, b.x + b.w + this.moveAccX, b.x + b.w / 2 + this.moveAccX];
+    const candY: number[] = [b.y + this.moveAccY, b.y + b.h + this.moveAccY, b.y + b.h / 2 + this.moveAccY];
+    if (this.snapGuidesOn) {
+      let bestD = tolDoc;
+      for (const g of this.guidesMirror.v) {
+        for (const c of candX) {
+          const d = c - g;
+          if (Math.abs(d) <= bestD) {
+            bestD = Math.abs(d);
+            sx = 0 - d;
+          }
+        }
+      }
+      bestD = tolDoc;
+      for (const g of this.guidesMirror.h) {
+        for (const c of candY) {
+          const d = c - g;
+          if (Math.abs(d) <= bestD) {
+            bestD = Math.abs(d);
+            sy = 0 - d;
+          }
+        }
+      }
+    }
+    if (this.snapGridOn && this.gridSpacing > 0) {
+      const g = this.gridSpacing;
+      if (sx === 0) {
+        for (const c of candX) {
+          const d = c - Math.round(c / g) * g;
+          if (Math.abs(d) <= tolDoc) {
+            sx = 0 - d;
+            break;
+          }
+        }
+      }
+      if (sy === 0) {
+        for (const c of candY) {
+          const d = c - Math.round(c / g) * g;
+          if (Math.abs(d) <= tolDoc) {
+            sy = 0 - d;
+            break;
+          }
+        }
+      }
+    }
+    return [sx, sy];
   }
 
   private refreshLayers(): void {
@@ -543,6 +724,35 @@ struct Index {
     if (this.navActive()) {
       return;  // 抓手/临时抓手：Pan 手势负责
     }
+    // M15a：参考线拖动/Alt+删除（画布内命中截获，优先于工具分发；锁定时跳过）
+    if (this.guidesMirror.visible && !this.guidesMirror.locked) {
+      if (e.type === TouchType.Down && this.guideMoveOrient < 0) {
+        const hit = this.hitGuide(docX, docY, 8 * k / this.zoom);
+        if (hit !== null) {
+          if (this.altHeld) {
+            this.engine.removeGuide(hit[0], hit[1]);
+            this.refreshGuides();
+            this.log('参考线已删除（Alt+点击）');
+          } else {
+            this.guideMoveOrient = hit[0];
+            this.guideMoveIndex = hit[1];
+          }
+          return;
+        }
+      } else if (this.guideMoveOrient >= 0) {
+        if (e.type === TouchType.Move) {
+          const pos = this.guideMoveOrient === 0
+            ? Math.max(0, Math.min(docY, this.docH))
+            : Math.max(0, Math.min(docX, this.docW));
+          this.engine.moveGuide(this.guideMoveOrient, this.guideMoveIndex, pos);
+          this.refreshGuides();
+        } else if (e.type === TouchType.Up || e.type === TouchType.Cancel) {
+          this.guideMoveOrient = -2;
+          this.guideMoveIndex = -1;
+        }
+        return;
+      }
+    }
     switch (this.tool) {
       case 'brush':
       case 'pencil':
@@ -777,13 +987,32 @@ struct Index {
       this.moveActive = true;
       this.moveLastX = docX;
       this.moveLastY = docY;
+      // M15a 吸附基准：活动层视觉包围盒（含蒙版合成/样式派生 origin）
+      this.moveSnapBase = this.engine.getLayerBounds(0);
+      this.moveAccX = 0;
+      this.moveAccY = 0;
+      this.moveAppliedX = 0;
+      this.moveAppliedY = 0;
     } else if (e.type === TouchType.Move && this.moveActive) {
-      this.engine.translateLayer(0, docX - this.moveLastX, docY - this.moveLastY, 1);
+      this.moveAccX += docX - this.moveLastX;
+      this.moveAccY += docY - this.moveLastY;
       this.moveLastX = docX;
       this.moveLastY = docY;
+      const snap = this.computeMoveSnap();
+      const dx = this.moveAccX + snap[0] - this.moveAppliedX;
+      const dy = this.moveAccY + snap[1] - this.moveAppliedY;
+      if (Math.abs(dx) >= 0.5 || Math.abs(dy) >= 0.5) {
+        this.engine.translateLayer(0, dx, dy, 1);
+        this.moveAppliedX += dx;
+        this.moveAppliedY += dy;
+      }
     } else if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.moveActive) {
       this.moveActive = false;
+      this.moveSnapBase = null;
       this.engine.translateLayer(0, 0, 0, 2);
+      // M15a 验证日志：acc = 光标累计位移、applied = 吸附修正后实际位移（两者差 = 吸附量）
+      this.log(`移动结束 acc=(${this.moveAccX.toFixed(1)},${this.moveAccY.toFixed(1)}) ` +
+        `applied=(${this.moveAppliedX.toFixed(1)},${this.moveAppliedY.toFixed(1)})`);
     }
   }
 
@@ -2170,6 +2399,68 @@ struct Index {
       case 'view.fit':
         this.tryFit();
         break;
+      // ---------- M15a 视图：标尺 / 参考线 / 网格 / 吸附 / 屏幕模式 ----------
+      case 'view.rulers':
+        this.rulersVisible = !this.rulersVisible;
+        this.prefs.setBool('view_rulers', this.rulersVisible);
+        this.log(`标尺: ${this.rulersVisible ? '开' : '关'}`);
+        break;
+      case 'view.rulerUnitPx':
+      case 'view.rulerUnitPct':
+        this.rulerUnit = id === 'view.rulerUnitPx' ? 0 : 1;
+        this.prefs.setNumber('view_ruler_unit', this.rulerUnit);
+        break;
+      case 'view.guidesVisible': {
+        const on = !this.guidesMirror.visible;
+        this.engine.setGuidesVisible(on);
+        this.refreshGuides();
+        this.log(`参考线: ${on ? '显示' : '隐藏'}`);
+        break;
+      }
+      case 'view.guidesLocked': {
+        const lock = !this.guidesMirror.locked;
+        this.engine.setGuidesLocked(lock);
+        this.refreshGuides();
+        this.toast(lock ? '参考线已锁定' : '参考线已解锁');
+        break;
+      }
+      case 'view.guidesClear':
+        if (this.engine.clearGuides()) {
+          this.refreshGuides();
+          this.log('参考线已清除');
+        }
+        break;
+      case 'view.grid':
+        this.gridVisible = !this.gridVisible;
+        this.prefs.setBool('view_grid', this.gridVisible);
+        this.log(`网格: ${this.gridVisible ? '开' : '关'}`);
+        break;
+      case 'view.gridSpacing50':
+      case 'view.gridSpacing100':
+      case 'view.gridSpacing250':
+      case 'view.gridSpacing500': {
+        const sp = Number(id.replace('view.gridSpacing', ''));
+        this.gridSpacing = sp;
+        this.prefs.setNumber('view_grid_spacing', sp);
+        break;
+      }
+      case 'view.snapGuides':
+        this.snapGuidesOn = !this.snapGuidesOn;
+        this.prefs.setBool('view_snap_guides', this.snapGuidesOn);
+        this.log(`对齐参考线: ${this.snapGuidesOn ? '开' : '关'}`);
+        break;
+      case 'view.snapGrid':
+        this.snapGridOn = !this.snapGridOn;
+        this.prefs.setBool('view_snap_grid', this.snapGridOn);
+        this.log(`对齐网格: ${this.snapGridOn ? '开' : '关'}`);
+        break;
+      case 'view.screenStd':
+      case 'view.screenFullMenu':
+      case 'view.screenFull':
+        this.screenMode = id === 'view.screenStd' ? 0 : id === 'view.screenFullMenu' ? 1 : 2;
+        this.prefs.setNumber('view_screen_mode', this.screenMode);
+        this.log(`屏幕模式: ${this.screenMode === 0 ? '标准' : this.screenMode === 1 ? '带菜单栏全屏' : '全屏'}`);
+        break;
       case 'window.toggleLayers':
         this.layersVisible = !this.layersVisible;
         break;
@@ -2577,6 +2868,28 @@ struct Index {
       leafItem('view.zoomOut', '缩小', 'Ctrl+-', d),
       leafItem('view.zoom100', '100%', 'Ctrl+1', d),
       leafItem('view.fit', '适配画布', 'Ctrl+0', d),
+      leafItem('view.rulers', '标尺', 'Ctrl+R', true, this.rulersVisible),
+      subItem('view.rulerUnitSub', '标尺单位', true, [
+        leafItem('view.rulerUnitPx', '像素', '', true, this.rulerUnit === 0),
+        leafItem('view.rulerUnitPct', '百分比', '', true, this.rulerUnit === 1),
+      ]),
+      leafItem('view.guidesVisible', '显示参考线', 'Ctrl+;', true, this.guidesMirror.visible),
+      leafItem('view.guidesLocked', '锁定参考线', 'Alt+Ctrl+;', true, this.guidesMirror.locked),
+      leafItem('view.guidesClear', '清除参考线', '', true),
+      leafItem('view.grid', '显示网格', "Ctrl+'", true, this.gridVisible),
+      subItem('view.gridSpacingSub', '网格间距', true, [
+        leafItem('view.gridSpacing50', '50 px', '', true, this.gridSpacing === 50),
+        leafItem('view.gridSpacing100', '100 px', '', true, this.gridSpacing === 100),
+        leafItem('view.gridSpacing250', '250 px', '', true, this.gridSpacing === 250),
+        leafItem('view.gridSpacing500', '500 px', '', true, this.gridSpacing === 500),
+      ]),
+      leafItem('view.snapGuides', '对齐参考线', '', true, this.snapGuidesOn),
+      leafItem('view.snapGrid', '对齐网格', "Shift+Ctrl+'", true, this.snapGridOn),
+      subItem('view.screenModeSub', '屏幕模式', true, [
+        leafItem('view.screenStd', '标准屏幕模式', 'F', this.screenMode === 0),
+        leafItem('view.screenFullMenu', '带菜单栏的全屏模式', '', this.screenMode === 1),
+        leafItem('view.screenFull', '全屏模式', '', this.screenMode === 2),
+      ]),
     ];
     const win: MenuItemVM[] = [
       leafItem('window.toggleLayers', '图层面板', '', true, this.layersVisible),
@@ -2589,6 +2902,11 @@ struct Index {
       ]),
       leafItem('help.shortcuts', '快捷键表', '', true),
       leafItem('help.about', '关于 Montage', '', true),
+      // M15a：沙箱往返包调试通道（模拟器 picker 保存缺陷的替代验证路径；三键组合注入受限）
+      subItem('help.debugSub', '调试（沙箱往返）', true, [
+        leafItem('file.saveSandbox', '保存往返包到沙箱', '', d),
+        leafItem('file.openSandbox', '打开沙箱往返包', '', d),
+      ]),
     ];
     return [
       { id: 'file', label: '文件', items: file },
@@ -2663,6 +2981,11 @@ struct Index {
       return;
     }
     if (e.type !== KeyType.Down) {
+      return;
+    }
+    // M15a 全屏模式（1/2）：Esc 退出回标准
+    if (this.screenMode > 0 && e.keyCode === KC_ESC) {
+      this.runCommand('view.screenStd');
       return;
     }
     // 修饰键状态维护
@@ -2831,6 +3154,17 @@ struct Index {
         case KC_T_KEY:
           this.runCommand('layer.transform');
         break;
+        case KC_R:
+          this.runCommand('view.rulers');  // Ctrl+R 标尺（PS 语义）
+          break;
+        case KC_SEMICOLON:
+          // Ctrl+; 显示/隐藏参考线；Alt+Ctrl+; 锁定
+          this.runCommand(this.altHeld ? 'view.guidesLocked' : 'view.guidesVisible');
+          break;
+        case KC_APOSTROPHE:
+          // Ctrl+' 显示网格；Shift+Ctrl+' 对齐网格
+          this.runCommand(this.shiftHeld ? 'view.snapGrid' : 'view.grid');
+          break;
         default:
           break;
       }
@@ -2941,6 +3275,11 @@ struct Index {
         break;
       case KC_H:
         this.pickTool('hand');
+        break;
+      case KC_F_KEY:
+        // M15a 屏幕模式循环（PS F 语义）：标准 → 带菜单栏全屏 → 全屏
+        this.runCommand(this.screenMode === 0 ? 'view.screenFullMenu'
+          : this.screenMode === 1 ? 'view.screenFull' : 'view.screenStd');
         break;
       case KC_Z:
         this.pickTool('zoom');
@@ -3180,7 +3519,10 @@ struct Index {
         `${g.id}|${g.items.length}|${this.docOpen ? 1 : 0}|${this.canUndo ? 1 : 0}|` +
         `${this.canRedo ? 1 : 0}|${this.layersVisible ? 1 : 0}|${this.themeMode}|` +
         `${this.activeLayer() !== undefined ? 1 : 0}${this.activeLayerHasMask() ? 1 : 0}` +
-        `${this.hasSelectionFlag ? 1 : 0}${this.quickMaskActive ? 1 : 0}`)
+        `${this.hasSelectionFlag ? 1 : 0}${this.quickMaskActive ? 1 : 0}` +
+        `${this.rulersVisible ? 1 : 0}${this.rulerUnit}${this.gridVisible ? 1 : 0}` +
+        `${this.gridSpacing}${this.snapGuidesOn ? 1 : 0}${this.snapGridOn ? 1 : 0}` +
+        `${this.screenMode}${this.guidesMirror.visible ? 1 : 0}${this.guidesMirror.locked ? 1 : 0}`)
     }
     .width('100%')
     .height(36)
@@ -3192,7 +3534,10 @@ struct Index {
   build() {
     Stack() {
       Column() {
-        this.menuBar()
+        if (this.screenMode < 2) {
+          this.menuBar()
+        }
+        if (this.screenMode === 0) {
         OptionsBar({
           tool: this.tool,
           toolLabel: this.toolLabel(this.tool),
@@ -3247,14 +3592,61 @@ struct Index {
           multiSelectCount: this.alignTargetIds().length,
           onAlignPick: (mode: number, isAlign: boolean): void => this.onAlignPick(mode, isAlign),
         })
+        }
         Row() {
+          if (this.screenMode === 0) {
           Toolbox({ tools: this.buildTools(),
             activeTool: this.tool === 'sharpen' || this.tool === 'smudge' ? 'blur'
               : this.tool === 'burn' || this.tool === 'sponge' ? 'dodge' : this.tool,
             onPick: (id: string): void => this.pickTool(id) })
+          }
 
-          // 画布区
-          Stack() {
+          // 画布区（M15a：标尺条 + 网格/参考线 overlay + 画布 Stack）
+          Column() {
+            if (this.rulersVisible && this.docOpen) {
+              Row() {
+                Column()
+                  .width(RULER_VP)
+                  .height('100%')
+                  .backgroundColor(RULER_BG)
+                RulerStrip({
+                  horizontal: true,
+                  zoom: this.zoom,
+                  panX: this.panX,
+                  panY: this.panY,
+                  pxPerVp: this.pxPerVp(),
+                  docW: this.docW,
+                  docH: this.docH,
+                  unit: this.rulerUnit,
+                  previewPos: this.guidePreview.length === 2 && this.guidePreview[0] === 0
+                    ? this.guidePreview[1] : -1,
+                })
+                  .layoutWeight(1)
+                  .height('100%')
+                  .onTouch((e: TouchEvent): void => this.onRulerTouch(e, true))
+              }
+              .width('100%')
+              .height(RULER_VP)
+            }
+            Row() {
+              if (this.rulersVisible && this.docOpen) {
+                RulerStrip({
+                  horizontal: false,
+                  zoom: this.zoom,
+                  panX: this.panX,
+                  panY: this.panY,
+                  pxPerVp: this.pxPerVp(),
+                  docW: this.docW,
+                  docH: this.docH,
+                  unit: this.rulerUnit,
+                  previewPos: this.guidePreview.length === 2 && this.guidePreview[0] === 1
+                    ? this.guidePreview[1] : -1,
+                })
+                  .width(RULER_VP)
+                  .height('100%')
+                  .onTouch((e: TouchEvent): void => this.onRulerTouch(e, false))
+              }
+              Stack() {
             XComponent({ id: 'montage-canvas', type: XComponentType.SURFACE, controller: this.xcController })
               .width('100%')
               .height('100%')
@@ -3267,6 +3659,21 @@ struct Index {
               .onTouch((e: TouchEvent): void => {
                 this.onTouchEvent(e);
               })
+            // M15a 网格 + 参考线覆盖层（纯视觉；组件内已设 hitTestBehavior=None）
+            GridGuidesOverlay({
+              zoom: this.zoom,
+              panX: this.panX,
+              panY: this.panY,
+              pxPerVp: this.pxPerVp(),
+              docW: this.docW,
+              docH: this.docH,
+              gridOn: this.gridVisible,
+              gridSpacing: this.gridSpacing,
+              guidesOn: this.guidesMirror.visible,
+              guidesH: this.guidesMirror.h,
+              guidesV: this.guidesMirror.v,
+              preview: this.guidePreview,
+            })
             // M8.1 自由变换手柄 overlay
             if (this.overlayBox !== null) {
               TransformOverlay({
@@ -3447,9 +3854,15 @@ struct Index {
               .onActionUpdate((e: PinchGestureEvent): void => this.onPinchUpdate(e))
               .onActionEnd((): void => this.onPinchEnd())
               .onActionCancel((): void => this.onPinchEnd()))
+            }
+            .layoutWeight(1)
+            .height('100%')
+          }
+          .layoutWeight(1)
+          .height('100%')
 
           // 右侧面板坞
-          if (this.layersVisible) {
+          if (this.screenMode === 0 && this.layersVisible) {
             Column() {
               if (this.activeLayer()?.isAdjustment === true || this.showAdjCreate) {
                 AdjustPanel({
@@ -3619,6 +4032,7 @@ struct Index {
         .layoutWeight(1)
         .alignItems(VerticalAlign.Top)
 
+        if (this.screenMode < 2) {
         StatusBar({
           docOpen: this.docOpen,
           docW: this.docW,
@@ -3630,6 +4044,7 @@ struct Index {
           importProgress: this.importProgress,
           fps: this.fps,
         })
+        }
       }
       .width('100%')
       .height('100%')
