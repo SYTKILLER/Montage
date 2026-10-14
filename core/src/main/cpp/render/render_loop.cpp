@@ -275,13 +275,22 @@ void RenderLoop::doFrame() {
 
     // 03 §2（M1 降级实现）：无脏跳过绘制与 swap；帧循环由回调线程自续（跨线程请求实证不可靠）。
     // 空闲成本 = vsync 空回调，省电的"停请求"待真机阶段实现。
-    // M7b：选区存在时蚂蚁线持续动画 → 视作常脏（LTPO 分档留真机阶段）
+    // M15d 蚂蚁线节拍治理（清偿 M7b"选区=常脏"）：选区静置时全帧合成趟归零，
+    // 仅每 ~100ms 以 overlayOnly 回显上次合成结果并推进 dash 相位（LTPO 真机量化留 M16）。
     bool dirty = e.needsRender.exchange(false);
+    bool overlayOnly = false;
     if (!dirty) {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        dirty = e.doc.selection != nullptr;
+        if (e.doc.selection != nullptr) {
+            const auto now = std::chrono::steady_clock::now();
+            if (!antsTickValid_ || now - lastAntsTick_ >= std::chrono::milliseconds(100)) {
+                lastAntsTick_ = now;
+                antsTickValid_ = true;
+                overlayOnly = true;
+            }
+        }
     }
-    if (!dirty) {
+    if (!dirty && !overlayOnly) {
         OH_NativeVSync_RequestFrame(vsync_, &RenderLoop::frameCallback, this);
         return;
     }
@@ -361,7 +370,7 @@ void RenderLoop::doFrame() {
         }
     }
     renderer_.drawFrame(docSnap, vp, w, h, strokeSnap.active ? &overlay : nullptr,
-                        transformPreview.active ? &xformPreview : nullptr);
+                        transformPreview.active ? &xformPreview : nullptr, overlayOnly);
 
     if (eglSwapBuffers(display_, surface_) != EGL_TRUE) {
         std::lock_guard<std::mutex> lk(statsMtx_);
@@ -371,11 +380,24 @@ void RenderLoop::doFrame() {
         const auto now = std::chrono::steady_clock::now();
         framesTotal_++;
         fpsWindowFrames_++;
+        if (overlayOnly) {
+            statOverlayFrames_++;
+        } else {
+            statFullFrames_++;
+        }
         const double dt = std::chrono::duration<double>(now - fpsWindowStart_).count();
         if (dt >= 2.0) {
             fps_ = static_cast<double>(fpsWindowFrames_) / dt;
             fpsWindowFrames_ = 0;
             fpsWindowStart_ = now;
+            static std::atomic<int> idleLog{0};
+            if (idleLog.fetch_add(1) < 5) {
+                OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag,
+                             "idle cadence: full=%{public}d overlay=%{public}d (2s window)\n",
+                             statFullFrames_, statOverlayFrames_);
+            }
+            statFullFrames_ = 0;
+            statOverlayFrames_ = 0;
         }
     }
     OH_NativeVSync_RequestFrame(vsync_, &RenderLoop::frameCallback, this);  // 回调线程内自续

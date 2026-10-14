@@ -820,7 +820,8 @@ int TileRenderer::composeLayerRange(const Document& doc, int from, int to, const
 }
 
 void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw, int32_t vh,
-                             const StrokeOverlay* stroke, const LayerXformPreview* preview) {
+                             const StrokeOverlay* stroke, const LayerXformPreview* preview,
+                             bool overlayOnly) {
     frame_++;
     glViewport(0, 0, vw, vh);
     // 画布外背板：中性灰（05 §7：与主题解耦，对齐 PS 行为）
@@ -832,6 +833,9 @@ void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw
     if (!ensureFbos(vw, vh)) {
         return;
     }
+    if (overlayOnly && lastAccIdx_ < 0) {
+        overlayOnly = false;  // 尚无可用合成结果（首帧）→ 退化为全帧
+    }
 
     const float zoom = static_cast<float>(clampZoom(vp.zoom));
     const float panX = static_cast<float>(vp.panX);
@@ -840,15 +844,20 @@ void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw
     const float vhF = static_cast<float>(vh);
 
     // ① 自底向上逐层两趟合成（03 §4）：assemble → layerFBO，blend → acc ping-pong
-    for (int i = 0; i < 2; ++i) {
-        glBindFramebuffer(GL_FRAMEBUFFER, accFbo_[i]);
-        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-    }
-    int accIdx = 0;
+    // M15d：overlayOnly 跳过两趟（acc 纹理持久持有上次合成结果），主合成趟归零
+    int accIdx = lastAccIdx_ < 0 ? 0 : lastAccIdx_;
     int composited = 0;
-    accIdx = composeLayerRange(doc, 0, static_cast<int>(doc.layers.size()), vp, vw, vh, stroke,
-                               preview, accIdx, false, 0, composited);
+    if (!overlayOnly) {
+        for (int i = 0; i < 2; ++i) {
+            glBindFramebuffer(GL_FRAMEBUFFER, accFbo_[i]);
+            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+        }
+        accIdx = 0;
+        accIdx = composeLayerRange(doc, 0, static_cast<int>(doc.layers.size()), vp, vw, vh, stroke,
+                                   preview, accIdx, false, 0, composited);
+        lastAccIdx_ = accIdx;
+    }
 
     // ② 屏幕：灰背板 → doc rect 棋盘格 → acc 终合成（按 doc rect 裁剪）
     glBindFramebuffer(GL_FRAMEBUFFER, 0);

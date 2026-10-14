@@ -73,6 +73,11 @@ private:
     double fps_ = 0.0;
     uint64_t fpsWindowFrames_ = 0;
     std::chrono::steady_clock::time_point fpsWindowStart_;
+    // M15d 蚂蚁线节拍：选区静置时覆盖层 ~10Hz 独立驱动（主合成趟归零）
+    std::chrono::steady_clock::time_point lastAntsTick_;
+    bool antsTickValid_ = false;
+    int statFullFrames_ = 0;
+    int statOverlayFrames_ = 0;
     int32_t width_ = 0;
     int32_t height_ = 0;
     std::string lastError_;

@@ -36,8 +36,11 @@ class TileRenderer {
         double m[6] = {1.0, 0.0, 0.0, 0.0, 1.0, 0.0};  // 行主序 x'=m0·x+m1·y+m2
     };
     // 绘制一帧（背板 + 棋盘格 + 图层栈合成）。vw/vh = 视口 px。
+    // overlayOnly（M15d 蚂蚁线节拍）：跳过合成两趟，回显上次合成结果（acc 纹理持久），
+    // 仅推进蚂蚁线相位——选区静置时主合成趟归零，覆盖层 ~10Hz 独立驱动。
     void drawFrame(const Document& doc, const Viewport& vp, int32_t vw, int32_t vh,
-                   const StrokeOverlay* stroke, const LayerXformPreview* preview = nullptr);
+                   const StrokeOverlay* stroke, const LayerXformPreview* preview = nullptr,
+                   bool overlayOnly = false);
     // 上下文销毁/丢失时清空全部 GL 资源（03 R3.9：派生缓存语义）
     void invalidate();
 
@@ -120,6 +123,7 @@ class TileRenderer {
 
     std::unordered_map<uint64_t, CacheEntry> cache_;  // key = layerId<<32 | tileIndex
     uint64_t frame_ = 0;
+    int lastAccIdx_ = -1;  // M15d：最近一次全帧合成的 acc 侧（overlayOnly 回显用）
     static constexpr size_t kCacheCap = 1024;  // 1024×256KB = 256MB，与 02 Limits 缓存预算一致
 };
 
