@@ -394,6 +394,7 @@ void Engine::resetDocument() {
         filterPreview = FilterPreview{};  // M13：预览会话随文档清空
         lastSelection.reset();  // M10a：重新选择来源不跨文档
         transformPreview = TransformPreview{};
+        rawDevelop = RawDevelopSession{};  // M15e：RAW 显影会话随文档清空
         historyVersion.fetch_add(1);  // 历史面板随清空刷新（M15b）
         needsRender.store(true);
     }

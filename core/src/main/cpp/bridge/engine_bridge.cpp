@@ -711,6 +711,8 @@ napi_value GetStats(napi_env env, napi_callback_info /*info*/) {
     double progress = 0.0;
     bool importing = false;
     bool quickMask = false;
+    bool hasRaw = false;               // M15e
+    io::DevelopParams devLast;         // M15e
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
         vp = e.viewport;
@@ -718,6 +720,8 @@ napi_value GetStats(napi_env env, napi_callback_info /*info*/) {
         dw = e.doc.width;
         dh = e.doc.height;
         quickMask = e.doc.quickMask != nullptr;  // M10d：UI 镜像（撤销跨 Q 边界后刷新）
+        hasRaw = e.rawDevelop.valid;             // M15e：RAW 显影会话镜像（导入线程会写，须锁内读）
+        devLast = e.rawDevelop.last;
     }
     {
         std::lock_guard<std::mutex> lk(e.import.mtx);
@@ -753,6 +757,12 @@ napi_value GetStats(napi_env env, napi_callback_info /*info*/) {
                             makeDouble(env, static_cast<double>(snap.idleParks)));
     napi_set_named_property(env, data, "renderCallbacks",
                             makeDouble(env, static_cast<double>(snap.callbacks)));
+    // M15e：RAW 显影会话镜像（菜单使能 + 面板参数回显）
+    napi_set_named_property(env, data, "hasRawDevelop", makeBool(env, hasRaw));
+    napi_set_named_property(env, data, "devTemp", makeDouble(env, devLast.temp));
+    napi_set_named_property(env, data, "devTint", makeDouble(env, devLast.tint));
+    napi_set_named_property(env, data, "devEv", makeDouble(env, devLast.ev));
+    napi_set_named_property(env, data, "devGamma", makeDouble(env, devLast.gamma));
     return makeOk(env, data);
 }
 
@@ -4462,8 +4472,127 @@ napi_value EndFilterPreview(napi_env env, napi_callback_info info) {
     return makeOk(env, nullptr);
 }
 
-// ---------- M14a 图层编组 ----------
+// ---------- M15e RAW 显影参数面板 ----------
 
+// RAW 重显影异步任务上下文（锁内快照 RAW 字节 → libuv 线程锁外显影 → JS 线程 COW 提交）
+struct DevelopRawCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    std::vector<uint8_t> bytes;
+    LayerId layerId = 0;
+    io::DevelopParams params;
+    bool ok = false;
+    uint32_t w = 0;
+    uint32_t h = 0;
+    std::string err;
+    std::shared_ptr<const TileGrid> grid;
+};
+
+// developRaw(temp, tint, ev, gamma)：从会话 RAW 缓存全分辨率重显影（恒从 RAW 出发，
+// 会话内非破坏），COW 换层像素 + 一步 history 事务。v1 无实时预览（登记后续）。
+napi_value DevelopRaw(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value argv[4] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 4) {
+        return makeError(env, kErrBadParam, "developRaw(temp,tint,ev,gamma) requires 4 args");
+    }
+    double temp = 0;
+    double tint = 0;
+    double ev = 0;
+    double gamma = 1;
+    if (napi_get_value_double(env, argv[0], &temp) != napi_ok ||
+        napi_get_value_double(env, argv[1], &tint) != napi_ok ||
+        napi_get_value_double(env, argv[2], &ev) != napi_ok ||
+        napi_get_value_double(env, argv[3], &gamma) != napi_ok) {
+        return makeError(env, kErrBadParam, "developRaw: invalid args");
+    }
+    auto& e = Engine::get();
+    auto* ctx = new DevelopRawCtx();
+    ctx->params.temp = static_cast<float>(std::min(100.0, std::max(-100.0, temp)));
+    ctx->params.tint = static_cast<float>(std::min(100.0, std::max(-100.0, tint)));
+    ctx->params.ev = static_cast<float>(std::min(2.0, std::max(-2.0, ev)));
+    ctx->params.gamma = static_cast<float>(std::min(2.0, std::max(0.5, gamma)));
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (!e.rawDevelop.valid || e.rawDevelop.bytes.empty()) {
+            delete ctx;
+            return makeError(env, kErrNoDoc, "developRaw: no RAW session (import a DNG first)");
+        }
+        if (e.textEditOpen || e.filterPreview.active) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "developRaw: session open");
+        }
+        ctx->bytes = e.rawDevelop.bytes;
+        ctx->layerId = e.rawDevelop.layerId;
+    }
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value workName = nullptr;
+    napi_create_string_utf8(env, "montageDevelopRaw", NAPI_AUTO_LENGTH, &workName);
+    napi_status st = napi_create_async_work(
+        env, nullptr, workName,
+        [](napi_env /*env*/, void* data) {
+            auto* c = static_cast<DevelopRawCtx*>(data);
+            c->ok = io::developDngToGrid(c->bytes, c->params, c->grid, c->w, c->h, c->err);
+        },
+        [](napi_env env, napi_status status, void* data) {
+            auto* c = static_cast<DevelopRawCtx*>(data);
+            auto& e = Engine::get();
+            if (status == napi_ok && c->ok) {
+                bool applied = false;
+                {
+                    std::lock_guard<std::mutex> lk(e.docMutex);
+                    for (Layer& l : e.doc.layers) {
+                        if (l.id != c->layerId) {
+                            continue;
+                        }
+                        // 同一 RAW 同尺寸：transform 不动，仅 COW 换像素 + 一步事务
+                        e.history.beginEdit(e.doc, "RAW 显影",
+                                            static_cast<uint64_t>(e.docRevision));
+                        l.pixels = c->grid;
+                        restyleAllLocked(e);
+                        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+                        e.bumpRevisionLocked();
+                        e.rawDevelop.last = c->params;
+                        applied = true;
+                        break;
+                    }
+                    if (!applied) {
+                        c->err = "developRaw: RAW layer no longer exists";
+                    }
+                }
+                if (applied) {
+                    e.requestRender();
+                    napi_value dataObj = nullptr;
+                    napi_create_object(env, &dataObj);
+                    napi_set_named_property(env, dataObj, "width", makeUint32(env, c->w));
+                    napi_set_named_property(env, dataObj, "height", makeUint32(env, c->h));
+                    napi_set_named_property(env, dataObj, "layerId",
+                                            makeDouble(env, static_cast<double>(c->layerId)));
+                    napi_resolve_deferred(env, c->deferred, makeOk(env, dataObj));
+                } else {
+                    napi_resolve_deferred(env, c->deferred,
+                                          makeError(env, kErrInternal, c->err));
+                }
+            } else {
+                napi_resolve_deferred(env, c->deferred,
+                                      makeError(env, kErrInternal,
+                                                c->err.empty() ? "developRaw failed" : c->err));
+            }
+            napi_delete_async_work(env, c->work);
+            delete c;
+        },
+        ctx, &ctx->work);
+    if (st != napi_ok) {
+        delete ctx;
+        return makeError(env, kErrInternal, "create async work failed");
+    }
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+// ---------- M14a 图层编组 ----------
 // M14a：新建空组（插活动层上方，激活）
 napi_value AddGroup(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();

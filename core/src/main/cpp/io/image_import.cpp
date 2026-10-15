@@ -288,6 +288,13 @@ ImportCompletion* runImport(int fd) {
                             engine.doc.layers.push_back(std::move(layer));
                             engine.doc.activeId = nid;
                         }
+                        // M15e：会话 RAW 缓存（显影参数面板数据源；resetDocument 随文档清）
+                        engine.rawDevelop.bytes = bytes;
+                        engine.rawDevelop.layerId = engine.doc.activeId;
+                        engine.rawDevelop.w = w;
+                        engine.rawDevelop.h = h;
+                        engine.rawDevelop.last = io::DevelopParams{};
+                        engine.rawDevelop.valid = true;
                         engine.bumpRevisionLocked();
                     }
                     engine.requestRender();

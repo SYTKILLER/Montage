@@ -17,6 +17,7 @@
 #include "engine/clipboard_ops.h"
 #include "engine/document.h"
 #include "engine/history.h"
+#include "io/dng_decode.h"
 #include "render/render_loop.h"
 
 namespace montage {
@@ -114,6 +115,19 @@ class Engine {
         uint32_t srcH = 0;
     };
     FilterPreview filterPreview;
+
+    // M15e：DNG 会话 RAW 缓存——显影参数面板数据源。导入 DNG 成功后缓存原始字节，
+    // 面板重显影恒从 RAW 出发（会话内非破坏）；随 resetDocument 清、不入 .montage/History，
+    // 导入下一个 DNG 覆盖（面板始终作用于最近导入的 RAW 层）。
+    struct RawDevelopSession {
+        std::vector<uint8_t> bytes;
+        LayerId layerId = 0;
+        uint32_t w = 0;
+        uint32_t h = 0;
+        io::DevelopParams last;  // 最近一次提交的参数（面板回显）
+        bool valid = false;
+    };
+    RawDevelopSession rawDevelop;
 
     // M10c 内部剪贴板（引擎内存；不随快照/持久化走，关闭文档保留——PS 同语义）
     ClipBuffer clipboard;

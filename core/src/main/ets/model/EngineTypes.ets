@@ -28,6 +28,19 @@ export interface EngineStats {
   overlayFrames: number;
   idleParks: number;
   renderCallbacks: number;  // 累计 vsync 回调数（CPU 唤醒次数，真机功耗量化代理）
+  hasRawDevelop: boolean;   // M15e：会话内有可重显影的 RAW（显影参数菜单使能）
+  devTemp: number;          // 最近一次提交的显影参数（面板回显）
+  devTint: number;
+  devEv: number;
+  devGamma: number;
+}
+
+/** RAW 重显影结果（developRaw 的 data，M15e）。 */
+export interface RawDevelopData {
+  ok: boolean;
+  width: number;
+  height: number;
+  layerId: number;
 }
 
 /** 快速蒙版 toggle 结果（toggleQuickMask 的 data，M10d）。 */

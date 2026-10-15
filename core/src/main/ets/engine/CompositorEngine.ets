@@ -1,7 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
-import { EngineStats, ExportPngData, HistogramData, QuickMaskState, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData } from '../model/EngineTypes';
+import { EngineStats, ExportPngData, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -97,6 +97,11 @@ function narrowStats(r: Record<string, Object>): EngineStats {
     overlayFrames: num(r, 'overlayFrames'),
     idleParks: num(r, 'idleParks'),
     renderCallbacks: num(r, 'renderCallbacks'),
+    hasRawDevelop: boolOf(r, 'hasRawDevelop'),
+    devTemp: num(r, 'devTemp'),
+    devTint: num(r, 'devTint'),
+    devEv: num(r, 'devEv'),
+    devGamma: num(r, 'devGamma'),
   };
 }
 
@@ -1418,6 +1423,21 @@ export class CompositorEngine {
     return r.ok;
   }
 
+  /** M15e：RAW 重显影（色温/色调/曝光/γ，从会话 RAW 缓存出发；一步 history 事务）。 */
+  async developRaw(temp: number, tint: number, ev: number, gamma: number): Promise<RawDevelopData> {
+    const value: Object = await (native.developRaw(temp, tint, ev, gamma) as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok || r.data === null) {
+      throw new Error(r.error !== null ? r.error.message : 'developRaw failed');
+    }
+    return {
+      ok: boolOf(r.data, 'ok'),
+      width: num(r.data, 'width'),
+      height: num(r.data, 'height'),
+      layerId: num(r.data, 'layerId'),
+    };
+  }
+
   getStats(): EngineStats {
     const r = narrowResult(native.getStats() as Object);
     if (!r.ok || r.data === null) {
@@ -1429,7 +1449,7 @@ export class CompositorEngine {
         importRunning: false, importProgress: 0, renderRunning: false,
         lastError: 'getStats failed', canUndo: false, canRedo: false, quickMask: false,
         historyVersion: 0, paceTier: 0, fullFrames: 0, overlayFrames: 0, idleParks: 0,
-        renderCallbacks: 0,
+        renderCallbacks: 0, hasRawDevelop: false, devTemp: 0, devTint: 0, devEv: 0, devGamma: 1,
       };
     }
     return narrowStats(r.data);

@@ -21,10 +21,26 @@ namespace io {
 // 内容探测：TIFF 魔数 + DNGVersion(50706) 标签存在
 bool looksLikeDng(const std::vector<uint8_t>& bytes);
 
+// M15e 显影参数（相对默认显影的偏移；显影参数面板 P1）
+struct DevelopParams {
+    float temp = 0.0f;   // -100..100 色温偏移（正=暖/偏黄，负=冷/偏蓝；调制 R/B 增益 ±30%）
+    float tint = 0.0f;   // -100..100 色调偏移（正=品红，负=绿；调制 G 增益）
+    float ev = 0.0f;     // -2..+2 曝光（线性增益 2^ev，高光照常截断）
+    float gamma = 1.0f;  // 0.5..2.0 伽马（sRGB 编码后再取 1/γ 次幂；>1 提亮中间调）
+};
+
 // 显影 → 直 RGBA TileGrid（引擎瓦片约定）。失败给明确错误。
 bool developDngToGrid(const std::vector<uint8_t>& bytes,
+                      const DevelopParams& params,
                       std::shared_ptr<const TileGrid>& out, uint32_t& outW, uint32_t& outH,
                       std::string& err);
+
+// 默认参数显影（M15d 导入路径语义不变）
+inline bool developDngToGrid(const std::vector<uint8_t>& bytes,
+                             std::shared_ptr<const TileGrid>& out, uint32_t& outW, uint32_t& outH,
+                             std::string& err) {
+    return developDngToGrid(bytes, DevelopParams{}, out, outW, outH, err);
+}
 
 }  // namespace io
 }  // namespace montage

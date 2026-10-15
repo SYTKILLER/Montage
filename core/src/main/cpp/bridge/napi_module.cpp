@@ -74,6 +74,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"createSurface", nullptr, montage::bridge::CreateSurface, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"destroySurface", nullptr, montage::bridge::DestroySurface, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"notifySurfaceChanged", nullptr, montage::bridge::NotifySurfaceChanged, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"developRaw", nullptr, montage::bridge::DevelopRaw, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getStats", nullptr, montage::bridge::GetStats, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"onRevisionChanged", nullptr, montage::bridge::OnRevisionChanged, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"onImportProgress", nullptr, montage::bridge::OnImportProgress, nullptr, nullptr, nullptr, napi_default, nullptr},

@@ -4,7 +4,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
 import { window } from '@kit.ArkUI';
-import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData } from 'core';
+import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, RawDevelopData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData } from 'core';
 import { AppPrefs, RecentProject, ThemeMode } from '../editor/AppPrefs';
 import { leafItem, MenuGroupVM, MenuItemVM, subItem, ToolVM } from '../editor/MenuModel';
 import { SWATCHES } from '../editor/components/OptionsBar';
@@ -185,6 +185,13 @@ struct Index {
   private filterDebounce: number = -1;
   @State fillSource: number = 0;        // 0=前景 1=背景 2=黑 3=白
   private gradDragging: boolean = false;
+  // M15e RAW 显影参数面板（会话内导入过 DNG 才可用；确定=一步 history 事务）
+  @State hasRawDevelop: boolean = false;
+  @State showDevelop: boolean = false;
+  @State devTemp: number = 0;           // -100..100（正=暖）
+  @State devTint: number = 0;           // -100..100（正=品红）
+  @State devEv: number = 0;             // -2..+2 EV
+  @State devGamma: number = 1;          // 0.5..2.0
   // M11c 形状工具：种类/样式 + 拖拽预览（视口 [x,y,w,h]）
   @State shapeKind: number = 0;         // 0=矩形 1=圆角矩形 2=椭圆 3=直线
   @State shapeFill: boolean = true;
@@ -633,6 +640,7 @@ struct Index {
     this.canUndo = s.canUndo;
     this.canRedo = s.canRedo;
     this.quickMaskActive = s.quickMask;  // M10d
+    this.hasRawDevelop = s.hasRawDevelop;  // M15e：RAW 显影菜单使能镜像
   }
 
   private log(msg: string): void {
@@ -1449,6 +1457,49 @@ struct Index {
     }
     this.filterDef = null;
     this.log('滤镜已取消');
+  }
+
+  // ---------- M15e RAW 显影参数面板 ----------
+  // v1 模态对话框 + 确定后异步全分辨率重显影（恒从会话 RAW 缓存出发，一步 history 事务）；
+  // 实时预览登记后续（需异步显影管线）。
+
+  private openDevelopPanel(): void {
+    if (!this.hasRawDevelop) {
+      this.toast('会话内没有 RAW（先打开 DNG）');
+      return;
+    }
+    // 滑条回显 = 最近一次提交的参数
+    const s = this.engine.getStats();
+    this.devTemp = s.devTemp;
+    this.devTint = s.devTint;
+    this.devEv = s.devEv;
+    this.devGamma = s.devGamma === 0 ? 1 : s.devGamma;
+    this.showDevelop = true;
+    this.log('显影参数面板: 打开');
+  }
+
+  private commitDevelop(): void {
+    if (!this.showDevelop) {
+      return;
+    }
+    this.showDevelop = false;
+    this.engine.developRaw(this.devTemp, this.devTint, this.devEv, this.devGamma)
+      .then((d: RawDevelopData): void => {
+        this.log(`RAW 重显影: ${d.width}x${d.height} 层${d.layerId}`);
+        this.toast(`显影已应用（温${Math.round(this.devTemp)} 曝光${this.devEv.toFixed(1)}）`);
+      })
+      .catch((e: BusinessError): void => {
+        this.log(`RAW 重显影失败: ${e.message}`);
+        this.toast(`显影失败: ${e.message}`);
+      });
+  }
+
+  private cancelDevelop(): void {
+    if (!this.showDevelop) {
+      return;
+    }
+    this.showDevelop = false;
+    this.log('显影已取消');
   }
 
   // 编辑 overlay 视口框 [x,y,w,h]（vp）；非编辑态返回空数组
@@ -2596,6 +2647,9 @@ struct Index {
       case 'image.trim':
         this.docOp((): boolean => this.engine.trimCanvas(), '裁切');
         break;
+      case 'image.develop':
+        this.openDevelopPanel();
+        break;
       case 'image.revealAll':
         this.docOp((): boolean => this.engine.revealAll(), '显示全部');
         break;
@@ -3018,6 +3072,8 @@ struct Index {
       leafItem('image.flipV', '垂直翻转画布', '', d),
       leafItem('image.trim', '裁切（基于像素）', '', d),
       leafItem('image.revealAll', '显示全部', '', d),
+      // M15e：RAW 显影参数（会话内导入过 DNG 才可用，P1）
+      leafItem('image.develop', 'RAW 显影参数…', '', d && this.hasRawDevelop),
     ];
     const layer: MenuItemVM[] = [
       leafItem('layer.transform', '自由变换', 'Ctrl+T', d),
@@ -3242,7 +3298,7 @@ struct Index {
       return;
     }
     // 对话框打开时：Esc 关闭，其余不抢
-    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform || this.showModify || this.showStoreSel || this.showLoadSel || this.showFill || this.showStyle || this.showFilter) {
+    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform || this.showModify || this.showStoreSel || this.showLoadSel || this.showFill || this.showStyle || this.showFilter || this.showDevelop) {
       if (e.keyCode === KC_ESC) {
         this.showTransform = false;
         this.showExport = false;
@@ -3253,6 +3309,9 @@ struct Index {
         this.showModify = false;
         this.showStoreSel = false;
         this.showLoadSel = false;
+        if (this.showDevelop) {
+          this.cancelDevelop();  // M15e：Esc=取消（不落参数）
+        }
         this.showFill = false;
         this.showStyle = false;
         this.cancelFilterDialog();
@@ -3763,7 +3822,8 @@ struct Index {
         `${this.gridSpacing}${this.snapGuidesOn ? 1 : 0}${this.snapGridOn ? 1 : 0}` +
         `${this.screenMode}${this.guidesMirror.visible ? 1 : 0}${this.guidesMirror.locked ? 1 : 0}` +
         `${this.historyVisible ? 1 : 0}${this.histogramVisible ? 1 : 0}${this.infoVisible ? 1 : 0}` +
-        `${this.historyCurrent}${this.historyLabels.length}`)
+        `${this.historyCurrent}${this.historyLabels.length}` +
+        `${this.hasRawDevelop ? 1 : 0}`)  // M15e：RAW 显影菜单项使能随会话 RAW 翻转
     }
     .width('100%')
     .height(36)
@@ -4498,6 +4558,63 @@ struct Index {
                 .backgroundColor($r('app.color.accent'))
                 .fontColor($r('app.color.on_accent'))
                 .onClick((): void => this.commitFilterDialog())
+            }.justifyContent(FlexAlign.End).width('100%')
+          }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
+            .border({ width: 1, color: $r('app.color.border') }).width(400)
+        }.width('100%').height('100%')
+      }
+      // M15e RAW 显影参数面板（会话内有 RAW 缓存才可开；确定=异步重显影+一步事务）
+      if (this.showDevelop) {
+        Stack() {
+          Column().width('100%').height('100%').backgroundColor('#66000000')
+            .onClick((): void => { this.cancelDevelop(); })
+          Column({ space: 14 }) {
+            Text('RAW 显影参数').fontSize(16).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+            Text('恒从原始 RAW 重显影（会话内非破坏）；确定 = 一步撤销事务')
+              .fontSize(11).fontColor($r('app.color.text_secondary'))
+            Row({ space: 10 }) {
+              Text('色温').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+              Slider({ value: this.devTemp, min: -100, max: 100, step: 1 })
+                .layoutWeight(1)
+                .onChange((v: number): void => { this.devTemp = v; })
+              Text(`${Math.round(this.devTemp)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                .fontColor($r('app.color.text_primary'))
+            }
+            Row({ space: 10 }) {
+              Text('色调').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+              Slider({ value: this.devTint, min: -100, max: 100, step: 1 })
+                .layoutWeight(1)
+                .onChange((v: number): void => { this.devTint = v; })
+              Text(`${Math.round(this.devTint)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                .fontColor($r('app.color.text_primary'))
+            }
+            Row({ space: 10 }) {
+              Text('曝光').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+              Slider({ value: this.devEv, min: -2, max: 2, step: 0.05 })
+                .layoutWeight(1)
+                .onChange((v: number): void => { this.devEv = v; })
+              Text(`${this.devEv.toFixed(2)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                .fontColor($r('app.color.text_primary'))
+            }
+            Row({ space: 10 }) {
+              Text('伽马').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+              Slider({ value: this.devGamma, min: 0.5, max: 2, step: 0.05 })
+                .layoutWeight(1)
+                .onChange((v: number): void => { this.devGamma = v; })
+              Text(`${this.devGamma.toFixed(2)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                .fontColor($r('app.color.text_primary'))
+            }
+            Row({ space: 12 }) {
+              Button('取消').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.surface'))
+                .fontColor($r('app.color.text_primary'))
+                .border({ width: 1, color: $r('app.color.border') })
+                .onClick((): void => this.cancelDevelop())
+              Button('确定').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.accent'))
+                .fontColor($r('app.color.on_accent'))
+                .onClick((): void => this.commitDevelop())
             }.justifyContent(FlexAlign.End).width('100%')
           }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
             .border({ width: 1, color: $r('app.color.border') }).width(400)

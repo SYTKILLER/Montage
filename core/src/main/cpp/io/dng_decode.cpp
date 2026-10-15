@@ -297,8 +297,14 @@ bool looksLikeDng(const std::vector<uint8_t>& bytes) {
 }
 
 bool developDngToGrid(const std::vector<uint8_t>& bytes,
+                      const DevelopParams& params,
                       std::shared_ptr<const TileGrid>& out, uint32_t& outW, uint32_t& outH,
                       std::string& err) {
+    // M15e：参数 defensively 钳制（桥接侧已钳，核内再钳一遍——显影核不信任入参）
+    const float temp = std::min(100.0f, std::max(-100.0f, params.temp));
+    const float tint = std::min(100.0f, std::max(-100.0f, params.tint));
+    const float ev = std::min(2.0f, std::max(-2.0f, params.ev));
+    const float gamma = std::min(2.0f, std::max(0.5f, params.gamma));
     TiffReader r;
     if (!r.open(bytes, err) || !r.collectIfds(err)) {
         return false;
@@ -405,6 +411,11 @@ bool developDngToGrid(const std::vector<uint8_t>& bytes,
             gain[2] *= s;
         }
     }
+    // M15e 用户显影参数：色温/色调在 AsShotNeutral 之上调制通道增益（±100 → ±30%）
+    gain[0] *= 1.0f + temp * 0.003f;   // 暖（temp>0）抬 R
+    gain[2] *= 1.0f - temp * 0.003f;   // 暖压 B
+    gain[1] *= 1.0f - tint * 0.003f;   // 品红（tint>0）压 G
+    const float evGain = std::pow(2.0f, ev);
     // 条带（tiled 不支持）
     auto stripOff = raw->tags.find(273);
     auto stripLen = raw->tags.find(279);
@@ -469,8 +480,14 @@ bool developDngToGrid(const std::vector<uint8_t>& bytes,
                     const size_t idx = static_cast<size_t>(y0 + rr) * w + (x0 + x);
                     uint8_t* px = row + static_cast<size_t>(x) * 4;
                     for (int ch = 0; ch < 3; ++ch) {
-                        const float v = std::min(4.0f, planes[ch][idx] / 65535.0f * gain[ch]);
-                        px[ch] = static_cast<uint8_t>(std::lround(srgbEncode(v) * 255.0f));
+                        const float v =
+                            std::min(4.0f, planes[ch][idx] / 65535.0f * gain[ch] * evGain);
+                        float enc = srgbEncode(v);
+                        if (gamma != 1.0f) {
+                            // 用户伽马作用在 sRGB 编码值上（端点保持 0/1，γ>1 提亮中间调）
+                            enc = std::pow(std::min(1.0f, std::max(0.0f, enc)), 1.0f / gamma);
+                        }
+                        px[ch] = static_cast<uint8_t>(std::lround(enc * 255.0f));
                     }
                     px[3] = 255;
                 }
@@ -481,10 +498,14 @@ bool developDngToGrid(const std::vector<uint8_t>& bytes,
     outW = w;
     outH = h;
     OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag,
-                 "developed %ux%u bps=%llu black=%.0f white=%.0f wb=(%.2f,%.2f,%.2f)", w, h,
+                 "developed %{public}u x %{public}u bps=%llu black=%.0f white=%.0f "
+                 "wb=(%.2f,%.2f,%.2f) user=(t=%{public}d ti=%{public}d ev=%{public}d g=%{public}d)",
+                 w, h,
                  static_cast<unsigned long long>(bps), black, white,
                  static_cast<double>(gain[0]), static_cast<double>(gain[1]),
-                 static_cast<double>(gain[2]));
+                 static_cast<double>(gain[2]), static_cast<int>(std::lround(temp)),
+                 static_cast<int>(std::lround(tint)), static_cast<int>(std::lround(ev * 100.0f)),
+                 static_cast<int>(std::lround(gamma * 100.0f)));
     return true;
 }
 

@@ -98,6 +98,8 @@ napi_value GetLayerThumbnail(napi_env env, napi_callback_info info);
 napi_value CreateSurface(napi_env env, napi_callback_info info);
 napi_value DestroySurface(napi_env env, napi_callback_info info);
 napi_value NotifySurfaceChanged(napi_env env, napi_callback_info info);  // M16a：尺寸变化唤醒
+// M15e RAW 显影参数面板
+napi_value DevelopRaw(napi_env env, napi_callback_info info);
 // 状态
 napi_value GetStats(napi_env env, napi_callback_info info);
 // 事件面：docVersion / importProgress
