@@ -20,6 +20,10 @@
         "startWindowIcon": "$media:startIcon",
         "startWindowBackground": "$color:start_window_background",
         "exported": true,
+        // M16a 自由窗口最小尺寸（单位 vp，官方 module.json5 标签核验；缺省=平台最小）：
+        // PS 级桌面布局（工具箱+选项条+面板坞）的下限，真机自由窗口缩窗行为 M16 三件套验收
+        "minWindowWidth": 640,
+        "minWindowHeight": 480,
         "skills": [
           {
             "entities": [

@@ -70,6 +70,11 @@ void RenderLoop::stop() {
     }
     stop_.store(true);
     stopCv_.notify_all();
+    {
+        // M16a：回调线程可能正挂起在 paceCv（锁序 lifecycleMtx_→paceMtx_，无反向）
+        std::lock_guard<std::mutex> paceLk(paceMtx_);
+        paceCv_.notify_all();
+    }
     lk.unlock();
     if (thread_.joinable()) {
         thread_.join();
@@ -87,13 +92,21 @@ RenderLoop::Snapshot RenderLoop::snapshot() const {
     s.height = height_;
     s.lastError = lastError_;
     s.callbackThread = callbackThread_;
+    s.fullFrames = statFullFrames_;
+    s.overlayFrames = statOverlayFrames_;
+    s.paceTier = paceTier_.load();
+    s.idleParks = idleParks_.load();
+    s.callbacks = callbacksTotal_.load();
     return s;
 }
 
 void RenderLoop::wake() {
-    // M1 实证：跨线程 OH_NativeVSync_RequestFrame 注册会静默丢失（回调不触发，framePending
-    // 卡死吞掉后续请求）。帧循环改为回调线程内自续帧（03 §2 的"空闲停请求"降级为"空闲跳绘"，
-    // LTPO 停帧留真机阶段经 SurfaceHolder 生命周期/降频实现），wake 因此退化为空操作。
+    // M16a governor 唤醒入口（03 §2"空闲停请求"转正，取代 M1 降级"空闲跳绘"）：
+    // 回调线程在 paceCv 上挂起（parkBeforeFrame），needsRender 已由 requestRender 先行置位；
+    // 此处持 paceMtx_ 通知——与挂起方的"持锁评估谓词"配对，堵「谓词评估与通知交错」丢唤醒竞态。
+    // 不在此处直接 RequestFrame：M1 实证跨线程注册静默丢失，请求一律由回调线程自己做。
+    std::lock_guard<std::mutex> lk(paceMtx_);
+    paceCv_.notify_all();
 }
 
 void RenderLoop::requestFrameLocked() {
@@ -245,13 +258,15 @@ bool RenderLoop::ensureCurrent() {
 }
 
 void RenderLoop::doFrame() {
+    callbacksTotal_.fetch_add(1);  // M16 仪表：vsync 回调次数 = CPU 唤醒次数（功耗量化直接代理）
     framePending_.store(false);
     if (stop_.load()) {
         releaseGl();
         return;
     }
     if (!ensureCurrent()) {
-        return;  // 下次命令 wake 重试
+        parkAndSchedule();  // 下次命令 wake 重试（挂起等待，不再死循环空转）
+        return;
     }
     auto& e = Engine::get();
 
@@ -273,10 +288,10 @@ void RenderLoop::doFrame() {
         }
     }
 
-    // 03 §2（M1 降级实现）：无脏跳过绘制与 swap；帧循环由回调线程自续（跨线程请求实证不可靠）。
-    // 空闲成本 = vsync 空回调，省电的"停请求"待真机阶段实现。
-    // M15d 蚂蚁线节拍治理（清偿 M7b"选区=常脏"）：选区静置时全帧合成趟归零，
-    // 仅每 ~100ms 以 overlayOnly 回显上次合成结果并推进 dash 相位（LTPO 真机量化留 M16）。
+    // 03 §2 帧调度（M16a governor 转正）：交互链=needsRender 驱动 60fps 自续；
+    // 蚂蚁档=选区静置时挂起至下一 ~100ms tick 再请求（等效 10Hz overlayOnly，M15d 语义）；
+    // 全闲档=无限挂起、零 vsync 回调，requestRender 经 paceCv 唤醒（见 parkAndSchedule）。
+    // 旧实现的"每 vsync 空回调跳绘"与 M15d 的 60Hz 回调 10Hz 绘制均由此消除。
     bool dirty = e.needsRender.exchange(false);
     bool overlayOnly = false;
     if (!dirty) {
@@ -291,7 +306,7 @@ void RenderLoop::doFrame() {
         }
     }
     if (!dirty && !overlayOnly) {
-        selfContinueFrame();  // P2-5：持 vsyncMtx_（与 threadMain 的 Destroy 互斥）
+        parkAndSchedule();  // M16a：无工作——挂起（蚂蚁 tick / 命令唤醒），不再 60Hz 空转
         return;
     }
 
@@ -391,7 +406,7 @@ void RenderLoop::doFrame() {
             fpsWindowFrames_ = 0;
             fpsWindowStart_ = now;
             static std::atomic<int> idleLog{0};
-            if (idleLog.fetch_add(1) < 5) {
+            if (idleLog.fetch_add(1) < 60) {  // M16a：放宽到 60 窗（2s/窗），覆盖整段验证会话
                 OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag,
                              "idle cadence: full=%{public}d overlay=%{public}d (2s window)\n",
                              statFullFrames_, statOverlayFrames_);
@@ -400,7 +415,79 @@ void RenderLoop::doFrame() {
             statOverlayFrames_ = 0;
         }
     }
-    selfContinueFrame();  // 回调线程内自续（P2-5：持 vsyncMtx_ + stop 检查）
+    parkAndSchedule();  // 绘制趟也走 governor：交互中 needsRender 连续置位即 60fps 链，闲则挂起
+}
+
+// M16a 空闲停帧 governor——doFrame 全部尾部路径的统一出口，三分调度：
+//  1) needsRender 已置（绘制期间又来命令/笔画）→ 立即自续（Active 档，60fps 链）；
+//  2) 无脏但有选区 → 回调线程挂起至下一蚂蚁 tick（AntsPark 档，~10Hz，M15d 语义不变）；
+//  3) 全闲 → 无限挂起（IdlePark 档，零 vsync 回调），requestRender→wake() 唤醒。
+// 挂起发生在回调线程内部：不引入跨线程 RequestFrame（M1 实证注册静默丢失），且挂起本身
+// 就是"停请求"——Idle 档下 NativeVSync 服务不再派发回调，功耗收益真机量化（M16 三件套）。
+void RenderLoop::parkAndSchedule() {
+    auto& e = Engine::get();
+    if (e.needsRender.load()) {
+        setPaceTier(PaceTier::Active);
+        selfContinueFrame();  // P2-5：持 vsyncMtx_（与 threadMain 的 Destroy 互斥）
+        return;
+    }
+    bool selectionLive = false;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        selectionLive = e.doc.selection != nullptr;
+    }
+    idleParks_.fetch_add(1);
+    if (selectionLive) {
+        setPaceTier(PaceTier::AntsPark);
+    } else {
+        setPaceTier(PaceTier::IdlePark);
+    }
+    if (parkBeforeFrame(selectionLive)) {
+        releaseGl();  // stop_：与 doFrame 入口 stop 分支同款收尾（threadMain 兜底等待依赖此标志）
+        return;
+    }
+    selfContinueFrame();
+}
+
+// 回调线程内挂起；antsPending=true 时至多睡到下一 ~100ms 蚂蚁 tick（对齐 doFrame 门拍），
+// 醒来谓词仍假 = tick 到点。返回 true = stop_ 置位（勿再触碰 vsync）。
+bool RenderLoop::parkBeforeFrame(bool antsPending) {
+    std::unique_lock<std::mutex> lk(paceMtx_);
+    const auto pred = [this] { return stop_.load() || Engine::get().needsRender.load(); };
+    if (antsPending) {
+        auto deadline = std::chrono::steady_clock::now();
+        if (antsTickValid_) {
+            deadline = lastAntsTick_ + std::chrono::milliseconds(100);
+            const auto now = std::chrono::steady_clock::now();
+            if (deadline < now) {
+                deadline = now;
+            }
+        }
+        paceCv_.wait_until(lk, deadline, pred);
+    } else {
+        paceCv_.wait(lk, pred);
+    }
+    return stop_.load();
+}
+
+void RenderLoop::setPaceTier(PaceTier t) {
+    const int prev = paceTier_.exchange(static_cast<int>(t));
+    if (prev == static_cast<int>(t)) {
+        return;
+    }
+    static const char* kNames[] = {"active60", "ants10", "idle0"};
+    // 档位迁移日志（M16 三件套验证依据）：500ms 限频，防交互抖动刷屏；
+    // 附累计 frames/callbacks——回调数远小于帧间 vsync 数即停帧生效的差分证据
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    auto last = paceLogMs_.load();
+    if (nowMs - last >= 500 && paceLogMs_.compare_exchange_strong(last, nowMs)) {
+        OH_LOG_Print(kLogType, LOG_INFO, kDomain, kTag, "pace: %{public}s (frames=%{public}llu callbacks=%{public}llu)",
+                     kNames[static_cast<int>(t)],
+                     static_cast<unsigned long long>(framesTotal_),
+                     static_cast<unsigned long long>(callbacksTotal_.load()));
+    }
 }
 
 // P2-5：帧尾自续统一走这里——持 vsyncMtx_ 与 threadMain 停止路径的

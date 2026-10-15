@@ -692,6 +692,13 @@ napi_value DestroySurface(napi_env env, napi_callback_info /*info*/) {
     return makeOk(env, nullptr);
 }
 
+// M16a：surface 尺寸变化唤醒（XComponent.onSurfaceChanged → 此处）。空闲停帧后 resize 的
+// 消费入口——旧 60Hz 常转循环由 doFrame 的 buffer geometry 检查顺带吸收，governor 下须显式唤醒。
+napi_value NotifySurfaceChanged(napi_env env, napi_callback_info /*info*/) {
+    Engine::get().requestRender();
+    return makeOk(env, nullptr);
+}
+
 // ---------- 状态 ----------
 
 napi_value GetStats(napi_env env, napi_callback_info /*info*/) {
@@ -738,6 +745,14 @@ napi_value GetStats(napi_env env, napi_callback_info /*info*/) {
     napi_set_named_property(env, data, "quickMask", makeBool(env, quickMask));
     napi_set_named_property(env, data, "historyVersion",
                             makeDouble(env, static_cast<double>(e.historyVersion.load())));
+    // M16a 真机基线仪表：帧调度档位 + 2s 统计窗累计（间隔采样做差即档位帧率）
+    napi_set_named_property(env, data, "paceTier", makeInt32(env, snap.paceTier));
+    napi_set_named_property(env, data, "fullFrames", makeInt32(env, snap.fullFrames));
+    napi_set_named_property(env, data, "overlayFrames", makeInt32(env, snap.overlayFrames));
+    napi_set_named_property(env, data, "idleParks",
+                            makeDouble(env, static_cast<double>(snap.idleParks)));
+    napi_set_named_property(env, data, "renderCallbacks",
+                            makeDouble(env, static_cast<double>(snap.callbacks)));
     return makeOk(env, data);
 }
 

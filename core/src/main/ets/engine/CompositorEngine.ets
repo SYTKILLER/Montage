@@ -92,6 +92,11 @@ function narrowStats(r: Record<string, Object>): EngineStats {
     canRedo: boolOf(r, 'canRedo'),
     quickMask: boolOf(r, 'quickMask'),
     historyVersion: num(r, 'historyVersion'),
+    paceTier: num(r, 'paceTier'),
+    fullFrames: num(r, 'fullFrames'),
+    overlayFrames: num(r, 'overlayFrames'),
+    idleParks: num(r, 'idleParks'),
+    renderCallbacks: num(r, 'renderCallbacks'),
   };
 }
 
@@ -1407,6 +1412,12 @@ export class CompositorEngine {
     return r.ok;
   }
 
+  /** M16a：surface 尺寸变化唤醒（空闲停帧后 resize 的消费入口；几何由 doFrame 兜底检查）。 */
+  notifySurfaceChanged(): boolean {
+    const r = narrowResult(native.notifySurfaceChanged() as Object);
+    return r.ok;
+  }
+
   getStats(): EngineStats {
     const r = narrowResult(native.getStats() as Object);
     if (!r.ok || r.data === null) {
@@ -1417,7 +1428,8 @@ export class CompositorEngine {
         docWidth: 0, docHeight: 0, zoom: 1, panX: 0, panY: 0,
         importRunning: false, importProgress: 0, renderRunning: false,
         lastError: 'getStats failed', canUndo: false, canRedo: false, quickMask: false,
-        historyVersion: 0,
+        historyVersion: 0, paceTier: 0, fullFrames: 0, overlayFrames: 0, idleParks: 0,
+        renderCallbacks: 0,
       };
     }
     return narrowStats(r.data);

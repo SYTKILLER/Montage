@@ -116,10 +116,13 @@ bool importCancelled() {
 }
 
 // 解出一个带并切瓦片写入 builder；失败时 err 带原因。
-// actualH 返回解码实际高度——PNG 等格式 desiredRegion 可能不生效（回退整图，M1 实证），
+// actualH 返回解码实际高度——PNG/JPEG 等格式 desiredRegion 可能不生效（回退整图，M1/M16a 实证），
 // 调用方据此跳过后续带，避免重复整图解码。
+// forceSwapRB：mimeType 驱动的换序覆盖（M16a 实证 JPEG 请求 BGRA 如实输出 BGRA——报告=请求=实际，
+// M1 的「报 3 才换」启发式在此漏换致红蓝对调；引擎瓦片约定 RGBA 字节序，BGRA 实出必须换）。
 bool decodeBand(OH_ImageSourceNative* source, uint32_t imgW, uint32_t imgY, uint32_t imgH,
-                TileGridBuilder& builder, uint32_t* actualH, std::string& err) {
+                TileGridBuilder& builder, uint32_t* actualH, std::string& err,
+                bool forceSwapRB = false) {
     OH_DecodingOptions* opts = nullptr;
     if (OH_DecodingOptions_Create(&opts) != IMAGE_SUCCESS || opts == nullptr) {
         err = "DecodingOptions create failed";
@@ -169,9 +172,10 @@ bool decodeBand(OH_ImageSourceNative* source, uint32_t imgW, uint32_t imgY, uint
         rowStride = bandW * 4u;
     }
     *actualH = bandH;
-    // M1 两轮实证：此解码路径的 fmt 报告与实际输出相反（报 RGBA 实出 BGRA，反之亦然）；
-    // 请求 BGRA(4) → 实出 RGBA → 不换；报 3 → 实出 BGRA → 换 R/B。JPEG 待复验。
-    const bool swapRB = (pixelFormat == 3);
+    // M1 两轮实证（PNG，现为自研解码器前的旧径）：此解码路径的 fmt 报告与实际输出相反；
+    // M16a JPEG 校准：JPEG 报告诚实（请求 BGRA=报告=实际输出 BGRA），按 M1 规则漏换致红蓝对调，
+    // 故 mimeType=image/jpeg 由调用方传 forceSwapRB=true；其余格式维持 fmt 启发式（待逐一校准）。
+    const bool swapRB = forceSwapRB || (pixelFormat == 3);
     // M4b 实证（.montage 保存对拍）：解码带为预乘 alpha（引擎约定直 alpha，对齐 PSD 路径
     // unpremultiply），DecodingOptions 无 alphaType 请求项（SDK 核验），只能检测后手动还原
     int32_t alphaType = 0;
@@ -435,8 +439,15 @@ ImportCompletion* runImport(int fd) {
             const uint32_t h = std::min(bandH, imgH - y0);
             std::string err;
             uint32_t actualH = 0;
-            if (!decodeBand(source.get(), imgW, y0, h, builder, &actualH, err)) {
+            if (!decodeBand(source.get(), imgW, y0, h, builder, &actualH, err,
+                            mimeType == "image/jpeg")) {
                 return makePayload(false, imgW, imgH, layerId, err);
+            }
+            // M16a：region 生效性逐带留痕（JPEG 行为 M16 校准项；真机复跑同通道对读）
+            if (band < 3) {
+                OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag,
+                             "band %{public}u/%{public}u: req y=%{public}u h=%{public}u -> actual h=%{public}u region=%{public}s",
+                             band + 1, bands, y0, h, actualH, actualH == h ? "honored" : "fallback");
             }
             if (band == 0 && actualH >= imgH) {
                 // region 解码不生效（整图回退，M1 实证 PNG 如此）：瓦片已全部就位，发布后结束

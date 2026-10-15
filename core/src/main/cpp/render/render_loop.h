@@ -24,6 +24,9 @@ namespace montage {
 // wake() 唤醒。
 class RenderLoop {
 public:
+    // M16a 帧调度档位（getStats 仪表）：0=交互链(~60fps) 1=蚂蚁档(~10Hz) 2=全闲档(零回调)
+    enum class PaceTier : int { Active = 0, AntsPark = 1, IdlePark = 2 };
+
     struct Snapshot {
         bool running = false;
         uint64_t frames = 0;
@@ -32,6 +35,11 @@ public:
         int32_t height = 0;
         std::string lastError;
         std::string callbackThread;
+        int fullFrames = 0;      // 当前 2s 统计窗累计（M16 真机基线仪表）
+        int overlayFrames = 0;
+        int paceTier = 0;
+        uint64_t idleParks = 0;  // 累计挂起次数（唤醒/蚂蚁 tick 各计一次）
+        uint64_t callbacks = 0;  // M16 累计 vsync 回调数（CPU 唤醒次数，功耗量化代理）
     };
 
     RenderLoop() = default;
@@ -55,6 +63,11 @@ private:
     void failInit(const std::string& reason);
     void requestFrameLocked();
     void selfContinueFrame();  // P2-5：doFrame 尾部自续（持 vsyncMtx_ + stop 复查）
+    // M16a 空闲停帧 governor：doFrame 尾部统一出口（自续/挂起/停 三分）
+    void parkAndSchedule();
+    // 回调线程内挂起至下一工作信号；返回 true = stop_（调用方 releaseGl 后退出）
+    bool parkBeforeFrame(bool antsPending);
+    void setPaceTier(PaceTier t);
 
     std::thread thread_;
     std::mutex lifecycleMtx_;
@@ -86,6 +99,15 @@ private:
 
     std::mutex vsyncMtx_;
     std::atomic<bool> framePending_{false};
+
+    // M16a 空闲停帧 governor（03 §2"空闲停请求"转正）：挂起发生在 vsync 回调线程内部，
+    // 唤醒经 requestRender→wake()（paceCv），不引入跨线程 RequestFrame（M1 实证静默丢失）。
+    std::mutex paceMtx_;
+    std::condition_variable paceCv_;
+    std::atomic<int> paceTier_{0};
+    std::atomic<uint64_t> idleParks_{0};
+    std::atomic<uint64_t> callbacksTotal_{0};
+    std::atomic<long> paceLogMs_{0};  // 档位迁移日志限频
     TileRenderer renderer_;
 
     EGLDisplay display_ = EGL_NO_DISPLAY;

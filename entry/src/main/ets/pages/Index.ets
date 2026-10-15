@@ -28,6 +28,28 @@ import { InfoPanel } from '../editor/components/InfoPanel';
 const TAG: string = 'Montage.Shell';
 const DOMAIN: number = 0x4D30;
 
+// M16a JPEG 分带校准采样点（debugJpegCalibration 用；期望色为生成图案的段色）
+interface JpegCalibCheck {
+  x: number;
+  y: number;
+  label: string;
+  r: number;
+  g: number;
+  b: number;
+}
+
+// M16a：surface 尺寸变化回调（XComponentController 子类覆写，API 12 起）。旧 60Hz 常转
+// 循环由帧内 geometry 检查顺带吸收 resize，空闲停帧 governor 下必须显式唤醒渲染。
+class CanvasSurfaceController extends XComponentController {
+  onChanged: ((rect: SurfaceRect) => void) | null = null;
+
+  onSurfaceChanged(surfaceId: string, rect: SurfaceRect): void {
+    if (this.onChanged !== null) {
+      this.onChanged(rect);
+    }
+  }
+}
+
 // KeyCode（@ohos.multimodalInput.keyCode 已核验，2026-10-07）
 const KC_B: number = 2018;
 const KC_A: number = 2017;
@@ -265,7 +287,7 @@ struct Index {
   @State thumbVersion: number = 0;
 
   private engine: CompositorEngine = new CompositorEngine();
-  private xcController: XComponentController = new XComponentController();
+  private xcController: CanvasSurfaceController = new CanvasSurfaceController();
   private prefs: AppPrefs = new AppPrefs();
   private statsTimer: number = -1;
   private saveUri: string = '';
@@ -1566,6 +1588,10 @@ struct Index {
     try {
       const id: string = this.xcController.getXComponentSurfaceId();
       this.log(`surfaceId=${id}`);
+      this.xcController.onChanged = (_rect: SurfaceRect): void => {
+        // M16a：空闲停帧后窗口 resize 的唯一消费入口
+        this.engine.notifySurfaceChanged();
+      };
       const ok: boolean = this.engine.createSurface(id);
       this.log(`创建渲染表面: ${ok ? '成功' : '失败'}`);
     } catch (e) {
@@ -1597,6 +1623,17 @@ struct Index {
     this.fittedOnce = false;
     this.maskTarget = false;
     this.quickMaskActive = false;
+    // M16a：换文档（新建/打开工程/PSD/图片导入共用此口）关滤镜对话框并作废在途防抖——
+    // 引擎 filterPreview 已由 resetDocument 清（审查修复批一），UI 侧对话框/定时器在此收口，
+    // 否则旧参数预览会打到新文档活动层
+    if (this.showFilter) {
+      this.showFilter = false;
+      this.filterDef = null;
+    }
+    if (this.filterDebounce >= 0) {
+      clearTimeout(this.filterDebounce);
+      this.filterDebounce = -1;
+    }
     this.engine.setBrushTarget(false);
     this.refreshChannelCount();
     this.refreshLayers();
@@ -1628,6 +1665,92 @@ struct Index {
     this.thumbCache.clear();
     this.log(`关闭文档: ${ok ? '成功' : '失败'}`);
     this.updateTitle();
+  }
+
+  // ---------- M16a：JPEG 分带/swapRB 校准通道 ----------
+  // 程序生成已知图案 JPEG（1024×4608 = 引擎分带 2048/2048/512；上 1/3 红、中 1/3 绿、下 1/3 蓝），
+  // 走 openFileFromFd 系统分带解码路径，采样 7 点：三段段色（swapRB 符号：R/B 互换会红蓝对调）
+  // + 两处跨带缝合行（2047/2048、4095/4096 同色跨带，断带必露邻段色）。分带是否真实生效
+  // 看 hilog [Montage.Import] band 行（req vs actual）。模拟器自证 + 真机复跑同通道。
+  private async debugJpegCalibration(): Promise<void> {
+    const W: number = 1024;
+    const H: number = 4608;
+    try {
+      const buf: ArrayBuffer = new ArrayBuffer(W * H * 4);
+      const px: Uint8Array = new Uint8Array(buf);
+      for (let y = 0; y < H; y++) {
+        let r = 255;
+        let g = 0;
+        let b = 0;
+        if (y >= 3072) {
+          r = 0;
+          g = 0;
+          b = 255;
+        } else if (y >= 1536) {
+          r = 0;
+          g = 255;
+          b = 0;
+        }
+        const rowStart = y * W * 4;
+        for (let x = 0; x < W; x++) {
+          const o = rowStart + x * 4;
+          px[o] = r;
+          px[o + 1] = g;
+          px[o + 2] = b;
+          px[o + 3] = 255;
+        }
+      }
+      const pm = image.createPixelMapSync(buf, {
+        size: { width: W, height: H },
+        srcPixelFormat: image.PixelMapFormat.RGBA_8888,
+      });
+      const path = getContext(this).cacheDir + '/band_test.jpg';
+      const fw = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      const packer = image.createImagePacker();
+      await packer.packToFile(pm, fw.fd, { format: 'image/jpeg', quality: 100 });
+      fs.closeSync(fw);
+      pm.release();
+      packer.release();
+      this.log(`校准 JPEG 已生成: ${path}`);
+      this.doCloseDocument();  // 清场：无文档 → 导入建档（层落 0,0，文档坐标=图像坐标）
+      const fd = fs.openSync(path, fs.OpenMode.READ_ONLY);
+      const dd = await this.engine.openFileFromFd(fd.fd);
+      this.docW = dd.width;
+      this.docH = dd.height;
+      this.docOpen = true;
+      this.afterDocChanged();
+      this.log(`JPEG 导入: ${dd.width}x${dd.height}（预期 ${W}x${H}）`);
+      const pts: JpegCalibCheck[] = [
+        { x: 512, y: 800, label: '上段红', r: 255, g: 0, b: 0 },
+        { x: 512, y: 2047, label: '带0缝合行', r: 0, g: 255, b: 0 },
+        { x: 512, y: 2048, label: '带1首行', r: 0, g: 255, b: 0 },
+        { x: 512, y: 2300, label: '中段绿', r: 0, g: 255, b: 0 },
+        { x: 512, y: 4095, label: '带1缝合行', r: 0, g: 0, b: 255 },
+        { x: 512, y: 4096, label: '带2首行', r: 0, g: 0, b: 255 },
+        { x: 512, y: 4300, label: '下段蓝', r: 0, g: 0, b: 255 },
+      ];
+      let pass = 0;
+      for (const c of pts) {
+        const s = await this.engine.samplePixel(c.x, c.y);
+        const ok = s.ok && Math.abs(s.red - c.r) <= 16 && Math.abs(s.green - c.g) <= 16 &&
+          Math.abs(s.blue - c.b) <= 16 && s.alpha === 255;
+        if (ok) {
+          pass++;
+        }
+        const msg = `校准点 ${c.label}(${c.x},${c.y}): rgb(${s.red},${s.green},${s.blue}) a${s.alpha} ` +
+          `${ok ? '✓' : `期望(${c.r},${c.g},${c.b})`}`;
+        this.log(msg);
+        hilog.info(DOMAIN, TAG, 'jpeg calib: %{public}s', msg);
+      }
+      const verdict = pass === pts.length ? 'PASS' : 'FAIL';
+      this.log(`JPEG 分带校准 ${verdict}（${pass}/${pts.length}）——分带生效性看 [Montage.Import] band 行`);
+      this.toast(`JPEG 校准 ${verdict} ${pass}/${pts.length}`);
+    } catch (e) {
+      const be = e as BusinessError;
+      const msg = `${be.code} ${be.message}`;
+      this.log(`JPEG 校准失败: ${msg}`);
+      hilog.error(DOMAIN, TAG, 'jpeg calib failed: %{public}s', msg);
+    }
   }
 
   private onOpenImage(): void {
@@ -2100,6 +2223,10 @@ struct Index {
         });
         break;
       }
+      case 'file.debugJpeg':
+        // M16a：JPEG 分带/swapRB 校准通道（模拟器自证 + 真机复跑同通道）
+        this.debugJpegCalibration();
+        break;
       case 'edit.undo':
         if (this.engine.undo()) {
           this.log('撤销');
@@ -3017,6 +3144,7 @@ struct Index {
         leafItem('file.saveSandbox', '保存往返包到沙箱', '', d),
         leafItem('file.openSandbox', '打开沙箱往返包', '', d),
         leafItem('file.openSandboxDng', '打开沙箱 DNG（RAW 显影）', '', d),
+        leafItem('file.debugJpeg', 'JPEG 分带校准（M16）', '', true),
       ]),
     ];
     return [

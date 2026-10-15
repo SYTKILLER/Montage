@@ -23,6 +23,11 @@ export interface EngineStats {
   canRedo: boolean;
   quickMask: boolean;  // M10d：快速蒙版模式中（撤销跨 Q 边界后经 1s 轮询/docVersion 刷新镜像）
   historyVersion: number;
+  paceTier: number;      // M16a：帧调度档位 0=交互(~60fps) 1=蚂蚁(~10Hz) 2=全闲(零回调)
+  fullFrames: number;    // 2s 统计窗全帧累计（间隔采样做差=档位帧率，真机基线仪表）
+  overlayFrames: number;
+  idleParks: number;
+  renderCallbacks: number;  // 累计 vsync 回调数（CPU 唤醒次数，真机功耗量化代理）
 }
 
 /** 快速蒙版 toggle 结果（toggleQuickMask 的 data，M10d）。 */
