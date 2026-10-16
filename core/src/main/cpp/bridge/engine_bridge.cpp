@@ -763,6 +763,9 @@ napi_value GetStats(napi_env env, napi_callback_info /*info*/) {
     napi_set_named_property(env, data, "devTint", makeDouble(env, devLast.tint));
     napi_set_named_property(env, data, "devEv", makeDouble(env, devLast.ev));
     napi_set_named_property(env, data, "devGamma", makeDouble(env, devLast.gamma));
+    // M17a：样式剪贴板镜像（粘贴菜单使能；copyLayerStyle 在 docMutex 内写，锁内读）
+    napi_set_named_property(env, data, "hasStyleClipboard",
+                            makeBool(env, e.styleClipboard != nullptr));
     return makeOk(env, data);
 }
 
@@ -827,6 +830,8 @@ napi_value makeLayerDto(napi_env env, const Layer& l, bool isActive) {
     napi_set_named_property(env, obj, "collapsed", makeBool(env, l.collapsed));
     napi_set_named_property(env, obj, "linkId", makeDouble(env, static_cast<double>(l.linkId)));
     napi_set_named_property(env, obj, "hasStyle", makeBool(env, l.style != nullptr));
+    napi_set_named_property(env, obj, "styleOn",
+                            makeBool(env, l.style != nullptr && l.style->enabled));  // M17a
     napi_set_named_property(env, obj, "isFill", makeBool(env, l.fill != nullptr));
     napi_set_named_property(env, obj, "hasMask", makeBool(env, l.mask != nullptr));
     napi_set_named_property(env, obj, "maskEnabled", makeBool(env, l.mask != nullptr && l.mask->enabled));
@@ -5159,6 +5164,240 @@ napi_value ClearLayerStyle(napi_env env, napi_callback_info info) {
                            [](Document&, Layer& l, std::string&) -> bool {
         l.style = nullptr;
         l.styledRender = nullptr;
+        return true;
+    });
+}
+
+// ---------- M17a 图层效果扩展：内阴影/外发光/内发光/渐变叠加 + 样式剪贴板 + 效果开关 ----------
+
+// setInnerShadow(id,enabled,angle,dist,size,opacity,r,g,b)
+napi_value SetInnerShadow(napi_env env, napi_callback_info info) {
+    size_t argc = 9;
+    napi_value argv[9];
+    for (size_t i = 0; i < 9; ++i) {
+        argv[i] = nullptr;
+    }
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double v[9] = {0};
+    if (argc < 9) {
+        return makeError(env, kErrBadParam,
+                         "setInnerShadow(id,enabled,angle,dist,size,opacity,r,g,b) requires 9");
+    }
+    for (size_t i = 0; i < 9; ++i) {
+        if (napi_get_value_double(env, argv[i], &v[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "setInnerShadow: invalid args");
+        }
+    }
+    const LayerId id = static_cast<LayerId>(v[0]);
+    return runStyleCommand(env, "inner shadow", id,
+                           [v](Document&, Layer& l, std::string&) -> bool {
+        if (l.style == nullptr) {
+            l.style = std::make_shared<LayerStyle>();
+        } else {
+            l.style = std::make_shared<LayerStyle>(*l.style);
+        }
+        l.style->innerShadow = v[1] != 0;
+        l.style->isAngleDeg = v[2];
+        l.style->isDistance = std::max(0.0, v[3]);
+        l.style->isSize = std::max(0.0, v[4]);
+        l.style->isOpacity = std::clamp(v[5], 0.0, 1.0);
+        l.style->isColor[0] = static_cast<float>(v[6] / 255.0);
+        l.style->isColor[1] = static_cast<float>(v[7] / 255.0);
+        l.style->isColor[2] = static_cast<float>(v[8] / 255.0);
+        l.style->isColor[3] = 1.0f;
+        return true;
+    });
+}
+
+// setOuterGlow(id,enabled,size,opacity,r,g,b)
+napi_value SetOuterGlow(napi_env env, napi_callback_info info) {
+    size_t argc = 7;
+    napi_value argv[7];
+    for (size_t i = 0; i < 7; ++i) {
+        argv[i] = nullptr;
+    }
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double v[7] = {0};
+    if (argc < 7) {
+        return makeError(env, kErrBadParam, "setOuterGlow(id,enabled,size,opacity,r,g,b) requires 7");
+    }
+    for (size_t i = 0; i < 7; ++i) {
+        if (napi_get_value_double(env, argv[i], &v[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "setOuterGlow: invalid args");
+        }
+    }
+    const LayerId id = static_cast<LayerId>(v[0]);
+    return runStyleCommand(env, "outer glow", id,
+                           [v](Document&, Layer& l, std::string&) -> bool {
+        if (l.style == nullptr) {
+            l.style = std::make_shared<LayerStyle>();
+        } else {
+            l.style = std::make_shared<LayerStyle>(*l.style);
+        }
+        l.style->outerGlow = v[1] != 0;
+        l.style->ogSize = std::max(0.0, v[2]);
+        l.style->ogOpacity = std::clamp(v[3], 0.0, 1.0);
+        l.style->ogColor[0] = static_cast<float>(v[4] / 255.0);
+        l.style->ogColor[1] = static_cast<float>(v[5] / 255.0);
+        l.style->ogColor[2] = static_cast<float>(v[6] / 255.0);
+        l.style->ogColor[3] = 1.0f;
+        return true;
+    });
+}
+
+// setInnerGlow(id,enabled,size,opacity,r,g,b)
+napi_value SetInnerGlow(napi_env env, napi_callback_info info) {
+    size_t argc = 7;
+    napi_value argv[7];
+    for (size_t i = 0; i < 7; ++i) {
+        argv[i] = nullptr;
+    }
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double v[7] = {0};
+    if (argc < 7) {
+        return makeError(env, kErrBadParam, "setInnerGlow(id,enabled,size,opacity,r,g,b) requires 7");
+    }
+    for (size_t i = 0; i < 7; ++i) {
+        if (napi_get_value_double(env, argv[i], &v[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "setInnerGlow: invalid args");
+        }
+    }
+    const LayerId id = static_cast<LayerId>(v[0]);
+    return runStyleCommand(env, "inner glow", id,
+                           [v](Document&, Layer& l, std::string&) -> bool {
+        if (l.style == nullptr) {
+            l.style = std::make_shared<LayerStyle>();
+        } else {
+            l.style = std::make_shared<LayerStyle>(*l.style);
+        }
+        l.style->innerGlow = v[1] != 0;
+        l.style->igSize = std::max(0.0, v[2]);
+        l.style->igOpacity = std::clamp(v[3], 0.0, 1.0);
+        l.style->igColor[0] = static_cast<float>(v[4] / 255.0);
+        l.style->igColor[1] = static_cast<float>(v[5] / 255.0);
+        l.style->igColor[2] = static_cast<float>(v[6] / 255.0);
+        l.style->igColor[3] = 1.0f;
+        return true;
+    });
+}
+
+// setGradientOverlay(id,enabled,angle,opacity,fr,fg,fb,tr,tg,tb)
+napi_value SetGradientOverlay(napi_env env, napi_callback_info info) {
+    size_t argc = 10;
+    napi_value argv[10];
+    for (size_t i = 0; i < 10; ++i) {
+        argv[i] = nullptr;
+    }
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double v[10] = {0};
+    if (argc < 10) {
+        return makeError(env, kErrBadParam,
+                         "setGradientOverlay(id,enabled,angle,opacity,fr,fg,fb,tr,tg,tb) requires 10");
+    }
+    for (size_t i = 0; i < 10; ++i) {
+        if (napi_get_value_double(env, argv[i], &v[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "setGradientOverlay: invalid args");
+        }
+    }
+    const LayerId id = static_cast<LayerId>(v[0]);
+    return runStyleCommand(env, "gradient overlay", id,
+                           [v](Document&, Layer& l, std::string&) -> bool {
+        if (l.style == nullptr) {
+            l.style = std::make_shared<LayerStyle>();
+        } else {
+            l.style = std::make_shared<LayerStyle>(*l.style);
+        }
+        l.style->gradientOverlay = v[1] != 0;
+        l.style->gdAngleDeg = v[2];
+        l.style->gdOpacity = std::clamp(v[3], 0.0, 1.0);
+        l.style->gdFrom[0] = static_cast<float>(v[4] / 255.0);
+        l.style->gdFrom[1] = static_cast<float>(v[5] / 255.0);
+        l.style->gdFrom[2] = static_cast<float>(v[6] / 255.0);
+        l.style->gdFrom[3] = 1.0f;
+        l.style->gdTo[0] = static_cast<float>(v[7] / 255.0);
+        l.style->gdTo[1] = static_cast<float>(v[8] / 255.0);
+        l.style->gdTo[2] = static_cast<float>(v[9] / 255.0);
+        l.style->gdTo[3] = 1.0f;
+        return true;
+    });
+}
+
+// 样式剪贴板（会话态，跨文档保留——M10c ClipBuffer 同语义）
+napi_value CopyLayerStyle(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double id = 0;
+    if (argc >= 1 && napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "copyLayerStyle(id?) invalid");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0) {
+            return makeError(env, kErrNoDoc, "copyLayerStyle: no document");
+        }
+        Layer* l = nullptr;
+        for (Layer& li : e.doc.layers) {
+            if (li.id == (id > 0 ? static_cast<LayerId>(id) : e.doc.activeId)) {
+                l = &li;
+                break;
+            }
+        }
+        if (l == nullptr || l->style == nullptr) {
+            return makeError(env, kErrBadParam, "copyLayerStyle: layer has no style");
+        }
+        e.styleClipboard = std::make_shared<LayerStyle>(*l->style);
+    }
+    return makeOk(env, nullptr);
+}
+
+// pasteLayerStyle(id)：剪贴板深拷贝 COW 替换 + 一步事务
+napi_value PasteLayerStyle(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double id = 0;
+    if (argc >= 1 && napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "pasteLayerStyle(id?) invalid");
+    }
+    auto& e = Engine::get();
+    std::shared_ptr<LayerStyle> snap;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.styleClipboard == nullptr) {
+            return makeError(env, kErrBadParam, "pasteLayerStyle: style clipboard empty");
+        }
+        snap = e.styleClipboard;
+    }
+    return runStyleCommand(env, "paste layer style", static_cast<LayerId>(id),
+                           [&snap](Document&, Layer& l, std::string&) -> bool {
+        l.style = std::make_shared<LayerStyle>(*snap);
+        l.styledRender = nullptr;  // runStyleCommand 内 restyleLayer 重算
+        return true;
+    });
+}
+
+// setLayerEffectsEnabled(id,enabled)：fx 总开关（PS「隐藏全部效果」，COW 翻 enabled）
+napi_value SetLayerEffectsEnabled(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double v[2] = {0, 1};
+    for (size_t i = 0; i < 2; ++i) {
+        if (argc >= i + 1 && napi_get_value_double(env, argv[i], &v[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "setLayerEffectsEnabled: invalid args");
+        }
+    }
+    return runStyleCommand(env, v[1] != 0 ? "show all effects" : "hide all effects",
+                           static_cast<LayerId>(v[0]),
+                           [v](Document&, Layer& l, std::string& err) -> bool {
+        if (l.style == nullptr) {
+            err = "layer has no style";
+            return false;
+        }
+        l.style = std::make_shared<LayerStyle>(*l.style);
+        l.style->enabled = v[1] != 0;
         return true;
     });
 }

@@ -131,6 +131,8 @@ class Engine {
 
     // M10c 内部剪贴板（引擎内存；不随快照/持久化走，关闭文档保留——PS 同语义）
     ClipBuffer clipboard;
+    // M17a 样式剪贴板（copyLayerStyle/pasteLayerStyle；跨文档保留，同 ClipBuffer 语义）
+    std::shared_ptr<LayerStyle> styleClipboard = nullptr;
 
     // M4a 撤销
     History history;

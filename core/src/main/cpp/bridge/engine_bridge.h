@@ -167,6 +167,14 @@ napi_value SetDropShadow(napi_env env, napi_callback_info info);
 napi_value SetLayerStroke(napi_env env, napi_callback_info info);
 napi_value SetColorOverlay(napi_env env, napi_callback_info info);
 napi_value ClearLayerStyle(napi_env env, napi_callback_info info);
+// M17a 图层效果扩展
+napi_value SetInnerShadow(napi_env env, napi_callback_info info);
+napi_value SetOuterGlow(napi_env env, napi_callback_info info);
+napi_value SetInnerGlow(napi_env env, napi_callback_info info);
+napi_value SetGradientOverlay(napi_env env, napi_callback_info info);
+napi_value CopyLayerStyle(napi_env env, napi_callback_info info);
+napi_value PasteLayerStyle(napi_env env, napi_callback_info info);
+napi_value SetLayerEffectsEnabled(napi_env env, napi_callback_info info);
 napi_value AddFillLayer(napi_env env, napi_callback_info info);
 napi_value SetFillLayerParams(napi_env env, napi_callback_info info);
 // M13 滤镜：直接应用（一步事务）/ 预览三件套（begin 建 1/4 proxy 源、set 跑核、

@@ -102,6 +102,7 @@ function narrowStats(r: Record<string, Object>): EngineStats {
     devTint: num(r, 'devTint'),
     devEv: num(r, 'devEv'),
     devGamma: num(r, 'devGamma'),
+    hasStyleClipboard: boolOf(r, 'hasStyleClipboard'),
   };
 }
 
@@ -158,6 +159,7 @@ function narrowLayer(r: Record<string, Object>): LayerDTO {
     collapsed: boolOf(r, 'collapsed'),
     linkId: num(r, 'linkId'),
     hasStyle: boolOf(r, 'hasStyle'),
+    styleOn: boolOf(r, 'styleOn'),
     isFill: boolOf(r, 'isFill'),
     hasMask: boolOf(r, 'hasMask'),
     maskEnabled: boolOf(r, 'maskEnabled'),
@@ -592,6 +594,87 @@ export class CompositorEngine {
     const r2 = narrowResult(native.clearLayerStyle(id) as Object);
     if (!r2.ok) {
       hilog.error(DOMAIN, TAG, 'clearLayerStyle failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  /** M17a：内阴影（角度/距离/大小/不透明度 + rgb）。 */
+  setInnerShadow(id: number, enabled: boolean, angle: number, dist: number, size: number,
+    opacity: number, r: number, g: number, b: number): boolean {
+    const r2 = narrowResult(native.setInnerShadow(id, enabled ? 1 : 0, angle, dist, size,
+      opacity, r, g, b) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'setInnerShadow failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  /** M17a：外发光（大小/不透明度 + rgb，渲染在层下）。 */
+  setOuterGlow(id: number, enabled: boolean, size: number, opacity: number,
+    r: number, g: number, b: number): boolean {
+    const r2 = narrowResult(native.setOuterGlow(id, enabled ? 1 : 0, size, opacity, r, g, b) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'setOuterGlow failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  /** M17a：内发光（大小/不透明度 + rgb，本体内边缘衰减带）。 */
+  setInnerGlow(id: number, enabled: boolean, size: number, opacity: number,
+    r: number, g: number, b: number): boolean {
+    const r2 = narrowResult(native.setInnerGlow(id, enabled ? 1 : 0, size, opacity, r, g, b) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'setInnerGlow failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  /** M17a：渐变叠加（v1 双色线性，层 bbox 对齐）。 */
+  setGradientOverlay(id: number, enabled: boolean, angle: number, opacity: number,
+    fr: number, fg: number, fb: number, tr: number, tg: number, tb: number): boolean {
+    const r2 = narrowResult(native.setGradientOverlay(id, enabled ? 1 : 0, angle, opacity,
+      fr, fg, fb, tr, tg, tb) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'setGradientOverlay failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  /** M17a：样式剪贴板（拷贝/粘贴/效果总开关）。 */
+  copyLayerStyle(id: number): boolean {
+    const r2 = narrowResult(native.copyLayerStyle(id) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'copyLayerStyle failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  pasteLayerStyle(id: number): boolean {
+    const r2 = narrowResult(native.pasteLayerStyle(id) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'pasteLayerStyle failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  setLayerEffectsEnabled(id: number, enabled: boolean): boolean {
+    const r2 = narrowResult(native.setLayerEffectsEnabled(id, enabled ? 1 : 0) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'setLayerEffectsEnabled failed: %{public}s',
         r2.error !== null ? r2.error.message : 'unknown');
       return false;
     }
@@ -1450,6 +1533,7 @@ export class CompositorEngine {
         lastError: 'getStats failed', canUndo: false, canRedo: false, quickMask: false,
         historyVersion: 0, paceTier: 0, fullFrames: 0, overlayFrames: 0, idleParks: 0,
         renderCallbacks: 0, hasRawDevelop: false, devTemp: 0, devTint: 0, devEv: 0, devGamma: 1,
+        hasStyleClipboard: false,
       };
     }
     return narrowStats(r.data);

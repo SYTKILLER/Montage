@@ -103,6 +103,30 @@ void srcOver(uint8_t* canvas, const float src[4]) {
     }
 }
 
+// alpha 通道高斯（打包 A→RGBA strip 复用 M13 FGaussianBlur，RGB=0；σ 钳制与投影同款）
+bool blurAlpha(std::vector<uint8_t>& a, int w, int h, double sigma, std::string& err) {
+    if (sigma < 0.5) {
+        return true;
+    }
+    const double s = std::min(kMaxBlurBudget, sigma);
+    std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4, 0);
+    for (size_t i = 0; i < a.size(); ++i) {
+        rgba[i * 4 + 3] = a[i];
+    }
+    filters::FilterParams p;
+    p.kind = filters::FGaussianBlur;
+    p.p0 = static_cast<float>(s);
+    std::vector<uint8_t> out(rgba.size(), 0);
+    if (!filters::applyFilter(rgba.data(), out.data(), static_cast<uint32_t>(w),
+                              static_cast<uint32_t>(h), p, err)) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        a[i] = out[i * 4 + 3];
+    }
+    return true;
+}
+
 // 域内取底片 alpha 在展开段内直线推导（doc 坐标 = 网格 origin + 网格局部 = 域 origin + 域局部）
 
 }  // namespace
@@ -155,7 +179,8 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
 
     const LayerStyle* st = l.style.get();
     const bool anyEffect = st != nullptr && st->enabled &&
-                           (st->dropShadow || st->stroke || st->colorOverlay);
+                           (st->dropShadow || st->stroke || st->colorOverlay || st->innerShadow ||
+                            st->outerGlow || st->innerGlow || st->gradientOverlay);
     if (!anyEffect) {
         l.styledRender = nullptr;
         return true;
@@ -187,6 +212,10 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
     }
     if (st->stroke) {
         pad = std::max(pad, std::min(kMaxBlurBudget, std::max(0.0, st->strokeWidth)));
+    }
+    if (st->outerGlow) {
+        // 外发光在层下向四周衰减（photocraft margin = size）
+        pad = std::max(pad, std::min(kMaxBlurBudget, std::max(0.0, st->ogSize)) * 2.0);
     }
     pad = std::min(pad, kMaxPadBudget);
     // 派生域（doc 坐标）→ 局部尺寸
@@ -283,21 +312,23 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
             }
         }
     }
-    // 2) 外描边：膨胀环带 = dilate(alpha, w) − alpha → 描边色 src-over
-    if (st->stroke && st->strokeWidth >= 0.5) {
-        const int r = static_cast<int>(std::lround(std::min(kMaxBlurBudget, st->strokeWidth)));
-        std::vector<uint8_t> dil = alpha;
-        dilateAlpha(dil, static_cast<int>(w), static_cast<int>(h), r);
-        for (size_t i = 0; i < alpha.size(); ++i) {
-            const int band = static_cast<int>(dil[i]) - static_cast<int>(alpha[i]);
-            if (band <= 0) {
+    // 2) 外发光（M17a，photocraft glow_map Softer：dilate(r=0 v1)+blur σ=size；画在本体之下）
+    if (st->outerGlow) {
+        std::vector<uint8_t> cov = alpha;
+        if (!blurAlpha(cov, static_cast<int>(w), static_cast<int>(h), st->ogSize, err)) {
+            return false;
+        }
+        for (size_t i = 0; i < cov.size(); ++i) {
+            if (cov[i] == 0) {
                 continue;
             }
-            float src[4] = {st->strokeColor[0], st->strokeColor[1], st->strokeColor[2],
-                            st->strokeColor[3] * (band / 255.0f)};
+            float src[4] = {st->ogColor[0], st->ogColor[1], st->ogColor[2],
+                            st->ogColor[3] * static_cast<float>(st->ogOpacity) *
+                                (cov[i] / 255.0f)};
             srcOver(canvas.data() + i * 4, src);
         }
     }
+    // 3) 本体：底片 RGB 按域坐标回取网格局部 src-over
     // 3) 本体：底片 RGB 按域坐标回取网格局部 src-over
     for (size_t i = 0; i < alpha.size(); ++i) {
         if (alpha[i] == 0) {
@@ -330,7 +361,41 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
         }
         srcOver(canvas.data() + i * 4, src);
     }
-    // 4) 颜色叠加：base alpha × overlay 色/不透明度 src-over（本体之上）
+    // 4) 渐变叠加（M17a，photocraft paint_fx Gradient：对齐图层=墨迹 bbox（gridInkBBox，
+    // 非 tile 粒度域）；v1 双色线性；photocraft 顺序在颜色叠加之前）
+    if (st->gradientOverlay) {
+        uint32_t ix = bx, iy = by, iw = bw, ih = bh;
+        gridInkBBox(*base, ix, iy, iw, ih);  // 失败保持 tile 粒度 bbox 兜底
+        const double inkOX = l.transform.originX + static_cast<double>(ix);
+        const double inkOY = l.transform.originY + static_cast<double>(iy);
+        const double rad = st->gdAngleDeg * 3.14159265358979323846 / 180.0;
+        const double gdx = std::cos(rad);
+        const double gdy = std::sin(rad);
+        const double cx = inkOX + static_cast<double>(iw) / 2.0;
+        const double cy = inkOY + static_cast<double>(ih) / 2.0;
+        const double halfLen =
+            std::fabs(gdx) * static_cast<double>(iw) / 2.0 +
+            std::fabs(gdy) * static_cast<double>(ih) / 2.0;
+        for (size_t i = 0; i < alpha.size(); ++i) {
+            if (alpha[i] == 0) {
+                continue;
+            }
+            const double docX = static_cast<double>(x0 + static_cast<int>(i % w)) + 0.5;
+            const double docY = static_cast<double>(y0 + static_cast<int>(i / w)) + 0.5;
+            double t = halfLen > 0.0
+                           ? (((docX - cx) * gdx + (docY - cy) * gdy) / halfLen + 1.0) / 2.0
+                           : 0.0;
+            t = std::clamp(t, 0.0, 1.0);
+            const float ta = static_cast<float>(t);
+            float src[4];
+            for (int k = 0; k < 4; ++k) {
+                src[k] = st->gdFrom[k] * (1.0f - ta) + st->gdTo[k] * ta;
+            }
+            src[3] *= static_cast<float>(st->gdOpacity) * (alpha[i] / 255.0f);
+            srcOver(canvas.data() + i * 4, src);
+        }
+    }
+    // 5) 颜色叠加：base alpha × overlay 色/不透明度 src-over（本体之上）
     if (st->colorOverlay) {
         for (size_t i = 0; i < alpha.size(); ++i) {
             if (alpha[i] == 0) {
@@ -339,6 +404,81 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
             float src[4] = {st->overlayColor[0], st->overlayColor[1], st->overlayColor[2],
                             st->overlayColor[3] * static_cast<float>(st->overlayOpacity) *
                                 (alpha[i] / 255.0f)};
+            srcOver(canvas.data() + i * 4, src);
+        }
+    }
+    // 6) 内发光（M17a，photocraft glow_map inner Softer：inv=1−a 模糊后 ×alpha 限层内）
+    if (st->innerGlow) {
+        std::vector<uint8_t> cov(alpha.size());
+        for (size_t i = 0; i < cov.size(); ++i) {
+            cov[i] = static_cast<uint8_t>(255 - alpha[i]);
+        }
+        if (!blurAlpha(cov, static_cast<int>(w), static_cast<int>(h), st->igSize, err)) {
+            return false;
+        }
+        for (size_t i = 0; i < cov.size(); ++i) {
+            if (alpha[i] == 0) {
+                continue;
+            }
+            const uint8_t m = static_cast<uint8_t>(
+                std::lround(cov[i] * alpha[i] / 255.0f));
+            if (m == 0) {
+                continue;
+            }
+            float src[4] = {st->igColor[0], st->igColor[1], st->igColor[2],
+                            st->igColor[3] * static_cast<float>(st->igOpacity) * (m / 255.0f)};
+            srcOver(canvas.data() + i * 4, src);
+        }
+    }
+    // 7) 内阴影（M17a，photocraft shadow_map inner：inv 平移(offset) 出界填满 → 模糊 →
+    // ×alpha 限层内；offset=(round(−cos·d), round(sin·d)) 与投影同向，最内效顶）
+    if (st->innerShadow) {
+        const double rad = st->isAngleDeg * 3.14159265358979323846 / 180.0;
+        const int dx = static_cast<int>(std::lround(-std::cos(rad) * st->isDistance));
+        const int dy = static_cast<int>(std::lround(std::sin(rad) * st->isDistance));
+        std::vector<uint8_t> inv(alpha.size());
+        for (size_t i = 0; i < inv.size(); ++i) {
+            inv[i] = static_cast<uint8_t>(255 - alpha[i]);
+        }
+        if (!blurAlpha(inv, static_cast<int>(w), static_cast<int>(h), st->isSize, err)) {
+            return false;
+        }
+        for (int yy = 0; yy < static_cast<int>(h); ++yy) {
+            const int sy = yy - dy;
+            for (int xx = 0; xx < static_cast<int>(w); ++xx) {
+                const size_t i = static_cast<size_t>(yy) * w + xx;
+                if (alpha[i] == 0) {
+                    continue;
+                }
+                const int sx = xx - dx;
+                const uint8_t v = (sx < 0 || sy < 0 || sx >= static_cast<int>(w) ||
+                                   sy >= static_cast<int>(h))
+                                      ? uint8_t{255}
+                                      : inv[static_cast<size_t>(sy) * w + sx];
+                const uint8_t m =
+                    static_cast<uint8_t>(std::lround(v * alpha[i] / 255.0f));
+                if (m == 0) {
+                    continue;
+                }
+                float src[4] = {st->isColor[0], st->isColor[1], st->isColor[2],
+                                st->isColor[3] * static_cast<float>(st->isOpacity) *
+                                    (m / 255.0f)};
+                srcOver(canvas.data() + i * 4, src);
+            }
+        }
+    }
+    // 8) 外描边（photocraft 顺序：stroke effect 在最顶——与外发光环带重叠时描边覆盖发光）
+    if (st->stroke && st->strokeWidth >= 0.5) {
+        const int r = static_cast<int>(std::lround(std::min(kMaxBlurBudget, st->strokeWidth)));
+        std::vector<uint8_t> dil = alpha;
+        dilateAlpha(dil, static_cast<int>(w), static_cast<int>(h), r);
+        for (size_t i = 0; i < alpha.size(); ++i) {
+            const int band = static_cast<int>(dil[i]) - static_cast<int>(alpha[i]);
+            if (band <= 0) {
+                continue;
+            }
+            float src[4] = {st->strokeColor[0], st->strokeColor[1], st->strokeColor[2],
+                            st->strokeColor[3] * (band / 255.0f)};
             srcOver(canvas.data() + i * 4, src);
         }
     }

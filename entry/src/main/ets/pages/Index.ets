@@ -175,6 +175,26 @@ struct Index {
   @State styOverlayOn: boolean = false;
   @State styOverlayOp: number = 100;
   @State styOverlayColor: string = '#1A6BD9';
+  // M17a 四新效果（对话框 last-applied 会话态，同 M14c 惯例不读回引擎）
+  @State styInnerShadowOn: boolean = false;
+  @State styIsAngle: number = 135;
+  @State styIsDist: number = 5;
+  @State styIsSize: number = 5;
+  @State styIsOp: number = 75;
+  @State styIsColor: string = '#000000';
+  @State styOuterGlowOn: boolean = false;
+  @State styOgSize: number = 10;
+  @State styOgOp: number = 50;
+  @State styOgColor: string = '#FFE470';
+  @State styInnerGlowOn: boolean = false;
+  @State styIgSize: number = 10;
+  @State styIgOp: number = 50;
+  @State styIgColor: string = '#FFE470';
+  @State styGradientOn: boolean = false;
+  @State styGdAngle: number = 90;
+  @State styGdOp: number = 100;
+  @State styGdFrom: string = '#000000';
+  @State styGdTo: string = '#FFFFFF';
   @State fillKind: number = 0;          // 填充层参数（活动层 isFill 时在样式对话框编辑）
   @State fillColor: string = '#D93025';
   @State fillAngle: number = 90;
@@ -187,6 +207,7 @@ struct Index {
   private gradDragging: boolean = false;
   // M15e RAW 显影参数面板（会话内导入过 DNG 才可用；确定=一步 history 事务）
   @State hasRawDevelop: boolean = false;
+  @State hasStyleClipboard: boolean = false;  // M17a：粘贴样式菜单使能
   @State showDevelop: boolean = false;
   @State devTemp: number = 0;           // -100..100（正=暖）
   @State devTint: number = 0;           // -100..100（正=品红）
@@ -641,6 +662,7 @@ struct Index {
     this.canRedo = s.canRedo;
     this.quickMaskActive = s.quickMask;  // M10d
     this.hasRawDevelop = s.hasRawDevelop;  // M15e：RAW 显影菜单使能镜像
+    this.hasStyleClipboard = s.hasStyleClipboard;  // M17a：粘贴样式菜单使能镜像
   }
 
   private log(msg: string): void {
@@ -2162,6 +2184,52 @@ struct Index {
     this.log(`overlay on=${this.styOverlayOn}: ${ok}`);
   }
 
+  // ---------- M17a 四新效果 ----------
+  private applyInnerShadow(): void {
+    const a = this.activeLayer();
+    if (a === undefined) {
+      return;
+    }
+    const c = this.hexToRgb(this.styIsColor);
+    const ok = this.engine.setInnerShadow(a.id, this.styInnerShadowOn, this.styIsAngle,
+      this.styIsDist, this.styIsSize, this.styIsOp / 100, c[0], c[1], c[2]);
+    this.log(`inner shadow on=${this.styInnerShadowOn}: ${ok}`);
+  }
+
+  private applyOuterGlow(): void {
+    const a = this.activeLayer();
+    if (a === undefined) {
+      return;
+    }
+    const c = this.hexToRgb(this.styOgColor);
+    const ok = this.engine.setOuterGlow(a.id, this.styOuterGlowOn, this.styOgSize,
+      this.styOgOp / 100, c[0], c[1], c[2]);
+    this.log(`outer glow on=${this.styOuterGlowOn}: ${ok}`);
+  }
+
+  private applyInnerGlow(): void {
+    const a = this.activeLayer();
+    if (a === undefined) {
+      return;
+    }
+    const c = this.hexToRgb(this.styIgColor);
+    const ok = this.engine.setInnerGlow(a.id, this.styInnerGlowOn, this.styIgSize,
+      this.styIgOp / 100, c[0], c[1], c[2]);
+    this.log(`inner glow on=${this.styInnerGlowOn}: ${ok}`);
+  }
+
+  private applyGradientOverlay(): void {
+    const a = this.activeLayer();
+    if (a === undefined) {
+      return;
+    }
+    const f = this.hexToRgb(this.styGdFrom);
+    const t = this.hexToRgb(this.styGdTo);
+    const ok = this.engine.setGradientOverlay(a.id, this.styGradientOn, this.styGdAngle,
+      this.styGdOp / 100, f[0], f[1], f[2], t[0], t[1], t[2]);
+    this.log(`gradient overlay on=${this.styGradientOn}: ${ok}`);
+  }
+
   private applyFillParams(): void {
     const a = this.activeLayer();
     if (a === undefined || !a.isFill) {
@@ -2428,6 +2496,32 @@ struct Index {
       }
       case 'layer.style': {
         this.showStyle = true;
+        break;
+      }
+      case 'layer.copyStyle': {
+        const a = this.activeLayer();
+        if (a !== undefined && this.engine.copyLayerStyle(a.id)) {
+          this.toast('图层样式已拷贝');
+          this.log(`拷贝样式: 层${a.id}`);
+        }
+        break;
+      }
+      case 'layer.pasteStyle': {
+        const a = this.activeLayer();
+        if (a !== undefined && this.engine.pasteLayerStyle(a.id)) {
+          this.toast('图层样式已粘贴');
+          this.log(`粘贴样式: 层${a.id}`);
+        }
+        break;
+      }
+      case 'layer.toggleEffects': {
+        const a = this.activeLayer();
+        if (a !== undefined) {
+          const on = a.styleOn;
+          if (this.engine.setLayerEffectsEnabled(a.id, !on)) {
+            this.log(`全部效果: ${!on ? '显示' : '隐藏'}`);
+          }
+        }
         break;
       }
       case 'layer.fillSolid': {
@@ -3088,6 +3182,13 @@ struct Index {
       leafItem('layer.stamp', '盖印', 'Shift+Ctrl+Alt+E', d),
       leafItem('layer.flatten', '拼合图像', '', d),
       leafItem('layer.style', '图层样式…', '', d && this.activeLayer()?.isGroup === false),
+      leafItem('layer.copyStyle', '拷贝图层样式', '',
+        d && this.activeLayer()?.hasStyle === true),
+      leafItem('layer.pasteStyle', '粘贴图层样式', '',
+        d && this.activeLayer()?.isGroup === false && this.hasStyleClipboard),
+      leafItem('layer.toggleEffects', '显示/隐藏全部效果', '',
+        d && this.activeLayer()?.hasStyle === true,
+        this.activeLayer()?.hasStyle === true && this.activeLayer()?.styleOn === false),
       leafItem('layer.fillSolid', '新建纯色填充图层', '', d),
       leafItem('layer.fillGrad', '新建渐变填充图层', '', d),
       leafItem('layer.linkToggle', '链接图层 / 解除链接', '',
@@ -4879,6 +4980,261 @@ struct Index {
                           ? $r('app.color.accent') : $r('app.color.border')
                       })
                       .onClick((): void => { this.styOverlayColor = sw; this.applyOverlay(); })
+                  }, (sw: string): string => sw)
+                }
+              }
+              .width('100%').padding(10).borderRadius(8)
+              .backgroundColor($r('app.color.surface'))
+              .border({ width: 1, color: $r('app.color.border') })
+              // M17a 内阴影
+              Column({ space: 6 }) {
+                Row({ space: 8 }) {
+                  Toggle({ type: ToggleType.Checkbox, isOn: this.styInnerShadowOn })
+                    .onChange((on: boolean): void => {
+                      this.styInnerShadowOn = on;
+                      this.applyInnerShadow();
+                    })
+                  Text('内阴影').fontSize(13).fontColor($r('app.color.text_primary'))
+                }
+                Row({ space: 6 }) {
+                  Text('角度').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styIsAngle, min: 0, max: 360, step: 5 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styIsAngle = v;
+                        this.applyInnerShadow();
+                      }
+                    })
+                  Text(`${Math.round(this.styIsAngle)}°`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('距离').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styIsDist, min: 0, max: 60, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styIsDist = v;
+                        this.applyInnerShadow();
+                      }
+                    })
+                  Text(`${Math.round(this.styIsDist)}`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('大小').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styIsSize, min: 0, max: 50, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styIsSize = v;
+                        this.applyInnerShadow();
+                      }
+                    })
+                  Text(`${Math.round(this.styIsSize)}`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('不透明度').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styIsOp, min: 0, max: 100, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styIsOp = v;
+                        this.applyInnerShadow();
+                      }
+                    })
+                  Text(`${Math.round(this.styIsOp)}%`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('颜色').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  ForEach(SWATCHES, (sw: string) => {
+                    Column()
+                      .width(22).height(22).borderRadius(4)
+                      .backgroundColor(sw)
+                      .border({
+                        width: this.styIsColor === sw ? 2 : 1,
+                        color: this.styIsColor === sw
+                          ? $r('app.color.accent') : $r('app.color.border')
+                      })
+                      .onClick((): void => { this.styIsColor = sw; this.applyInnerShadow(); })
+                  }, (sw: string): string => sw)
+                }
+              }
+              .width('100%').padding(10).borderRadius(8)
+              .backgroundColor($r('app.color.surface'))
+              .border({ width: 1, color: $r('app.color.border') })
+              // M17a 外发光 / 内发光（同构段）
+              Column({ space: 6 }) {
+                Row({ space: 8 }) {
+                  Toggle({ type: ToggleType.Checkbox, isOn: this.styOuterGlowOn })
+                    .onChange((on: boolean): void => {
+                      this.styOuterGlowOn = on;
+                      this.applyOuterGlow();
+                    })
+                  Text('外发光').fontSize(13).fontColor($r('app.color.text_primary'))
+                }
+                Row({ space: 6 }) {
+                  Text('大小').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styOgSize, min: 0, max: 50, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styOgSize = v;
+                        this.applyOuterGlow();
+                      }
+                    })
+                  Text(`${Math.round(this.styOgSize)}`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('不透明度').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styOgOp, min: 0, max: 100, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styOgOp = v;
+                        this.applyOuterGlow();
+                      }
+                    })
+                  Text(`${Math.round(this.styOgOp)}%`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('颜色').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  ForEach(SWATCHES, (sw: string) => {
+                    Column()
+                      .width(22).height(22).borderRadius(4)
+                      .backgroundColor(sw)
+                      .border({
+                        width: this.styOgColor === sw ? 2 : 1,
+                        color: this.styOgColor === sw
+                          ? $r('app.color.accent') : $r('app.color.border')
+                      })
+                      .onClick((): void => { this.styOgColor = sw; this.applyOuterGlow(); })
+                  }, (sw: string): string => sw)
+                }
+              }
+              .width('100%').padding(10).borderRadius(8)
+              .backgroundColor($r('app.color.surface'))
+              .border({ width: 1, color: $r('app.color.border') })
+              Column({ space: 6 }) {
+                Row({ space: 8 }) {
+                  Toggle({ type: ToggleType.Checkbox, isOn: this.styInnerGlowOn })
+                    .onChange((on: boolean): void => {
+                      this.styInnerGlowOn = on;
+                      this.applyInnerGlow();
+                    })
+                  Text('内发光').fontSize(13).fontColor($r('app.color.text_primary'))
+                }
+                Row({ space: 6 }) {
+                  Text('大小').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styIgSize, min: 0, max: 50, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styIgSize = v;
+                        this.applyInnerGlow();
+                      }
+                    })
+                  Text(`${Math.round(this.styIgSize)}`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('不透明度').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styIgOp, min: 0, max: 100, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styIgOp = v;
+                        this.applyInnerGlow();
+                      }
+                    })
+                  Text(`${Math.round(this.styIgOp)}%`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('颜色').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  ForEach(SWATCHES, (sw: string) => {
+                    Column()
+                      .width(22).height(22).borderRadius(4)
+                      .backgroundColor(sw)
+                      .border({
+                        width: this.styIgColor === sw ? 2 : 1,
+                        color: this.styIgColor === sw
+                          ? $r('app.color.accent') : $r('app.color.border')
+                      })
+                      .onClick((): void => { this.styIgColor = sw; this.applyInnerGlow(); })
+                  }, (sw: string): string => sw)
+                }
+              }
+              .width('100%').padding(10).borderRadius(8)
+              .backgroundColor($r('app.color.surface'))
+              .border({ width: 1, color: $r('app.color.border') })
+              // M17a 渐变叠加（v1 双色线性）
+              Column({ space: 6 }) {
+                Row({ space: 8 }) {
+                  Toggle({ type: ToggleType.Checkbox, isOn: this.styGradientOn })
+                    .onChange((on: boolean): void => {
+                      this.styGradientOn = on;
+                      this.applyGradientOverlay();
+                    })
+                  Text('渐变叠加').fontSize(13).fontColor($r('app.color.text_primary'))
+                }
+                Row({ space: 6 }) {
+                  Text('角度').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styGdAngle, min: 0, max: 360, step: 5 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styGdAngle = v;
+                        this.applyGradientOverlay();
+                      }
+                    })
+                  Text(`${Math.round(this.styGdAngle)}°`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('不透明度').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styGdOp, min: 0, max: 100, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styGdOp = v;
+                        this.applyGradientOverlay();
+                      }
+                    })
+                  Text(`${Math.round(this.styGdOp)}%`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('起色').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  ForEach(SWATCHES, (sw: string) => {
+                    Column()
+                      .width(22).height(22).borderRadius(4)
+                      .backgroundColor(sw)
+                      .border({
+                        width: this.styGdFrom === sw ? 2 : 1,
+                        color: this.styGdFrom === sw
+                          ? $r('app.color.accent') : $r('app.color.border')
+                      })
+                      .onClick((): void => { this.styGdFrom = sw; this.applyGradientOverlay(); })
+                  }, (sw: string): string => sw)
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('止色').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  ForEach(SWATCHES, (sw: string) => {
+                    Column()
+                      .width(22).height(22).borderRadius(4)
+                      .backgroundColor(sw)
+                      .border({
+                        width: this.styGdTo === sw ? 2 : 1,
+                        color: this.styGdTo === sw
+                          ? $r('app.color.accent') : $r('app.color.border')
+                      })
+                      .onClick((): void => { this.styGdTo = sw; this.applyGradientOverlay(); })
                   }, (sw: string): string => sw)
                 }
               }

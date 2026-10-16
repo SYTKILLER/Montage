@@ -22,7 +22,7 @@ namespace {
 constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Save";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
-constexpr int kFormatVersion = 9;  // v9：+参考线 guides 块（M15a，空则不写兼容 v8 包）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
+constexpr int kFormatVersion = 10;  // v10：+图层样式效果扩展（M17a 内阴影/外发光/内发光/渐变叠加，非默认才写）；v9：+参考线 guides 块（M15a，空则不写兼容 v8 包）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
 constexpr int kDeflateLevel = 6;
 // 04 §1.3 格式上限（沿用上游档位，与引擎运行预算分立）
 constexpr uint32_t kMaxSide = 30000;
@@ -634,6 +634,69 @@ std::string buildManifest(const DocSnapshot& doc) {
                 sf += "]";
                 std::snprintf(num, sizeof(num), "%.6g", st.overlayOpacity);
                 sf += std::string(",\n      \"ovOpacity\": ") + num;
+            }
+            // v10 效果扩展（M17a）：非默认才写（读兼容 v8/v9）
+            if (st.innerShadow) {
+                std::snprintf(num, sizeof(num), "%.6g", st.isAngleDeg);
+                sf += std::string(",\n      \"isAngle\": ") + num;
+                std::snprintf(num, sizeof(num), "%.6g", st.isDistance);
+                sf += std::string(",\n      \"isDist\": ") + num;
+                std::snprintf(num, sizeof(num), "%.6g", st.isSize);
+                sf += std::string(",\n      \"isSize\": ") + num;
+                std::snprintf(num, sizeof(num), "%.6g", st.isOpacity);
+                sf += std::string(",\n      \"isOpacity\": ") + num;
+                sf += ",\n      \"isColor\": [";
+                for (int ci = 0; ci < 3; ++ci) {
+                    std::snprintf(num, sizeof(num), "%.6g", st.isColor[ci]);
+                    sf += num;
+                    if (ci < 2) sf += ", ";
+                }
+                sf += "]";
+            }
+            if (st.outerGlow) {
+                std::snprintf(num, sizeof(num), "%.6g", st.ogSize);
+                sf += std::string(",\n      \"ogSize\": ") + num;
+                std::snprintf(num, sizeof(num), "%.6g", st.ogOpacity);
+                sf += std::string(",\n      \"ogOpacity\": ") + num;
+                sf += ",\n      \"ogColor\": [";
+                for (int ci = 0; ci < 3; ++ci) {
+                    std::snprintf(num, sizeof(num), "%.6g", st.ogColor[ci]);
+                    sf += num;
+                    if (ci < 2) sf += ", ";
+                }
+                sf += "]";
+            }
+            if (st.innerGlow) {
+                std::snprintf(num, sizeof(num), "%.6g", st.igSize);
+                sf += std::string(",\n      \"igSize\": ") + num;
+                std::snprintf(num, sizeof(num), "%.6g", st.igOpacity);
+                sf += std::string(",\n      \"igOpacity\": ") + num;
+                sf += ",\n      \"igColor\": [";
+                for (int ci = 0; ci < 3; ++ci) {
+                    std::snprintf(num, sizeof(num), "%.6g", st.igColor[ci]);
+                    sf += num;
+                    if (ci < 2) sf += ", ";
+                }
+                sf += "]";
+            }
+            if (st.gradientOverlay) {
+                std::snprintf(num, sizeof(num), "%.6g", st.gdAngleDeg);
+                sf += std::string(",\n      \"gdAngle\": ") + num;
+                std::snprintf(num, sizeof(num), "%.6g", st.gdOpacity);
+                sf += std::string(",\n      \"gdOpacity\": ") + num;
+                sf += ",\n      \"gdFrom\": [";
+                for (int ci = 0; ci < 3; ++ci) {
+                    std::snprintf(num, sizeof(num), "%.6g", st.gdFrom[ci]);
+                    sf += num;
+                    if (ci < 2) sf += ", ";
+                }
+                sf += "],\n      \"gdTo\": [";
+                for (int ci = 0; ci < 3; ++ci) {
+                    std::snprintf(num, sizeof(num), "%.6g", st.gdTo[ci]);
+                    sf += num;
+                    if (ci < 2) sf += ", ";
+                }
+                sf += "]";
             }
             fields.push_back(std::string("      \"style\": {\n") + sf + "\n      }");
         }

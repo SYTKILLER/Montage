@@ -193,6 +193,30 @@ struct LayerStyle {
     bool colorOverlay = false;
     float overlayColor[4] = {1.0f, 0.0f, 0.0f, 1.0f};
     double overlayOpacity = 1.0;
+    // M17a 内阴影（photocraft shadow_map inner 语义：反向 alpha 平移+模糊、出界填满、限层内；
+    // v1 无 spread/等高线/噪点）
+    bool innerShadow = false;
+    double isAngleDeg = 135.0;
+    double isDistance = 5.0;
+    double isSize = 5.0;
+    float isColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    double isOpacity = 0.75;
+    // M17a 外发光（层下，Softer 技术 = 膨胀+高斯；v1 无 spread/等高线）
+    bool outerGlow = false;
+    double ogSize = 10.0;
+    float ogColor[4] = {1.0f, 0.894f, 0.431f, 1.0f};  // PS 默认淡黄
+    double ogOpacity = 0.5;
+    // M17a 内发光（本体内边缘衰减带；v1 Edge 源、Softer 技术）
+    bool innerGlow = false;
+    double igSize = 10.0;
+    float igColor[4] = {1.0f, 0.894f, 0.431f, 1.0f};
+    double igOpacity = 0.5;
+    // M17a 渐变叠加（v1 双色线性、层 bbox 对齐、90=上→下；多段 stops 挂 M17b）
+    bool gradientOverlay = false;
+    float gdFrom[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    float gdTo[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    double gdAngleDeg = 90.0;
+    double gdOpacity = 1.0;
 };
 
 // M14c 填充图层（非破坏内容层）：无像素，渲染 = 全文档域派生网格（改参重生成）。

@@ -28,7 +28,7 @@ constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Open";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
 constexpr int kMinVersion = 1;
-constexpr int kMaxVersion = 9;  // v9：+参考线 guides 块（M15a，可选字段读兼容 v1–v8）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
+constexpr int kMaxVersion = 10;  // v10：+图层样式效果扩展（M17a，可选字段读兼容 v1–v9）；v9：+参考线 guides 块（M15a）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
 constexpr uint32_t kMaxSide = 30000;
 constexpr uint64_t kMaxTotalPixels = 100ull * 1000 * 1000;
 constexpr size_t kMaxLayers = 10000;
@@ -1004,6 +1004,69 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
                 st->colorOverlay = true;
                 st->overlayColor[3] = 1.0f;
                 st->overlayOpacity = std::clamp(op, 0.0, 1.0);
+            }
+            // v10 效果扩展（M17a，可选字段；缺省 = 结构体默认值）
+            auto readColor3 = [&](const char* key, float out[4]) -> bool {
+                const JValue* jc = jst->find(key);
+                if (jc == nullptr || jc->type != JValue::Arr || jc->arr.size() != 3) {
+                    err = std::string("bad ") + key;
+                    return false;
+                }
+                for (size_t ci = 0; ci < 3; ++ci) {
+                    double cv = 0;
+                    if (!getDouble(jc->arr[ci], cv) || !std::isfinite(cv) || cv < 0 || cv > 1) {
+                        err = std::string("bad ") + key + " value";
+                        return false;
+                    }
+                    out[ci] = static_cast<float>(cv);
+                }
+                out[3] = 1.0f;
+                return true;
+            };
+            auto readNum = [&](const char* key, double& out) -> bool {
+                const JValue* jn2 = jst->find(key);
+                return jn2 != nullptr && getDouble(*jn2, out) && std::isfinite(out);
+            };
+            if (jst->find("isAngle") != nullptr) {  // M17a：save 只写参数键（无总键），按首参数判定
+                double v = 0;
+                if (!readNum("isAngle", v)) { err = "bad isAngle"; return false; }
+                st->isAngleDeg = v;
+                if (!readNum("isDist", v)) { err = "bad isDist"; return false; }
+                st->isDistance = std::max(0.0, v);
+                if (!readNum("isSize", v)) { err = "bad isSize"; return false; }
+                st->isSize = std::max(0.0, v);
+                if (!readNum("isOpacity", v)) { err = "bad isOpacity"; return false; }
+                st->isOpacity = std::clamp(v, 0.0, 1.0);
+                if (!readColor3("isColor", st->isColor)) { return false; }
+                st->innerShadow = true;
+            }
+            if (jst->find("ogSize") != nullptr) {
+                double v = 0;
+                if (!readNum("ogSize", v)) { err = "bad ogSize"; return false; }
+                st->ogSize = std::max(0.0, v);
+                if (!readNum("ogOpacity", v)) { err = "bad ogOpacity"; return false; }
+                st->ogOpacity = std::clamp(v, 0.0, 1.0);
+                if (!readColor3("ogColor", st->ogColor)) { return false; }
+                st->outerGlow = true;
+            }
+            if (jst->find("igSize") != nullptr) {
+                double v = 0;
+                if (!readNum("igSize", v)) { err = "bad igSize"; return false; }
+                st->igSize = std::max(0.0, v);
+                if (!readNum("igOpacity", v)) { err = "bad igOpacity"; return false; }
+                st->igOpacity = std::clamp(v, 0.0, 1.0);
+                if (!readColor3("igColor", st->igColor)) { return false; }
+                st->innerGlow = true;
+            }
+            if (jst->find("gdAngle") != nullptr) {
+                double v = 0;
+                if (!readNum("gdAngle", v)) { err = "bad gdAngle"; return false; }
+                st->gdAngleDeg = v;
+                if (!readNum("gdOpacity", v)) { err = "bad gdOpacity"; return false; }
+                st->gdOpacity = std::clamp(v, 0.0, 1.0);
+                if (!readColor3("gdFrom", st->gdFrom)) { return false; }
+                if (!readColor3("gdTo", st->gdTo)) { return false; }
+                st->gradientOverlay = true;
             }
             l.style = std::move(st);
         }

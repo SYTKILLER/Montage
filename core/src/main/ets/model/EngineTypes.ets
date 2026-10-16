@@ -33,6 +33,7 @@ export interface EngineStats {
   devTint: number;
   devEv: number;
   devGamma: number;
+  hasStyleClipboard: boolean;  // M17a：样式剪贴板非空（粘贴菜单使能）
 }
 
 /** RAW 重显影结果（developRaw 的 data，M15e）。 */
@@ -99,6 +100,7 @@ export interface LayerDTO {
   collapsed: boolean;
   linkId: number;    // M14b 链接层（非零 = 同号层联动移动；会话态不持久化）
   hasStyle: boolean; // M14c 图层样式（投影/描边/颜色叠加任一）
+  styleOn: boolean;  // M17a fx 总开关（enabled；菜单「显示/隐藏全部效果」checked）
   isFill: boolean;   // M14c 填充图层（纯色/渐变参数化内容）
   hasMask: boolean;
   maskEnabled: boolean;
