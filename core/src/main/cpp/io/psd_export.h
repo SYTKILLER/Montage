@@ -43,7 +43,8 @@ struct PsdLayerSnap {
     bool collapsed = false;   // lsct type 1=展开 / 2=折叠
     bool isText = false;      // 降级 note（像素已栅格化导出）
     bool isFill = false;      // 降级 note（styledRender 像素导出）
-    bool hasStyle = false;    // 降级 note（样式已合成进像素）
+    bool hasStyle = false;    // 降级 note（样式已合成进像素——不可 lrFX 表示的路径）
+    std::shared_ptr<const LayerStyle> style;  // M17c 非空 = 效果全可 lrFX 表示（像素走原始+lrFX）
     // 调整层参数（isAdjustment 时；kind 对齐 AdjustmentKind 枚举）
     int32_t adjKind = 0;      // 0=Levels 1=Curves 3=Invert 可直写；其余跳过 + note
     float adjInBlack = 0.0f;

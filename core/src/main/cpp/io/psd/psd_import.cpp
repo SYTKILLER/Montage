@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <map>
 #include <unordered_map>
 #include <unistd.h>
@@ -9,6 +10,7 @@
 #include <hilog/log.h>
 
 #include "engine/engine.h"
+#include "engine/style_ops.h"
 #include "io/psd/psd_reader.h"
 
 namespace montage {
@@ -256,6 +258,59 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
                 layer.render = composeMasked(layer.pixels, *layer.mask);
             }
         }
+        // M17c：lrFX 效果 → LayerStyle（五类；lfx2 专属字段已在 reader 降级 notes）
+        if (rec.hasStyle && !rec.style.empty()) {
+            auto st = std::make_shared<LayerStyle>();
+            for (const psd::Record::PsdStyleEffect& e : rec.style) {
+                if (e.key == "dsdw") {
+                    st->dropShadow = true;
+                    st->shadowAngleDeg = e.angle;
+                    st->shadowDistance = e.distance;
+                    st->shadowSize = e.size;
+                    st->shadowOpacity = e.opacity;
+                    st->shadowColor[0] = e.color[0];
+                    st->shadowColor[1] = e.color[1];
+                    st->shadowColor[2] = e.color[2];
+                    st->shadowColor[3] = 1.0f;
+                    st->shadowUseGL = e.useGlobal;
+                } else if (e.key == "isdw") {
+                    st->innerShadow = true;
+                    st->isAngleDeg = e.angle;
+                    st->isDistance = e.distance;
+                    st->isSize = e.size;
+                    st->isOpacity = e.opacity;
+                    st->isColor[0] = e.color[0];
+                    st->isColor[1] = e.color[1];
+                    st->isColor[2] = e.color[2];
+                    st->isColor[3] = 1.0f;
+                    st->isUseGL = e.useGlobal;
+                } else if (e.key == "oglw") {
+                    st->outerGlow = true;
+                    st->ogSize = e.size;
+                    st->ogOpacity = e.opacity;
+                    st->ogColor[0] = e.color[0];
+                    st->ogColor[1] = e.color[1];
+                    st->ogColor[2] = e.color[2];
+                    st->ogColor[3] = 1.0f;
+                } else if (e.key == "iglw") {
+                    st->innerGlow = true;
+                    st->igSize = e.size;
+                    st->igOpacity = e.opacity;
+                    st->igColor[0] = e.color[0];
+                    st->igColor[1] = e.color[1];
+                    st->igColor[2] = e.color[2];
+                    st->igColor[3] = 1.0f;
+                } else if (e.key == "sofi") {
+                    st->colorOverlay = true;
+                    st->overlayOpacity = e.opacity;
+                    st->overlayColor[0] = e.color[0];
+                    st->overlayColor[1] = e.color[1];
+                    st->overlayColor[2] = e.color[2];
+                    st->overlayColor[3] = 1.0f;
+                }
+            }
+            layer.style = st;
+        }
         // 空像素剪贴层：无内容不渲染，无需提示（M5b-2 剪贴已非破坏）
 
         for (const std::string& n : rec.notes) {
@@ -277,6 +332,8 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
         engine.doc.activeId = engine.doc.layers.empty()
                                   ? 0
                                   : engine.doc.layers[engine.doc.layers.size() - 1].id;
+        // M17c：带 lrFX 样式的层重建派生网格（openProject 同款收尾）
+        restyleDocument(engine.doc);
         engine.bumpRevisionLocked();
         engine.requestRender();
     }

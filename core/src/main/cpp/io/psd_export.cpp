@@ -19,6 +19,212 @@ namespace {
 
 constexpr uint32_t kTile = kTileSize;
 
+// ---------- M17c：lrFX 图层效果写出（Photoshop 5 布局，对拍 photocraft parse_lrfx 契约） ----------
+
+// 五类可表示效果 → lrFX 块数据。dsdw/isdw 41B、oglw/iglw 32B、sofi 24B；
+// 未知偏移字段全部写 0（photocraft 读取契约只消费列出的偏移）。
+std::vector<uint8_t> buildLrfx(const LayerStyle& st) {
+    std::vector<uint8_t> out;
+    auto push16 = [&out](uint16_t v) {
+        out.push_back(static_cast<uint8_t>(v >> 8));
+        out.push_back(static_cast<uint8_t>(v & 0xFF));
+    };
+    auto push32 = [&out](uint32_t v) {
+        out.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+        out.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+        out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+        out.push_back(static_cast<uint8_t>(v & 0xFF));
+    };
+    auto pushColor = [&out, &push16](const float c[3]) {
+        push16(0);  // space = RGB
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t comp =
+                k < 3 ? static_cast<uint32_t>(std::lround(std::clamp(c[k], 0.0f, 1.0f) * 255.0f))
+                      : 0;
+            push16(static_cast<uint16_t>(comp << 8));
+        }
+    };
+    auto pushFixed = [&out, &push32](double v) {
+        push32(static_cast<uint32_t>(static_cast<int64_t>(std::llround(v * 65536.0))));
+    };
+    struct Item {
+        const char* key;
+        std::vector<uint8_t> data;
+    };
+    std::vector<Item> items;
+    if (st.dropShadow) {
+        std::vector<uint8_t> d(41, 0);
+        auto fixed = [&d](size_t o, double v) {
+            const uint32_t v32 =
+                static_cast<uint32_t>(static_cast<int64_t>(std::llround(v * 65536.0)));
+            d[o] = static_cast<uint8_t>(v32 >> 24);
+            d[o + 1] = static_cast<uint8_t>(v32 >> 16);
+            d[o + 2] = static_cast<uint8_t>(v32 >> 8);
+            d[o + 3] = static_cast<uint8_t>(v32);
+        };
+        auto push16At = [&d](size_t o, uint16_t v) {
+            d[o] = static_cast<uint8_t>(v >> 8);
+            d[o + 1] = static_cast<uint8_t>(v & 0xFF);
+        };
+        fixed(4, st.shadowSize);
+        fixed(12, st.shadowAngleDeg);
+        fixed(16, st.shadowDistance);
+        push16At(20, 0);
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t comp =
+                k < 3 ? static_cast<uint32_t>(
+                            std::lround(std::clamp(st.shadowColor[k], 0.0f, 1.0f) * 255.0f))
+                      : 0;
+            push16At(22 + k * 2, static_cast<uint16_t>(comp << 8));
+        }
+        d[30] = 'N';
+        d[31] = 'r';
+        d[32] = 'm';
+        d[33] = 'l';
+        d[38] = 1;  // enabled
+        d[39] = st.shadowUseGL ? 1 : 0;
+        d[40] = static_cast<uint8_t>(std::lround(std::clamp(st.shadowOpacity, 0.0, 1.0) * 255.0));
+        items.push_back({"dsdw", std::move(d)});
+    }
+    if (st.innerShadow) {
+        std::vector<uint8_t> d(41, 0);
+        auto fixed = [&d](size_t o, double v) {
+            const uint32_t v32 =
+                static_cast<uint32_t>(static_cast<int64_t>(std::llround(v * 65536.0)));
+            d[o] = static_cast<uint8_t>(v32 >> 24);
+            d[o + 1] = static_cast<uint8_t>(v32 >> 16);
+            d[o + 2] = static_cast<uint8_t>(v32 >> 8);
+            d[o + 3] = static_cast<uint8_t>(v32);
+        };
+        auto push16At = [&d](size_t o, uint16_t v) {
+            d[o] = static_cast<uint8_t>(v >> 8);
+            d[o + 1] = static_cast<uint8_t>(v & 0xFF);
+        };
+        fixed(4, st.isSize);
+        fixed(12, st.isAngleDeg);
+        fixed(16, st.isDistance);
+        push16At(20, 0);
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t comp =
+                k < 3
+                    ? static_cast<uint32_t>(std::lround(std::clamp(st.isColor[k], 0.0f, 1.0f) * 255.0f))
+                    : 0;
+            push16At(22 + k * 2, static_cast<uint16_t>(comp << 8));
+        }
+        d[30] = 'N';
+        d[31] = 'r';
+        d[32] = 'm';
+        d[33] = 'l';
+        d[38] = 1;
+        d[39] = st.isUseGL ? 1 : 0;
+        d[40] = static_cast<uint8_t>(std::lround(std::clamp(st.isOpacity, 0.0, 1.0) * 255.0));
+        items.push_back({"isdw", std::move(d)});
+    }
+    if (st.outerGlow) {
+        std::vector<uint8_t> d(32, 0);
+        auto fixed = [&d](size_t o, double v) {
+            const uint32_t v32 =
+                static_cast<uint32_t>(static_cast<int64_t>(std::llround(v * 65536.0)));
+            d[o] = static_cast<uint8_t>(v32 >> 24);
+            d[o + 1] = static_cast<uint8_t>(v32 >> 16);
+            d[o + 2] = static_cast<uint8_t>(v32 >> 8);
+            d[o + 3] = static_cast<uint8_t>(v32);
+        };
+        auto push16At = [&d](size_t o, uint16_t v) {
+            d[o] = static_cast<uint8_t>(v >> 8);
+            d[o + 1] = static_cast<uint8_t>(v & 0xFF);
+        };
+        fixed(4, st.ogSize);
+        push16At(12, 0);
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t comp =
+                k < 3
+                    ? static_cast<uint32_t>(std::lround(std::clamp(st.ogColor[k], 0.0f, 1.0f) * 255.0f))
+                    : 0;
+            push16At(14 + k * 2, static_cast<uint16_t>(comp << 8));
+        }
+        d[22] = 'N';
+        d[23] = 'r';
+        d[24] = 'm';
+        d[25] = 'l';
+        d[30] = 1;
+        d[31] = static_cast<uint8_t>(std::lround(std::clamp(st.ogOpacity, 0.0, 1.0) * 255.0));
+        items.push_back({"oglw", std::move(d)});
+    }
+    if (st.innerGlow) {
+        std::vector<uint8_t> d(32, 0);
+        auto fixed = [&d](size_t o, double v) {
+            const uint32_t v32 =
+                static_cast<uint32_t>(static_cast<int64_t>(std::llround(v * 65536.0)));
+            d[o] = static_cast<uint8_t>(v32 >> 24);
+            d[o + 1] = static_cast<uint8_t>(v32 >> 16);
+            d[o + 2] = static_cast<uint8_t>(v32 >> 8);
+            d[o + 3] = static_cast<uint8_t>(v32);
+        };
+        auto push16At = [&d](size_t o, uint16_t v) {
+            d[o] = static_cast<uint8_t>(v >> 8);
+            d[o + 1] = static_cast<uint8_t>(v & 0xFF);
+        };
+        fixed(4, st.igSize);
+        push16At(12, 0);
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t comp =
+                k < 3
+                    ? static_cast<uint32_t>(std::lround(std::clamp(st.igColor[k], 0.0f, 1.0f) * 255.0f))
+                    : 0;
+            push16At(14 + k * 2, static_cast<uint16_t>(comp << 8));
+        }
+        d[22] = 'N';
+        d[23] = 'r';
+        d[24] = 'm';
+        d[25] = 'l';
+        d[30] = 1;
+        d[31] = static_cast<uint8_t>(std::lround(std::clamp(st.igOpacity, 0.0, 1.0) * 255.0));
+        items.push_back({"iglw", std::move(d)});
+    }
+    if (st.colorOverlay) {
+        std::vector<uint8_t> d(24, 0);
+        auto push16At = [&d](size_t o, uint16_t v) {
+            d[o] = static_cast<uint8_t>(v >> 8);
+            d[o + 1] = static_cast<uint8_t>(v & 0xFF);
+        };
+        d[4] = 'N';
+        d[5] = 'r';
+        d[6] = 'm';
+        d[7] = 'l';
+        push16At(12, 0);
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t comp =
+                k < 3 ? static_cast<uint32_t>(std::lround(
+                                  std::clamp(st.overlayColor[k], 0.0f, 1.0f) * 255.0f))
+                      : 0;
+            push16At(14 + k * 2, static_cast<uint16_t>(comp << 8));
+        }
+        d[22] = static_cast<uint8_t>(
+            std::lround(std::clamp(st.overlayOpacity, 0.0, 1.0) * 255.0));
+        d[23] = 1;
+        items.push_back({"sofi", std::move(d)});
+    }
+    if (items.empty()) {
+        return out;
+    }
+    push16(0);  // version
+    push16(static_cast<uint16_t>(items.size()));
+    for (const Item& it : items) {
+        out.push_back('8');
+        out.push_back('B');
+        out.push_back('I');
+        out.push_back('M');
+        out.push_back(it.key[0]);
+        out.push_back(it.key[1]);
+        out.push_back(it.key[2]);
+        out.push_back(it.key[3]);
+        push32(static_cast<uint32_t>(it.data.size()));
+        out.insert(out.end(), it.data.begin(), it.data.end());
+    }
+    return out;
+}
+
 // ---------- 大端写助手（PSD 全程大端） ----------
 
 class BeWriter {
@@ -280,6 +486,7 @@ struct EncodedLayer {
     int recordType = 0;
     std::string adjKey;             // "levl"/"curv"/"nvrt"；空 = 无
     std::vector<uint8_t> adjPayload;
+    std::vector<uint8_t> lrfx;      // M17c：图层效果（非空 = 附加信息写 lrFX 块）
 };
 
 }  // namespace
@@ -445,6 +652,10 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
                                     "\" 的样式效果已合成进像素导出（非破坏样式不保留）。");
             }
             EncodedLayer el;
+            // M17c：可 lrFX 表示的样式 → 原始像素 + lrFX 块（像素已由快照分流为原始）
+            if (l.style != nullptr) {
+                el.lrfx = buildLrfx(*l.style);
+            }
             if (encodePixel(l, &el)) {
                 layers.push_back(std::move(el));
             }
@@ -677,6 +888,14 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
             w.u32(static_cast<uint32_t>(el.adjPayload.size()));
             w.raw(el.adjPayload);
             w.pad2In(w.size() - el.adjPayload.size());
+        }
+        // M17c：图层效果（lrFX；PS 读取兼容——其自身产物同时含 lfx2+lrFX）
+        if (!el.lrfx.empty()) {
+            w.ascii("8BIM", 4);
+            w.ascii("lrFX", 4);
+            w.u32(static_cast<uint32_t>(el.lrfx.size()));
+            w.raw(el.lrfx);
+            w.pad2In(w.size() - el.lrfx.size());
         }
         w.patchU32(extraAt, static_cast<uint32_t>(w.size() - extraAt - 4));
     }

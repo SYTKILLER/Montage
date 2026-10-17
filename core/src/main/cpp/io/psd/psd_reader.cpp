@@ -152,6 +152,10 @@ struct RawLayer {
     bool maskCropValid = false;
     int maskCropX = 0, maskCropY = 0, maskCropW = 0, maskCropH = 0;
     bool cropped = false;
+    // M17c：lrFX 五类效果（readRecord 解析；组装期转 Record.style）+ 降级键
+    std::vector<Record::PsdStyleEffect> style;
+    bool hasStyle = false;
+    std::vector<std::string> skippedFx;
 };
 
 bool readRecord(Cursor& c, bool isPSB, RawLayer& layer, std::string& err) {
@@ -329,6 +333,101 @@ bool readRecord(Cursor& c, bool isPSB, RawLayer& layer, std::string& err) {
             layer.section = static_cast<int>(
                 static_cast<uint32_t>(d[0]) << 24 | d[1] << 16 | d[2] << 8 | d[3]);
         }
+        // M17c：lrFX 图层效果（Photoshop 5 布局，对拍 photocraft parse_lrfx）
+        if (key == "lrFX" && layer.extra[key].size() >= 4) {
+            const std::vector<uint8_t>& d = layer.extra[key];
+            const uint32_t count = static_cast<uint32_t>(d[2]) << 8 | d[3];
+            auto rd32 = [&d](size_t o) -> uint32_t {
+                return static_cast<uint32_t>(d[o]) << 24 | static_cast<uint32_t>(d[o + 1]) << 16 |
+                       static_cast<uint32_t>(d[o + 2]) << 8 | static_cast<uint32_t>(d[o + 3]);
+            };
+            auto colorAt = [&d, &rd32](size_t o, float rgb[3]) -> bool {
+                // space u16 + 4×u16 分量（RGB 用前三个）；v>>8/255
+                if (o + 10 > d.size()) {
+                    return false;
+                }
+                for (int k = 0; k < 3; ++k) {
+                    const uint16_t v =
+                        static_cast<uint16_t>(d[o + 2 + k * 2]) << 8 | d[o + 3 + k * 2];
+                    rgb[k] = static_cast<float>(v >> 8) / 255.0f;
+                }
+                return true;
+            };
+            size_t at = 4;
+            bool anyMapped = false;
+            for (uint32_t e = 0; e < count && at + 12 <= d.size(); ++e) {
+                if (!(d[at] == '8' && d[at + 1] == 'B' && d[at + 2] == 'I' && d[at + 3] == 'M')) {
+                    break;
+                }
+                const std::string ekey(d.begin() + static_cast<long>(at + 4),
+                                       d.begin() + static_cast<long>(at + 8));
+                const uint32_t size = rd32(at + 8);
+                const size_t b = at + 12;
+                if (b + size > d.size()) {
+                    break;
+                }
+                bool mapped = false;
+                if ((ekey == "dsdw" || ekey == "isdw") && size >= 41) {
+                    Record::PsdStyleEffect fx;
+                    fx.key = ekey;
+                    fx.size = static_cast<double>(rd32(b + 4)) / 65536.0;
+                    fx.angle = static_cast<double>(static_cast<int32_t>(rd32(b + 12))) / 65536.0;
+                    fx.distance = static_cast<double>(rd32(b + 16)) / 65536.0;
+                    if (colorAt(b + 20, fx.color)) {
+                        const std::string blend(d.begin() + static_cast<long>(b + 30),
+                                                d.begin() + static_cast<long>(b + 34));
+                        fx.blendNormal = blend == "Nrml";
+                        fx.enabled = d[b + 38] != 0;
+                        fx.useGlobal = d[b + 39] != 0;
+                        fx.opacity = static_cast<double>(d[b + 40]) / 255.0;
+                        layer.style.push_back(fx);
+                        mapped = true;
+                    }
+                } else if ((ekey == "oglw" || ekey == "iglw") && size >= 32) {
+                    Record::PsdStyleEffect fx;
+                    fx.key = ekey;
+                    fx.size = static_cast<double>(rd32(b + 4)) / 65536.0;
+                    if (colorAt(b + 12, fx.color)) {
+                        const std::string blend(d.begin() + static_cast<long>(b + 22),
+                                                d.begin() + static_cast<long>(b + 26));
+                        fx.blendNormal = blend == "Nrml";
+                        fx.enabled = d[b + 30] != 0;
+                        fx.opacity = static_cast<double>(d[b + 31]) / 255.0;
+                        layer.style.push_back(fx);
+                        mapped = true;
+                    }
+                } else if (ekey == "sofi" && size >= 24) {
+                    Record::PsdStyleEffect fx;
+                    fx.key = ekey;
+                    const std::string blend(d.begin() + static_cast<long>(b + 4),
+                                            d.begin() + static_cast<long>(b + 8));
+                    fx.blendNormal = blend == "Nrml";
+                    if (colorAt(b + 12, fx.color)) {
+                        fx.opacity = static_cast<double>(d[b + 22]) / 255.0;
+                        fx.enabled = d[b + 23] != 0;
+                        layer.style.push_back(fx);
+                        mapped = true;
+                    }
+                } else if (ekey != "ebbl" && ekey != "sosl" && ekey != "strk" &&
+                           ekey != "grfl" && ekey != "ptfl" && ekey != "bevl") {
+                    layer.skippedFx.push_back(ekey);
+                }
+                if (mapped) {
+                    anyMapped = true;
+                    if (!layer.style.back().blendNormal) {
+                        layer.skippedFx.push_back(ekey + "-blend");
+                    }
+                }
+                at = b + size;  // 效果记录间不填充（photocraft parse_lrfx 同款；块级 pad 由外层处理）
+            }
+            if (anyMapped) {
+                layer.hasStyle = true;
+            }
+        }
+    }
+    // M17c：仅有 lfx2（无 lrFX）的文件——五类效果也拿不到，降级提示（PS 正常产物两者都有）
+    if (layer.extra.count("lfx2") != 0 && !layer.hasStyle) {
+        layer.skippedFx.push_back("lfx2-only");
     }
     if (!c.skip(static_cast<int64_t>(extraEnd) - static_cast<int64_t>(c.offset))) {
         err = "truncated";
@@ -760,6 +859,18 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
         const bool isGroup = layer.section == 1 || layer.section == 2;
         Record rec;
         rec.name = layer.name;
+        rec.hasStyle = layer.hasStyle;   // M17c：lrFX 效果
+        rec.style = layer.style;
+        for (const std::string& k : layer.skippedFx) {
+            if (k == "lfx2-only") {
+                rec.notes.push_back("Layer effects in lfx2 format only were skipped.");
+            } else if (k.size() > 6 && k.substr(k.size() - 6) == "-blend") {
+                rec.notes.push_back("Layer effect " + k.substr(0, k.size() - 6) +
+                                    " uses a non-normal blend; painted as normal.");
+            } else {
+                rec.notes.push_back("Layer effect " + k + " was skipped.");
+            }
+        }
         rec.isGroup = isGroup;
         rec.parentGroup = groupIds.empty() ? 0 : static_cast<int>(groupIds.back());
         rec.visible = !layer.hidden;

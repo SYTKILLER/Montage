@@ -3809,7 +3809,22 @@ napi_value ExportPsd(napi_env env, napi_callback_info info) {
             pl.collapsed = l.collapsed;
             pl.isText = l.text != nullptr;
             pl.isFill = l.fill != nullptr;
-            pl.hasStyle = l.style != nullptr;
+            // M17c：样式 → lrFX 导出。仅当已启用效果全部可由 lrFX 五类表示（无光泽/斜面/
+            // 渐变叠加/spread）才走「原始像素 + lrFX」；否则维持烘焙像素 + 降级 note，
+            // 避免 PS 端像素已含效果再叠 lrFX 双重应用。
+            if (l.style != nullptr && l.style->enabled) {
+                const LayerStyle& st = *l.style;
+                const bool allRepresentable = !st.satin && !st.bevel && !st.gradientOverlay &&
+                                              st.shadowSpread == 0.0 && st.isSpread == 0.0 &&
+                                              st.ogSpread == 0.0 && st.igSpread == 0.0;
+                if (allRepresentable) {
+                    pl.style = l.style;
+                    pl.pixels = l.pixels;  // 原始像素（效果由 lrFX 承载，PS 端渲染）
+                    pl.originX = l.transform.originX;
+                    pl.originY = l.transform.originY;
+                }
+            }
+            pl.hasStyle = l.style != nullptr && pl.style == nullptr;
             if (l.adjustment != nullptr) {
                 pl.adjKind = static_cast<int32_t>(l.adjustment->kind);
                 pl.adjInBlack = l.adjustment->inBlack;

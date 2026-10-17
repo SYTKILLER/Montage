@@ -52,6 +52,23 @@ struct Record {
     // M9d：调整层数据（kind=Adjustment 时；levl/curv/nvrt 可映射非破坏，其余 payload 原样）
     std::string adjKey;
     std::vector<uint8_t> adjPayload;
+    // M17c：lrFX 图层效果（Photoshop 5 布局）。v1 映射五类：dsdw/isdw（投影/内阴影）、
+    // oglw/iglw（外/内发光）、sofi（颜色叠加）；bevel/satin/stroke/gradient/pattern 走
+    // lfx2 descriptor（photocraft 亦不解析其 lrFX）→ notes 降级。PS 写效果时同时含
+    // lfx2+lrFX，lrFX 恒在 → 五类无损。
+    struct PsdStyleEffect {
+        std::string key = "";        // "dsdw"/"isdw"/"oglw"/"iglw"/"sofi"
+        double size = 0;             // blur px（fixed16.16）
+        double angle = 120;          // 度（投影/内阴影）
+        double distance = 0;
+        float color[4] = {0, 0, 0, 1};  // rgb 直 alpha 0..1（space≠RGB 时按 RGB 读前三分量）
+        bool blendNormal = true;     // PSD 混合键非 'Nrml' → false（渲染按正常处理+note）
+        bool enabled = true;
+        bool useGlobal = true;
+        double opacity = 1.0;
+    };
+    bool hasStyle = false;
+    std::vector<PsdStyleEffect> style;
 };
 
 struct PsdDocument {
