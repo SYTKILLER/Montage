@@ -1068,6 +1068,60 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
                 if (!readColor3("gdTo", st->gdTo)) { return false; }
                 st->gradientOverlay = true;
             }
+            // M17b：spread / 全局光开关 / 光泽 / 斜面（可选键，缺省 = 结构体默认值）
+            auto readOptNum = [&](const char* key, double& out) {
+                const JValue* jn2 = jst->find(key);
+                if (jn2 != nullptr && getDouble(*jn2, out) && std::isfinite(out)) {
+                    return true;
+                }
+                return false;
+            };
+            double sv = 0;
+            if (readOptNum("shSpread", sv)) { st->shadowSpread = std::clamp(sv, 0.0, 1.0); }
+            if (readOptNum("isSpread", sv)) { st->isSpread = std::clamp(sv, 0.0, 1.0); }
+            if (readOptNum("ogSpread", sv)) { st->ogSpread = std::clamp(sv, 0.0, 1.0); }
+            if (readOptNum("igSpread", sv)) { st->igSpread = std::clamp(sv, 0.0, 1.0); }
+            const JValue* jb = jst->find("shUseGL");
+            if (jb != nullptr && jb->type == JValue::Bool) { st->shadowUseGL = jb->b; }
+            jb = jst->find("isUseGL");
+            if (jb != nullptr && jb->type == JValue::Bool) { st->isUseGL = jb->b; }
+            if (jst->find("saAngle") != nullptr) {
+                if (!readOptNum("saAngle", sv)) { err = "bad saAngle"; return false; }
+                st->satinAngleDeg = sv;
+                if (!readOptNum("saDist", sv)) { err = "bad saDist"; return false; }
+                st->satinDistance = std::max(0.0, sv);
+                if (!readOptNum("saSize", sv)) { err = "bad saSize"; return false; }
+                st->satinSize = std::max(0.0, sv);
+                if (!readOptNum("saOpacity", sv)) { err = "bad saOpacity"; return false; }
+                st->satinOpacity = std::clamp(sv, 0.0, 1.0);
+                if (!readColor3("saColor", st->satinColor)) { return false; }
+                const JValue* ji = jst->find("saInvert");
+                if (ji != nullptr && ji->type == JValue::Bool) { st->satinInvert = ji->b; }
+                st->satin = true;
+            }
+            if (jst->find("bvStyle") != nullptr) {
+                if (!readOptNum("bvStyle", sv)) { err = "bad bvStyle"; return false; }
+                st->bevelStyle = sv != 0 ? 1 : 0;
+                if (!readOptNum("bvDepth", sv)) { err = "bad bvDepth"; return false; }
+                st->bevelDepth = std::clamp(sv, 0.0, 10.0);
+                const JValue* ju = jst->find("bvUp");
+                if (ju != nullptr && ju->type == JValue::Bool) { st->bevelUp = ju->b; }
+                if (!readOptNum("bvSize", sv)) { err = "bad bvSize"; return false; }
+                st->bevelSize = std::max(0.0, sv);
+                if (!readOptNum("bvAngle", sv)) { err = "bad bvAngle"; return false; }
+                st->bevelAngleDeg = sv;
+                if (!readOptNum("bvAlt", sv)) { err = "bad bvAlt"; return false; }
+                st->bevelAltitudeDeg = std::clamp(sv, 1.0, 89.0);
+                if (!readOptNum("bvHiOp", sv)) { err = "bad bvHiOp"; return false; }
+                st->bevelHiOpacity = std::clamp(sv, 0.0, 1.0);
+                if (!readColor3("bvHi", st->bevelHiColor)) { return false; }
+                if (!readOptNum("bvShOp", sv)) { err = "bad bvShOp"; return false; }
+                st->bevelShOpacity = std::clamp(sv, 0.0, 1.0);
+                if (!readColor3("bvSh", st->bevelShColor)) { return false; }
+                ju = jst->find("bvUseGL");
+                if (ju != nullptr && ju->type == JValue::Bool) { st->bevelUseGL = ju->b; }
+                st->bevel = true;
+            }
             l.style = std::move(st);
         }
         // v8 填充图层（M14c，可选字段）
@@ -1191,6 +1245,11 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
         if (jv != nullptr && jv->type == JValue::Bool) {
             doc.guidesVisible = jv->b;
         }
+    }
+    // v10：全局光角度（M17b，可选；缺省 120）
+    const JValue* jgl = root.find("globalLight");
+    if (jgl != nullptr && jgl->type == JValue::Num && std::isfinite(jgl->num)) {
+        doc.globalLightAngle = std::clamp(jgl->num, 0.0, 360.0);
     }
     // activeLayerId 必须在集合内（对齐上游 validate）
     const JValue* jactive = root.find("activeLayerId");

@@ -195,6 +195,33 @@ struct Index {
   @State styGdOp: number = 100;
   @State styGdFrom: string = '#000000';
   @State styGdTo: string = '#FFFFFF';
+  // M17b spread/全局光/光泽/斜面（对话框 last-applied 会话态）
+  @State styShadowSpread: number = 0;
+  @State styIsSpread: number = 0;
+  @State styOgSpread: number = 0;
+  @State styIgSpread: number = 0;
+  @State styShadowGL: boolean = true;
+  @State styIsGL: boolean = true;
+  @State stySatinOn: boolean = false;
+  @State stySatinAngle: number = 120;
+  @State stySatinDist: number = 8;
+  @State stySatinSize: number = 8;
+  @State stySatinOp: number = 100;
+  @State stySatinColor: string = '#808080';
+  @State stySatinInvert: boolean = false;
+  @State styBevelOn: boolean = false;
+  @State styBevelOuter: boolean = false;
+  @State styBevelDepth: number = 2;
+  @State styBevelUp: boolean = true;
+  @State styBevelSize: number = 5;
+  @State styBevelAngle: number = 120;
+  @State styBevelAlt: number = 30;
+  @State styBevelHiOp: number = 100;
+  @State styBevelHiColor: string = '#FFFFFF';
+  @State styBevelShOp: number = 100;
+  @State styBevelShColor: string = '#000000';
+  @State showGlobalLight: boolean = false;
+  @State globalLightAngle: number = 120;
   @State fillKind: number = 0;          // 填充层参数（活动层 isFill 时在样式对话框编辑）
   @State fillColor: string = '#D93025';
   @State fillAngle: number = 90;
@@ -2158,7 +2185,8 @@ struct Index {
     }
     const c = this.hexToRgb(this.styShadowColor);
     const ok = this.engine.setDropShadow(a.id, this.styShadowOn, this.styAngle, this.styDist,
-      this.stySize, this.styShadowOp / 100, c[0], c[1], c[2]);
+      this.stySize, this.styShadowOp / 100, c[0], c[1], c[2], this.styShadowSpread / 100,
+      this.styShadowGL);
     this.log(`drop shadow on=${this.styShadowOn}: ${ok}`);
   }
 
@@ -2192,7 +2220,8 @@ struct Index {
     }
     const c = this.hexToRgb(this.styIsColor);
     const ok = this.engine.setInnerShadow(a.id, this.styInnerShadowOn, this.styIsAngle,
-      this.styIsDist, this.styIsSize, this.styIsOp / 100, c[0], c[1], c[2]);
+      this.styIsDist, this.styIsSize, this.styIsOp / 100, c[0], c[1], c[2],
+      this.styIsSpread / 100, this.styIsGL);
     this.log(`inner shadow on=${this.styInnerShadowOn}: ${ok}`);
   }
 
@@ -2203,7 +2232,7 @@ struct Index {
     }
     const c = this.hexToRgb(this.styOgColor);
     const ok = this.engine.setOuterGlow(a.id, this.styOuterGlowOn, this.styOgSize,
-      this.styOgOp / 100, c[0], c[1], c[2]);
+      this.styOgOp / 100, c[0], c[1], c[2], this.styOgSpread / 100);
     this.log(`outer glow on=${this.styOuterGlowOn}: ${ok}`);
   }
 
@@ -2214,7 +2243,7 @@ struct Index {
     }
     const c = this.hexToRgb(this.styIgColor);
     const ok = this.engine.setInnerGlow(a.id, this.styInnerGlowOn, this.styIgSize,
-      this.styIgOp / 100, c[0], c[1], c[2]);
+      this.styIgOp / 100, c[0], c[1], c[2], this.styIgSpread / 100);
     this.log(`inner glow on=${this.styInnerGlowOn}: ${ok}`);
   }
 
@@ -2228,6 +2257,38 @@ struct Index {
     const ok = this.engine.setGradientOverlay(a.id, this.styGradientOn, this.styGdAngle,
       this.styGdOp / 100, f[0], f[1], f[2], t[0], t[1], t[2]);
     this.log(`gradient overlay on=${this.styGradientOn}: ${ok}`);
+  }
+
+  // ---------- M17b 光泽/斜面/全局光 ----------
+  private applySatin(): void {
+    const a = this.activeLayer();
+    if (a === undefined) {
+      return;
+    }
+    const c = this.hexToRgb(this.stySatinColor);
+    const ok = this.engine.setSatin(a.id, this.stySatinOn, this.stySatinAngle,
+      this.stySatinDist, this.stySatinSize, this.stySatinOp / 100, c[0], c[1], c[2],
+      this.stySatinInvert);
+    this.log(`satin on=${this.stySatinOn}: ${ok}`);
+  }
+
+  private applyBevel(): void {
+    const a = this.activeLayer();
+    if (a === undefined) {
+      return;
+    }
+    const hi = this.hexToRgb(this.styBevelHiColor);
+    const sh = this.hexToRgb(this.styBevelShColor);
+    const ok = this.engine.setBevel(a.id, this.styBevelOn, this.styBevelOuter ? 1 : 0,
+      this.styBevelDepth, this.styBevelUp, this.styBevelSize, this.styBevelAngle,
+      this.styBevelAlt, this.styBevelHiOp / 100, hi[0], hi[1], hi[2],
+      this.styBevelShOp / 100, sh[0], sh[1], sh[2]);
+    this.log(`bevel on=${this.styBevelOn}: ${ok}`);
+  }
+
+  private applyGlobalLight(): void {
+    const ok = this.engine.setGlobalLight(this.globalLightAngle);
+    this.log(`全局光 ${Math.round(this.globalLightAngle)}°: ${ok}`);
   }
 
   private applyFillParams(): void {
@@ -2744,6 +2805,9 @@ struct Index {
       case 'image.develop':
         this.openDevelopPanel();
         break;
+      case 'layer.globalLight':
+        this.showGlobalLight = true;
+        break;
       case 'image.revealAll':
         this.docOp((): boolean => this.engine.revealAll(), '显示全部');
         break;
@@ -3189,6 +3253,7 @@ struct Index {
       leafItem('layer.toggleEffects', '显示/隐藏全部效果', '',
         d && this.activeLayer()?.hasStyle === true,
         this.activeLayer()?.hasStyle === true && this.activeLayer()?.styleOn === false),
+      leafItem('layer.globalLight', '全局光角度…', '', d),
       leafItem('layer.fillSolid', '新建纯色填充图层', '', d),
       leafItem('layer.fillGrad', '新建渐变填充图层', '', d),
       leafItem('layer.linkToggle', '链接图层 / 解除链接', '',
@@ -3399,7 +3464,7 @@ struct Index {
       return;
     }
     // 对话框打开时：Esc 关闭，其余不抢
-    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform || this.showModify || this.showStoreSel || this.showLoadSel || this.showFill || this.showStyle || this.showFilter || this.showDevelop) {
+    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform || this.showModify || this.showStoreSel || this.showLoadSel || this.showFill || this.showStyle || this.showFilter || this.showDevelop || this.showGlobalLight) {
       if (e.keyCode === KC_ESC) {
         this.showTransform = false;
         this.showExport = false;
@@ -3415,6 +3480,7 @@ struct Index {
         }
         this.showFill = false;
         this.showStyle = false;
+        this.showGlobalLight = false;
         this.cancelFilterDialog();
       }
       return;
@@ -4721,6 +4787,39 @@ struct Index {
             .border({ width: 1, color: $r('app.color.border') }).width(400)
         }.width('100%').height('100%')
       }
+      // M17b 全局光角度
+      if (this.showGlobalLight) {
+        Stack() {
+          Column().width('100%').height('100%').backgroundColor('#66000000')
+            .onClick((): void => { this.showGlobalLight = false; })
+          Column({ space: 14 }) {
+            Text('全局光角度').fontSize(16).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+            Text('投影 / 内阴影 / 斜面浮雕勾选「全局光」时引用此角度')
+              .fontSize(11).fontColor($r('app.color.text_secondary'))
+            Row({ space: 10 }) {
+              Text('角度').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+              Slider({ value: this.globalLightAngle, min: 0, max: 360, step: 1 })
+                .layoutWeight(1)
+                .onChange((v: number, mode: SliderChangeMode): void => {
+                  if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                    this.globalLightAngle = v;
+                    this.applyGlobalLight();
+                  }
+                })
+              Text(`${Math.round(this.globalLightAngle)}°`).fontSize(12).width(44)
+                .textAlign(TextAlign.End).fontColor($r('app.color.text_primary'))
+            }
+            Row({ space: 12 }) {
+              Button('关闭').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.accent'))
+                .fontColor($r('app.color.on_accent'))
+                .onClick((): void => { this.showGlobalLight = false; })
+            }.justifyContent(FlexAlign.End).width('100%')
+          }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
+            .border({ width: 1, color: $r('app.color.border') }).width(400)
+        }.width('100%').height('100%')
+      }
       if (this.showFill) {
         Stack() {
           Column().width('100%').height('100%').backgroundColor('#66000000')
@@ -4834,6 +4933,27 @@ struct Index {
                     })
                   Text('投影').fontSize(13).fontColor($r('app.color.text_primary'))
                 }
+                Row({ space: 6 }) {
+                  Text('扩展').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styShadowSpread, min: 0, max: 100, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styShadowSpread = v;
+                        this.applyDropShadow();
+                      }
+                    })
+                  Text(`${Math.round(this.styShadowSpread)}%`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('全局光').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Toggle({ type: ToggleType.Checkbox, isOn: this.styShadowGL })
+                    .onChange((on: boolean): void => {
+                      this.styShadowGL = on;
+                      this.applyDropShadow();
+                    })
+                }.width('100%')
                 Row({ space: 6 }) {
                   Text('角度').fontSize(12).fontColor($r('app.color.text_secondary'))
                   Slider({ value: this.styAngle, min: 0, max: 360, step: 5 })
@@ -4997,6 +5117,27 @@ struct Index {
                   Text('内阴影').fontSize(13).fontColor($r('app.color.text_primary'))
                 }
                 Row({ space: 6 }) {
+                  Text('扩展').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styIsSpread, min: 0, max: 100, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styIsSpread = v;
+                        this.applyInnerShadow();
+                      }
+                    })
+                  Text(`${Math.round(this.styIsSpread)}%`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('全局光').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Toggle({ type: ToggleType.Checkbox, isOn: this.styIsGL })
+                    .onChange((on: boolean): void => {
+                      this.styIsGL = on;
+                      this.applyInnerShadow();
+                    })
+                }.width('100%')
+                Row({ space: 6 }) {
                   Text('角度').fontSize(12).fontColor($r('app.color.text_secondary'))
                   Slider({ value: this.styIsAngle, min: 0, max: 360, step: 5 })
                     .layoutWeight(1).height(24)
@@ -5077,6 +5218,19 @@ struct Index {
                   Text('外发光').fontSize(13).fontColor($r('app.color.text_primary'))
                 }
                 Row({ space: 6 }) {
+                  Text('扩展').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styOgSpread, min: 0, max: 100, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styOgSpread = v;
+                        this.applyOuterGlow();
+                      }
+                    })
+                  Text(`${Math.round(this.styOgSpread)}%`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
                   Text('大小').fontSize(12).fontColor($r('app.color.text_secondary'))
                   Slider({ value: this.styOgSize, min: 0, max: 50, step: 1 })
                     .layoutWeight(1).height(24)
@@ -5129,6 +5283,19 @@ struct Index {
                     })
                   Text('内发光').fontSize(13).fontColor($r('app.color.text_primary'))
                 }
+                Row({ space: 6 }) {
+                  Text('扩展').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styIgSpread, min: 0, max: 100, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styIgSpread = v;
+                        this.applyInnerGlow();
+                      }
+                    })
+                  Text(`${Math.round(this.styIgSpread)}%`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
                 Row({ space: 6 }) {
                   Text('大小').fontSize(12).fontColor($r('app.color.text_secondary'))
                   Slider({ value: this.styIgSize, min: 0, max: 50, step: 1 })
@@ -5237,6 +5404,222 @@ struct Index {
                       .onClick((): void => { this.styGdTo = sw; this.applyGradientOverlay(); })
                   }, (sw: string): string => sw)
                 }
+              }
+              .width('100%').padding(10).borderRadius(8)
+              .backgroundColor($r('app.color.surface'))
+              .border({ width: 1, color: $r('app.color.border') })
+              // M17b 光泽
+              Column({ space: 6 }) {
+                Row({ space: 8 }) {
+                  Toggle({ type: ToggleType.Checkbox, isOn: this.stySatinOn })
+                    .onChange((on: boolean): void => {
+                      this.stySatinOn = on;
+                      this.applySatin();
+                    })
+                  Text('光泽').fontSize(13).fontColor($r('app.color.text_primary'))
+                  Toggle({ type: ToggleType.Checkbox, isOn: this.stySatinInvert })
+                    .onChange((on: boolean): void => {
+                      this.stySatinInvert = on;
+                      this.applySatin();
+                    })
+                  Text('反相').fontSize(11).fontColor($r('app.color.text_secondary'))
+                }
+                Row({ space: 6 }) {
+                  Text('角度').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.stySatinAngle, min: 0, max: 360, step: 5 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.stySatinAngle = v;
+                        this.applySatin();
+                      }
+                    })
+                  Text(`${Math.round(this.stySatinAngle)}°`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('距离').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.stySatinDist, min: 0, max: 60, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.stySatinDist = v;
+                        this.applySatin();
+                      }
+                    })
+                  Text(`${Math.round(this.stySatinDist)}`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('大小').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.stySatinSize, min: 0, max: 50, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.stySatinSize = v;
+                        this.applySatin();
+                      }
+                    })
+                  Text(`${Math.round(this.stySatinSize)}`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('不透明度').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.stySatinOp, min: 0, max: 100, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.stySatinOp = v;
+                        this.applySatin();
+                      }
+                    })
+                  Text(`${Math.round(this.stySatinOp)}%`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('颜色').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  ForEach(SWATCHES, (sw: string) => {
+                    Column()
+                      .width(22).height(22).borderRadius(4)
+                      .backgroundColor(sw)
+                      .border({
+                        width: this.stySatinColor === sw ? 2 : 1,
+                        color: this.stySatinColor === sw
+                          ? $r('app.color.accent') : $r('app.color.border')
+                      })
+                      .onClick((): void => { this.stySatinColor = sw; this.applySatin(); })
+                  }, (sw: string): string => sw)
+                }
+              }
+              .width('100%').padding(10).borderRadius(8)
+              .backgroundColor($r('app.color.surface'))
+              .border({ width: 1, color: $r('app.color.border') })
+              // M17b 斜面浮雕
+              Column({ space: 6 }) {
+                Row({ space: 8 }) {
+                  Toggle({ type: ToggleType.Checkbox, isOn: this.styBevelOn })
+                    .onChange((on: boolean): void => {
+                      this.styBevelOn = on;
+                      this.applyBevel();
+                    })
+                  Text('斜面浮雕').fontSize(13).fontColor($r('app.color.text_primary'))
+                  Button(this.styBevelOuter ? '外斜面' : '内斜面')
+                    .fontSize(11).height(26)
+                    .backgroundColor($r('app.color.accent_container'))
+                    .fontColor($r('app.color.accent'))
+                    .onClick((): void => {
+                      this.styBevelOuter = !this.styBevelOuter;
+                      this.applyBevel();
+                    })
+                  Button(this.styBevelUp ? '向上' : '向下')
+                    .fontSize(11).height(26)
+                    .backgroundColor($r('app.color.accent_container'))
+                    .fontColor($r('app.color.accent'))
+                    .onClick((): void => {
+                      this.styBevelUp = !this.styBevelUp;
+                      this.applyBevel();
+                    })
+                }
+                Row({ space: 6 }) {
+                  Text('深度').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styBevelDepth * 10, min: 10, max: 100, step: 5 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styBevelDepth = v / 10;
+                        this.applyBevel();
+                      }
+                    })
+                  Text(`${Math.round(this.styBevelDepth * 100)}%`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('大小').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styBevelSize, min: 0, max: 50, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styBevelSize = v;
+                        this.applyBevel();
+                      }
+                    })
+                  Text(`${Math.round(this.styBevelSize)}`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('角度').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styBevelAngle, min: 0, max: 360, step: 5 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styBevelAngle = v;
+                        this.applyBevel();
+                      }
+                    })
+                  Text(`${Math.round(this.styBevelAngle)}°`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('高度').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styBevelAlt, min: 1, max: 89, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styBevelAlt = v;
+                        this.applyBevel();
+                      }
+                    })
+                  Text(`${Math.round(this.styBevelAlt)}°`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('高光').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styBevelHiOp, min: 0, max: 100, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styBevelHiOp = v;
+                        this.applyBevel();
+                      }
+                    })
+                  Text(`${Math.round(this.styBevelHiOp)}%`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                  ForEach(SWATCHES, (sw: string) => {
+                    Column()
+                      .width(22).height(22).borderRadius(4)
+                      .backgroundColor(sw)
+                      .border({
+                        width: this.styBevelHiColor === sw ? 2 : 1,
+                        color: this.styBevelHiColor === sw
+                          ? $r('app.color.accent') : $r('app.color.border')
+                      })
+                      .onClick((): void => { this.styBevelHiColor = sw; this.applyBevel(); })
+                  }, (sw: string): string => sw)
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('暗影').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styBevelShOp, min: 0, max: 100, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styBevelShOp = v;
+                        this.applyBevel();
+                      }
+                    })
+                  Text(`${Math.round(this.styBevelShOp)}%`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                  ForEach(SWATCHES, (sw: string) => {
+                    Column()
+                      .width(22).height(22).borderRadius(4)
+                      .backgroundColor(sw)
+                      .border({
+                        width: this.styBevelShColor === sw ? 2 : 1,
+                        color: this.styBevelShColor === sw
+                          ? $r('app.color.accent') : $r('app.color.border')
+                      })
+                      .onClick((): void => { this.styBevelShColor = sw; this.applyBevel(); })
+                  }, (sw: string): string => sw)
+                }.width('100%')
               }
               .width('100%').padding(10).borderRadius(8)
               .backgroundColor($r('app.color.surface'))

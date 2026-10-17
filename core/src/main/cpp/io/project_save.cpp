@@ -465,6 +465,7 @@ struct DocSnapshot {
     std::vector<float> guidesV;
     bool guidesLocked = false;
     bool guidesVisible = true;
+    double globalLightAngle = 120.0;  // v10（M17b）
 };
 
 std::string jsonEscape(const std::string& in) {
@@ -608,6 +609,13 @@ std::string buildManifest(const DocSnapshot& doc) {
                     if (ci < 2) sf += ", ";
                 }
                 sf += "]";
+                if (st.shadowSpread != 0.0) {
+                    std::snprintf(num, sizeof(num), "%.6g", st.shadowSpread);
+                    sf += std::string(",\n      \"shSpread\": ") + num;
+                }
+                if (!st.shadowUseGL) {
+                    sf += ",\n      \"shUseGL\": false";
+                }
             }
             sf += ",\n      \"stroke\": ";
             sf += (st.stroke ? "true" : "false");
@@ -652,6 +660,13 @@ std::string buildManifest(const DocSnapshot& doc) {
                     if (ci < 2) sf += ", ";
                 }
                 sf += "]";
+                if (st.isSpread != 0.0) {
+                    std::snprintf(num, sizeof(num), "%.6g", st.isSpread);
+                    sf += std::string(",\n      \"isSpread\": ") + num;
+                }
+                if (!st.isUseGL) {
+                    sf += ",\n      \"isUseGL\": false";
+                }
             }
             if (st.outerGlow) {
                 std::snprintf(num, sizeof(num), "%.6g", st.ogSize);
@@ -665,6 +680,10 @@ std::string buildManifest(const DocSnapshot& doc) {
                     if (ci < 2) sf += ", ";
                 }
                 sf += "]";
+                if (st.ogSpread != 0.0) {
+                    std::snprintf(num, sizeof(num), "%.6g", st.ogSpread);
+                    sf += std::string(",\n      \"ogSpread\": ") + num;
+                }
             }
             if (st.innerGlow) {
                 std::snprintf(num, sizeof(num), "%.6g", st.igSize);
@@ -678,6 +697,10 @@ std::string buildManifest(const DocSnapshot& doc) {
                     if (ci < 2) sf += ", ";
                 }
                 sf += "]";
+                if (st.igSpread != 0.0) {
+                    std::snprintf(num, sizeof(num), "%.6g", st.igSpread);
+                    sf += std::string(",\n      \"igSpread\": ") + num;
+                }
             }
             if (st.gradientOverlay) {
                 std::snprintf(num, sizeof(num), "%.6g", st.gdAngleDeg);
@@ -697,6 +720,62 @@ std::string buildManifest(const DocSnapshot& doc) {
                     if (ci < 2) sf += ", ";
                 }
                 sf += "]";
+            }
+            // M17b 光泽/斜面（非默认才写）
+            if (st.satin) {
+                std::snprintf(num, sizeof(num), "%.6g", st.satinAngleDeg);
+                sf += std::string(",\n      \"saAngle\": ") + num;
+                std::snprintf(num, sizeof(num), "%.6g", st.satinDistance);
+                sf += std::string(",\n      \"saDist\": ") + num;
+                std::snprintf(num, sizeof(num), "%.6g", st.satinSize);
+                sf += std::string(",\n      \"saSize\": ") + num;
+                std::snprintf(num, sizeof(num), "%.6g", st.satinOpacity);
+                sf += std::string(",\n      \"saOpacity\": ") + num;
+                sf += ",\n      \"saColor\": [";
+                for (int ci = 0; ci < 3; ++ci) {
+                    std::snprintf(num, sizeof(num), "%.6g", st.satinColor[ci]);
+                    sf += num;
+                    if (ci < 2) sf += ", ";
+                }
+                sf += "]";
+                if (st.satinInvert) {
+                    sf += ",\n      \"saInvert\": true";
+                }
+            }
+            if (st.bevel) {
+                sf += std::string(",\n      \"bvStyle\": ") + std::to_string(st.bevelStyle);
+                std::snprintf(num, sizeof(num), "%.6g", st.bevelDepth);
+                sf += std::string(",\n      \"bvDepth\": ") + num;
+                if (!st.bevelUp) {
+                    sf += ",\n      \"bvUp\": false";
+                }
+                std::snprintf(num, sizeof(num), "%.6g", st.bevelSize);
+                sf += std::string(",\n      \"bvSize\": ") + num;
+                std::snprintf(num, sizeof(num), "%.6g", st.bevelAngleDeg);
+                sf += std::string(",\n      \"bvAngle\": ") + num;
+                std::snprintf(num, sizeof(num), "%.6g", st.bevelAltitudeDeg);
+                sf += std::string(",\n      \"bvAlt\": ") + num;
+                std::snprintf(num, sizeof(num), "%.6g", st.bevelHiOpacity);
+                sf += std::string(",\n      \"bvHiOp\": ") + num;
+                sf += ",\n      \"bvHi\": [";
+                for (int ci = 0; ci < 3; ++ci) {
+                    std::snprintf(num, sizeof(num), "%.6g", st.bevelHiColor[ci]);
+                    sf += num;
+                    if (ci < 2) sf += ", ";
+                }
+                sf += "]";
+                std::snprintf(num, sizeof(num), "%.6g", st.bevelShOpacity);
+                sf += std::string(",\n      \"bvShOp\": ") + num;
+                sf += ",\n      \"bvSh\": [";
+                for (int ci = 0; ci < 3; ++ci) {
+                    std::snprintf(num, sizeof(num), "%.6g", st.bevelShColor[ci]);
+                    sf += num;
+                    if (ci < 2) sf += ", ";
+                }
+                sf += "]";
+                if (!st.bevelUseGL) {
+                    sf += ",\n      \"bvUseGL\": false";
+                }
             }
             fields.push_back(std::string("      \"style\": {\n") + sf + "\n      }");
         }
@@ -830,6 +909,12 @@ std::string buildManifest(const DocSnapshot& doc) {
         j += std::string("    \"visible\": ") + (doc.guidesVisible ? "true" : "false") + "\n";
         j += "  }\n";
     }
+    // v10：全局光角度（M17b 文档级；非默认 120 不写 = 旧包字节不变）
+    if (doc.globalLightAngle != 120.0) {
+        char num[32];
+        std::snprintf(num, sizeof(num), "%.6g", doc.globalLightAngle);
+        j += std::string(",\n  \"globalLight\": ") + num + "\n";
+    }
     j += "}\n";
     return j;
 }
@@ -851,6 +936,7 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
         snap.height = e.doc.height;
         snap.name = e.doc.name;
         snap.activeId = e.doc.activeId;
+        snap.globalLightAngle = e.doc.globalLightAngle;
         for (const AlphaChannel& c : e.doc.channels) {
             if (c.mask != nullptr) {
                 ChannelSnapshot cs;

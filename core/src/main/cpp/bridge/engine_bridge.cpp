@@ -2660,6 +2660,20 @@ napi_value ContinueStroke(napi_env env, napi_callback_info info) {
         e.ensureStrokeThreadLocked();
         e.strokeCv.notify_all();
     }
+    // STROKEDBG（临时排查）：入队点逐点日志（上限 4096 条防刷爆）
+    {
+        static std::atomic<int> dbgCount{0};
+        static float lastX = 0, lastY = 0;
+        if (dbgCount.fetch_add(1) < 4096) {
+            const float dx = static_cast<float>(x) - lastX;
+            const float dy = static_cast<float>(y) - lastY;
+            OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.StrokeDbg",
+                         "in seq=%{public}d x=%{public}.1f y=%{public}.1f dxy=(%{public}.1f,%{public}.1f) p=%{public}.2f",
+                         dbgCount.load(), x, y, dx, dy, pressure);
+            lastX = static_cast<float>(x);
+            lastY = static_cast<float>(y);
+        }
+    }
     return makeOk(env, nullptr);
 }
 
@@ -2671,6 +2685,7 @@ napi_value EndStroke(napi_env env, napi_callback_info /*info*/) {
         e.ensureStrokeThreadLocked();
         e.strokeCv.notify_all();
     }
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.StrokeDbg", "END marker enqueued");
     return makeOk(env, nullptr);
 }
 
@@ -5043,18 +5058,18 @@ napi_value runStyleCommand(napi_env env, const char* what, LayerId id,
 
 // 投影：setDropShadow(id, enabled, angleDeg, dist, size, opacity, r, g, b)（色 0..255）
 napi_value SetDropShadow(napi_env env, napi_callback_info info) {
-    size_t argc = 9;
-    napi_value argv[9];
-    for (size_t i = 0; i < 9; ++i) {
+    size_t argc = 11;
+    napi_value argv[11];
+    for (size_t i = 0; i < 11; ++i) {
         argv[i] = nullptr;
     }
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    double v[9] = {0};
-    if (argc < 9) {
+    double v[11] = {0};
+    if (argc < 11) {
         return makeError(env, kErrBadParam,
-                         "setDropShadow(id,enabled,angle,dist,size,opacity,r,g,b) requires 9");
+                         "setDropShadow(id,enabled,angle,dist,size,opacity,r,g,b,spread,useGL) requires 11");
     }
-    for (size_t i = 0; i < 9; ++i) {
+    for (size_t i = 0; i < 11; ++i) {
         if (napi_get_value_double(env, argv[i], &v[i]) != napi_ok) {
             return makeError(env, kErrBadParam, "setDropShadow: invalid args");
         }
@@ -5075,6 +5090,8 @@ napi_value SetDropShadow(napi_env env, napi_callback_info info) {
         l.style->shadowColor[0] = static_cast<float>(v[6] / 255.0);
         l.style->shadowColor[1] = static_cast<float>(v[7] / 255.0);
         l.style->shadowColor[2] = static_cast<float>(v[8] / 255.0);
+        l.style->shadowSpread = std::clamp(v[9], 0.0, 1.0);   // M17b
+        l.style->shadowUseGL = v[10] != 0;                    // M17b
         l.style->shadowColor[3] = 1.0f;
         return true;
     });
@@ -5173,17 +5190,17 @@ napi_value ClearLayerStyle(napi_env env, napi_callback_info info) {
 // setInnerShadow(id,enabled,angle,dist,size,opacity,r,g,b)
 napi_value SetInnerShadow(napi_env env, napi_callback_info info) {
     size_t argc = 9;
-    napi_value argv[9];
-    for (size_t i = 0; i < 9; ++i) {
+    napi_value argv[11];
+    for (size_t i = 0; i < 11; ++i) {
         argv[i] = nullptr;
     }
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    double v[9] = {0};
-    if (argc < 9) {
+    double v[11] = {0};
+    if (argc < 11) {
         return makeError(env, kErrBadParam,
-                         "setInnerShadow(id,enabled,angle,dist,size,opacity,r,g,b) requires 9");
+                         "setInnerShadow(id,enabled,angle,dist,size,opacity,r,g,b,spread,useGL) requires 11");
     }
-    for (size_t i = 0; i < 9; ++i) {
+    for (size_t i = 0; i < 11; ++i) {
         if (napi_get_value_double(env, argv[i], &v[i]) != napi_ok) {
             return makeError(env, kErrBadParam, "setInnerShadow: invalid args");
         }
@@ -5205,23 +5222,26 @@ napi_value SetInnerShadow(napi_env env, napi_callback_info info) {
         l.style->isColor[1] = static_cast<float>(v[7] / 255.0);
         l.style->isColor[2] = static_cast<float>(v[8] / 255.0);
         l.style->isColor[3] = 1.0f;
+        l.style->isSpread = std::clamp(v[9], 0.0, 1.0);   // M17b
+        l.style->isUseGL = v[10] != 0;                    // M17b
         return true;
     });
 }
 
 // setOuterGlow(id,enabled,size,opacity,r,g,b)
 napi_value SetOuterGlow(napi_env env, napi_callback_info info) {
-    size_t argc = 7;
-    napi_value argv[7];
-    for (size_t i = 0; i < 7; ++i) {
+    size_t argc = 8;
+    napi_value argv[8];
+    for (size_t i = 0; i < 8; ++i) {
         argv[i] = nullptr;
     }
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    double v[7] = {0};
-    if (argc < 7) {
-        return makeError(env, kErrBadParam, "setOuterGlow(id,enabled,size,opacity,r,g,b) requires 7");
+    double v[8] = {0};
+    if (argc < 8) {
+        return makeError(env, kErrBadParam,
+                         "setOuterGlow(id,enabled,size,opacity,r,g,b,spread) requires 8");
     }
-    for (size_t i = 0; i < 7; ++i) {
+    for (size_t i = 0; i < 8; ++i) {
         if (napi_get_value_double(env, argv[i], &v[i]) != napi_ok) {
             return makeError(env, kErrBadParam, "setOuterGlow: invalid args");
         }
@@ -5241,23 +5261,25 @@ napi_value SetOuterGlow(napi_env env, napi_callback_info info) {
         l.style->ogColor[1] = static_cast<float>(v[5] / 255.0);
         l.style->ogColor[2] = static_cast<float>(v[6] / 255.0);
         l.style->ogColor[3] = 1.0f;
+        l.style->ogSpread = std::clamp(v[7], 0.0, 1.0);   // M17b
         return true;
     });
 }
 
 // setInnerGlow(id,enabled,size,opacity,r,g,b)
 napi_value SetInnerGlow(napi_env env, napi_callback_info info) {
-    size_t argc = 7;
-    napi_value argv[7];
-    for (size_t i = 0; i < 7; ++i) {
+    size_t argc = 8;
+    napi_value argv[8];
+    for (size_t i = 0; i < 8; ++i) {
         argv[i] = nullptr;
     }
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    double v[7] = {0};
-    if (argc < 7) {
-        return makeError(env, kErrBadParam, "setInnerGlow(id,enabled,size,opacity,r,g,b) requires 7");
+    double v[8] = {0};
+    if (argc < 8) {
+        return makeError(env, kErrBadParam,
+                         "setInnerGlow(id,enabled,size,opacity,r,g,b,spread) requires 8");
     }
-    for (size_t i = 0; i < 7; ++i) {
+    for (size_t i = 0; i < 8; ++i) {
         if (napi_get_value_double(env, argv[i], &v[i]) != napi_ok) {
             return makeError(env, kErrBadParam, "setInnerGlow: invalid args");
         }
@@ -5277,6 +5299,7 @@ napi_value SetInnerGlow(napi_env env, napi_callback_info info) {
         l.style->igColor[1] = static_cast<float>(v[5] / 255.0);
         l.style->igColor[2] = static_cast<float>(v[6] / 255.0);
         l.style->igColor[3] = 1.0f;
+        l.style->igSpread = std::clamp(v[7], 0.0, 1.0);   // M17b
         return true;
     });
 }
@@ -5320,6 +5343,124 @@ napi_value SetGradientOverlay(napi_env env, napi_callback_info info) {
         l.style->gdTo[3] = 1.0f;
         return true;
     });
+}
+
+// ---------- M17b 光泽 / 斜面浮雕 / 全局光 ----------
+
+// setSatin(id,enabled,angle,dist,size,opacity,r,g,b,invert)
+napi_value SetSatin(napi_env env, napi_callback_info info) {
+    size_t argc = 10;
+    napi_value argv[10];
+    for (size_t i = 0; i < 10; ++i) {
+        argv[i] = nullptr;
+    }
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double v[10] = {0};
+    if (argc < 10) {
+        return makeError(env, kErrBadParam,
+                         "setSatin(id,enabled,angle,dist,size,opacity,r,g,b,invert) requires 10");
+    }
+    for (size_t i = 0; i < 10; ++i) {
+        if (napi_get_value_double(env, argv[i], &v[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "setSatin: invalid args");
+        }
+    }
+    const LayerId id = static_cast<LayerId>(v[0]);
+    return runStyleCommand(env, "satin", id,
+                           [v](Document&, Layer& l, std::string&) -> bool {
+        if (l.style == nullptr) {
+            l.style = std::make_shared<LayerStyle>();
+        } else {
+            l.style = std::make_shared<LayerStyle>(*l.style);
+        }
+        l.style->satin = v[1] != 0;
+        l.style->satinAngleDeg = v[2];
+        l.style->satinDistance = std::max(0.0, v[3]);
+        l.style->satinSize = std::max(0.0, v[4]);
+        l.style->satinOpacity = std::clamp(v[5], 0.0, 1.0);
+        l.style->satinColor[0] = static_cast<float>(v[6] / 255.0);
+        l.style->satinColor[1] = static_cast<float>(v[7] / 255.0);
+        l.style->satinColor[2] = static_cast<float>(v[8] / 255.0);
+        l.style->satinColor[3] = 1.0f;
+        l.style->satinInvert = v[9] != 0;
+        return true;
+    });
+}
+
+// setBevel(id,enabled,style,depth,up,size,angle,altitude,hiOp,hr,hg,hb,shOp,sr,sg,sb)
+napi_value SetBevel(napi_env env, napi_callback_info info) {
+    size_t argc = 16;
+    napi_value argv[16];
+    for (size_t i = 0; i < 16; ++i) {
+        argv[i] = nullptr;
+    }
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double v[16] = {0};
+    if (argc < 16) {
+        return makeError(env, kErrBadParam,
+                         "setBevel(id,enabled,style,depth,up,size,angle,altitude,"
+                         "hiOp,hr,hg,hb,shOp,sr,sg,sb) requires 16");
+    }
+    for (size_t i = 0; i < 16; ++i) {
+        if (napi_get_value_double(env, argv[i], &v[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "setBevel: invalid args");
+        }
+    }
+    const LayerId id = static_cast<LayerId>(v[0]);
+    return runStyleCommand(env, "bevel emboss", id,
+                           [v](Document&, Layer& l, std::string&) -> bool {
+        if (l.style == nullptr) {
+            l.style = std::make_shared<LayerStyle>();
+        } else {
+            l.style = std::make_shared<LayerStyle>(*l.style);
+        }
+        l.style->bevel = v[1] != 0;
+        l.style->bevelStyle = v[2] != 0 ? 1 : 0;  // 0=Inner 1=Outer（Emboss 族挂 M17c）
+        l.style->bevelDepth = std::clamp(v[3], 0.0, 10.0);
+        l.style->bevelUp = v[4] != 0;
+        l.style->bevelSize = std::max(0.0, v[5]);
+        l.style->bevelAngleDeg = v[6];
+        l.style->bevelAltitudeDeg = std::clamp(v[7], 1.0, 89.0);
+        l.style->bevelHiOpacity = std::clamp(v[8], 0.0, 1.0);
+        l.style->bevelHiColor[0] = static_cast<float>(v[9] / 255.0);
+        l.style->bevelHiColor[1] = static_cast<float>(v[10] / 255.0);
+        l.style->bevelHiColor[2] = static_cast<float>(v[11] / 255.0);
+        l.style->bevelHiColor[3] = 1.0f;
+        l.style->bevelShOpacity = std::clamp(v[12], 0.0, 1.0);
+        l.style->bevelShColor[0] = static_cast<float>(v[13] / 255.0);
+        l.style->bevelShColor[1] = static_cast<float>(v[14] / 255.0);
+        l.style->bevelShColor[2] = static_cast<float>(v[15] / 255.0);
+        l.style->bevelShColor[3] = 1.0f;
+        return true;
+    });
+}
+
+// setGlobalLight(angle)：文档级全局光角度（无 History 事务——PS 同语义；全文档重样式）
+napi_value SetGlobalLight(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double angle = 120.0;
+    if (argc >= 1 && napi_get_value_double(env, argv[0], &angle) != napi_ok) {
+        return makeError(env, kErrBadParam, "setGlobalLight(angle) invalid");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0) {
+            return makeError(env, kErrNoDoc, "setGlobalLight: no document");
+        }
+        e.doc.globalLightAngle = std::clamp(angle, 0.0, 360.0);
+        std::string err;
+        for (Layer& l : e.doc.layers) {
+            if (l.style != nullptr || l.fill != nullptr) {
+                restyleLayer(e.doc, l, nextGridRevision(), err);
+            }
+        }
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
 }
 
 // 样式剪贴板（会话态，跨文档保留——M10c ClipBuffer 同语义）

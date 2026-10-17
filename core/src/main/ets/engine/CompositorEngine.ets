@@ -557,9 +557,10 @@ export class CompositorEngine {
   // ---------- M14c 图层样式 / 填充图层 ----------
 
   setDropShadow(id: number, enabled: boolean, angle: number, dist: number, size: number,
-    opacity: number, r: number, g: number, b: number): boolean {
+    opacity: number, r: number, g: number, b: number, spread: number = 0,
+    useGL: boolean = true): boolean {
     const r2 = narrowResult(native.setDropShadow(id, enabled ? 1 : 0, angle, dist, size, opacity,
-      r, g, b) as Object);
+      r, g, b, spread, useGL ? 1 : 0) as Object);
     if (!r2.ok) {
       hilog.error(DOMAIN, TAG, 'setDropShadow failed: %{public}s',
         r2.error !== null ? r2.error.message : 'unknown');
@@ -602,9 +603,10 @@ export class CompositorEngine {
 
   /** M17a：内阴影（角度/距离/大小/不透明度 + rgb）。 */
   setInnerShadow(id: number, enabled: boolean, angle: number, dist: number, size: number,
-    opacity: number, r: number, g: number, b: number): boolean {
+    opacity: number, r: number, g: number, b: number, spread: number = 0,
+    useGL: boolean = true): boolean {
     const r2 = narrowResult(native.setInnerShadow(id, enabled ? 1 : 0, angle, dist, size,
-      opacity, r, g, b) as Object);
+      opacity, r, g, b, spread, useGL ? 1 : 0) as Object);
     if (!r2.ok) {
       hilog.error(DOMAIN, TAG, 'setInnerShadow failed: %{public}s',
         r2.error !== null ? r2.error.message : 'unknown');
@@ -615,8 +617,9 @@ export class CompositorEngine {
 
   /** M17a：外发光（大小/不透明度 + rgb，渲染在层下）。 */
   setOuterGlow(id: number, enabled: boolean, size: number, opacity: number,
-    r: number, g: number, b: number): boolean {
-    const r2 = narrowResult(native.setOuterGlow(id, enabled ? 1 : 0, size, opacity, r, g, b) as Object);
+    r: number, g: number, b: number, spread: number = 0): boolean {
+    const r2 = narrowResult(native.setOuterGlow(id, enabled ? 1 : 0, size, opacity, r, g, b,
+      spread) as Object);
     if (!r2.ok) {
       hilog.error(DOMAIN, TAG, 'setOuterGlow failed: %{public}s',
         r2.error !== null ? r2.error.message : 'unknown');
@@ -627,8 +630,9 @@ export class CompositorEngine {
 
   /** M17a：内发光（大小/不透明度 + rgb，本体内边缘衰减带）。 */
   setInnerGlow(id: number, enabled: boolean, size: number, opacity: number,
-    r: number, g: number, b: number): boolean {
-    const r2 = narrowResult(native.setInnerGlow(id, enabled ? 1 : 0, size, opacity, r, g, b) as Object);
+    r: number, g: number, b: number, spread: number = 0): boolean {
+    const r2 = narrowResult(native.setInnerGlow(id, enabled ? 1 : 0, size, opacity, r, g, b,
+      spread) as Object);
     if (!r2.ok) {
       hilog.error(DOMAIN, TAG, 'setInnerGlow failed: %{public}s',
         r2.error !== null ? r2.error.message : 'unknown');
@@ -644,6 +648,44 @@ export class CompositorEngine {
       fr, fg, fb, tr, tg, tb) as Object);
     if (!r2.ok) {
       hilog.error(DOMAIN, TAG, 'setGradientOverlay failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  /** M17b：光泽（双向平移差分；invert）。 */
+  setSatin(id: number, enabled: boolean, angle: number, dist: number, size: number,
+    opacity: number, r: number, g: number, b: number, invert: boolean): boolean {
+    const r2 = narrowResult(native.setSatin(id, enabled ? 1 : 0, angle, dist, size, opacity,
+      r, g, b, invert ? 1 : 0) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'setSatin failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  /** M17b：斜面浮雕（style 0=内 1=外；Smooth 技术 v1）。 */
+  setBevel(id: number, enabled: boolean, style: number, depth: number, up: boolean,
+    size: number, angle: number, altitude: number, hiOp: number, hr: number, hg: number,
+    hb: number, shOp: number, sr: number, sg: number, sb: number): boolean {
+    const r2 = narrowResult(native.setBevel(id, enabled ? 1 : 0, style, depth, up ? 1 : 0, size,
+      angle, altitude, hiOp, hr, hg, hb, shOp, sr, sg, sb) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'setBevel failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  /** M17b：全局光角度（文档级，无 History）。 */
+  setGlobalLight(angle: number): boolean {
+    const r2 = narrowResult(native.setGlobalLight(angle) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'setGlobalLight failed: %{public}s',
         r2.error !== null ? r2.error.message : 'unknown');
       return false;
     }

@@ -217,6 +217,37 @@ struct LayerStyle {
     float gdTo[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     double gdAngleDeg = 90.0;
     double gdOpacity = 1.0;
+    // M17b spread（photocraft spread_split：dilate r=size·spread 先、blur bw=size·(1−spread) 后；
+    // 投影=spread、内阴影/内发光=choke、外发光=spread）
+    double shadowSpread = 0.0;
+    double isSpread = 0.0;
+    double ogSpread = 0.0;
+    double igSpread = 0.0;
+    // M17b 全局光（photocraft use_global_light：真 = 用 Engine::globalLightAngle）
+    bool shadowUseGL = true;
+    bool isUseGL = true;
+    bool bevelUseGL = true;
+    // M17b 光泽（photocraft satin_map：双向平移 σ=size 模糊取 |a−b| ×alpha；invert 默认关）
+    bool satin = false;
+    float satinColor[4] = {0.5f, 0.5f, 0.5f, 1.0f};
+    double satinAngleDeg = 120.0;
+    double satinDistance = 8.0;
+    double satinSize = 8.0;
+    double satinOpacity = 1.0;
+    bool satinInvert = false;
+    // M17b 斜面浮雕（photocraft bevel_height Smooth + bevel_maps 光照；v1 Smooth 技术，
+    // 无 contour/texture/soften/Emboss 族；Inner=层上、Outer=层下）
+    bool bevel = false;
+    int bevelStyle = 0;  // 0=InnerBevel 1=OuterBevel（Emboss 族挂 M17c）
+    double bevelDepth = 2.0;   // 0..10（PS 100% = 1）
+    bool bevelUp = true;
+    double bevelSize = 5.0;
+    double bevelAngleDeg = 120.0;
+    double bevelAltitudeDeg = 30.0;
+    float bevelHiColor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    double bevelHiOpacity = 1.0;
+    float bevelShColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    double bevelShOpacity = 1.0;
 };
 
 // M14c 填充图层（非破坏内容层）：无像素，渲染 = 全文档域派生网格（改参重生成）。
@@ -325,6 +356,9 @@ struct Document {
     std::vector<float> guidesV;
     bool guidesLocked = false;
     bool guidesVisible = true;
+    // M17b 全局光角度（度；投影/内阴影/斜面 useGL=true 时引用。PS 文档级设置——
+    // 改动经 setGlobalLight 命令全文档重样式，不走 History；.montage v10 可选持久化）
+    double globalLightAngle = 120.0;
 };
 
 // 视口：pan = 视口左上角的文档坐标（doc px），screen = (doc - pan) * zoom。

@@ -127,6 +127,85 @@ bool blurAlpha(std::vector<uint8_t>& a, int w, int h, double sigma, std::string&
     return true;
 }
 
+// alpha 域内平移（photocraft Map::shifted 整数版：out(x,y)=src(x−dx,y−dy)，出界填 0）
+void shiftAlpha(std::vector<uint8_t>& v, int w, int h, int dx, int dy) {
+    std::vector<uint8_t> out(v.size(), 0);
+    for (int y = 0; y < h; ++y) {
+        const int sy = y - dy;
+        if (sy < 0 || sy >= h) {
+            continue;
+        }
+        for (int x = 0; x < w; ++x) {
+            const int sx = x - dx;
+            if (sx < 0 || sx >= w) {
+                continue;
+            }
+            out[static_cast<size_t>(y) * w + x] = v[static_cast<size_t>(sy) * w + sx];
+        }
+    }
+    v.swap(out);
+}
+
+// M17b 斜面明暗图（photocraft bevel_height Smooth + bevel_maps shade_into）：
+// 高度图 = 形状 alpha 高斯（近似 photocraft tent 双 box，登记 B 类差异）；中心差分梯度 ×
+// depth（=depth×size×方向符号）；法线 (−gx,−gy,1)，光向量 (cosA·cosE, −sinA·cosE, sinE)；
+// k=shade−sinE：>0 高光、<0 暗影。region：Inner=×alpha；Outer=非本体 × on_bevel（高度/4邻域>ε）。
+bool bevelShade(const std::vector<uint8_t>& alpha, int w, int h, const LayerStyle* st,
+                double angleDeg, std::vector<uint8_t>& hi, std::vector<uint8_t>& sh,
+                std::string& err) {
+    std::vector<uint8_t> h8 = alpha;
+    if (!blurAlpha(h8, w, h, std::min(kMaxBlurBudget, std::max(0.0, st->bevelSize)), err)) {
+        return false;
+    }
+    const size_t n = alpha.size();
+    std::vector<float> hf(n);
+    for (size_t i = 0; i < n; ++i) {
+        hf[i] = h8[i] / 255.0f;
+    }
+    const double az = angleDeg * 3.14159265358979323846 / 180.0;
+    const double alt =
+        std::clamp(st->bevelAltitudeDeg, 1.0, 89.0) * 3.14159265358979323846 / 180.0;
+    const float lv0 = static_cast<float>(std::cos(az) * std::cos(alt));
+    const float lv1 = static_cast<float>(-std::sin(az) * std::cos(alt));
+    const float lv2 = static_cast<float>(std::sin(alt));
+    const float se = static_cast<float>(std::sin(alt));
+    const float depth = static_cast<float>(
+        st->bevelDepth * std::min(kMaxBlurBudget, std::max(1.0, st->bevelSize)) *
+        (st->bevelUp ? 1.0 : -1.0));
+    const bool outer = st->bevelStyle == 1;
+    hi.assign(n, 0);
+    sh.assign(n, 0);
+    for (int y = 1; y < h - 1; ++y) {
+        for (int x = 1; x < w - 1; ++x) {
+            const size_t i = static_cast<size_t>(y) * w + x;
+            if (!outer) {
+                if (alpha[i] == 0) {
+                    continue;
+                }
+            } else {
+                const bool onBevel = hf[i] > 1e-5f || hf[i - 1] > 1e-5f || hf[i + 1] > 1e-5f ||
+                                     hf[i - w] > 1e-5f || hf[i + w] > 1e-5f;
+                if (!(alpha[i] < 254 && onBevel)) {
+                    continue;
+                }
+            }
+            const float gx = (hf[i + 1] - hf[i - 1]) * 0.5f * depth;
+            const float gy = (hf[i + w] - hf[i - w]) * 0.5f * depth;
+            const float len = std::sqrt(gx * gx + gy * gy + 1.0f);
+            const float shade = (-gx * lv0 - gy * lv1 + lv2) / len;
+            const float k = shade - se;
+            if (k > 0.0f) {
+                hi[i] = static_cast<uint8_t>(
+                    std::lround(std::min(1.0f, k / (1.0f - se)) * 255.0f));
+            } else {
+                sh[i] = static_cast<uint8_t>(
+                    std::lround(std::min(1.0f, -k / se) * 255.0f));
+            }
+        }
+    }
+    return true;
+}
+
 // 域内取底片 alpha 在展开段内直线推导（doc 坐标 = 网格 origin + 网格局部 = 域 origin + 域局部）
 
 }  // namespace
@@ -180,7 +259,8 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
     const LayerStyle* st = l.style.get();
     const bool anyEffect = st != nullptr && st->enabled &&
                            (st->dropShadow || st->stroke || st->colorOverlay || st->innerShadow ||
-                            st->outerGlow || st->innerGlow || st->gradientOverlay);
+                            st->outerGlow || st->innerGlow || st->gradientOverlay || st->satin ||
+                            st->bevel);
     if (!anyEffect) {
         l.styledRender = nullptr;
         return true;
@@ -202,7 +282,10 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
     double offX = 0.0;
     double offY = 0.0;
     if (st->dropShadow) {
-        const double rad = st->shadowAngleDeg * 3.14159265358979323846 / 180.0;
+        // M17b：useGL=true 用文档全局光角度（photocraft use_global_light）
+        const double angDeg =
+            st->shadowUseGL ? doc.globalLightAngle : st->shadowAngleDeg;
+        const double rad = angDeg * 3.14159265358979323846 / 180.0;
         // PS 角度：0=向右，90=向下（y 向下域 cos/sin 直用）
         offX = std::cos(rad) * st->shadowDistance;
         offY = std::sin(rad) * st->shadowDistance;
@@ -216,6 +299,10 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
     if (st->outerGlow) {
         // 外发光在层下向四周衰减（photocraft margin = size）
         pad = std::max(pad, std::min(kMaxBlurBudget, std::max(0.0, st->ogSize)) * 2.0);
+    }
+    if (st->bevel && st->bevelStyle == 1) {
+        // M17b 外斜面在层下向外坡起（photocraft margin = size）
+        pad = std::max(pad, std::min(kMaxBlurBudget, std::max(0.0, st->bevelSize)) * 2.0);
     }
     pad = std::min(pad, kMaxPadBudget);
     // 派生域（doc 坐标）→ 局部尺寸
@@ -266,24 +353,38 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
         }
     }
     std::vector<uint8_t> canvas(static_cast<size_t>(w) * h * 4, 0);
-    // 1) 投影：alpha×opacity 置影色 → 高斯模糊（M13 FGaussianBlur，σ=size）→ 偏移 src-over
+    // 1) 投影：alpha×opacity 置影色 → [M17b spread：dilate(size·spread) 先] → 高斯模糊
+    // （M13 FGaussianBlur，σ=size·(1−spread)，photocraft spread_split）→ 偏移 src-over
     if (st->dropShadow) {
         std::vector<uint8_t> sh(static_cast<size_t>(w) * h * 4, 0);
         const float so = static_cast<float>(st->shadowOpacity);
-        for (size_t i = 0; i < alpha.size(); ++i) {
-            if (alpha[i] == 0) {
-                continue;
+        const double spread = std::clamp(st->shadowSpread, 0.0, 1.0);
+        const double sizeEff = std::min(kMaxBlurBudget, std::max(0.0, st->shadowSize));
+        {
+            std::vector<uint8_t> shA(alpha.size(), 0);
+            for (size_t i = 0; i < alpha.size(); ++i) {
+                if (alpha[i] == 0) {
+                    continue;
+                }
+                shA[i] = static_cast<uint8_t>(
+                    std::lround(alpha[i] * so * st->shadowColor[3]));
             }
-            sh[i * 4 + 0] = static_cast<uint8_t>(std::lround(st->shadowColor[0] * 255.0f));
-            sh[i * 4 + 1] = static_cast<uint8_t>(std::lround(st->shadowColor[1] * 255.0f));
-            sh[i * 4 + 2] = static_cast<uint8_t>(std::lround(st->shadowColor[2] * 255.0f));
-            sh[i * 4 + 3] = static_cast<uint8_t>(
-                std::lround(alpha[i] * so * st->shadowColor[3]));
+            dilateAlpha(shA, static_cast<int>(w), static_cast<int>(h),
+                        static_cast<int>(std::lround(sizeEff * spread)));
+            for (size_t i = 0; i < alpha.size(); ++i) {
+                if (shA[i] == 0) {
+                    continue;
+                }
+                sh[i * 4 + 0] = static_cast<uint8_t>(std::lround(st->shadowColor[0] * 255.0f));
+                sh[i * 4 + 1] = static_cast<uint8_t>(std::lround(st->shadowColor[1] * 255.0f));
+                sh[i * 4 + 2] = static_cast<uint8_t>(std::lround(st->shadowColor[2] * 255.0f));
+                sh[i * 4 + 3] = shA[i];
+            }
         }
-        if (st->shadowSize > 0.5) {
+        if (sizeEff * (1.0 - spread) > 0.5) {
             filters::FilterParams p;
             p.kind = filters::FGaussianBlur;
-            p.p0 = static_cast<float>(std::min(kMaxBlurBudget, st->shadowSize));
+            p.p0 = static_cast<float>(sizeEff * (1.0 - spread));
             std::vector<uint8_t> blurred(sh.size(), 0);
             if (!filters::applyFilter(sh.data(), blurred.data(), w, h, p, err)) {
                 return false;
@@ -312,10 +413,16 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
             }
         }
     }
-    // 2) 外发光（M17a，photocraft glow_map Softer：dilate(r=0 v1)+blur σ=size；画在本体之下）
+    // 2) 外发光（M17a/M17b，photocraft glow_map Softer：dilate(size·spread)+blur σ=size·(1−spread)；
+    // 画在本体之下）
     if (st->outerGlow) {
         std::vector<uint8_t> cov = alpha;
-        if (!blurAlpha(cov, static_cast<int>(w), static_cast<int>(h), st->ogSize, err)) {
+        const double spread = std::clamp(st->ogSpread, 0.0, 1.0);
+        const double sizeEff = std::min(kMaxBlurBudget, std::max(0.0, st->ogSize));
+        dilateAlpha(cov, static_cast<int>(w), static_cast<int>(h),
+                    static_cast<int>(std::lround(sizeEff * spread)));
+        if (!blurAlpha(cov, static_cast<int>(w), static_cast<int>(h),
+                       sizeEff * (1.0 - spread), err)) {
             return false;
         }
         for (size_t i = 0; i < cov.size(); ++i) {
@@ -326,6 +433,29 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
                             st->ogColor[3] * static_cast<float>(st->ogOpacity) *
                                 (cov[i] / 255.0f)};
             srcOver(canvas.data() + i * 4, src);
+        }
+    }
+    // 2b) 外斜面（M17b，photocraft BevelPaint::Outer：明暗画在层下、外发光之后）
+    if (st->bevel && st->bevelStyle == 1) {
+        const double angDeg = st->bevelUseGL ? doc.globalLightAngle : st->bevelAngleDeg;
+        std::vector<uint8_t> hi, sh;
+        if (!bevelShade(alpha, static_cast<int>(w), static_cast<int>(h), st, angDeg, hi, sh,
+                        err)) {
+            return false;
+        }
+        for (size_t i = 0; i < hi.size(); ++i) {
+            if (hi[i] != 0) {
+                float src[4] = {st->bevelHiColor[0], st->bevelHiColor[1], st->bevelHiColor[2],
+                                st->bevelHiColor[3] * static_cast<float>(st->bevelHiOpacity) *
+                                    (hi[i] / 255.0f)};
+                srcOver(canvas.data() + i * 4, src);
+            }
+            if (sh[i] != 0) {
+                float src[4] = {st->bevelShColor[0], st->bevelShColor[1], st->bevelShColor[2],
+                                st->bevelShColor[3] * static_cast<float>(st->bevelShOpacity) *
+                                    (sh[i] / 255.0f)};
+                srcOver(canvas.data() + i * 4, src);
+            }
         }
     }
     // 3) 本体：底片 RGB 按域坐标回取网格局部 src-over
@@ -407,13 +537,52 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
             srcOver(canvas.data() + i * 4, src);
         }
     }
-    // 6) 内发光（M17a，photocraft glow_map inner Softer：inv=1−a 模糊后 ×alpha 限层内）
+    // 6) 光泽（M17b，photocraft satin_map：形状双向平移(+d/−d) 各 σ=size 模糊 → |a−b| →
+    // invert → ×alpha；distance 下限 1px（PS Distance 0 画 1px，photocraft satin_distance））
+    if (st->satin) {
+        const double rad = st->satinAngleDeg * 3.14159265358979323846 / 180.0;
+        const double dist = std::max(1.0, st->satinDistance);
+        const int dx = static_cast<int>(std::lround(-std::cos(rad) * dist));
+        const int dy = static_cast<int>(std::lround(std::sin(rad) * dist));
+        std::vector<uint8_t> sa = alpha;
+        std::vector<uint8_t> sb = alpha;
+        shiftAlpha(sa, static_cast<int>(w), static_cast<int>(h), dx, dy);
+        shiftAlpha(sb, static_cast<int>(w), static_cast<int>(h), -dx, -dy);
+        const double sizeEff = std::min(kMaxBlurBudget, std::max(0.0, st->satinSize));
+        if (!blurAlpha(sa, static_cast<int>(w), static_cast<int>(h), sizeEff, err) ||
+            !blurAlpha(sb, static_cast<int>(w), static_cast<int>(h), sizeEff, err)) {
+            return false;
+        }
+        for (size_t i = 0; i < alpha.size(); ++i) {
+            if (alpha[i] == 0) {
+                continue;
+            }
+            float m = std::abs(sa[i] - sb[i]) / 255.0f;
+            if (st->satinInvert) {
+                m = 1.0f - m;
+            }
+            m *= alpha[i] / 255.0f;
+            if (m <= 0.0f) {
+                continue;
+            }
+            float src[4] = {st->satinColor[0], st->satinColor[1], st->satinColor[2],
+                            st->satinColor[3] * static_cast<float>(st->satinOpacity) * m};
+            srcOver(canvas.data() + i * 4, src);
+        }
+    }
+    // 7) 内发光（M17a/M17b，photocraft glow_map inner Softer：inv=1−a → dilate(choke) →
+    // 模糊 → ×alpha 限层内）
     if (st->innerGlow) {
         std::vector<uint8_t> cov(alpha.size());
         for (size_t i = 0; i < cov.size(); ++i) {
             cov[i] = static_cast<uint8_t>(255 - alpha[i]);
         }
-        if (!blurAlpha(cov, static_cast<int>(w), static_cast<int>(h), st->igSize, err)) {
+        const double spread = std::clamp(st->igSpread, 0.0, 1.0);
+        const double sizeEff = std::min(kMaxBlurBudget, std::max(0.0, st->igSize));
+        dilateAlpha(cov, static_cast<int>(w), static_cast<int>(h),
+                    static_cast<int>(std::lround(sizeEff * spread)));
+        if (!blurAlpha(cov, static_cast<int>(w), static_cast<int>(h),
+                       sizeEff * (1.0 - spread), err)) {
             return false;
         }
         for (size_t i = 0; i < cov.size(); ++i) {
@@ -430,17 +599,25 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
             srcOver(canvas.data() + i * 4, src);
         }
     }
-    // 7) 内阴影（M17a，photocraft shadow_map inner：inv 平移(offset) 出界填满 → 模糊 →
-    // ×alpha 限层内；offset=(round(−cos·d), round(sin·d)) 与投影同向，最内效顶）
+    // 7) 内阴影（M17a/M17b，photocraft shadow_map inner：inv 平移(offset) 出界填满 →
+    // dilate(choke) → 模糊 → ×alpha 限层内；offset=(round(−cos·d), round(sin·d)) 与投影同向）
     if (st->innerShadow) {
-        const double rad = st->isAngleDeg * 3.14159265358979323846 / 180.0;
+        const double angDeg = st->isUseGL ? doc.globalLightAngle : st->isAngleDeg;
+        const double rad = angDeg * 3.14159265358979323846 / 180.0;
         const int dx = static_cast<int>(std::lround(-std::cos(rad) * st->isDistance));
         const int dy = static_cast<int>(std::lround(std::sin(rad) * st->isDistance));
         std::vector<uint8_t> inv(alpha.size());
         for (size_t i = 0; i < inv.size(); ++i) {
             inv[i] = static_cast<uint8_t>(255 - alpha[i]);
         }
-        if (!blurAlpha(inv, static_cast<int>(w), static_cast<int>(h), st->isSize, err)) {
+        // photocraft 顺序：shift 后 dilate(choke)、再模糊——本实现 shift 在取样时做，
+        // dilate 平移可交换（方形 SE 各向同性近似）
+        const double spread = std::clamp(st->isSpread, 0.0, 1.0);
+        const double sizeEff = std::min(kMaxBlurBudget, std::max(0.0, st->isSize));
+        dilateAlpha(inv, static_cast<int>(w), static_cast<int>(h),
+                    static_cast<int>(std::lround(sizeEff * spread)));
+        if (!blurAlpha(inv, static_cast<int>(w), static_cast<int>(h),
+                       sizeEff * (1.0 - spread), err)) {
             return false;
         }
         for (int yy = 0; yy < static_cast<int>(h); ++yy) {
@@ -463,6 +640,29 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
                 float src[4] = {st->isColor[0], st->isColor[1], st->isColor[2],
                                 st->isColor[3] * static_cast<float>(st->isOpacity) *
                                     (m / 255.0f)};
+                srcOver(canvas.data() + i * 4, src);
+            }
+        }
+    }
+    // 7b) 内斜面（M17b，photocraft BevelPaint::Inner：明暗画在本体与全部内效之上、描边之下）
+    if (st->bevel && st->bevelStyle == 0) {
+        const double angDeg = st->bevelUseGL ? doc.globalLightAngle : st->bevelAngleDeg;
+        std::vector<uint8_t> hi, sh;
+        if (!bevelShade(alpha, static_cast<int>(w), static_cast<int>(h), st, angDeg, hi, sh,
+                        err)) {
+            return false;
+        }
+        for (size_t i = 0; i < hi.size(); ++i) {
+            if (hi[i] != 0) {
+                float src[4] = {st->bevelHiColor[0], st->bevelHiColor[1], st->bevelHiColor[2],
+                                st->bevelHiColor[3] * static_cast<float>(st->bevelHiOpacity) *
+                                    (hi[i] / 255.0f)};
+                srcOver(canvas.data() + i * 4, src);
+            }
+            if (sh[i] != 0) {
+                float src[4] = {st->bevelShColor[0], st->bevelShColor[1], st->bevelShColor[2],
+                                st->bevelShColor[3] * static_cast<float>(st->bevelShOpacity) *
+                                    (sh[i] / 255.0f)};
                 srcOver(canvas.data() + i * 4, src);
             }
         }

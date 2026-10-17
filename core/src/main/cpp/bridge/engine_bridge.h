@@ -175,6 +175,10 @@ napi_value SetGradientOverlay(napi_env env, napi_callback_info info);
 napi_value CopyLayerStyle(napi_env env, napi_callback_info info);
 napi_value PasteLayerStyle(napi_env env, napi_callback_info info);
 napi_value SetLayerEffectsEnabled(napi_env env, napi_callback_info info);
+// M17b 光泽/斜面浮雕/全局光
+napi_value SetSatin(napi_env env, napi_callback_info info);
+napi_value SetBevel(napi_env env, napi_callback_info info);
+napi_value SetGlobalLight(napi_env env, napi_callback_info info);
 napi_value AddFillLayer(napi_env env, napi_callback_info info);
 napi_value SetFillLayerParams(napi_env env, napi_callback_info info);
 // M13 滤镜：直接应用（一步事务）/ 预览三件套（begin 建 1/4 proxy 源、set 跑核、
