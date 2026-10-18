@@ -2857,122 +2857,182 @@ napi_value ResizeCanvas(napi_env env, napi_callback_info info) {
     return makeOk(env, data);
 }
 
-napi_value TrimCanvas(napi_env env, napi_callback_info /*info*/) {
-    auto& e = Engine::get();
+// ---------- M8a/M8c 文档级几何命令（审查修复：原在 JS 线程同步持 docMutex 整档搬像素 +
+// restyleAllLocked，大图 appfreeze 与 M8.1 warp 同型——统一 async work，重活锁外作用于
+// 快照副本，发布段 docEpoch+docRevision 复核（防并发编辑/关档后被旧快照覆盖）） ----------
+struct DocGeomCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    Document docSnap;   // 锁内整档拷贝（shared_ptr 共享瓦片，O(层数)）
+    uint64_t epoch = 0;
+    int64_t revision = 0;
+    int op = 0;         // 0=rot90 1=flip 2=trim 3=revealAll 4=resample 5=rotArb
+    bool flag = true;   // clockwise / horizontal
+    double deg = 0;     // rotArb
+    uint32_t w = 0, h = 0;  // resample
     bool changed = false;
+};
+
+napi_value DocGeomAsync(napi_env env, napi_callback_info info, int op) {
+    auto& e = Engine::get();
+    auto* ctx = new DocGeomCtx();
+    ctx->op = op;
+    if (op == 0 || op == 1) {
+        size_t argc = 1;
+        napi_value argv[1] = {nullptr};
+        napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+        if (argc >= 1) {
+            napi_get_value_bool(env, argv[0], &ctx->flag);
+        }
+    } else if (op == 4) {
+        size_t argc = 2;
+        napi_value argv[2] = {nullptr, nullptr};
+        napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+        if (argc < 2) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "resampleDocument(w, h) requires 2 args");
+        }
+        double w = 0, h = 0;
+        if (napi_get_value_double(env, argv[0], &w) != napi_ok ||
+            napi_get_value_double(env, argv[1], &h) != napi_ok || w < 1 || h < 1) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "resampleDocument: invalid size");
+        }
+        ctx->w = static_cast<uint32_t>(w);
+        ctx->h = static_cast<uint32_t>(h);
+    } else if (op == 5) {
+        size_t argc = 1;
+        napi_value argv[1] = {nullptr};
+        napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+        if (argc < 1) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "rotateDocumentArbitrary(deg) requires 1 arg");
+        }
+        if (napi_get_value_double(env, argv[0], &ctx->deg) != napi_ok) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "rotateDocumentArbitrary: invalid deg");
+        }
+    }
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
         if (e.doc.width == 0 || e.doc.height == 0) {
-            return makeError(env, kErrNoDoc, "trimCanvas: no document");
+            delete ctx;
+            return makeError(env, kErrNoDoc, "docGeom: no document");
         }
-        int bx = 0, by = 0, bw = 0, bh = 0;
-        if (!visibleContentBBox(e.doc, bx, by, bw, bh)) {
-            napi_value data = nullptr;
-            napi_create_object(env, &data);
-            napi_set_named_property(env, data, "changed", makeBool(env, false));
-            return makeOk(env, data);
-        }
-        e.history.beginEdit(e.doc, "trim", static_cast<uint64_t>(e.docRevision));
-        changed = resizeCanvas(e.doc, bx, by, bw, bh);
-        if (changed) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
-            e.bumpRevisionLocked();
-            e.requestRender();
-        } else {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
-        }
+        ctx->docSnap = e.doc;
+        ctx->epoch = e.docEpoch;
+        ctx->revision = e.docRevision;
     }
-    napi_value data = nullptr;
-    napi_create_object(env, &data);
-    napi_set_named_property(env, data, "changed", makeBool(env, changed));
-    return makeOk(env, data);
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value workName = nullptr;
+    napi_create_string_utf8(env, "montageDocGeom", NAPI_AUTO_LENGTH, &workName);
+    napi_status st = napi_create_async_work(
+        env, nullptr, workName,
+        [](napi_env /*env*/, void* data) {
+            auto* c = static_cast<DocGeomCtx*>(data);
+            // 重活在锁外：整档像素搬运 + restyleDocument（纯函数）作用于本地副本
+            Document work = c->docSnap;
+            switch (c->op) {
+                case 0:
+                    rotateDocument90(work, c->flag);
+                    c->changed = true;
+                    break;
+                case 1:
+                    flipDocument(work, c->flag);
+                    c->changed = true;
+                    break;
+                case 2: {
+                    int bx = 0, by = 0, bw = 0, bh = 0;
+                    if (visibleContentBBox(work, bx, by, bw, bh)) {
+                        c->changed = resizeCanvas(work, bx, by, bw, bh);
+                    }
+                    break;
+                }
+                case 3: {
+                    int bx = 0, by = 0, bw = 0, bh = 0;
+                    int x = 0;
+                    int y = 0;
+                    int w = static_cast<int>(work.width);
+                    int h = static_cast<int>(work.height);
+                    if (visibleContentBBox(work, bx, by, bw, bh)) {
+                        const int x1 = std::max(x + w, bx + bw);
+                        const int y1 = std::max(y + h, by + bh);
+                        x = std::min(x, bx);
+                        y = std::min(y, by);
+                        w = x1 - x;
+                        h = y1 - y;
+                    }
+                    c->changed = resizeCanvas(work, x, y, w, h);
+                    break;
+                }
+                case 4:
+                    c->changed = resampleDocument(work, c->w, c->h);
+                    break;
+                case 5:
+                    rotateDocumentArbitrary(work, c->deg);
+                    c->changed = true;
+                    break;
+                default:
+                    break;
+            }
+            if (c->changed) {
+                restyleDocument(work);
+            }
+            // 发布段（持锁）：代次/版本失配 = 快照后有并发编辑/关档 → 整体作废
+            auto& eg = Engine::get();
+            std::lock_guard<std::mutex> lk(eg.docMutex);
+            if (c->changed && eg.docEpoch == c->epoch && eg.docRevision == c->revision) {
+                const char* label = c->op == 0
+                                        ? (c->flag ? "rotate 90 CW" : "rotate 90 CCW")
+                                    : c->op == 1
+                                        ? (c->flag ? "flip horizontal" : "flip vertical")
+                                    : c->op == 2 ? "trim"
+                                    : c->op == 3 ? "reveal all"
+                                    : c->op == 4 ? "image size"
+                                                 : "rotate arbitrary";
+                eg.history.beginEdit(eg.doc, label, static_cast<uint64_t>(eg.docRevision));
+                eg.doc = std::move(work);
+                eg.history.endEdit(eg.doc, static_cast<uint64_t>(eg.docRevision));
+                eg.bumpRevisionLocked();
+                eg.requestRender();
+            } else {
+                c->changed = false;
+            }
+        },
+        [](napi_env env, napi_status status, void* data) {
+            auto* c = static_cast<DocGeomCtx*>(data);
+            napi_value dataObj = nullptr;
+            napi_create_object(env, &dataObj);
+            napi_set_named_property(env, dataObj, "changed",
+                                    makeBool(env, status == napi_ok && c->changed));
+            napi_resolve_deferred(env, c->deferred, makeOk(env, dataObj));
+            napi_delete_async_work(env, c->work);
+            delete c;
+        },
+        ctx, &ctx->work);
+    if (st != napi_ok) {
+        delete ctx;
+        return makeError(env, kErrInternal, "create async work failed");
+    }
+    napi_queue_async_work(env, ctx->work);
+    return promise;
 }
 
-napi_value RevealAll(napi_env env, napi_callback_info /*info*/) {
-    auto& e = Engine::get();
-    bool changed = false;
-    {
-        std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
-            return makeError(env, kErrNoDoc, "revealAll: no document");
-        }
-        int bx = 0, by = 0, bw = 0, bh = 0;
-        int x = 0;
-        int y = 0;
-        int w = static_cast<int>(e.doc.width);
-        int h = static_cast<int>(e.doc.height);
-        if (visibleContentBBox(e.doc, bx, by, bw, bh)) {
-            const int x1 = std::max(x + w, bx + bw);
-            const int y1 = std::max(y + h, by + bh);
-            x = std::min(x, bx);
-            y = std::min(y, by);
-            w = x1 - x;
-            h = y1 - y;
-        }
-        e.history.beginEdit(e.doc, "reveal all", static_cast<uint64_t>(e.docRevision));
-        changed = resizeCanvas(e.doc, x, y, w, h);
-        if (changed) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
-            e.bumpRevisionLocked();
-            e.requestRender();
-        } else {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
-        }
-    }
-    napi_value data = nullptr;
-    napi_create_object(env, &data);
-    napi_set_named_property(env, data, "changed", makeBool(env, changed));
-    return makeOk(env, data);
+napi_value TrimCanvas(napi_env env, napi_callback_info info) {
+    return DocGeomAsync(env, info, 2);
+}
+
+napi_value RevealAll(napi_env env, napi_callback_info info) {
+    return DocGeomAsync(env, info, 3);
 }
 
 napi_value RotateDocument90(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value argv[1] = {nullptr};
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    bool clockwise = true;
-    if (argc >= 1) {
-        napi_get_value_bool(env, argv[0], &clockwise);
-    }
-    auto& e = Engine::get();
-    {
-        std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
-            return makeError(env, kErrNoDoc, "rotateDocument90: no document");
-        }
-        e.history.beginEdit(e.doc, clockwise ? "rotate 90 CW" : "rotate 90 CCW",
-                            static_cast<uint64_t>(e.docRevision));
-        rotateDocument90(e.doc, clockwise);
-        restyleAllLocked(e);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
-        e.bumpRevisionLocked();
-        e.requestRender();
-    }
-    return makeOk(env, nullptr);
+    return DocGeomAsync(env, info, 0);
 }
 
 napi_value FlipDocument(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value argv[1] = {nullptr};
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    bool horizontal = true;
-    if (argc >= 1) {
-        napi_get_value_bool(env, argv[0], &horizontal);
-    }
-    auto& e = Engine::get();
-    {
-        std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
-            return makeError(env, kErrNoDoc, "flipDocument: no document");
-        }
-        e.history.beginEdit(e.doc, horizontal ? "flip horizontal" : "flip vertical",
-                            static_cast<uint64_t>(e.docRevision));
-        flipDocument(e.doc, horizontal);
-        restyleAllLocked(e);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
-        e.bumpRevisionLocked();
-        e.requestRender();
-    }
-    return makeOk(env, nullptr);
+    return DocGeomAsync(env, info, 1);
 }
 
 // 移动工具：三段事务（0=begin 快照 / 1=move 实时平移 / 2=end 提交），拖拽过程实时渲染、
@@ -3706,71 +3766,14 @@ napi_value GetHistogram(napi_env env, napi_callback_info /*info*/) {
     return promise;
 }
 
-// M8c：图像大小重采样（history 事务）
+// M8c：图像大小重采样（history 事务；异步 work，同 DocGeomAsync）
 napi_value ResampleDocument(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value argv[2] = {nullptr, nullptr};
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (argc < 2) {
-        return makeError(env, kErrBadParam, "resampleDocument(w, h) requires 2 args");
-    }
-    double w = 0, h = 0;
-    if (napi_get_value_double(env, argv[0], &w) != napi_ok ||
-        napi_get_value_double(env, argv[1], &h) != napi_ok || w < 1 || h < 1) {
-        return makeError(env, kErrBadParam, "resampleDocument: invalid size");
-    }
-    auto& e = Engine::get();
-    bool changed = false;
-    {
-        std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
-            return makeError(env, kErrNoDoc, "resampleDocument: no document");
-        }
-        e.history.beginEdit(e.doc, "image size", static_cast<uint64_t>(e.docRevision));
-        changed = resampleDocument(e.doc, static_cast<uint32_t>(w), static_cast<uint32_t>(h));
-        if (changed) {
-            restyleAllLocked(e);
-        }
-        if (changed) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
-            e.bumpRevisionLocked();
-            e.requestRender();
-        } else {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
-        }
-    }
-    napi_value data = nullptr;
-    napi_create_object(env, &data);
-    napi_set_named_property(env, data, "changed", makeBool(env, changed));
-    return makeOk(env, data);
+    return DocGeomAsync(env, info, 4);
 }
 
-// M8c：任意角旋转（度，顺时针；history 事务）
+// M8c：任意角旋转（度，顺时针；history 事务；异步 work，同 DocGeomAsync）
 napi_value RotateDocumentArbitrary(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value argv[1] = {nullptr};
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (argc < 1) {
-        return makeError(env, kErrBadParam, "rotateDocumentArbitrary(deg) requires 1 arg");
-    }
-    double deg = 0;
-    if (napi_get_value_double(env, argv[0], &deg) != napi_ok) {
-        return makeError(env, kErrBadParam, "rotateDocumentArbitrary: invalid deg");
-    }
-    auto& e = Engine::get();
-    {
-        std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
-            return makeError(env, kErrNoDoc, "rotateDocumentArbitrary: no document");
-        }
-        e.history.beginEdit(e.doc, "rotate arbitrary", static_cast<uint64_t>(e.docRevision));
-        rotateDocumentArbitrary(e.doc, deg);
-        restyleAllLocked(e);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
-        e.bumpRevisionLocked();
-        e.requestRender();
-    }
-    return makeOk(env, nullptr);
+    return DocGeomAsync(env, info, 5);
 }
 
 // M8b：PSD 导出（锁内拍快照 + 扁平化任务，锁外编码写出；fd 全路径接管）

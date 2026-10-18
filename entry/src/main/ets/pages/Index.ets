@@ -1,6 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { util } from '@kit.ArkTS';
 import { BusinessError } from '@kit.BasicServicesKit';
+import { common } from '@kit.AbilityKit';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
 import { window } from '@kit.ArkUI';
@@ -415,10 +416,26 @@ struct Index {
   private readonly thumbCache: Map<number, ThumbEntry> = new Map();
   private readonly thumbsInFlight: Set<number> = new Set();
 
+  // getContext（API 18 废弃，审查修复 MEDIUM）替代：UIContext.getHostContext。
+  // 页面挂载后恒有宿主上下文；undefined 时跳过偏好/主题（不致命）
+  private hostCtx(): common.Context | undefined {
+    return this.getUIContext().getHostContext();
+  }
+
+  private cachePath(name: string): string {
+    const c = this.getUIContext().getHostContext();
+    return (c !== undefined ? c.cacheDir : '') + '/' + name;
+  }
+
   aboutToAppear(): void {
-    this.prefs.init(getContext(this));
+    const hc = this.hostCtx();
+    if (hc !== undefined) {
+      this.prefs.init(hc);
+    }
     this.themeMode = this.prefs.getThemeMode();
-    this.prefs.applyTheme(this.themeMode, getContext(this));
+    if (hc !== undefined) {
+      this.prefs.applyTheme(this.themeMode, hc);
+    }
     this.recents = this.prefs.getRecents();
     // M15a：视图偏好恢复（C-1）
     this.rulersVisible = this.prefs.getBool('view_rulers', true);
@@ -1454,7 +1471,7 @@ struct Index {
       }
       const seg = decodeURIComponent(uri.split('/').pop() ?? 'font.ttf');
       const alias = seg.replace(/\.(ttf|otf|ttc)$/i, '');
-      const fontsDir = getContext(this).cacheDir + '/fonts';
+      const fontsDir = this.cachePath('fonts');
       if (!fs.accessSync(fontsDir)) {
         fs.mkdirSync(fontsDir, true);
       }
@@ -1778,7 +1795,11 @@ struct Index {
   }
 
   private updateTitle(): void {
-    window.getLastWindow(getContext(this)).then((w: window.Window): void => {
+    const hc = this.hostCtx();
+    if (hc === undefined) {
+      return;
+    }
+    window.getLastWindow(hc).then((w: window.Window): void => {
       w.setWindowTitle(`${this.docName()} - Montage`).catch((): void => {
         // 自由窗口标题失败不致命
       });
@@ -1874,7 +1895,7 @@ struct Index {
         size: { width: W, height: H },
         srcPixelFormat: image.PixelMapFormat.RGBA_8888,
       });
-      const path = getContext(this).cacheDir + '/band_test.jpg';
+      const path = this.cachePath('band_test.jpg');
       const fw = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
       const packer = image.createImagePacker();
       await packer.packToFile(pm, fw.fd, { format: 'image/jpeg', quality: 100 });
@@ -2770,7 +2791,7 @@ struct Index {
         break;
       case 'file.saveSandbox': {
         // 隐藏调试通道（模拟器 picker 保存缺陷的往返验证替代，M12 定案）：cacheDir/rt_check.montage
-        const path = getContext(this).cacheDir + '/rt_check.montage';
+        const path = this.cachePath('rt_check.montage');
         let f: fs.File;
         try {
           f = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
@@ -2788,7 +2809,7 @@ struct Index {
         break;
       }
       case 'file.openSandbox': {
-        const p2 = getContext(this).cacheDir + '/rt_check.montage';
+        const p2 = this.cachePath('rt_check.montage');
         let f2: fs.File;
         try {
           f2 = fs.openSync(p2, fs.OpenMode.READ_ONLY);
@@ -2815,7 +2836,7 @@ struct Index {
         // M15d：DNG RAW 显影设备验证通道（内嵌合成 DNG base64 → cacheDir → 显影打开；
         // 模拟器 picker/沙箱写入受限，自包含可复跑）
         const B64_DNG = 'SUkqAAgAAAAOAAABBAABAAAACAAAAAEBBAABAAAACAAAAAIBAwABAAAAEAAAAAMBAwABAAAAAQAAAAYBAwABAAAAI4AAABEBBAABAAAAzgAAABUBAwABAAAAAQAAABcBBAABAAAAgAAAAI2CAwACAAAAAgACAI6CAQAEAAAAAAEBAhLGAQAEAAAAAQQAABrGAwABAAAAyAAAAB3GBAABAAAADDAAACjGBQADAAAAtgAAAAAAAAD0AQAA6AMAAOgDAADoAwAA6AMAAOgDAABwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwFw==';
-        const pd = getContext(this).cacheDir + '/raw_test.dng';
+        const pd = this.cachePath('raw_test.dng');
         const bin: Uint8Array = new util.Base64Helper().decodeSync(B64_DNG);
         let fw: fs.File;
         try {
@@ -3236,25 +3257,25 @@ struct Index {
         break;
       }
       case 'image.rotate90cw':
-        this.docOp((): boolean => this.engine.rotateDocument90(true), '旋转 90° 顺时针');
+        this.docOp((): Promise<boolean> => this.engine.rotateDocument90(true), '旋转 90° 顺时针');
         break;
       case 'image.rotate90ccw':
-        this.docOp((): boolean => this.engine.rotateDocument90(false), '旋转 90° 逆时针');
+        this.docOp((): Promise<boolean> => this.engine.rotateDocument90(false), '旋转 90° 逆时针');
         break;
       case 'image.rotate180':
-        this.docOp((): boolean => {
-          const a = this.engine.rotateDocument90(true);
-          return a && this.engine.rotateDocument90(true);
+        this.docOp(async (): Promise<boolean> => {
+          const a = await this.engine.rotateDocument90(true);
+          return a && await this.engine.rotateDocument90(true);
         }, '旋转 180°');
         break;
       case 'image.flipH':
-        this.docOp((): boolean => this.engine.flipDocument(true), '水平翻转');
+        this.docOp((): Promise<boolean> => this.engine.flipDocument(true), '水平翻转');
         break;
       case 'image.flipV':
-        this.docOp((): boolean => this.engine.flipDocument(false), '垂直翻转');
+        this.docOp((): Promise<boolean> => this.engine.flipDocument(false), '垂直翻转');
         break;
       case 'image.trim':
-        this.docOp((): boolean => this.engine.trimCanvas(), '裁切');
+        this.docOp((): Promise<boolean> => this.engine.trimCanvas(), '裁切');
         break;
       case 'image.develop':
         this.openDevelopPanel();
@@ -3263,7 +3284,7 @@ struct Index {
         this.showGlobalLight = true;
         break;
       case 'image.revealAll':
-        this.docOp((): boolean => this.engine.revealAll(), '显示全部');
+        this.docOp((): Promise<boolean> => this.engine.revealAll(), '显示全部');
         break;
       case 'crop.commit':
         this.commitCrop();
@@ -3424,7 +3445,7 @@ struct Index {
       return;
     }
     this.showImageSize = false;
-    this.docOp((): boolean => this.engine.resampleDocument(w, h), `图像大小 ${w}×${h}`);
+    this.docOp((): Promise<boolean> => this.engine.resampleDocument(w, h), `图像大小 ${w}×${h}`);
   }
 
   // M10c 通道数镜像刷新（存储/删除后调用；驱动载入选区菜单使能）
@@ -3521,7 +3542,7 @@ struct Index {
       return;
     }
     this.showRotateAny = false;
-    this.docOp((): boolean => this.engine.rotateDocumentArbitrary(deg), `旋转 ${deg} 度`);
+    this.docOp((): Promise<boolean> => this.engine.rotateDocumentArbitrary(deg), `旋转 ${deg} 度`);
   }
   private commitTransform(): void {
     const a = this.activeLayer();
@@ -3608,21 +3629,40 @@ struct Index {
   private applyTheme(mode: ThemeMode): void {
     this.themeMode = mode;
     this.prefs.setThemeMode(mode);
-    this.prefs.applyTheme(mode, getContext(this));
+    const hc = this.hostCtx();
+    if (hc !== undefined) {
+      this.prefs.applyTheme(mode, hc);
+    }
     this.showTheme = false;
   }
 
   /** M8a 文档级操作统一包装：执行 + 刷文档尺寸 + 清选区镜像 + 提示。 */
-  private docOp(op: () => boolean, label: string): void {
+  private docBusy: boolean = false;
+
+  // 文档级几何命令（旋转/翻转/裁切/显示全部/图像大小/任意角）已 async 化（审查修复 D2：
+  // 大图重活走 worker 防主线程 appfreeze）。busy 防重入：上一项未发布前拒绝新操作。
+  private async docOp(op: () => boolean | Promise<boolean>, label: string): Promise<void> {
     if (!this.docOpen) {
       return;
     }
-    if (op()) {
-      this.hasSelectionFlag = false;
-      this.cropRect = null;
-      this.refreshDocMeta();
-      this.toast(label + '完成');
-      this.log(`${label} 完成`);
+    if (this.docBusy) {
+      this.toast('上一项文档操作进行中…');
+      return;
+    }
+    this.docBusy = true;
+    this.busyText = `${label}…`;
+    try {
+      const changed = await op();
+      if (changed) {
+        this.hasSelectionFlag = false;
+        this.cropRect = null;
+        this.refreshDocMeta();
+        this.toast(label + '完成');
+        this.log(`${label} 完成`);
+      }
+    } finally {
+      this.docBusy = false;
+      this.busyText = '';
     }
   }
 

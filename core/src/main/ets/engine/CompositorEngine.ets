@@ -1368,27 +1368,31 @@ export class CompositorEngine {
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
-  /** 裁切（M8a：可见内容包围盒收画布）。 */
-  trimCanvas(): boolean {
-    const r = narrowResult(native.trimCanvas() as Object);
+  /** 裁切（M8a：可见内容包围盒收画布；异步 work，审查修复 D2 appfreeze）。 */
+  async trimCanvas(): Promise<boolean> {
+    const value: Object = await (native.trimCanvas() as Promise<Object>);
+    const r = narrowResult(value);
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
-  /** 显示全部（M8a：内容包围盒 ∪ 当前文档域）。 */
-  revealAll(): boolean {
-    const r = narrowResult(native.revealAll() as Object);
+  /** 显示全部（M8a：内容包围盒 ∪ 当前文档域；异步 work）。 */
+  async revealAll(): Promise<boolean> {
+    const value: Object = await (native.revealAll() as Promise<Object>);
+    const r = narrowResult(value);
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
-  /** 90° 旋转（M8a；clockwise=true 顺时针）。 */
-  rotateDocument90(clockwise: boolean): boolean {
-    const r = narrowResult(native.rotateDocument90(clockwise) as Object);
+  /** 90° 旋转（M8a；clockwise=true 顺时针；异步 work，审查修复 D2 appfreeze）。 */
+  async rotateDocument90(clockwise: boolean): Promise<boolean> {
+    const value: Object = await (native.rotateDocument90(clockwise) as Promise<Object>);
+    const r = narrowResult(value);
     return r.ok;
   }
 
-  /** 翻转（M8a；horizontal=true 水平）。 */
-  flipDocument(horizontal: boolean): boolean {
-    const r = narrowResult(native.flipDocument(horizontal) as Object);
+  /** 翻转（M8a；horizontal=true 水平；异步 work）。 */
+  async flipDocument(horizontal: boolean): Promise<boolean> {
+    const value: Object = await (native.flipDocument(horizontal) as Promise<Object>);
+    const r = narrowResult(value);
     return r.ok;
   }
 
@@ -1442,9 +1446,10 @@ export class CompositorEngine {
     return { luma: pick('luma'), r: pick('r'), g: pick('g'), b: pick('b') };
   }
 
-  /** 图像大小重采样（M8c；双线性）。 */
-  resampleDocument(w: number, h: number): boolean {
-    const r = narrowResult(native.resampleDocument(w, h) as Object);
+  /** 图像大小重采样（M8c；双线性；异步 work，审查修复 D2 appfreeze）。 */
+  async resampleDocument(w: number, h: number): Promise<boolean> {
+    const value: Object = await (native.resampleDocument(w, h) as Promise<Object>);
+    const r = narrowResult(value);
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
@@ -1492,9 +1497,10 @@ export class CompositorEngine {
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
-  /** 任意角旋转（M8c；顺时针度）。 */
-  rotateDocumentArbitrary(deg: number): boolean {
-    const r = narrowResult(native.rotateDocumentArbitrary(deg) as Object);
+  /** 任意角旋转（M8c；顺时针度；异步 work）。 */
+  async rotateDocumentArbitrary(deg: number): Promise<boolean> {
+    const value: Object = await (native.rotateDocumentArbitrary(deg) as Promise<Object>);
+    const r = narrowResult(value);
     return r.ok;
   }
 
