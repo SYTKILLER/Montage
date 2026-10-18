@@ -12,6 +12,9 @@ namespace {
 
 constexpr size_t kMaxPngBytes = 512ull * 1024 * 1024;
 constexpr size_t kMaxDims = 30000;
+// 像素总量预算（审查修复）：与 project/psd/image 各解码器同档（100MP）。原先仅单边
+// 30000 门且用 > 判断，30000×30000 恰好放行 → raw 缓冲+瓦片 ~7GB 分配后才被上游拒绝
+constexpr uint64_t kMaxPngPixels = 100ull * 1000 * 1000;
 
 // 大端读
 uint32_t be32(const uint8_t* p) {
@@ -63,7 +66,8 @@ std::shared_ptr<const TileGrid> decodePngToGrid(const uint8_t* data, size_t size
             const int depth = payload[8];
             const int colorType = payload[9];
             const int interlace = payload[12];
-            if (width == 0 || height == 0 || width > kMaxDims || height > kMaxDims) {
+            if (width == 0 || height == 0 || width > kMaxDims || height > kMaxDims ||
+                static_cast<uint64_t>(width) * height > kMaxPngPixels) {
                 err = "png size out of range";
                 return nullptr;
             }

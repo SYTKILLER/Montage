@@ -20,6 +20,16 @@ export const ADJ_KINDS: AdjKindDef[] = [
   { kind: 7, label: '色相/饱和度' },
 ];
 
+// @Builder 按引用传参（审查修复：按值参数不随状态重渲染，滑条提交后数值冻结）
+interface SliderItem {
+  label: string;
+  min: number;
+  max: number;
+  value: number;
+  text: string;
+  onCommit: (v: number) => void;
+}
+
 @Component
 export struct AdjustPanel {
   @Prop adjKind: number = 0;
@@ -29,9 +39,11 @@ export struct AdjustPanel {
   @Prop adjP0: number = 0;
   @Prop adjP1: number = 0;
   @Prop adjP2: number = 0;
-  @Prop curveXs: number[] = [0, 1];   // 0..1
-  @Prop curveYs: number[] = [0, 1];
-  @Prop histLuma: number[] = [];
+  // 审查修复：曲线/直方图数据外部变化（撤销/切层/采样回推）须重绘 Canvas——
+  // 原先重绘只挂 onReady + 自身触摸，数据变化后显示陈旧
+  @Prop @Watch('onCurveDataChanged') curveXs: number[] = [0, 1];   // 0..1
+  @Prop @Watch('onCurveDataChanged') curveYs: number[] = [0, 1];
+  @Prop @Watch('onHistDataChanged') histLuma: number[] = [];
   @Prop isAdjustment: boolean = false;
   onSetKind: (kind: number) => void = (_k: number) => {};
   onLevels: (b: number, w: number, g: number) => void =
@@ -47,6 +59,26 @@ export struct AdjustPanel {
   @State private dragIdx: number = -1;
   @State private localXs: number[] = [0, 1];
   @State private localYs: number[] = [0, 1];
+  private curveReady: boolean = false;
+  private histReady: boolean = false;
+
+  // 撤销/切层等外部数据回推：未拖拽时同步本地镜像并重绘（拖拽中本地优先，Up 提交后回推）
+  private onCurveDataChanged(): void {
+    if (this.dragIdx >= 0) {
+      return;
+    }
+    this.localXs = this.curveXs.slice();
+    this.localYs = this.curveYs.slice();
+    if (this.curveReady) {
+      this.drawCurve();
+    }
+  }
+
+  private onHistDataChanged(): void {
+    if (this.histReady) {
+      this.drawHist();
+    }
+  }
 
   private readonly P0: number = 24;
   private readonly PSZ: number = 152;
@@ -138,20 +170,22 @@ export struct AdjustPanel {
     }
   }
 
+  // 审查修复（NOTICE 实证坑）：按值参数的 @Builder 不随状态重渲染 → 滑条提交后数值
+  // 文本冻结。改按引用传参（对象字面量内引用状态变量），属性变化即刷新。
   @Builder
-  slider(label: string, min: number, max: number, value: number,
-    onCommit: (v: number) => void, text: string) {
+  slider($$: SliderItem) {
     Row({ space: 6 }) {
-      Text(label).fontSize(11).fontColor($r('app.color.text_secondary')).width(50)
-      Slider({ value: Math.min(max, Math.max(min, value)), min: min, max: max, step: 1 })
+      Text($$.label).fontSize(11).fontColor($r('app.color.text_secondary')).width(50)
+      Slider({ value: Math.min($$.max, Math.max($$.min, $$.value)), min: $$.min,
+        max: $$.max, step: 1 })
         .layoutWeight(1)
         .height(22)
         .onChange((v: number, mode: SliderChangeMode): void => {
           if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
-            onCommit(Math.round(v));
+            $$.onCommit(Math.round(v));
           }
         })
-      Text(text).fontSize(10).fontColor($r('app.color.text_primary')).width(36)
+      Text($$.text).fontSize(10).fontColor($r('app.color.text_primary')).width(36)
     }
     .width('100%')
   }
@@ -179,55 +213,103 @@ export struct AdjustPanel {
       }.width('100%')
 
       if (this.adjKind === 0) {
-        this.slider('黑', 0, 250, this.adjBlack, (v: number): void => {
-          this.onLevels(v, this.adjWhite, this.adjGammaX100 / 100);
-        }, `${Math.round(this.adjBlack)}`)
-        this.slider('白', 5, 255, this.adjWhite, (v: number): void => {
-          this.onLevels(this.adjBlack, v, this.adjGammaX100 / 100);
-        }, `${Math.round(this.adjWhite)}`)
-        this.slider('γ', 10, 1000, this.adjGammaX100, (v: number): void => {
-          this.onLevels(this.adjBlack, this.adjWhite, v / 100);
-        }, (this.adjGammaX100 / 100).toFixed(2))
+        this.slider({
+          label: '黑', min: 0, max: 250, value: this.adjBlack,
+          text: `${Math.round(this.adjBlack)}`,
+          onCommit: (v: number): void => {
+            this.onLevels(v, this.adjWhite, this.adjGammaX100 / 100);
+          }
+        })
+        this.slider({
+          label: '白', min: 5, max: 255, value: this.adjWhite,
+          text: `${Math.round(this.adjWhite)}`,
+          onCommit: (v: number): void => {
+            this.onLevels(this.adjBlack, v, this.adjGammaX100 / 100);
+          }
+        })
+        this.slider({
+          label: 'γ', min: 10, max: 1000, value: this.adjGammaX100,
+          text: (this.adjGammaX100 / 100).toFixed(2),
+          onCommit: (v: number): void => {
+            this.onLevels(this.adjBlack, this.adjWhite, v / 100);
+          }
+        })
       } else if (this.adjKind === 1) {
         Canvas(this.histCtx)
           .width(200).height(40)
-          .onReady((): void => this.drawHist())
+          .onReady((): void => {
+            this.histReady = true;
+            this.drawHist();
+          })
         Canvas(this.curveCtx)
           .width(200).height(200)
-          .onReady((): void => this.drawCurve())
+          .onReady((): void => {
+            this.curveReady = true;
+            this.localXs = this.curveXs.slice();
+            this.localYs = this.curveYs.slice();
+            this.drawCurve();
+          })
           .onTouch((e: TouchEvent): void => this.curveTouch(e))
         Text('拖点调整；空白单击加点')
           .fontSize(10)
           .fontColor($r('app.color.text_secondary'))
       } else if (this.adjKind === 2) {
-        this.slider('亮度', -150, 150, this.adjP0, (v: number): void => {
-          this.onParams(v, this.adjP1, this.adjP2);
-        }, `${Math.round(this.adjP0)}`)
-        this.slider('对比度', -50, 100, this.adjP1, (v: number): void => {
-          this.onParams(this.adjP0, v, this.adjP2);
-        }, `${Math.round(this.adjP1)}`)
+        this.slider({
+          label: '亮度', min: -150, max: 150, value: this.adjP0,
+          text: `${Math.round(this.adjP0)}`,
+          onCommit: (v: number): void => {
+            this.onParams(v, this.adjP1, this.adjP2);
+          }
+        })
+        this.slider({
+          label: '对比度', min: -50, max: 100, value: this.adjP1,
+          text: `${Math.round(this.adjP1)}`,
+          onCommit: (v: number): void => {
+            this.onParams(this.adjP0, v, this.adjP2);
+          }
+        })
       } else if (this.adjKind === 3) {
         Text('反相：无参数（即时生效）')
           .fontSize(11)
           .fontColor($r('app.color.text_secondary'))
       } else if (this.adjKind === 4) {
-        this.slider('阈值', 0, 255, this.adjP0, (v: number): void => {
-          this.onParams(v, 0, 0);
-        }, `${Math.round(this.adjP0)}`)
+        this.slider({
+          label: '阈值', min: 0, max: 255, value: this.adjP0,
+          text: `${Math.round(this.adjP0)}`,
+          onCommit: (v: number): void => {
+            this.onParams(v, 0, 0);
+          }
+        })
       } else if (this.adjKind === 5) {
-        this.slider('色阶数', 2, 32, this.adjP0, (v: number): void => {
-          this.onParams(v, 0, 0);
-        }, `${Math.round(this.adjP0)}`)
+        this.slider({
+          label: '色阶数', min: 2, max: 32, value: this.adjP0,
+          text: `${Math.round(this.adjP0)}`,
+          onCommit: (v: number): void => {
+            this.onParams(v, 0, 0);
+          }
+        })
       } else if (this.adjKind === 6) {
-        this.slider('红', -100, 100, this.adjP0, (v: number): void => {
-          this.onParams(v, this.adjP1, this.adjP2);
-        }, `${Math.round(this.adjP0)}`)
-        this.slider('绿', -100, 100, this.adjP1, (v: number): void => {
-          this.onParams(this.adjP0, v, this.adjP2);
-        }, `${Math.round(this.adjP1)}`)
-        this.slider('蓝', -100, 100, this.adjP2, (v: number): void => {
-          this.onParams(this.adjP0, this.adjP1, v);
-        }, `${Math.round(this.adjP2)}`)
+        this.slider({
+          label: '红', min: -100, max: 100, value: this.adjP0,
+          text: `${Math.round(this.adjP0)}`,
+          onCommit: (v: number): void => {
+            this.onParams(v, this.adjP1, this.adjP2);
+          }
+        })
+        this.slider({
+          label: '绿', min: -100, max: 100, value: this.adjP1,
+          text: `${Math.round(this.adjP1)}`,
+          onCommit: (v: number): void => {
+            this.onParams(this.adjP0, v, this.adjP2);
+          }
+        })
+        this.slider({
+          label: '蓝', min: -100, max: 100, value: this.adjP2,
+          text: `${Math.round(this.adjP2)}`,
+          onCommit: (v: number): void => {
+            this.onParams(this.adjP0, this.adjP1, v);
+          }
+        })
       } else if (this.adjKind === 7) {
         Text('色相/饱和度：GPU 路径后续批次')
           .fontSize(11)

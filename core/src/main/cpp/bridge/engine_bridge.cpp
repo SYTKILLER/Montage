@@ -797,7 +797,8 @@ napi_value OnImportProgress(napi_env env, napi_callback_info info) {
     }
     auto& e = Engine::get();
     {
-        std::lock_guard<std::mutex> lk(e.docMutex);
+        // 与 notifyProgress/Dispose 同锁（import.mtx）：换绑窗口内导入线程不会读到悬垂指针
+        std::lock_guard<std::mutex> lk(e.import.mtx);
         if (e.progressTsfn != nullptr) {
             napi_release_threadsafe_function(e.progressTsfn, napi_tsfn_release);
         }
@@ -1263,11 +1264,19 @@ napi_value ReorderLayer(napi_env env, napi_callback_info info) {
         if (at == e.doc.layers.size()) {
             return makeError(env, kErrBadParam, "reorderLayer: layer not found");
         }
-        Layer layer = e.doc.layers[at];
-        e.doc.layers.erase(e.doc.layers.begin() + static_cast<long>(at));
+        // M14a 组树不变式：平铺序必须是先序 DFS（组节点紧跟完整子树）。无检查的单节点
+        // 搬移可把组段打散（子层逃逸组 blend/opacity 语义），坏顺序还会原样入存档——
+        // 虚拟副本上移动 + contiguousOn 终检，破坏即拒绝（照 setLayerParent 范式）。
+        std::vector<Layer> tmp = e.doc.layers;
+        Layer layer = tmp[at];
+        tmp.erase(tmp.begin() + static_cast<long>(at));
         long dst = std::min(std::max(0L, static_cast<long>(toIndex)),
-                            static_cast<long>(e.doc.layers.size()));
-        e.doc.layers.insert(e.doc.layers.begin() + dst, std::move(layer));
+                            static_cast<long>(tmp.size()));
+        tmp.insert(tmp.begin() + dst, std::move(layer));
+        if (!contiguousOn(tmp)) {
+            return makeError(env, kErrBadParam, "reorderLayer: move breaks group contiguity");
+        }
+        e.doc.layers = std::move(tmp);
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -2786,19 +2795,23 @@ napi_value Dispose(napi_env env, napi_callback_info /*info*/) {
     }
     io::cancelImageImport();
     napi_threadsafe_function revision = nullptr;
-    napi_threadsafe_function progress = nullptr;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
         revision = e.revisionTsfn;
         e.revisionTsfn = nullptr;
-        progress = e.progressTsfn;
-        e.progressTsfn = nullptr;
     }
     if (revision != nullptr) {
         napi_release_threadsafe_function(revision, napi_tsfn_release);
     }
-    if (progress != nullptr) {
-        napi_release_threadsafe_function(progress, napi_tsfn_release);
+    // progress TSFN 必须与导入线程同锁（import.mtx）销毁：notifyProgress 持该锁读指针并
+    // 调用，此处锁内置空+release → 不存在「线程已读到旧指针、release 后才调用」的
+    // use-after-release 窗口（原先读 docMutex 写、无锁读，两侧互斥不成立）
+    {
+        std::lock_guard<std::mutex> lk(e.import.mtx);
+        if (e.progressTsfn != nullptr) {
+            napi_release_threadsafe_function(e.progressTsfn, napi_tsfn_release);
+            e.progressTsfn = nullptr;
+        }
     }
     e.render.stop();
     return makeOk(env, nullptr);
@@ -3367,6 +3380,10 @@ struct BakeCtx {
     double id = 0;
     double m[6] = {1, 0, 0, 0, 1, 0};
     bool ok = false;
+    // 发布护栏（审查修复）：快照到 worker 执行之间文档可能被并发编辑/关闭，
+    // 代次+版本失配即作废，防旧 docSnap 整档覆盖丢编辑/复活已关档（照 developRaw 复核范式）
+    uint64_t epoch = 0;
+    int64_t revision = 0;
 };
 
 napi_value BakeLayerMatrix(napi_env env, napi_callback_info info) {
@@ -3403,6 +3420,8 @@ napi_value BakeLayerMatrix(napi_env env, napi_callback_info info) {
             return makeError(env, kErrNoDoc, "bakeLayerMatrix: no document");
         }
         ctx->docSnap = e.doc;
+        ctx->epoch = e.docEpoch;
+        ctx->revision = e.docRevision;
         // 预览态即清（渲染回到未变换；烘焙结果异步发布）
         e.transformPreview.active = false;
         e.requestRender();
@@ -3415,19 +3434,23 @@ napi_value BakeLayerMatrix(napi_env env, napi_callback_info info) {
         env, nullptr, workName,
         [](napi_env /*env*/, void* data) {
             auto* c = static_cast<BakeCtx*>(data);
-            // 锁内替换整档（bake 结果 + history 事务）
             auto& e = Engine::get();
+            // warp 在锁外跑（此前持 docMutex 整段烘焙，大图长阻塞所有命令）；
+            // 纯函数作用于快照副本，历史事务只在发布段挂 e.doc——作废路径零污染
+            Document work = c->docSnap;
+            const bool baked = bakeLayerMatrix(work, static_cast<LayerId>(c->id), c->m);
             std::lock_guard<std::mutex> lk(e.docMutex);
-            e.history.beginEdit(c->docSnap, "free transform",
-                                static_cast<uint64_t>(e.docRevision));
-            c->ok = bakeLayerMatrix(c->docSnap, static_cast<LayerId>(c->id), c->m);
-            e.history.endEdit(c->docSnap, static_cast<uint64_t>(e.docRevision));
-            if (c->ok) {
-                e.doc = c->docSnap;
-                restyleAllLocked(e);
-                e.bumpRevisionLocked();
-                e.requestRender();
+            if (!baked || e.docEpoch != c->epoch || e.docRevision != c->revision) {
+                c->ok = false;  // 烘焙失败或快照已过期 → 整体作废，不发布不进历史
+                return;
             }
+            e.history.beginEdit(e.doc, "free transform", static_cast<uint64_t>(e.docRevision));
+            e.doc = std::move(work);
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            c->ok = true;
+            restyleAllLocked(e);
+            e.bumpRevisionLocked();
+            e.requestRender();
         },
         [](napi_env env, napi_status status, void* data) {
             auto* c = static_cast<BakeCtx*>(data);
@@ -3510,9 +3533,13 @@ napi_value SetCurvePoints(napi_env env, napi_callback_info info) {
             return makeError(env, kErrBadParam, "setCurvePoints: not an adjustment layer");
         }
         e.history.beginEdit(e.doc, "curves points", static_cast<uint64_t>(e.docRevision));
-        l->adjustment->kind = AdjustmentKind::Curves;
-        l->adjustment->curveX = xs;
-        l->adjustment->curveY = ys;
+        // COW（照 setAdjustmentParams 范式）：History 快照浅拷贝 shared_ptr，原地改 pointee
+        // 会同步污染撤销前快照 → undo 恢复不出旧曲线
+        auto adj = std::make_shared<LayerAdjustment>(*l->adjustment);
+        adj->kind = AdjustmentKind::Curves;
+        adj->curveX = xs;
+        adj->curveY = ys;
+        l->adjustment = std::move(adj);
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();
         e.requestRender();
@@ -3581,11 +3608,14 @@ napi_value SetAdjustmentKind(napi_env env, napi_callback_info info) {
             return makeError(env, kErrBadParam, "setAdjustmentKind: bad kind");
         }
         e.history.beginEdit(e.doc, "adjustment kind", static_cast<uint64_t>(e.docRevision));
-        l->adjustment->kind = static_cast<AdjustmentKind>(kind);
-        l->adjustment->p0 = static_cast<float>(v[2]);
-        l->adjustment->p1 = static_cast<float>(v[3]);
-        l->adjustment->p2 = static_cast<float>(v[4]);
-        l->adjustment->p3 = static_cast<float>(v[5]);
+        // COW：同 setCurvePoints——kind/参数原地改会污染 History 浅拷贝的撤销前快照
+        auto adj = std::make_shared<LayerAdjustment>(*l->adjustment);
+        adj->kind = static_cast<AdjustmentKind>(kind);
+        adj->p0 = static_cast<float>(v[2]);
+        adj->p1 = static_cast<float>(v[3]);
+        adj->p2 = static_cast<float>(v[4]);
+        adj->p3 = static_cast<float>(v[5]);
+        l->adjustment = std::move(adj);
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();
         e.requestRender();
@@ -5200,7 +5230,8 @@ napi_value ClearLayerStyle(napi_env env, napi_callback_info info) {
 
 // setInnerShadow(id,enabled,angle,dist,size,opacity,r,g,b)
 napi_value SetInnerShadow(napi_env env, napi_callback_info info) {
-    size_t argc = 9;
+    size_t argc = 11;  // 审查修复：原 9 < 所需 11，napi_get_cb_info 只拷 9 个 → argv[9..10]
+                       // 恒 nullptr，spread/useGL 两参解析必败，内阴影整体不可用
     napi_value argv[11];
     for (size_t i = 0; i < 11; ++i) {
         argv[i] = nullptr;
@@ -5659,12 +5690,15 @@ napi_value SetFillLayerParams(napi_env env, napi_callback_info info) {
             return makeError(env, kErrBadParam, "setFillLayerParams: not a fill layer");
         }
         e.history.beginEdit(e.doc, "fill layer params", static_cast<uint64_t>(e.docRevision));
-        l->fill->kind = static_cast<int>(v[1]) == 1 ? 1 : 0;
-        l->fill->color[0] = static_cast<float>(v[2] / 255.0);
-        l->fill->color[1] = static_cast<float>(v[3] / 255.0);
-        l->fill->color[2] = static_cast<float>(v[4] / 255.0);
-        l->fill->color[3] = 1.0f;
-        l->fill->angleDeg = v[5];
+        // COW：fill 为 shared_ptr 且 History 浅拷贝，原地改会污染撤销前快照（同 adjustment）
+        auto fill = std::make_shared<FillLayerState>(*l->fill);
+        fill->kind = static_cast<int>(v[1]) == 1 ? 1 : 0;
+        fill->color[0] = static_cast<float>(v[2] / 255.0);
+        fill->color[1] = static_cast<float>(v[3] / 255.0);
+        fill->color[2] = static_cast<float>(v[4] / 255.0);
+        fill->color[3] = 1.0f;
+        fill->angleDeg = v[5];
+        l->fill = std::move(fill);
         std::string err;
         if (!restyleLayer(e.doc, *l, nextGridRevision(), err)) {
             e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));

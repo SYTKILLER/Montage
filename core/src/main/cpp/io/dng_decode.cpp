@@ -68,27 +68,30 @@ public:
 
 private:
     bool readIfd(uint32_t off, std::string& err) {
-        if (off + 2 > data_->size()) {
+        // uint64 判界（审查修复）：uint32 加法在 0xFFFFFFFF 附近回绕可穿过判界，
+        // 后续按原始偏移越界读
+        if (static_cast<uint64_t>(off) + 2 > data_->size()) {
             err = "dng: ifd out of range";
             return false;
         }
         const uint16_t count = u16(off);
         TiffIfd f;
-        uint32_t p = off + 2;
+        uint64_t p = static_cast<uint64_t>(off) + 2;
         for (uint16_t i = 0; i < count; ++i) {
             if (p + 12 > data_->size()) {
                 err = "dng: entry out of range";
                 return false;
             }
-            const uint16_t tag = u16(p);
-            const uint16_t type = u16(p + 2);
-            const uint32_t cnt = u32(p + 4);
+            // 文件 ≤512MB（image_import 读入上限）→ 有效偏移恒在 uint32 内，截断安全
+            const uint16_t tag = u16(static_cast<uint32_t>(p));
+            const uint16_t type = u16(static_cast<uint32_t>(p + 2));
+            const uint32_t cnt = u32(static_cast<uint32_t>(p + 4));
             static const uint16_t kTypeSize[] = {0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8, 4, 8};
             const uint32_t tsz = type < 13 ? kTypeSize[type] : 1;
             const uint64_t total = static_cast<uint64_t>(tsz) * cnt;
             uint64_t valOff = p + 8;
             if (total > 4) {
-                valOff = u32(p + 8);
+                valOff = u32(static_cast<uint32_t>(p + 8));
             }
             if (valOff + total > data_->size()) {
                 err = "dng: value out of range";
@@ -99,6 +102,10 @@ private:
             std::vector<uint64_t> vals;
             for (uint32_t k = 0; k < cnt && tsz > 0; ++k) {
                 const uint64_t vo = valOff + static_cast<uint64_t>(k) * tsz;
+                if (vo + tsz > data_->size()) {
+                    err = "dng: value out of range";
+                    return false;
+                }
                 if (type == 1 || type == 6 || type == 7) {
                     vals.push_back((*data_)[static_cast<size_t>(vo)]);
                 } else if (type == 3) {
@@ -280,7 +287,7 @@ bool looksLikeDng(const std::vector<uint8_t>& bytes) {
                          static_cast<uint32_t>(bytes[o + 3]);
     };
     const uint32_t ifd0 = rd32(4);
-    if (ifd0 + 2 > bytes.size()) {
+    if (static_cast<uint64_t>(ifd0) + 2 > bytes.size()) {
         return false;
     }
     const uint16_t n = rd16(ifd0);
@@ -368,6 +375,21 @@ bool developDngToGrid(const std::vector<uint8_t>& bytes,
         cfaDim->second.size() >= 2 && cfaDim->second[0] == 2 && cfaDim->second[1] == 2 &&
         cfaPat->second.size() >= 4) {
         std::memcpy(cfa, cfaPat->second.data(), 4);
+        // tag 来自不可信文件，必须校验：值域外的通道号会经 channelAt 索引 planes[3]
+        // 栈上数组（越界 vector 对象按垃圾指针写入）。计数校验 {R,G,G,B} 四值各一，
+        // 四种合法 Bayer（RGGB/GRBG/BGGR/GBRG）全过、其余拒绝
+        int cnt[3] = {0, 0, 0};
+        for (int i = 0; i < 4; ++i) {
+            if (cfa[i] > 2) {
+                err = "dng: invalid CFA pattern";
+                return false;
+            }
+            ++cnt[cfa[i]];
+        }
+        if (cnt[0] != 1 || cnt[1] != 2 || cnt[2] != 1) {
+            err = "dng: invalid CFA pattern";
+            return false;
+        }
     } else {
         err = "dng: missing CFA pattern";
         return false;

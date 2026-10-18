@@ -35,6 +35,9 @@ bool deleteGroupRecursive(Document& doc, LayerId groupId, std::string& err);
 // 连续性校验（调试/测试用）：全部组的子层在平铺序中连续。
 bool groupsContiguous(const Document& doc);
 
+// 平铺序先序不变式终检（consumeSubtree 全量消费）：reorderLayer/setLayerParent 守卫共用。
+bool contiguousOn(const std::vector<Layer>& layers);
+
 }  // namespace montage
 
 #endif  // MONTAGE_ENGINE_GROUP_OPS_H

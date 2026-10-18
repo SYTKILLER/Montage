@@ -18,16 +18,25 @@ export struct TransformOverlay {
   @Prop ovTop: number = 0;
   @Prop ovWidth: number = 0;
   @Prop ovHeight: number = 0;
-  @Prop zoom: number = 1;
-  @Prop panX: number = 0;
-  @Prop panY: number = 0;
-  @Prop pxPerVp: number = 3;
+  // 审查修复：变换会话中框外触摸会平移/缩放画布（穿透导航），zoom/pan 变化后手柄
+  // Canvas 不重绘 → 与 GL 画布错位。视图相关 @Prop 全部挂 @Watch 重绘。
+  @Prop @Watch('onViewChanged') zoom: number = 1;
+  @Prop @Watch('onViewChanged') panX: number = 0;
+  @Prop @Watch('onViewChanged') panY: number = 0;
+  @Prop @Watch('onViewChanged') pxPerVp: number = 3;
   onMatrix: (tx: number, ty: number, sx: number, sy: number) => void =
     (_tx: number, _ty: number, _sx: number, _sy: number) => {};
   private settings: RenderingContextSettings = new RenderingContextSettings(true);
   private ctx: CanvasRenderingContext2D =
     new CanvasRenderingContext2D(this.settings);
   @State private cur: XformState = { tx: 0, ty: 0, sx: 1, sy: 1 };
+  private canvasReady: boolean = false;
+
+  private onViewChanged(): void {
+    if (this.canvasReady && !this.dragging) {
+      this.redraw();
+    }
+  }
   private dragging: boolean = false;
   private dragKind: number = -1;   // 0..7 手柄（角0,2,4,6/边1,3,5,7）；8 = 框内
   private startPtrX: number = 0;
@@ -196,6 +205,7 @@ export struct TransformOverlay {
       .width('100%')
       .height('100%')
       .onReady((): void => {
+        this.canvasReady = true;
         this.redraw();
       })
       .onTouch((e: TouchEvent): void => {

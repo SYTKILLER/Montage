@@ -76,11 +76,12 @@ size_t consumeSubtree(const std::vector<Layer>& layers, size_t i, LayerId parent
     return i - start;
 }
 
+}  // namespace
+
+// 平铺序先序不变式终检（group_ops.h 声明；reorderLayer/setLayerParent 守卫共用）
 bool contiguousOn(const std::vector<Layer>& layers) {
     return consumeSubtree(layers, 0, 0) == layers.size();
 }
-
-}  // namespace
 
 LayerId createGroup(Document& doc, LayerId newId, const std::string& name, std::string& err) {
     if (doc.width == 0) {

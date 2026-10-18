@@ -456,6 +456,15 @@ struct Index {
       clearTimeout(this.histTimer);
       this.histTimer = -1;
     }
+    // 审查修复：防抖/文字提交定时器跨 dispose 回调（引擎已释放后仍发命令）
+    if (this.filterDebounce >= 0) {
+      clearTimeout(this.filterDebounce);
+      this.filterDebounce = -1;
+    }
+    if (this.textEditTimer >= 0) {
+      clearTimeout(this.textEditTimer);
+      this.textEditTimer = -1;
+    }
     this.engine.dispose();
   }
 
@@ -2049,10 +2058,21 @@ struct Index {
 
   private writeProjectTo(uri: string): void {
     this.busyText = '保存中…';
-    // TRUNC 清旧包再整包重写（fd 移交 native）
-    const f = fs.openSync(uri, fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
-    this.log(`保存工程 fd=${f.fd}`);
-    this.engine.saveProject(f.fd).then((d: SaveProjectData): void => {
+    // TRUNC 清旧包再整包重写（fd 移交 native）；openSync 同步抛 BusinessError，
+    // 不捕获会卡死忙态（审查修复）
+    let f: fs.File | null = null;
+    try {
+      f = fs.openSync(uri, fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
+      this.log(`保存工程 fd=${f.fd}`);
+    } catch (e) {
+      this.busyText = '';
+      const be = e as BusinessError;
+      this.log(`保存打开失败: ${be.code} ${be.message}`);
+      this.toast('保存失败（无法写入目标文件）');
+      return;
+    }
+    const file: fs.File = f;
+    this.engine.saveProject(file.fd).then((d: SaveProjectData): void => {
       this.busyText = '';
       const seg = uri.split('/');
       this.recents = this.prefs.addRecent(decodeURIComponent(seg[seg.length - 1]), uri);
@@ -2089,7 +2109,17 @@ struct Index {
     this.showExport = false;
     this.busyText = '扁平合成中…';
     const t0 = Date.now();
-    const f = fs.openSync(uri, fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
+    // openSync 同步抛 BusinessError，不捕获会卡死忙态（审查修复）
+    let f: fs.File;
+    try {
+      f = fs.openSync(uri, fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
+    } catch (e) {
+      this.busyText = '';
+      const be = e as BusinessError;
+      this.log(`导出打开失败: ${be.code} ${be.message}`);
+      this.toast('导出失败（无法写入目标文件）');
+      return;
+    }
     if (format === 'psd') {
       // PSD：层/蒙版/剪贴非破坏导出（M8b）
       this.engine.exportPsd(f.fd).then((d): void => {
@@ -2741,7 +2771,14 @@ struct Index {
       case 'file.saveSandbox': {
         // 隐藏调试通道（模拟器 picker 保存缺陷的往返验证替代，M12 定案）：cacheDir/rt_check.montage
         const path = getContext(this).cacheDir + '/rt_check.montage';
-        const f = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+        let f: fs.File;
+        try {
+          f = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+        } catch (e) {
+          const be = e as BusinessError;
+          this.log(`沙箱保存打开失败: ${be.code} ${be.message}`);
+          break;
+        }
         this.engine.saveProject(f.fd).then((d: SaveProjectData): void => {
           this.log(`沙箱往返保存: ${d.layers} 层 ${d.bytes} 字节`);
           this.toast(`沙箱保存完成（${d.layers} 层）`);
@@ -2752,7 +2789,14 @@ struct Index {
       }
       case 'file.openSandbox': {
         const p2 = getContext(this).cacheDir + '/rt_check.montage';
-        const f2 = fs.openSync(p2, fs.OpenMode.READ_ONLY);
+        let f2: fs.File;
+        try {
+          f2 = fs.openSync(p2, fs.OpenMode.READ_ONLY);
+        } catch (e) {
+          const be = e as BusinessError;
+          this.log(`沙箱打开失败（无往返包？先保存）: ${be.code} ${be.message}`);
+          break;
+        }
         this.engine.openProject(f2.fd).then((d: OpenProjectData): void => {
           this.docW = d.width;
           this.docH = d.height;
@@ -2770,13 +2814,27 @@ struct Index {
       case 'file.openSandboxDng': {
         // M15d：DNG RAW 显影设备验证通道（内嵌合成 DNG base64 → cacheDir → 显影打开；
         // 模拟器 picker/沙箱写入受限，自包含可复跑）
-        const B64_DNG = 'SUkqAAgAAAAOAAABBAABAAAACAAAAAEBBAABAAAACAAAAAIBAwABAAAAEAAAAAMBAwABAAAAAQAAAAYBAwABAAAAI4AAABEBBAABAAAAzgAAABUBAwABAAAAAQAAABcBBAABAAAAgAAAAI2CAwACAAAAAgACAI6CAQAEAAAAAAEBAhLGAQAEAAAAAQQAABrGAwABAAAAyAAAAB3GBAABAAAADDAAACjGBQADAAAAtgAAAAAAAAD0AQAA6AMAAOgDAADoAwAA6AMAAOgDAABwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwFw==';
+        const B64_DNG = 'SUkqAAgAAAAOAAABBAABAAAACAAAAAEBBAABAAAACAAAAAIBAwABAAAAEAAAAAMBAwABAAAAAQAAAAYBAwABAAAAI4AAABEBBAABAAAAzgAAABUBAwABAAAAAQAAABcBBAABAAAAgAAAAI2CAwACAAAAAgACAI6CAQAEAAAAAAEBAhLGAQAEAAAAAQQAABrGAwABAAAAyAAAAB3GBAABAAAADDAAACjGBQADAAAAtgAAAAAAAAD0AQAA6AMAAOgDAADoAwAA6AMAAOgDAABwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwF3AXcBdwFw==';
         const pd = getContext(this).cacheDir + '/raw_test.dng';
         const bin: Uint8Array = new util.Base64Helper().decodeSync(B64_DNG);
-        const fw = fs.openSync(pd, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-        fs.writeSync(fw.fd, bin.buffer);
-        fs.closeSync(fw);
-        const fd2 = fs.openSync(pd, fs.OpenMode.READ_ONLY);
+        let fw: fs.File;
+        try {
+          fw = fs.openSync(pd, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+          fs.writeSync(fw.fd, bin.buffer);
+          fs.closeSync(fw);
+        } catch (e) {
+          const be = e as BusinessError;
+          this.log(`沙箱 DNG 写入失败: ${be.code} ${be.message}`);
+          break;
+        }
+        let fd2: fs.File;
+        try {
+          fd2 = fs.openSync(pd, fs.OpenMode.READ_ONLY);
+        } catch (e) {
+          const be = e as BusinessError;
+          this.log(`沙箱 DNG 打开失败: ${be.code} ${be.message}`);
+          break;
+        }
         this.engine.openFileFromFd(fd2.fd).then((dd: OpenFileData): void => {
           this.docW = dd.width;
           this.docH = dd.height;

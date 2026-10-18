@@ -22,7 +22,7 @@ namespace {
 constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Save";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
-constexpr int kFormatVersion = 10;  // v10：+图层样式效果扩展（M17a 内阴影/外发光/内发光/渐变叠加，非默认才写）；v9：+参考线 guides 块（M15a，空则不写兼容 v8 包）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
+constexpr int kFormatVersion = 11;  // v11：+等高线/Range/图案叠加/文档图案（M17d）；v10：+图层样式效果扩展（M17a 内阴影/外发光/内发光/渐变叠加，非默认才写）；v9：+参考线 guides 块（M15a，空则不写兼容 v8 包）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
 constexpr int kDeflateLevel = 6;
 // 04 §1.3 格式上限（沿用上游档位，与引擎运行预算分立）
 constexpr uint32_t kMaxSide = 30000;
@@ -592,7 +592,9 @@ std::string buildManifest(const DocSnapshot& doc) {
                 case AdjustmentKind::HueSaturation: kindStr = "huesat"; break;
                 default: kindStr = "levels"; break;
             }
-            fields2 += std::string("      \"kind\": ") + kindStr + "," + nl;
+            // 审查修复：kind 串漏引号 → manifest 非法 JSON，任何含调整层的工程 open 必败
+            //（宿主往返测试 rt_fix1.montage 实证 "kind": levels）
+            fields2 += std::string("      \"kind\": \"") + kindStr + "\"," + nl;
             std::snprintf(num, sizeof(num), "%.6g", adj.inBlack);
             fields2 += std::string("      \"inBlack\": ") + num + "," + nl;
             std::snprintf(num, sizeof(num), "%.6g", adj.inWhite);
@@ -603,6 +605,19 @@ std::string buildManifest(const DocSnapshot& doc) {
                 float pv = (&adj.p0)[pi];
                 std::snprintf(num, sizeof(num), "%.6g", pv);
                 fields2 += std::string(",") + nl + "      \"p" + std::to_string(pi) + "\": " + num;
+            }
+            // 审查修复：曲线点此前从未落盘（open 侧有读取但 save 漏写）→ 曲线参数存后即丢
+            if (adj.kind == AdjustmentKind::Curves && !adj.curveX.empty() &&
+                adj.curveX.size() == adj.curveY.size() && adj.curveX.size() <= 64) {
+                std::string cx, cy;
+                for (size_t ci = 0; ci < adj.curveX.size(); ++ci) {
+                    std::snprintf(num, sizeof(num), "%.6g", adj.curveX[ci]);
+                    cx += (ci != 0 ? std::string(", ") : std::string()) + num;
+                    std::snprintf(num, sizeof(num), "%.6g", adj.curveY[ci]);
+                    cy += (ci != 0 ? std::string(", ") : std::string()) + num;
+                }
+                fields2 += std::string(",") + nl + "      \"curveX\": [" + cx + "]";
+                fields2 += std::string(",") + nl + "      \"curveY\": [" + cy + "]";
             }
             fields.push_back(std::string("      \"adjustment\": {") + nl + fields2 + nl + "      }");
         }
@@ -1151,6 +1166,14 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
     };
 
     for (const LayerSnapshot& l : snap.layers) {
+        // 蒙版编码独立于像素（审查修复）：空图层+蒙版（M10c 合法）manifest 已写 maskFile，
+        // 蒙版 PNG 若挂在 pixels 非空分支漏编码，open 侧 layer mask missing 整档打不开
+        if (l.maskGrid != nullptr &&
+            !encodeGridPng(*l.maskGrid, l.maskW, l.maskH,
+                           "images/" + std::to_string(l.id) + ".mask.png")) {
+            close(fd);
+            return false;
+        }
         if (l.pixels == nullptr) {
             continue;
         }
@@ -1195,13 +1218,6 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
         }
         if (!png.finish() || !zip.endEntry()) {
             err = "png finalize failed";
-            close(fd);
-            return false;
-        }
-        // M5a：蒙版 patch 原样存出（整幅，无 bbox 裁剪）
-        if (l.maskGrid != nullptr &&
-            !encodeGridPng(*l.maskGrid, l.maskW, l.maskH,
-                           "images/" + std::to_string(l.id) + ".mask.png")) {
             close(fd);
             return false;
         }

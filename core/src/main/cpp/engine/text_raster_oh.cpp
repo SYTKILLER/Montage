@@ -63,9 +63,11 @@ void unpremultiplyRow(uint8_t* px, size_t n) {
         if (a == 0 || a == 255) {
             continue;
         }
-        px[0] = static_cast<uint8_t>((px[0] * 255u + a / 2u) / a);
-        px[1] = static_cast<uint8_t>((px[1] * 255u + a / 2u) / a);
-        px[2] = static_cast<uint8_t>((px[2] * 255u + a / 2u) / a);
+        // 审查修复：RGB 通道须随行游标 i（原写死 px[0..2]——半透明彩色字边缘保持预乘态
+        // 发暗，且首像素被后续所有像素的 alpha 反复相除损坏）
+        px[i] = static_cast<uint8_t>((px[i] * 255u + a / 2u) / a);
+        px[i + 1] = static_cast<uint8_t>((px[i + 1] * 255u + a / 2u) / a);
+        px[i + 2] = static_cast<uint8_t>((px[i + 2] * 255u + a / 2u) / a);
     }
 }
 

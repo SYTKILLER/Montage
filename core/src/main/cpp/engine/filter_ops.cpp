@@ -138,9 +138,20 @@ bool applyFilterToLayer(Document& doc, LayerId layerId, const filters::FilterPar
         err = "no content";
         return false;
     }
-    // D-1 预算：6144×4096 域 strip = 100MB（v1 单块 strip，photocraft 分块模式登记后续）
-    if (static_cast<uint64_t>(w) * h > 64ull * 1000 * 1000) {
-        err = "filter area exceeds budget (64MP)";
+    // D-1 预算：按 kind 折算（审查修复）——原 64MP 一刀切只算 strip 8B/px，模糊/锐化/
+    // 自定义卷积内部还有 float 预乘中间缓冲（峰值 40..72 B/px，64MP 下 2.6..4.6GB）。
+    // 预算闸对齐 ~1.5GB 峰值档：float 重路径 16MP、模糊路径 32MP、其余 64MP
+    const uint64_t area = static_cast<uint64_t>(w) * h;
+    const int kind = p.kind;
+    const bool heavyFloat = kind == filters::FUnsharpMask || kind == filters::FSmartSharpen ||
+                            kind == filters::FHighPass || kind == filters::FColorHalftone;
+    const bool blurPath = kind == filters::FGaussianBlur || kind == filters::FBoxBlur ||
+                          kind == filters::FMotionBlur || kind == filters::FAddNoise ||
+                          kind == filters::FCustom;
+    const uint64_t budget = heavyFloat ? 16ull * 1000 * 1000
+                                       : (blurPath ? 32ull * 1000 * 1000 : 64ull * 1000 * 1000);
+    if (area > budget) {
+        err = "filter area exceeds budget";
         return false;
     }
     std::vector<uint8_t> strip;

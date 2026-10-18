@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <unordered_map>
 #include <unistd.h>
@@ -23,14 +24,16 @@ constexpr const char* kTag = "Montage.PSD";
 void notifyProgress(double progress) {
     auto& e = Engine::get();
     {
+        // 锁内完成读指针+调用：与 Dispose/OnImportProgress 的 import.mtx 置空/release 互斥
+        //（同 image_import.cpp 的 notifyProgress，审查修复）
         std::lock_guard<std::mutex> lk(e.import.mtx);
         e.import.progress = progress;
-    }
-    if (e.progressTsfn != nullptr) {
-        napi_call_threadsafe_function(
-            e.progressTsfn,
-            reinterpret_cast<void*>(static_cast<intptr_t>(progress * 1000.0 + 0.5)),
-            napi_tsfn_nonblocking);
+        if (e.progressTsfn != nullptr) {
+            napi_call_threadsafe_function(
+                e.progressTsfn,
+                reinterpret_cast<void*>(static_cast<intptr_t>(progress * 1000.0 + 0.5)),
+                napi_tsfn_nonblocking);
+        }
     }
 }
 
@@ -96,11 +99,18 @@ std::shared_ptr<LayerMask> buildMask(const psd::Record& rec) {
 
 bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* notes,
                std::string& err) {
-    // 全量读入（PSD 解析需随机访问；典型工程文件数十 MB）
+    // 全量读入（PSD 解析需随机访问；典型工程文件数十 MB）；512MB 上限（审查修复：
+    // 原先仅查空文件即按 sz 全量分配，对抗文件可打到 OOM）
+    constexpr off_t kMaxPsdBytes = 512ll * 1024 * 1024;
     off_t sz = lseek(fd, 0, SEEK_END);
     if (sz <= 0) {
         close(fd);
         err = "empty file";
+        return false;
+    }
+    if (sz > kMaxPsdBytes) {
+        close(fd);
+        err = "psd file too large";
         return false;
     }
     lseek(fd, 0, SEEK_SET);
@@ -128,31 +138,39 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
     // 烘焙：蒙版 → 剪贴 → 直通 alpha；逐层切瓦片（M5b-2 起蒙版/剪贴均非破坏）
     std::vector<Layer> layers;
     layers.reserve(doc.layers.size());
+    // M14a 真编组 + 审查修复：reader 文件序中子层/内层组记录先于其父组记录出现（组头在
+    // 收尾 divider 才产出），单趟解析时 groupIdMap 未填充 → parentId 恒 0（层级全扁平），
+    // 且组节点落在子段之后破坏「组节点紧跟完整子树」先序不变式（渲染/连续性检查均按此
+    // 约定）。改两遍：先扫全部组记录预分配 组号→引擎 id，再按组树 DFS 前序组装。
     std::unordered_map<int, uint64_t> groupIdMap;  // M14a：组装期组号 → 引擎 LayerId
+    for (const psd::Record& rec : doc.layers) {
+        if (rec.isGroup && rec.groupId != 0) {
+            groupIdMap[rec.groupId] = engine.nextLayerId();
+        }
+    }
+    std::unordered_map<int, std::vector<size_t>> childrenOf;  // 父组号 → 记录下标（记录序）
+    for (size_t ri = 0; ri < doc.layers.size(); ++ri) {
+        childrenOf[doc.layers[ri].parentGroup].push_back(ri);
+    }
     int done = 0;
-    for (psd::Record& rec : doc.layers) {
+    // 逐记录建层（parentId 由 DFS 父链给定）；返回是否产出引擎层（未映射调整类跳过）
+    auto createRecord = [&](psd::Record& rec, uint64_t parent) -> bool {
         done++;
         notifyProgress(0.15 + 0.8 * static_cast<double>(done) /
                                    static_cast<double>(std::max<size_t>(doc.layers.size(), 1)));
-        // M14a：真编组——parentId = 父组引擎 id（bottom→top 序中父组先处理）
-        const uint64_t parent = rec.parentGroup != 0 && groupIdMap.count(rec.parentGroup)
-                                    ? groupIdMap[rec.parentGroup]
-                                    : 0;
         if (rec.isGroup) {
             Layer g;
-            g.id = engine.nextLayerId();
+            auto git = rec.groupId != 0 ? groupIdMap.find(rec.groupId) : groupIdMap.end();
+            g.id = git != groupIdMap.end() ? git->second : engine.nextLayerId();
             g.name = rec.name;
             g.visible = rec.visible;
             g.opacity = std::min(1.0, std::max(0.0, rec.opacity));
             g.blendMode = rec.blendMode;
             g.isGroup = true;
             g.parentId = parent;
-            if (rec.groupId != 0) {
-                groupIdMap[rec.groupId] = g.id;
-            }
             layers.push_back(std::move(g));
             done++;
-            continue;
+            return true;
         }
         if (rec.kind == psd::LayerKind::Adjustment) {
             // M9d：levl/curv/nvrt → 非破坏调整层（无像素内容）；其余仍跳过
@@ -201,12 +219,13 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
                 layer.opacity = std::min(1.0, std::max(0.0, rec.opacity));
                 layer.blendMode = rec.blendMode;
                 layer.clipping = rec.clipping;
+                layer.parentId = parent;  // 组内调整层须留在组子树内（平铺不变式）
                 layer.adjustment = std::move(adj);
                 layers.push_back(std::move(layer));
                 done++;
-                continue;
+                return true;
             }
-            continue;  // 其余调整类（hue2/blnc/...）仍跳过（note 已带）
+            return false;  // 其余调整类（hue2/blnc/...）仍跳过（note 已带）
         }
         Layer layer;
         layer.id = engine.nextLayerId();
@@ -319,7 +338,44 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
             }
         }
         layers.push_back(std::move(layer));
-    }
+        return true;
+    };
+
+    // DFS 前序组装：组节点先于其子段（根序 = 记录序 = PSD 自底向上）。
+    // 深度护栏：对抗文件的深嵌套不下钻，超限组子段拍平为根并登记 note。
+    constexpr int kMaxGroupDepth = 64;
+    bool depthClipped = false;
+    std::function<void(int, int)> emitChildren = [&](int parentKey, int depth) {
+        auto cit = childrenOf.find(parentKey);
+        if (cit == childrenOf.end()) {
+            return;
+        }
+        for (size_t ri : cit->second) {
+            psd::Record& rec = doc.layers[ri];
+            const uint64_t parent =
+                parentKey != 0 && groupIdMap.count(parentKey) != 0 ? groupIdMap[parentKey] : 0;
+            if (!createRecord(rec, parent)) {
+                continue;
+            }
+            if (rec.isGroup && rec.groupId != 0) {
+                if (depth < kMaxGroupDepth) {
+                    emitChildren(rec.groupId, depth + 1);
+                } else if (!depthClipped) {
+                    depthClipped = true;
+                    if (notes != nullptr) {
+                        notes->push_back("Groups nested deeper than 64 levels were flattened.");
+                    }
+                    auto sub = childrenOf.find(rec.groupId);
+                    if (sub != childrenOf.end()) {
+                        for (size_t ci : sub->second) {
+                            createRecord(doc.layers[ci], 0);
+                        }
+                    }
+                }
+            }
+        }
+    };
+    emitChildren(0, 0);
 
     // 整档替换：统一走 resetDocument（清撤销/会话态，撤销不跨文档；未持锁调用）
     engine.resetDocument();

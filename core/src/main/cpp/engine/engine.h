@@ -172,6 +172,9 @@ class Engine {
     void publishStyledLocked(const Document& work);
 
     int64_t docRevision = 0;
+    // 文档代次：resetDocument（关/新/开档）递增。异步任务（bakeLayerMatrix 等）发布前
+    // 与 docRevision 一起复核——防排队时的旧快照整档覆盖并发编辑或复活已关闭文档
+    uint64_t docEpoch = 0;
     napi_threadsafe_function revisionTsfn = nullptr;   // docVersion 事件
     napi_threadsafe_function progressTsfn = nullptr;   // importProgress 事件（payload=permille intptr）
 

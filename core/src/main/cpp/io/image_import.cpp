@@ -97,15 +97,17 @@ ImportCompletion* makePayload(bool ok, uint32_t w, uint32_t h, LayerId layerId, 
 void notifyProgress(double progress) {
     auto& e = Engine::get();
     {
+        // 锁内完成读指针+调用：与 Dispose/OnImportProgress 的 import.mtx 置空/release 互斥，
+        // 杜绝「读到旧指针 → 对方 release 后才调用」的 use-after-release（审查修复）
         std::lock_guard<std::mutex> lk(e.import.mtx);
         e.import.progress = progress;
-    }
-    if (e.progressTsfn != nullptr) {
-        // permille 走 intptr，免堆分配
-        napi_call_threadsafe_function(
-            e.progressTsfn,
-            reinterpret_cast<void*>(static_cast<intptr_t>(progress * 1000.0 + 0.5)),
-            napi_tsfn_nonblocking);
+        if (e.progressTsfn != nullptr) {
+            // permille 走 intptr，免堆分配
+            napi_call_threadsafe_function(
+                e.progressTsfn,
+                reinterpret_cast<void*>(static_cast<intptr_t>(progress * 1000.0 + 0.5)),
+                napi_tsfn_nonblocking);
+        }
     }
 }
 
@@ -352,7 +354,8 @@ ImportCompletion* runImport(int fd) {
         off_t sz = lseek(fd, 0, SEEK_END);
         lseek(fd, 0, SEEK_SET);
         std::string err;
-        if (sz > 0) {
+        // 512MB 读入上限（审查修复：仅查 sz>0 即全量分配；同文件 DNG 路径已有同款上限）
+        if (sz > 0 && sz <= 512ll * 1024 * 1024) {
             std::vector<uint8_t> bytes(static_cast<size_t>(sz));
             size_t got = 0;
             while (got < bytes.size()) {

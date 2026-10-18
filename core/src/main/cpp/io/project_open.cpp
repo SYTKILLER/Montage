@@ -618,8 +618,9 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
         ids[id] = true;
         l.id = static_cast<LayerId>(id);
         const JValue* jn = item.find("name");
-        if (jn == nullptr || jn->type != JValue::Str ||
-            jn->str.find_first_not_of(" \t\r\n") == std::string::npos || jn->str.size() > 16384) {
+        // 审查修复：空名合法（PSD 无名图层导入即空名，原全空白拒绝会让这类工程
+        // save→open 整档失败）；仅拒非字符串与超长
+        if (jn == nullptr || jn->type != JValue::Str || jn->str.size() > 16384) {
             err = "bad layer name";
             return false;
         }
@@ -765,7 +766,14 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
                         adj->curveY.push_back(static_cast<float>(vy));
                     }
                 }
-            } else if (jkind == nullptr || jkind->type != JValue::Str || jkind->str != "levels") {
+            } else if (jkind != nullptr && jkind->type == JValue::Str &&
+                       jkind->str != "levels" && jkind->str != "bc" &&
+                       jkind->str != "invert" && jkind->str != "threshold" &&
+                       jkind->str != "posterize" && jkind->str != "colorbalance" &&
+                       jkind->str != "huesat") {
+                // 审查修复：放行表须与 save 侧写出的 8 类对齐（v4 起 bc/invert/threshold/
+                // posterize/colorbalance/huesat 均会落盘；原表只认 curves/levels，含这些
+                // 调整层的工程 save→open 必失败整档打不开；上方 if 链已把这 6 类映射进 adj）
                 err = "unknown adjustment kind";
                 return false;
             }
@@ -1362,13 +1370,20 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
 }  // namespace
 
 bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
-    // 整包读入（与 PSD 导入同策略：包体几十 MB 量级）
+    // 整包读入（与 PSD 导入同策略：包体几十 MB 量级）；512MB 上限（审查修复：
+    // 原先仅查空文件即按 sz 全量分配，对抗文件可打到 OOM——DNG 路径已有同款上限）
+    constexpr off_t kMaxProjectBytes = 512ll * 1024 * 1024;
     std::vector<uint8_t> data;
     {
         off_t sz = lseek(fd, 0, SEEK_END);
         if (sz <= 0) {
             close(fd);
             err = "empty file";
+            return false;
+        }
+        if (sz > kMaxProjectBytes) {
+            close(fd);
+            err = "project file too large";
             return false;
         }
         lseek(fd, 0, SEEK_SET);

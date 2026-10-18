@@ -20,7 +20,9 @@ export struct TextPanel {
   @Prop colorHex: string = '#000000';
   @Prop alignIdx: number = 0;
   @Prop wrapW: number = 0;             // 0 = 点文字
-  @Prop content: string = '';
+  @Prop @Watch('syncContentBox') content: string = '';  // 活动文本层内容（审查修复：
+                                                        // 原先零消费——选中已有层后应用会以
+                                                        // 框内残留旧值覆写/清空层文字）
   @Prop editing: boolean = false;      // overlay 编辑会话中（面板改动 txn=0）
   @Prop isText: boolean = false;
   onPickFont: (idx: number) => void = (_i: number) => {};
@@ -36,6 +38,22 @@ export struct TextPanel {
   onImportFont: () => void = () => {};
 
   @State private contentBox: string = '';
+
+  aboutToAppear(): void {
+    this.contentBox = this.content;
+  }
+
+  // 父侧切换活动层/刷新时跟随层内容（切层不清框、不残留上一层的值）
+  private syncContentBox(): void {
+    this.contentBox = this.content;
+  }
+
+  // 提交前比对：框内与层内容一致时不发命令（防以空串/残留值误清层文字）
+  private submitContent(): void {
+    if (this.contentBox !== this.content) {
+      this.onContent(this.contentBox);
+    }
+  }
 
   build() {
     Column({ space: 8 }) {
@@ -166,14 +184,14 @@ export struct TextPanel {
           this.contentBox = v;
         })
         .onBlur((): void => {
-          this.onContent(this.contentBox);
+          this.submitContent();
         })
       Row({ space: 6 }) {
         Button('应用内容')
           .fontSize(10).height(24).padding({ left: 10, right: 10 })
           .backgroundColor($r('app.color.accent_container'))
           .fontColor($r('app.color.text_primary'))
-          .onClick((): void => this.onContent(this.contentBox))
+          .onClick((): void => this.submitContent())
         Button('栅格化')
           .fontSize(10).height(24).padding({ left: 10, right: 10 })
           .backgroundColor($r('app.color.surface'))
