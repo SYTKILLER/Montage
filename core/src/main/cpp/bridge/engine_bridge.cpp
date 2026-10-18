@@ -2660,20 +2660,6 @@ napi_value ContinueStroke(napi_env env, napi_callback_info info) {
         e.ensureStrokeThreadLocked();
         e.strokeCv.notify_all();
     }
-    // STROKEDBG（临时排查）：入队点逐点日志（上限 4096 条防刷爆）
-    {
-        static std::atomic<int> dbgCount{0};
-        static float lastX = 0, lastY = 0;
-        if (dbgCount.fetch_add(1) < 4096) {
-            const float dx = static_cast<float>(x) - lastX;
-            const float dy = static_cast<float>(y) - lastY;
-            OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.StrokeDbg",
-                         "in seq=%{public}d x=%{public}.1f y=%{public}.1f dxy=(%{public}.1f,%{public}.1f) p=%{public}.2f",
-                         dbgCount.load(), x, y, dx, dy, pressure);
-            lastX = static_cast<float>(x);
-            lastY = static_cast<float>(y);
-        }
-    }
     return makeOk(env, nullptr);
 }
 
@@ -2685,7 +2671,6 @@ napi_value EndStroke(napi_env env, napi_callback_info /*info*/) {
         e.ensureStrokeThreadLocked();
         e.strokeCv.notify_all();
     }
-    OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.StrokeDbg", "END marker enqueued");
     return makeOk(env, nullptr);
 }
 

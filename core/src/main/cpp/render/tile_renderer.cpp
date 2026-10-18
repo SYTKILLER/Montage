@@ -368,24 +368,28 @@ void TileRenderer::drawTiles(const Layer& layer, float zoom, float panX, float p
     for (uint32_t ty = ty0; ty <= ty1; ++ty) {
         for (uint32_t tx = tx0; tx <= tx1; ++tx) {
             const uint32_t idx = ty * grid.cols + tx;
-            // 绘制中的笔画瓦片：逐帧直传（独立纹理，不进 LRU）
+            // 绘制中的笔画瓦片：增量直传（修复①对拍 Compositor identity 去重）——
+            // 快照只带自上帧变化的瓦片；未变瓦片沿用已传纹理，成本不再随笔画长度增长
             if (stroke != nullptr && stroke->active && stroke->layerId == layer.id &&
                 stroke->gridCols == grid.cols && stroke->gridRows == grid.rows) {
                 auto st = stroke->tiles->find(idx);
-                if (st != stroke->tiles->end()) {
-                    uint64_t skey = (static_cast<uint64_t>(layer.id) << 32) | idx;
+                const uint64_t skey = (static_cast<uint64_t>(layer.id) << 32) | idx;
+                if (st != stroke->tiles->end() || strokeTex_.count(skey) != 0) {
                     uint32_t& tex = strokeTex_[skey];
                     if (tex == 0) {
                         glGenTextures(1, &tex);
                     }
                     glBindTexture(GL_TEXTURE_2D, tex);
+                    // 过滤参数每帧重设（廉价，无像素传输）：缩放跨 200% 阈值时旧纹理同步切换
                     const GLint f0 = wantNearest ? GL_NEAREST : GL_LINEAR;
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f0);
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f0);
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kTileSize, kTileSize, 0, GL_RGBA,
-                                 GL_UNSIGNED_BYTE, st->second.data());
+                    if (st != stroke->tiles->end()) {
+                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kTileSize, kTileSize, 0, GL_RGBA,
+                                     GL_UNSIGNED_BYTE, st->second.data());
+                    }
                     drawQuad(tileProg_, ox + static_cast<float>(tx * kTileSize),
                              oy + static_cast<float>(ty * kTileSize),
                              static_cast<float>(kTileSize), static_cast<float>(kTileSize), zoom,
@@ -569,6 +573,17 @@ void TileRenderer::drawQuickMask(const Document& doc, float zoom, float panX, fl
             }
         }
         qmStrokeTex_.clear();
+    } else {
+        // 修复①：尾段还原撤出的瓦片随帧删除（残影不再滞留）
+        for (const uint32_t k : qmStroke->erased) {
+            auto it = qmStrokeTex_.find(k);
+            if (it != qmStrokeTex_.end()) {
+                if (it->second != 0) {
+                    glDeleteTextures(1, &it->second);
+                }
+                qmStrokeTex_.erase(it);
+            }
+        }
     }
     glUseProgram(qmProg_);
     glUniform1i(glGetUniformLocation(qmProg_, "uTex"), 0);
@@ -599,19 +614,21 @@ void TileRenderer::drawQuickMask(const Document& doc, float zoom, float panX, fl
                     strokeTile = &st->second;
                 }
             }
-            if (strokeTile != nullptr) {
-                // 草稿瓦片逐帧直传（同像素笔画 overlay 语义）
+            // 草稿瓦片（增量直传 + 未变沿用已传纹理；该瓦已不在快照且纹理仍在 = 未变）
+            if (strokeTile != nullptr || qmStrokeTex_.count(idx) != 0) {
                 uint32_t& tex = qmStrokeTex_[idx];
                 if (tex == 0) {
                     glGenTextures(1, &tex);
                 }
                 glBindTexture(GL_TEXTURE_2D, tex);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kTileSize, kTileSize, 0, GL_RGBA,
-                             GL_UNSIGNED_BYTE, strokeTile->data());
+                if (strokeTile != nullptr) {
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, kTileSize, kTileSize, 0, GL_RGBA,
+                                 GL_UNSIGNED_BYTE, strokeTile->data());
+                }
             } else {
                 auto it = qm.tiles.find(idx);
                 if (it == qm.tiles.end() || it->second == nullptr) {
@@ -835,7 +852,8 @@ void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw
     }
     // 笔画草稿纹理生命周期 = 当前笔画（P0-2：此前只在 invalidate 清理——笔画每触碰
     // 一个新瓦片就留一张 256KB 纹理，长期编辑泄漏显存直至 glGenTextures 失败静默不绘。
-    // 对齐 drawQuickMask 对 qmStrokeTex_ 的写法：无活跃笔画即整表清空）
+    // 对齐 drawQuickMask 对 qmStrokeTex_ 的写法：无活跃笔画即整表清空。
+    // 修复①：活跃期内纹理常驻增量更新；erased = 尾段还原撤出的瓦片，随帧删除）
     if (stroke == nullptr || !stroke->active) {
         for (auto& kv : strokeTex_) {
             if (kv.second != 0) {
@@ -843,6 +861,17 @@ void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw
             }
         }
         strokeTex_.clear();
+    } else if (!stroke->quickMask) {
+        for (const uint32_t k : stroke->erased) {
+            const uint64_t skey = (static_cast<uint64_t>(stroke->layerId) << 32) | k;
+            auto it = strokeTex_.find(skey);
+            if (it != strokeTex_.end()) {
+                if (it->second != 0) {
+                    glDeleteTextures(1, &it->second);
+                }
+                strokeTex_.erase(it);
+            }
+        }
     }
     glViewport(0, 0, vw, vh);
     // 画布外背板：中性灰（05 §7：与主题解耦，对齐 PS 行为）

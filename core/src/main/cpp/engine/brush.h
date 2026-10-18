@@ -80,6 +80,9 @@ class StrokeDraft {
     bool qmTarget() const { return qmTarget_; }  // M10d：落笔目标 = 快速蒙版通道（文档域灰度）
     // 渲染取数：draft 中该瓦片的合成像素（直通 RGBA，256×256）；无则返回 false
     bool tileFor(uint32_t tx, uint32_t ty, std::vector<uint8_t>& out) const;
+    // 工作瓦片发布版本号（paintTile 递增/撤出清除）：渲染快照按 rev 判变，
+    // 每帧只拷贝自上帧以来变化的瓦片（对拍 Compositor 逐瓦 identity 去重）
+    uint32_t tileRev(uint32_t tx, uint32_t ty) const;
     const std::set<uint32_t>& touchedTiles() const { return touched_; }
     uint32_t gridCols() const { return gridCols_; }
     uint32_t gridRows() const { return gridRows_; }
@@ -152,6 +155,7 @@ class StrokeDraft {
     // 工作瓦片（key = ty*cols+tx）：cov 灰度累计 + 合成结果（直通 RGBA）
     std::map<uint32_t, std::vector<uint8_t>> coverage_;
     std::map<uint32_t, std::vector<uint8_t>> work_;
+    std::map<uint32_t, uint32_t> workRev_;  // key → 发布版本（paintTile++/撤出 erase）
     std::set<uint32_t> touched_;
     // provisional tail 备份：key → 尾段前整瓦 coverage（空 vector = 尾段前无 coverage）
     std::map<uint32_t, std::vector<uint8_t>> tailBackup_;

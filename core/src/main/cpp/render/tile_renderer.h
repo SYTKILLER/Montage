@@ -27,6 +27,7 @@ class TileRenderer {
         uint32_t gridCols = 0;
         uint32_t gridRows = 0;
         const std::map<uint32_t, std::vector<uint8_t>>* tiles = nullptr;
+        std::vector<uint32_t> erased;  // 修复①：尾段还原撤出的瓦片（渲染器随帧删纹理）
         bool quickMask = false;  // M10d：草稿瓦片 = 快速蒙版通道（红 overlay 内替换，不走图层）
     };
     // M8.1：自由变换预览（layerId 匹配的层经 doc→doc 仿射实时绘制）

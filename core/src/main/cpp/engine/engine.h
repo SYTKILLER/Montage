@@ -56,6 +56,7 @@ class Engine {
     bool strokeQuit = false;                // 常驻线程退出标记（dispose 置位）
     std::mutex strokeCycleMtx;              // 生命周期互斥：begin/end 处理段与 dispose 清理串行
     std::unique_ptr<StrokeDraft> draft;     // 绘制中的笔画（mutex 内访问）
+    uint64_t draftGen_ = 0;                 // 草稿代次（每次新建 draft 递增；渲染快照去重状态换代依据）
     BrushSettings brush;                    // 当前笔刷参数（ArkTS setBrushSettings 写入）
     float fgColor[3] = {0.0f, 0.0f, 0.0f};  // M9c 前景色（直 alpha 0..1；起笔覆盖 brush 色）
     float bgColor[3] = {1.0f, 1.0f, 1.0f};  // M9c 背景色（渐变/填充 M11 用）
@@ -138,16 +139,35 @@ class Engine {
     History history;
     std::atomic<uint32_t> historyVersion{0};
 
-    // 渲染帧快照携带的笔画瓦片（docMutex 内拷贝，避免渲染线程跨锁悬挂）
+    // 渲染帧快照携带的笔画瓦片（docMutex 内拷贝，避免渲染线程跨锁悬挂）。
+    // 修复①（对拍 Compositor identity 去重）：tiles 只带自上帧以来 workRev_ 变化的瓦片，
+    // 渲染器对未变瓦片沿用已上传纹理（strokeTex_/qmStrokeTex_ 常驻笔画期）；
+    // erased = 自上帧被尾段还原撤出的瓦片（渲染器删纹理，尾段残影不再滞留）。
     struct StrokeSnapshot {
         LayerId layerId = 0;
         uint32_t gridCols = 0;
         uint32_t gridRows = 0;
         std::map<uint32_t, std::vector<uint8_t>> tiles;
+        std::vector<uint32_t> erased;
         bool active = false;
         bool quickMask = false;  // M10d：草稿瓦片 = 快速蒙版通道灰度（渲染走红 overlay 替换）
     };
     StrokeSnapshot copyStrokeSnapshotLocked();
+
+    // GL 上下文重建后由渲染线程调用：overlay 纹理已全部销毁，去重状态作废（下帧全量重建）
+    void resetStrokeSnapSeen() {
+        std::lock_guard<std::mutex> lk(docMutex);
+        strokeSnapSeen_.clear();
+        ++strokeSnapGen_;  // 与 draftGen_ 失配 → copyStrokeSnapshotLocked 首帧清态全量
+    }
+
+    // 修复①：渲染快照增量去重状态（仅渲染线程经 copyStrokeSnapshotLocked 持 docMutex 访问）
+    uint64_t strokeSnapGen_ = 0;             // 已同步快照所属草稿代次
+    std::map<uint32_t, uint32_t> strokeSnapSeen_;  // tile key → 上次交给渲染器的 workRev
+
+    // 修复②：笔末样式重算移出 docMutex——锁外对 CoW 快照 restyleDocument 后，
+    // 锁内按身份护栏发布（id 命中 + pixels/mask/style/fill 期间未变才换入 styledRender）
+    void publishStyledLocked(const Document& work);
 
     int64_t docRevision = 0;
     napi_threadsafe_function revisionTsfn = nullptr;   // docVersion 事件

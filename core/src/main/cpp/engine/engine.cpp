@@ -95,9 +95,10 @@ void Engine::strokeThreadMain() {
             batch.swap(strokeQueue);
         }
         {
-            // 生命周期互斥：与 dispose 清理串行（锁序：cycle → doc）
-            std::lock_guard<std::mutex> cycle(strokeCycleMtx);
-            std::lock_guard<std::mutex> lk(docMutex);
+            // 生命周期互斥：与 dispose 清理串行（锁序：cycle → doc）。
+            // 修复②：end 分支可能在样式重算期间按同序临时放锁再重取，故用 unique_lock
+            std::unique_lock<std::mutex> cycle(strokeCycleMtx);
+            std::unique_lock<std::mutex> lk(docMutex);
             for (const StrokePoint& p : batch) {
                 if (p.begin) {
                     if (draft != nullptr) {
@@ -169,6 +170,7 @@ void Engine::strokeThreadMain() {
                                           : (brush.erasing ? "eraser" : "brush")),
                                       static_cast<uint64_t>(docRevision));
                     draft = std::make_unique<StrokeDraft>();
+                    ++draftGen_;  // 渲染快照去重状态换代（copyStrokeSnapshotLocked 侦测）
                     std::string err;
                     if (!draft->begin(doc, doc.activeId, brush, !qm && brushOnMask, qm,
                                       (useClone || useHistoryBrush) ? &cloneParams : nullptr, err,
@@ -226,12 +228,38 @@ void Engine::strokeThreadMain() {
                             }
                         }
                     }
-                    // M14c：提交像素变更后重算带样式/填充层派生渲染（样式实时跟随笔画）
-                    restyleDocument(doc);
-                    const int64_t rev = docRevision + 1;
-                    history.endEdit(doc, static_cast<uint64_t>(rev));
-                    bumpRevisionLocked();
-                    draft.reset();
+                    // M14c：提交像素变更后重算带样式/填充层派生渲染（样式实时跟随笔画）。
+                    // 修复②：样式重算是秒级 CPU（模糊/膨胀全域）——持 docMutex 会把渲染
+                    // 线程冻在 doFrame 等锁处，样式层每笔收尾一次（8 连笔 10fps 实测主因）。
+                    // 有样式层时改走「CoW 快照 → 放锁重算 → 重取锁身份护栏发布」；endEdit
+                    // 移到发布后，undo/redo 快照仍自带最终 styledRender（与原时序一致）。
+                    // 放锁窗口内 resetDocument/其他事务可能插入：发布护栏 + endEdit 的
+                    // pendingFlag_ 守卫保证不落错账（窗口内他端 beginEdit 会并入本条目，
+                    // 与既有嵌套语义同类）。
+                    bool needRestyle = false;
+                    for (const Layer& l : doc.layers) {
+                        if (l.style != nullptr || l.fill != nullptr) {
+                            needRestyle = true;
+                            break;
+                        }
+                    }
+                    if (needRestyle) {
+                        Document work = doc;  // CoW：瓦片 shared_ptr 共享，O(层+瓦)指针拷贝
+                        draft.reset();
+                        lk.unlock();
+                        cycle.unlock();
+                        restyleDocument(work);
+                        cycle.lock();
+                        lk.lock();
+                        publishStyledLocked(work);
+                        history.endEdit(doc, static_cast<uint64_t>(docRevision + 1));
+                        bumpRevisionLocked();
+                    } else {
+                        restyleDocument(doc);  // 无样式/填充层：空转遍历，保持锁内原路径
+                        history.endEdit(doc, static_cast<uint64_t>(docRevision + 1));
+                        bumpRevisionLocked();
+                        draft.reset();
+                    }
                     historyVersion.fetch_add(1);
                 } else if (draft != nullptr) {
                     draft->append(p.x, p.y, p.pressure);
@@ -247,16 +275,36 @@ Engine::StrokeSnapshot Engine::copyStrokeSnapshotLocked() {
     if (draft == nullptr || !draft->active()) {
         return snap;
     }
+    // 修复①：草稿换代（新笔画）→ 去重状态作废，首帧全量重建
+    if (strokeSnapGen_ != draftGen_) {
+        strokeSnapGen_ = draftGen_;
+        strokeSnapSeen_.clear();
+    }
     if (draft->qmTarget()) {
         // M10d：快速蒙版草稿 = 文档域通道灰度（work 已并 base），渲染侧直接替换该瓦片
         snap.active = true;
         snap.quickMask = true;
         snap.gridCols = draft->gridCols();
         snap.gridRows = draft->gridRows();
+        // 尾段还原撤出的瓦片：seen 中已不在 touched_ → 通知渲染器删纹理（残影）
+        for (auto sit = strokeSnapSeen_.begin(); sit != strokeSnapSeen_.end();) {
+            if (draft->touchedTiles().count(sit->first) == 0) {
+                snap.erased.push_back(sit->first);
+                sit = strokeSnapSeen_.erase(sit);
+            } else {
+                ++sit;
+            }
+        }
         for (const uint32_t key : draft->touchedTiles()) {
+            const uint32_t rev = draft->tileRev(key % draft->gridCols(), key / draft->gridCols());
+            auto seen = strokeSnapSeen_.find(key);
+            if (seen != strokeSnapSeen_.end() && seen->second == rev) {
+                continue;  // 自上帧未变：渲染器沿用已上传纹理，不重复拷贝 256KB
+            }
             std::vector<uint8_t> px;
             if (draft->tileFor(key % draft->gridCols(), key / draft->gridCols(), px)) {
                 snap.tiles[key] = std::move(px);
+                strokeSnapSeen_[key] = rev;
             }
         }
         return snap;
@@ -276,6 +324,8 @@ Engine::StrokeSnapshot Engine::copyStrokeSnapshotLocked() {
     if (draft->maskTarget()) {
         // M5b 蒙版落笔：草稿瓦片在 patch 网格空间；显示需按像素网格合成
         // （display = pixelTile × draftMask）。蒙版停用或空像素层 → 无叠加。
+        // 多 patch 瓦可覆盖同一像素瓦（offset 非对齐）→ 输出与来源非一 一映射，
+        // 不做增量去重，保持每帧全量（蒙版笔画低频路径）。
         if (layer->pixels == nullptr || layer->mask == nullptr || !layer->mask->enabled) {
             snap.active = false;
             return snap;
@@ -346,16 +396,56 @@ Engine::StrokeSnapshot Engine::copyStrokeSnapshotLocked() {
     snap.gridRows = draft->gridRows();
     const LayerMask* mask =
         (layer->mask != nullptr && layer->mask->enabled) ? layer->mask.get() : nullptr;
+    // 尾段还原撤出的瓦片 → 通知渲染器删纹理（同 QM 分支）
+    for (auto sit = strokeSnapSeen_.begin(); sit != strokeSnapSeen_.end();) {
+        if (draft->touchedTiles().count(sit->first) == 0) {
+            snap.erased.push_back(sit->first);
+            sit = strokeSnapSeen_.erase(sit);
+        } else {
+            ++sit;
+        }
+    }
     for (const uint32_t key : draft->touchedTiles()) {
+        const uint32_t tx = key % draft->gridCols();
+        const uint32_t ty = key / draft->gridCols();
+        const uint32_t rev = draft->tileRev(tx, ty);
+        auto seen = strokeSnapSeen_.find(key);
+        if (seen != strokeSnapSeen_.end() && seen->second == rev) {
+            continue;  // 自上帧未变：渲染器沿用已上传纹理，不重复拷贝 256KB
+        }
         std::vector<uint8_t> px;
-        if (draft->tileFor(key % draft->gridCols(), key / draft->gridCols(), px)) {
+        if (draft->tileFor(tx, ty, px)) {
             if (mask != nullptr) {
-                applyMaskToTile(*mask, px, key % draft->gridCols(), key / draft->gridCols());
+                applyMaskToTile(*mask, px, tx, ty);
             }
             snap.tiles[key] = std::move(px);
+            strokeSnapSeen_[key] = rev;
         }
     }
     return snap;
+}
+
+// 修复②：锁外重算结果的发布（须持 docMutex）。身份护栏：锁外窗口内层被撤销/像素重换
+// （pixels 身份变化）、蒙版变更、样式/填充替换任一发生 → 本次结果不发布（撤销恢复的
+// 快照自带与像素配套的 styledRender；其余情形由下一次样式触发点重算覆盖）。
+void Engine::publishStyledLocked(const Document& work) {
+    for (const Layer& wl : work.layers) {
+        if (wl.style == nullptr && wl.fill == nullptr) {
+            continue;
+        }
+        for (Layer& l : doc.layers) {
+            if (l.id != wl.id) {
+                continue;
+            }
+            if (wl.pixels == l.pixels && wl.mask == l.mask && wl.style == l.style &&
+                wl.fill == l.fill) {
+                l.styledRender = wl.styledRender;
+                l.styledOriginX = wl.styledOriginX;
+                l.styledOriginY = wl.styledOriginY;
+            }
+            break;
+        }
+    }
 }
 
 // 关闭/新建/整档替换（打开工程/PSD）统一入口。调用方不得持 docMutex 进入。

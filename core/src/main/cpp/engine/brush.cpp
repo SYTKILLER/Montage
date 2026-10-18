@@ -135,6 +135,7 @@ bool StrokeDraft::begin(const Document& doc, LayerId layerId, const BrushSetting
     selMask_ = doc.selection != nullptr ? doc.selection.get() : nullptr;
     coverage_.clear();
     work_.clear();
+    workRev_.clear();
     touched_.clear();
     tailBackup_.clear();
     samples_.clear();
@@ -399,6 +400,7 @@ void StrokeDraft::removeTail() {
             // 尾段前无 coverage：现值全为尾段所画 → 整瓦撤出（提交/渲染均忽略）
             coverage_.erase(covIt);
             work_.erase(key);
+            workRev_.erase(key);
             touched_.erase(key);
         } else {
             covIt->second = backup;
@@ -469,6 +471,7 @@ void StrokeDraft::cancel() {
     active_ = false;
     coverage_.clear();
     work_.clear();
+    workRev_.clear();
     touched_.clear();
     tailBackup_.clear();
     srcGrid_ = nullptr;      // 源网格为借用指针，笔画终止即弃用（缓存随清）
@@ -486,6 +489,14 @@ bool StrokeDraft::tileFor(uint32_t tx, uint32_t ty, std::vector<uint8_t>& out) c
     }
     out = it->second;
     return true;
+}
+
+uint32_t StrokeDraft::tileRev(uint32_t tx, uint32_t ty) const {
+    if (gridCols_ == 0) {
+        return 0;
+    }
+    auto it = workRev_.find(ty * gridCols_ + tx);
+    return it == workRev_.end() ? 0u : it->second;
 }
 
 // M11d：源网格局部采样（越界 = 全透明）；单瓦片缓存（克隆采样逐像素随机访问）
@@ -550,6 +561,7 @@ void StrokeDraft::paintTile(uint32_t key) {
     if (covIt == coverage_.end() || workIt == work_.end()) {
         return;
     }
+    ++workRev_[key];  // 发布版本递增（渲染快照增量判变依据）
     const uint8_t* cov = covIt->second.data();
     uint8_t* px = workIt->second.data();
     const float op = settings_.opacity;

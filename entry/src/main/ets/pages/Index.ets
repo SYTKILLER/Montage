@@ -376,6 +376,14 @@ struct Index {
   private moveAccY: number = 0;
   private moveAppliedX: number = 0;
   private moveAppliedY: number = 0;
+  // 笔画进行中（Down→Up）。期间暂停信息面板取色：samplePixel 是同步 NAPI，会阻塞
+  // UI 线程等 docMutex——笔画线程的提交/重样式（样式层含高斯模糊）和渲染线程的
+  // 逐帧快照都长持该锁，撞上即秒级冻结（appfreeze 实证，冻结栈＝SamplePixel←mutex::lock）
+  private strokeDrawing: boolean = false;
+  // 收笔护栏（修复③）：Up 后到提交完成（docVersion 事件）之间的取色仍会撞笔画线程
+  // commit/重样式临界区。护栏期 800ms 兜底，收到 revision 广播即提前解除；
+  // Up 事件本身的取色因 strokeDrawing 尚未复位天然跳过，此处只管收笔后的第一波 Move/悬停
+  private strokeEndGuardUntil: number = 0;
   // M15a 参考线交互态（画布内拖动 + 标尺拖拽创建）
   private guideMoveOrient: number = -2;  // >=0 = 画布内拖动中
   private guideMoveIndex: number = -1;
@@ -438,6 +446,7 @@ struct Index {
   // ---------- 状态刷新（05 §6 数据流） ----------
 
   private onDocVersion(): void {
+    this.strokeEndGuardUntil = 0;  // 修复③：提交/撤销完成（含重样式发布），取色护栏解除
     this.refreshLayers();
     this.refreshStats();  // M10d：撤销跨 Q 边界时同步快速蒙版镜像（canUndo/Redo 同步受益）
     this.scheduleHistogram();
@@ -472,6 +481,12 @@ struct Index {
   private updatePointerInfo(docX: number, docY: number, final: boolean): void {
     this.infoPointerX = docX;
     this.infoPointerY = docY;
+    if (this.strokeDrawing) {
+      return;  // 坐标读数照常，取色延到笔画结束（原因见 strokeDrawing 声明处）
+    }
+    if (Date.now() < this.strokeEndGuardUntil) {
+      return;  // 修复③：收笔护栏期内跳过取色（docVersion 到达即解除，见 onDocVersion）
+    }
     const now = Date.now();
     if (!final && now - this.lastInfoSampleMs < 150) {
       return;
@@ -855,6 +870,26 @@ struct Index {
     return this.tool === 'hand' || (this.spaceHeld && this.tool !== 'hand');
   }
 
+  // 落墨族工具（Down/Move/Up 走 strokeTouch；stamp 仅 Alt+点击取源时 Down 不入笔）
+  private isStrokeTool(): boolean {
+    switch (this.tool) {
+      case 'brush':
+      case 'pencil':
+      case 'eraser':
+      case 'blur':
+      case 'sharpen':
+      case 'smudge':
+      case 'dodge':
+      case 'burn':
+      case 'sponge':
+      case 'historyBrush':
+      case 'stamp':
+        return true;
+      default:
+        return false;
+    }
+  }
+
   // ---------- 画布触摸（按工具分发；笔画走 onTouch 原始事件） ----------
 
   private onTouchEvent(e: TouchEvent): void {
@@ -868,7 +903,12 @@ struct Index {
     const k = this.pxPerVp();
     const docX = this.panX + (t.x * k) / this.zoom;
     const docY = this.panY + (t.y * k) / this.zoom;
-    // M15b 信息面板：指针坐标/颜色（Up 即时采样，Move 节流）
+    // 笔画工具按下即置位（在取色之前）：连笔时上一笔的提交/重样式仍持 docMutex，
+    // Down 即时取色会同步等锁冻住 UI 线程
+    if (e.type === TouchType.Down && this.isStrokeTool()) {
+      this.strokeDrawing = true;
+    }
+    // M15b 信息面板：指针坐标/颜色（Up 即时采样，Move 节流；笔画进行中取色暂停）
     this.updatePointerInfo(docX, docY, e.type === TouchType.Up || e.type === TouchType.Down);
 
     if (this.navActive()) {
@@ -1194,6 +1234,10 @@ struct Index {
     } else if (e.type === TouchType.Move) {
       this.engine.continueStroke(docX, docY, pressure);
     } else if (e.type === TouchType.Up || e.type === TouchType.Cancel) {
+      // 修复③：先立护栏再复位标志（Up 的取色因 strokeDrawing 未复位天然跳过；
+      // 护栏覆盖收笔后第一波 Move/悬停，防撞笔画线程 commit/重样式临界区）
+      this.strokeEndGuardUntil = Date.now() + 800;
+      this.strokeDrawing = false;  // 提交在笔画线程异步进行，此刻取色仍可能撞长临界区，故先复位再收笔
       this.engine.endStroke();
     }
   }
@@ -1723,6 +1767,7 @@ struct Index {
     this.fittedOnce = false;
     this.maskTarget = false;
     this.quickMaskActive = false;
+    this.strokeDrawing = false;  // 换文档作废在途笔画状态（引擎侧 resetDocument 同步清队列/draft）
     // M16a：换文档（新建/打开工程/PSD/图片导入共用此口）关滤镜对话框并作废在途防抖——
     // 引擎 filterPreview 已由 resetDocument 清（审查修复批一），UI 侧对话框/定时器在此收口，
     // 否则旧参数预览会打到新文档活动层

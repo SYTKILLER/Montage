@@ -371,6 +371,7 @@ void RenderLoop::doFrame() {
         overlay.gridCols = strokeSnap.gridCols;
         overlay.gridRows = strokeSnap.gridRows;
         overlay.tiles = &strokeSnap.tiles;
+        overlay.erased = strokeSnap.erased;  // 修复①：撤出瓦片透传（渲染器删纹理）
         overlay.quickMask = strokeSnap.quickMask;  // M10d
     }
 
@@ -507,6 +508,7 @@ void RenderLoop::releaseGl() {
     // 上下文若正被回调线程 current，由该线程调用本函数释放；空闲停帧时由 T2 兜底（未 current 可移动）
     eglMakeCurrent(display_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     renderer_.invalidate();
+    Engine::get().resetStrokeSnapSeen();  // overlay 纹理随上下文销毁：快照去重状态作废（下帧全量重建）
     if (surface_ != EGL_NO_SURFACE) {
         eglDestroySurface(display_, surface_);
         surface_ = EGL_NO_SURFACE;
