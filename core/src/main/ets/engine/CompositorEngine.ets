@@ -1,7 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
-import { EngineStats, ExportPngData, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData } from '../model/EngineTypes';
+import { EngineStats, ExportPngData, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -679,6 +679,55 @@ export class CompositorEngine {
       return false;
     }
     return true;
+  }
+
+  /** M17d：效果等高线（0=投影 1=内阴影 2=外发光 3=内发光 4=光泽 5=斜面轮廓 6=斜面光泽；
+   * xs/ys 0..1，corners 可选与点一一对应；range 仅 2/3 生效）。 */
+  setStyleContour(id: number, effect: number, xs: number[], ys: number[], corners: number[],
+    range: number): boolean {
+    const r2 = narrowResult(native.setStyleContour(id, effect, xs, ys, corners, range) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'setStyleContour failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  /** M17d：图案叠加（patternId 空 = 不渲染）。 */
+  setPatternOverlay(id: number, enabled: boolean, patternId: string, scale: number,
+    opacity: number): boolean {
+    const r2 = narrowResult(native.setPatternOverlay(id, enabled ? 1 : 0, patternId, scale,
+      opacity) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'setPatternOverlay failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  /** M17d：定义图案（选区 ∩ 活动层；无 History）。失败返回 null。 */
+  definePattern(): PatternInfo | null {
+    const r2 = narrowResult(native.definePattern() as Object);
+    if (!r2.ok || r2.data === null || r2.data === undefined) {
+      hilog.error(DOMAIN, TAG, 'definePattern failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return null;
+    }
+    return r2.data as Object as PatternInfo;
+  }
+
+  /** M17d：文档图案列表。 */
+  getPatterns(): PatternInfo[] {
+    const value = native.getPatterns() as PatternInfo[];
+    const out: PatternInfo[] = [];
+    if (value !== null && value !== undefined) {
+      for (const v of value) {
+        out.push(v);
+      }
+    }
+    return out;
   }
 
   /** M17b：全局光角度（文档级，无 History）。 */

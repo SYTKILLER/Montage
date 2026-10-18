@@ -146,6 +146,116 @@ void shiftAlpha(std::vector<uint8_t>& v, int w, int h, int dx, int dy) {
     v.swap(out);
 }
 
+// ---------- M17d 等高线（photocraft adjust.rs curve_lut / effects.rs contour_lut 移植） ----------
+
+constexpr int kContourLutSize = 4096;
+
+// 0..1 传递表插值取样（photocraft lut_at）
+float contourLutAt(const std::vector<float>& l, float v) {
+    const float x = std::clamp(v, 0.0f, 1.0f) * static_cast<float>(l.size() - 1);
+    const size_t i = static_cast<size_t>(x);
+    const size_t j = std::min(i + 1, l.size() - 1);
+    return l[i] + (l[j] - l[i]) * (x - static_cast<float>(i));
+}
+
+// 点列按 x 排序 + 近重合点去重（photocraft curve_lut 头部同款：|Δx|<1e-6 去重，保段距>0）
+void contourSortDedup(std::vector<double>& xs, std::vector<double>& ys) {
+    const size_t n = xs.size();
+    std::vector<size_t> order(n);
+    for (size_t i = 0; i < n; ++i) {
+        order[i] = i;
+    }
+    std::sort(order.begin(), order.end(),
+              [&](size_t a, size_t b) { return xs[a] < xs[b]; });
+    std::vector<double> sx, sy;
+    sx.reserve(n);
+    sy.reserve(n);
+    for (size_t i : order) {
+        if (!sx.empty() && std::fabs(xs[i] - sx.back()) < 1e-6) {
+            continue;
+        }
+        sx.push_back(xs[i]);
+        sy.push_back(ys[i]);
+    }
+    xs.swap(sx);
+    ys.swap(sy);
+}
+
+// 自然样条 LUT（photocraft curve_lut 逐式对拍：三对角追赶解二阶导 m2，分段三次 Hermite
+// 基函数求值，端点外平台，输出 clamp 0..1）
+std::vector<float> contourCurveLut(const std::vector<double>& xsIn, const std::vector<double>& ysIn) {
+    std::vector<double> xs = xsIn;
+    std::vector<double> ys = ysIn;
+    contourSortDedup(xs, ys);
+    std::vector<float> out(static_cast<size_t>(kContourLutSize));
+    if (xs.size() < 2) {
+        for (int k = 0; k < kContourLutSize; ++k) {
+            out[static_cast<size_t>(k)] = static_cast<float>(k) / (kContourLutSize - 1);
+        }
+        return out;
+    }
+    const size_t n = xs.size();
+    std::vector<double> m2(n, 0.0);
+    if (n > 2) {
+        std::vector<double> c(n, 0.0);
+        std::vector<double> d(n, 0.0);
+        for (size_t i = 1; i + 1 < n; ++i) {
+            const double h0 = xs[i] - xs[i - 1];
+            const double h1 = xs[i + 1] - xs[i];
+            const double a = h0 / 6.0;
+            const double b = (h0 + h1) / 3.0;
+            const double cc = h1 / 6.0;
+            const double r = (ys[i + 1] - ys[i]) / h1 - (ys[i] - ys[i - 1]) / h0;
+            const double denom = b - a * c[i - 1];
+            c[i] = cc / denom;
+            d[i] = (r - a * d[i - 1]) / denom;
+        }
+        for (size_t i = n - 2; i >= 1; --i) {
+            m2[i] = d[i] - c[i] * m2[i + 1];
+        }
+    }
+    for (int k = 0; k < kContourLutSize; ++k) {
+        const double xv = static_cast<double>(k) / (kContourLutSize - 1);
+        if (xv <= xs.front()) {
+            out[static_cast<size_t>(k)] = static_cast<float>(std::clamp(ys.front(), 0.0, 1.0));
+            continue;
+        }
+        if (xv >= xs[n - 1]) {
+            out[static_cast<size_t>(k)] = static_cast<float>(std::clamp(ys[n - 1], 0.0, 1.0));
+            continue;
+        }
+        size_t i = n - 2;
+        for (size_t j = 0; j + 1 < n; ++j) {
+            if (xv <= xs[j + 1]) {
+                i = j;
+                break;
+            }
+        }
+        const double x0 = xs[i];
+        const double x1 = xs[i + 1];
+        const double y0 = ys[i];
+        const double y1 = ys[i + 1];
+        const double h = x1 - x0;
+        const double t = xv;
+        const double A = (x1 - t) / h;
+        const double B = (t - x0) / h;
+        const double y =
+            A * y0 + B * y1 + ((A * A * A - A) * m2[i] + (B * B * B - B) * m2[i + 1]) * h * h / 6.0;
+        out[static_cast<size_t>(k)] = static_cast<float>(std::clamp(y, 0.0, 1.0));
+    }
+    return out;
+}
+
+// 覆盖度 uint8 图过 LUT（photocraft apply_contour：v→lut 线性插值；空表 = 恒等跳过）
+void applyContourLut8(std::vector<uint8_t>& m, const std::vector<float>& l) {
+    if (l.empty()) {
+        return;
+    }
+    for (uint8_t& v : m) {
+        v = static_cast<uint8_t>(std::lround(contourLutAt(l, v / 255.0f) * 255.0f));
+    }
+}
+
 // M17b 斜面明暗图（photocraft bevel_height Smooth + bevel_maps shade_into）：
 // 高度图 = 形状 alpha 高斯（近似 photocraft tent 双 box，登记 B 类差异）；中心差分梯度 ×
 // depth（=depth×size×方向符号）；法线 (−gx,−gy,1)，光向量 (cosA·cosE, −sinA·cosE, sinE)；
@@ -161,6 +271,15 @@ bool bevelShade(const std::vector<uint8_t>& alpha, int w, int h, const LayerStyl
     std::vector<float> hf(n);
     for (size_t i = 0; i < n; ++i) {
         hf[i] = h8[i] / 255.0f;
+    }
+    // M17d 等高线：高度轮廓 LUT 作用于高度图（photocraft bevel_contour_lut——Range 不拉伸
+    // 斜面轮廓，photocraft 实测登记）；光泽等高线作用于明暗图（shade 后、量化前）。
+    const std::vector<float> hcLut = buildContourLut(st->bevelContour);
+    const std::vector<float> gcLut = buildContourLut(st->bevelGlossContour);
+    if (!hcLut.empty()) {
+        for (size_t i = 0; i < n; ++i) {
+            hf[i] = contourLutAt(hcLut, hf[i]);
+        }
     }
     const double az = angleDeg * 3.14159265358979323846 / 180.0;
     const double alt =
@@ -195,11 +314,17 @@ bool bevelShade(const std::vector<uint8_t>& alpha, int w, int h, const LayerStyl
             const float shade = (-gx * lv0 - gy * lv1 + lv2) / len;
             const float k = shade - se;
             if (k > 0.0f) {
-                hi[i] = static_cast<uint8_t>(
-                    std::lround(std::min(1.0f, k / (1.0f - se)) * 255.0f));
+                float hv = std::min(1.0f, k / (1.0f - se));
+                if (!gcLut.empty()) {
+                    hv = contourLutAt(gcLut, hv);
+                }
+                hi[i] = static_cast<uint8_t>(std::lround(hv * 255.0f));
             } else {
-                sh[i] = static_cast<uint8_t>(
-                    std::lround(std::min(1.0f, -k / se) * 255.0f));
+                float sv = std::min(1.0f, -k / se);
+                if (!gcLut.empty()) {
+                    sv = contourLutAt(gcLut, sv);
+                }
+                sh[i] = static_cast<uint8_t>(std::lround(sv * 255.0f));
             }
         }
     }
@@ -209,6 +334,99 @@ bool bevelShade(const std::vector<uint8_t>& alpha, int w, int h, const LayerStyl
 // 域内取底片 alpha 在展开段内直线推导（doc 坐标 = 网格 origin + 网格局部 = 域 origin + 域局部）
 
 }  // namespace
+
+// M17d 等高线 LUT（见 style_ops.h；photocraft contour_lut + contour_curve_lut 移植）。
+std::vector<float> buildContourLut(const StyleContour& c) {
+    if (!c.custom) {
+        return {};
+    }
+    const size_t np = c.pts.size() / 2;
+    if (np < 2) {
+        return {};
+    }
+    bool anyCorner = false;
+    for (uint8_t v : c.corners) {
+        anyCorner = anyCorner || v != 0;
+    }
+    std::vector<double> xs(np);
+    std::vector<double> ys(np);
+    for (size_t i = 0; i < np; ++i) {
+        xs[i] = std::clamp(c.pts[i * 2], 0.0f, 1.0f);
+        ys[i] = std::clamp(c.pts[i * 2 + 1], 0.0f, 1.0f);
+    }
+    if (!anyCorner) {
+        return contourCurveLut(xs, ys);
+    }
+    // 角点分段（photocraft contour_curve_lut）：按 x 排序后，角点之间的每段独立成自然样条
+    //（全角点 = 折线）；后段覆盖 out 中 x ≥ 段首 x 的区间。
+    std::vector<size_t> order(np);
+    for (size_t i = 0; i < np; ++i) {
+        order[i] = i;
+    }
+    std::sort(order.begin(), order.end(),
+              [&](size_t a, size_t b) { return xs[a] < xs[b]; });
+    std::vector<size_t> ptsIdx;
+    ptsIdx.reserve(np);
+    for (size_t i : order) {
+        if (!ptsIdx.empty() && std::fabs(xs[i] - xs[ptsIdx.back()]) < 1e-6) {
+            continue;
+        }
+        ptsIdx.push_back(i);
+    }
+    const auto isCorner = [&](size_t idx) -> bool {
+        return idx < c.corners.size() && c.corners[idx] != 0;
+    };
+    std::vector<float> out;
+    size_t start = 0;
+    const size_t last = ptsIdx.size() - 1;
+    for (size_t i = 1; i <= last; ++i) {
+        const bool corner = isCorner(ptsIdx[i]);
+        if (!(corner || i == last)) {
+            continue;
+        }
+        std::vector<double> sx, sy;
+        for (size_t j = start; j <= i; ++j) {
+            sx.push_back(xs[ptsIdx[j]]);
+            sy.push_back(ys[ptsIdx[j]]);
+        }
+        contourSortDedup(sx, sy);
+        std::vector<float> lut = contourCurveLut(sx, sy);
+        const double from = sx.front();
+        if (out.empty()) {
+            out = lut;
+        } else {
+            for (int k = 0; k < kContourLutSize; ++k) {
+                if (static_cast<double>(k) / (kContourLutSize - 1) >= from) {
+                    out[static_cast<size_t>(k)] = lut[static_cast<size_t>(k)];
+                }
+            }
+        }
+        start = i;
+    }
+    if (out.empty()) {
+        return contourCurveLut(xs, ys);
+    }
+    return out;
+}
+
+// M17d 发光 Range（photocraft ranged_lut/glow_lut）：contour(min(v / range, 1))。
+std::vector<float> buildRangedLut(const StyleContour& c, double range) {
+    if (!std::isfinite(range)) {
+        range = 1.0;
+    }
+    range = std::clamp(range, 0.01, 1.0);
+    if (range >= 0.999) {
+        return buildContourLut(c);
+    }
+    const std::vector<float> base = buildContourLut(c);
+    std::vector<float> out(static_cast<size_t>(kContourLutSize));
+    for (int k = 0; k < kContourLutSize; ++k) {
+        const float v = std::min(
+            static_cast<float>(static_cast<double>(k) / (kContourLutSize - 1) / range), 1.0f);
+        out[static_cast<size_t>(k)] = base.empty() ? v : contourLutAt(base, v);
+    }
+    return out;
+}
 
 bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
     // 填充层：全文档域重生成
@@ -260,7 +478,7 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
     const bool anyEffect = st != nullptr && st->enabled &&
                            (st->dropShadow || st->stroke || st->colorOverlay || st->innerShadow ||
                             st->outerGlow || st->innerGlow || st->gradientOverlay || st->satin ||
-                            st->bevel);
+                            st->bevel || st->patternOverlay);
     if (!anyEffect) {
         l.styledRender = nullptr;
         return true;
@@ -353,24 +571,32 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
         }
     }
     std::vector<uint8_t> canvas(static_cast<size_t>(w) * h * 4, 0);
-    // 1) 投影：alpha×opacity 置影色 → [M17b spread：dilate(size·spread) 先] → 高斯模糊
-    // （M13 FGaussianBlur，σ=size·(1−spread)，photocraft spread_split）→ 偏移 src-over
+    // 1) 投影：alpha 纯覆盖度 → [M17b spread：dilate(size·spread) 先] → 高斯模糊
+    // （M13 FGaussianBlur，σ=size·(1−spread)，photocraft spread_split）→ M17d 等高线 LUT
+    //（photocraft shadow_map：contour 在 blur 后、作用于纯覆盖度；不透明度合成时才乘——
+    // PS 语义 contour(contour(coverage)) 而非 contour(coverage×op)）→ 上色 → 偏移 src-over
     if (st->dropShadow) {
         std::vector<uint8_t> sh(static_cast<size_t>(w) * h * 4, 0);
         const float so = static_cast<float>(st->shadowOpacity);
         const double spread = std::clamp(st->shadowSpread, 0.0, 1.0);
         const double sizeEff = std::min(kMaxBlurBudget, std::max(0.0, st->shadowSize));
         {
-            std::vector<uint8_t> shA(alpha.size(), 0);
-            for (size_t i = 0; i < alpha.size(); ++i) {
-                if (alpha[i] == 0) {
-                    continue;
-                }
-                shA[i] = static_cast<uint8_t>(
-                    std::lround(alpha[i] * so * st->shadowColor[3]));
-            }
+            std::vector<uint8_t> shA = alpha;  // 纯覆盖度
             dilateAlpha(shA, static_cast<int>(w), static_cast<int>(h),
                         static_cast<int>(std::lround(sizeEff * spread)));
+            if (sizeEff * (1.0 - spread) > 0.5) {
+                filters::FilterParams p;
+                p.kind = filters::FGaussianBlur;
+                p.p0 = static_cast<float>(sizeEff * (1.0 - spread));
+                std::vector<uint8_t> blurred(shA.size(), 0);
+                if (!filters::applyFilter(shA.data(), blurred.data(),
+                                          static_cast<uint32_t>(w), static_cast<uint32_t>(h), p,
+                                          err)) {
+                    return false;
+                }
+                shA.swap(blurred);
+            }
+            applyContourLut8(shA, buildContourLut(st->shadowContour));
             for (size_t i = 0; i < alpha.size(); ++i) {
                 if (shA[i] == 0) {
                     continue;
@@ -378,18 +604,9 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
                 sh[i * 4 + 0] = static_cast<uint8_t>(std::lround(st->shadowColor[0] * 255.0f));
                 sh[i * 4 + 1] = static_cast<uint8_t>(std::lround(st->shadowColor[1] * 255.0f));
                 sh[i * 4 + 2] = static_cast<uint8_t>(std::lround(st->shadowColor[2] * 255.0f));
-                sh[i * 4 + 3] = shA[i];
+                sh[i * 4 + 3] = static_cast<uint8_t>(
+                    std::lround(shA[i] * so * st->shadowColor[3]));
             }
-        }
-        if (sizeEff * (1.0 - spread) > 0.5) {
-            filters::FilterParams p;
-            p.kind = filters::FGaussianBlur;
-            p.p0 = static_cast<float>(sizeEff * (1.0 - spread));
-            std::vector<uint8_t> blurred(sh.size(), 0);
-            if (!filters::applyFilter(sh.data(), blurred.data(), w, h, p, err)) {
-                return false;
-            }
-            sh.swap(blurred);
         }
         const int ox = static_cast<int>(std::lround(offX));
         const int oy = static_cast<int>(std::lround(offY));
@@ -413,8 +630,8 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
             }
         }
     }
-    // 2) 外发光（M17a/M17b，photocraft glow_map Softer：dilate(size·spread)+blur σ=size·(1−spread)；
-    // 画在本体之下）
+    // 2) 外发光（M17a/M17b，photocraft glow_map Softer：dilate(size·spread)+blur σ=size·(1−spread)
+    // → M17d glow_lut = contour(min(v/range,1))；画在本体之下）
     if (st->outerGlow) {
         std::vector<uint8_t> cov = alpha;
         const double spread = std::clamp(st->ogSpread, 0.0, 1.0);
@@ -425,6 +642,7 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
                        sizeEff * (1.0 - spread), err)) {
             return false;
         }
+        applyContourLut8(cov, buildRangedLut(st->ogContour, st->ogRange));
         for (size_t i = 0; i < cov.size(); ++i) {
             if (cov[i] == 0) {
                 continue;
@@ -525,6 +743,69 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
             srcOver(canvas.data() + i * 4, src);
         }
     }
+    // 4b) 图案叠加（M17d，photocraft FxPaint::Pattern / PS「图案叠加」）：ink 墨迹内按图案
+    // 平铺，锚点 = ink bbox 左上（PS「与图层对齐」默认语义），nearest × scale；渲染序在
+    // 渐变叠加之后、颜色叠加之前（PS 效果栈序）。图案缺失/未选 = 不画。
+    if (st->patternOverlay && !st->patternId.empty()) {
+        const DocumentPattern* pat = nullptr;
+        for (const DocumentPattern& p : doc.patterns) {
+            if (p.id == st->patternId && p.pixels != nullptr && p.w > 0 && p.h > 0) {
+                pat = &p;
+                break;
+            }
+        }
+        if (pat != nullptr) {
+            uint32_t ix = bx, iy = by, iw = bw, ih = bh;
+            gridInkBBox(*base, ix, iy, iw, ih);  // 失败保持 tile 粒度 bbox 兜底
+            const double inkOX = l.transform.originX + static_cast<double>(ix);
+            const double inkOY = l.transform.originY + static_cast<double>(iy);
+            const double scale = std::clamp(st->poScale, 0.01, 10.0);
+            const TileGrid& pg = *pat->pixels;
+            const int pw = static_cast<int>(pat->w);
+            const int phh = static_cast<int>(pat->h);
+            auto patAt = [&](int px, int py) -> const uint8_t* {
+                px %= pw;
+                if (px < 0) {
+                    px += pw;
+                }
+                py %= phh;
+                if (py < 0) {
+                    py += phh;
+                }
+                auto it = pg.tiles.find(
+                    static_cast<uint32_t>(py) / kTileSize * pg.cols +
+                    static_cast<uint32_t>(px) / kTileSize);
+                if (it == pg.tiles.end() || it->second == nullptr ||
+                    it->second->pixels == nullptr) {
+                    return nullptr;
+                }
+                const uint8_t* p = it->second->pixels->mapCpu();
+                if (p == nullptr) {
+                    return nullptr;
+                }
+                return p + static_cast<size_t>(static_cast<uint32_t>(py) % kTileSize) *
+                                  it->second->pixels->rowBytes() +
+                           static_cast<size_t>(static_cast<uint32_t>(px) % kTileSize) * 4;
+            };
+            for (size_t i = 0; i < alpha.size(); ++i) {
+                if (alpha[i] == 0) {
+                    continue;
+                }
+                const double docX = static_cast<double>(x0 + static_cast<int>(i % w)) + 0.5;
+                const double docY = static_cast<double>(y0 + static_cast<int>(i / w)) + 0.5;
+                const int sx = static_cast<int>(std::floor((docX - inkOX) * scale));
+                const int sy = static_cast<int>(std::floor((docY - inkOY) * scale));
+                const uint8_t* q = patAt(sx, sy);
+                if (q == nullptr || q[3] == 0) {
+                    continue;
+                }
+                float src[4] = {q[0] / 255.0f, q[1] / 255.0f, q[2] / 255.0f,
+                                q[3] / 255.0f * static_cast<float>(st->poOpacity) *
+                                    (alpha[i] / 255.0f)};
+                srcOver(canvas.data() + i * 4, src);
+            }
+        }
+    }
     // 5) 颜色叠加：base alpha × overlay 色/不透明度 src-over（本体之上）
     if (st->colorOverlay) {
         for (size_t i = 0; i < alpha.size(); ++i) {
@@ -538,7 +819,8 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
         }
     }
     // 6) 光泽（M17b，photocraft satin_map：形状双向平移(+d/−d) 各 σ=size 模糊 → |a−b| →
-    // invert → ×alpha；distance 下限 1px（PS Distance 0 画 1px，photocraft satin_distance））
+    // invert → M17d 等高线 → ×alpha；distance 下限 1px（PS Distance 0 画 1px，photocraft
+    // satin_distance））
     if (st->satin) {
         const double rad = st->satinAngleDeg * 3.14159265358979323846 / 180.0;
         const double dist = std::max(1.0, st->satinDistance);
@@ -553,6 +835,7 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
             !blurAlpha(sb, static_cast<int>(w), static_cast<int>(h), sizeEff, err)) {
             return false;
         }
+        const std::vector<float> satinLut = buildContourLut(st->satinContour);
         for (size_t i = 0; i < alpha.size(); ++i) {
             if (alpha[i] == 0) {
                 continue;
@@ -560,6 +843,9 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
             float m = std::abs(sa[i] - sb[i]) / 255.0f;
             if (st->satinInvert) {
                 m = 1.0f - m;
+            }
+            if (!satinLut.empty()) {
+                m = contourLutAt(satinLut, m);
             }
             m *= alpha[i] / 255.0f;
             if (m <= 0.0f) {
@@ -585,6 +871,7 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
                        sizeEff * (1.0 - spread), err)) {
             return false;
         }
+        applyContourLut8(cov, buildRangedLut(st->igContour, st->igRange));
         for (size_t i = 0; i < cov.size(); ++i) {
             if (alpha[i] == 0) {
                 continue;
@@ -620,6 +907,7 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
                        sizeEff * (1.0 - spread), err)) {
             return false;
         }
+        applyContourLut8(inv, buildContourLut(st->isContour));
         for (int yy = 0; yy < static_cast<int>(h); ++yy) {
             const int sy = yy - dy;
             for (int xx = 0; xx < static_cast<int>(w); ++xx) {

@@ -4,6 +4,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -28,7 +29,7 @@ constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Open";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
 constexpr int kMinVersion = 1;
-constexpr int kMaxVersion = 10;  // v10：+图层样式效果扩展（M17a，可选字段读兼容 v1–v9）；v9：+参考线 guides 块（M15a）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
+constexpr int kMaxVersion = 11;  // v11：+等高线/Range/图案叠加/文档图案（M17d，可选字段读兼容 v1–v10）；v10：+图层样式效果扩展（M17a，可选字段读兼容 v1–v9）；v9：+参考线 guides 块（M15a）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
 constexpr uint32_t kMaxSide = 30000;
 constexpr uint64_t kMaxTotalPixels = 100ull * 1000 * 1000;
 constexpr size_t kMaxLayers = 10000;
@@ -547,6 +548,7 @@ bool getDouble(const JValue& v, double& out) {
 
 bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector<LayerRecord>& layers,
                    std::vector<std::string>& channelFiles,
+                   std::vector<DocumentPattern>& patterns,
                    std::string& err) {
     if (bytes.size() > kMaxManifestBytes) {
         err = "manifest too large";
@@ -1122,6 +1124,63 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
                 if (ju != nullptr && ju->type == JValue::Bool) { st->bevelUseGL = ju->b; }
                 st->bevel = true;
             }
+            // v11 等高线/Range/图案叠加（M17d，可选键；缺省 = 结构体默认值 = Linear/0.5/关）
+            auto readContour = [&](const char* key, StyleContour& out) -> bool {
+                const JValue* jc = jst->find(key);
+                if (jc == nullptr) {
+                    return true;
+                }
+                if (jc->type != JValue::Obj) { err = std::string("bad ") + key; return false; }
+                const JValue* jp = jc->find("pts");
+                if (jp == nullptr || jp->type != JValue::Arr || jp->arr.size() < 4 ||
+                    jp->arr.size() % 2 != 0 || jp->arr.size() > 64) {
+                    err = std::string("bad ") + key + " pts";
+                    return false;
+                }
+                std::vector<float> pts;
+                for (const JValue& jv : jp->arr) {
+                    double d = 0;
+                    if (jv.type != JValue::Num || !getDouble(jv, d) || !std::isfinite(d)) {
+                        err = std::string("bad ") + key + " pt";
+                        return false;
+                    }
+                    pts.push_back(static_cast<float>(std::clamp(d, 0.0, 1.0)));
+                }
+                std::vector<uint8_t> corners;
+                const JValue* jcr = jc->find("corners");
+                if (jcr != nullptr && jcr->type == JValue::Arr) {
+                    for (const JValue& jv : jcr->arr) {
+                        if (jv.type == JValue::Num) {
+                            corners.push_back(jv.num != 0.0 ? 1 : 0);
+                        }
+                    }
+                }
+                out.custom = true;
+                out.pts = std::move(pts);
+                out.corners = std::move(corners);
+                return true;
+            };
+            if (!readContour("shContour", st->shadowContour) ||
+                !readContour("isContour", st->isContour) ||
+                !readContour("ogContour", st->ogContour) ||
+                !readContour("igContour", st->igContour) ||
+                !readContour("saContour", st->satinContour) ||
+                !readContour("bvContour", st->bevelContour) ||
+                !readContour("bvGlossContour", st->bevelGlossContour)) {
+                return false;
+            }
+            if (readOptNum("ogRange", sv)) { st->ogRange = std::clamp(sv, 0.01, 1.0); }
+            if (readOptNum("igRange", sv)) { st->igRange = std::clamp(sv, 0.01, 1.0); }
+            if (jst->find("poOn") != nullptr) {
+                const JValue* jid = jst->find("poId");
+                if (jid == nullptr || jid->type != JValue::Str) { err = "bad poId"; return false; }
+                st->patternOverlay = true;
+                st->patternId = jid->str;
+                if (!readOptNum("poScale", sv)) { err = "bad poScale"; return false; }
+                st->poScale = std::clamp(sv, 0.01, 10.0);
+                if (!readOptNum("poOpacity", sv)) { err = "bad poOpacity"; return false; }
+                st->poOpacity = std::clamp(sv, 0.0, 1.0);
+            }
             l.style = std::move(st);
         }
         // v8 填充图层（M14c，可选字段）
@@ -1251,6 +1310,45 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
     if (jgl != nullptr && jgl->type == JValue::Num && std::isfinite(jgl->num)) {
         doc.globalLightAngle = std::clamp(jgl->num, 0.0, 360.0);
     }
+    // v11：文档图案（M17d，可选块；像素走 images/pattern_<id>.png，openProject 装载）
+    const JValue* jpats = root.find("patterns");
+    if (jpats != nullptr) {
+        if (jpats->type != JValue::Arr) {
+            err = "bad patterns record";
+            return false;
+        }
+        for (const JValue& jp : jpats->arr) {
+            if (jp.type != JValue::Obj) {
+                err = "bad pattern record";
+                return false;
+            }
+            const JValue* jid = jp.find("id");
+            const JValue* jnm = jp.find("name");
+            const JValue* jw = jp.find("w");
+            const JValue* jh = jp.find("h");
+            double w = 0, h = 0;
+            if (jid == nullptr || jid->type != JValue::Str || jid->str.empty() ||
+                jid->str.size() > 64 || jnm == nullptr || jnm->type != JValue::Str ||
+                jw == nullptr || !getDouble(*jw, w) || jh == nullptr || !getDouble(*jh, h) ||
+                w < 1 || h < 1 || w > 4096 || h > 4096) {
+                err = "bad pattern record fields";
+                return false;
+            }
+            // id 只允许字母数字下划线（拼 zip 条目名，防路径注入——ZipReader 同纪律）
+            for (char c : jid->str) {
+                if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_') {
+                    err = "bad pattern id";
+                    return false;
+                }
+            }
+            DocumentPattern p;
+            p.id = jid->str;
+            p.name = jnm->str;
+            p.w = static_cast<uint32_t>(w);
+            p.h = static_cast<uint32_t>(h);
+            patterns.push_back(std::move(p));
+        }
+    }
     // activeLayerId 必须在集合内（对齐上游 validate）
     const JValue* jactive = root.find("activeLayerId");
     if (jactive != nullptr && jactive->type == JValue::Num && jactive->num > 0) {
@@ -1307,7 +1405,8 @@ bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
     Document doc;
     std::vector<LayerRecord> records;
     std::vector<std::string> channelFiles;
-    if (!parseManifest(manifestBytes, doc, records, channelFiles, err)) {
+    std::vector<DocumentPattern> patterns;
+    if (!parseManifest(manifestBytes, doc, records, channelFiles, patterns, err)) {
         return false;
     }
 
@@ -1419,6 +1518,40 @@ bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
         doc.channels[i].mask = std::move(cgrid);
     }
 
+    // v11：文档图案 PNG（M17d；网格域须与 manifest 尺寸一致；id 数字后缀回填 patternSeq
+    // 防打开后新建撞号）
+    uint64_t maxPatternSeq = 0;
+    for (DocumentPattern& p : patterns) {
+        const std::string entry = "images/pattern_" + p.id + ".png";
+        const ZipReader::CdEntry* ppng = zip.find(entry);
+        if (ppng == nullptr) {
+            err = "pattern image missing: " + entry;
+            return false;
+        }
+        std::vector<uint8_t> pBytes;
+        if (!zip.extract(*ppng, pBytes, err)) {
+            return false;
+        }
+        std::shared_ptr<const TileGrid> grid = decodePngToGrid(pBytes.data(), pBytes.size(), err);
+        if (grid == nullptr) {
+            return false;
+        }
+        const uint32_t expCols = (p.w + kTileSize - 1u) / kTileSize;
+        const uint32_t expRows = (p.h + kTileSize - 1u) / kTileSize;
+        if (grid->cols != expCols || grid->rows != expRows) {
+            err = "pattern image size mismatch: " + entry;
+            return false;
+        }
+        p.pixels = std::move(grid);
+        if (p.id.rfind("pat_", 0) == 0) {
+            maxPatternSeq = std::max(maxPatternSeq,
+                                     static_cast<uint64_t>(std::strtoull(p.id.c_str() + 4,
+                                                                         nullptr, 10)));
+        }
+        doc.patterns.push_back(std::move(p));
+    }
+    Engine::get().patternSeq = std::max(Engine::get().patternSeq, maxPatternSeq);
+
     // 整档替换（02 §5 语义）：统一走 resetDocument（清撤销/会话态，撤销不跨文档）
     auto& engine = Engine::get();
     engine.resetDocument();
@@ -1435,6 +1568,7 @@ bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
         engine.doc.guidesV = std::move(doc.guidesV);
         engine.doc.guidesLocked = doc.guidesLocked;
         engine.doc.guidesVisible = doc.guidesVisible;
+        engine.doc.patterns = std::move(doc.patterns);  // M17d：图案资源随工程恢复
         // M14c：样式/填充派生渲染重建（styledRender 不入库，读入后按参数重生成）
         restyleDocument(engine.doc);
         engine.bumpRevisionLocked();

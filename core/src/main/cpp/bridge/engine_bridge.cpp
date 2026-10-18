@@ -766,6 +766,9 @@ napi_value GetStats(napi_env env, napi_callback_info /*info*/) {
     // M17a：样式剪贴板镜像（粘贴菜单使能；copyLayerStyle 在 docMutex 内写，锁内读）
     napi_set_named_property(env, data, "hasStyleClipboard",
                             makeBool(env, e.styleClipboard != nullptr));
+    // M17d：文档图案数（「定义图案」菜单使能/图案列表刷新键）
+    napi_set_named_property(env, data, "patternCount", makeDouble(env,
+                            static_cast<double>(e.doc.patterns.size())));
     return makeOk(env, data);
 }
 
@@ -3799,9 +3802,17 @@ napi_value ExportPsd(napi_env env, napi_callback_info info) {
             // 避免 PS 端像素已含效果再叠 lrFX 双重应用。
             if (l.style != nullptr && l.style->enabled) {
                 const LayerStyle& st = *l.style;
-                const bool allRepresentable = !st.satin && !st.bevel && !st.gradientOverlay &&
-                                              st.shadowSpread == 0.0 && st.isSpread == 0.0 &&
-                                              st.ogSpread == 0.0 && st.igSpread == 0.0;
+                // M17d：自定义等高线/非默认 Range/图案叠加同样不可由 lrFX PS5 布局承载
+                //（photocraft parse_lrfx 对 contour/range 硬编码 Linear/0.5）→ 走烘焙分流。
+                const bool contourCustom =
+                    st.shadowContour.custom || st.isContour.custom || st.ogContour.custom ||
+                    st.igContour.custom || st.satinContour.custom || st.bevelContour.custom ||
+                    st.bevelGlossContour.custom;
+                const bool allRepresentable =
+                    !st.satin && !st.bevel && !st.gradientOverlay && !st.patternOverlay &&
+                    !contourCustom && st.shadowSpread == 0.0 && st.isSpread == 0.0 &&
+                    st.ogSpread == 0.0 && st.igSpread == 0.0 && st.ogRange == 0.5 &&
+                    st.igRange == 0.5;
                 if (allRepresentable) {
                     pl.style = l.style;
                     pl.pixels = l.pixels;  // 原始像素（效果由 lrFX 承载，PS 端渲染）
@@ -5860,6 +5871,308 @@ napi_value SetHistoryState(napi_env env, napi_callback_info info) {
     }
     e.historyVersion.fetch_add(1);
     return makeOk(env, nullptr);
+}
+
+// ---------- M17d 等高线 / 图案资源 ----------
+
+// setStyleContour(id, effect, xs[], ys[], corners[], range)：效果等高线（0=投影 1=内阴影
+// 2=外发光 3=内发光 4=光泽 5=斜面轮廓 6=斜面光泽；xs/ys 0..1 各 2..32 点，corners 与点
+// 一一对应 0/1；点数 <2 = 清回 Linear；range 仅 2/3 生效，0.01..1）。
+napi_value SetStyleContour(napi_env env, napi_callback_info info) {
+    size_t argc = 6;
+    napi_value argv[6] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 5) {
+        return makeError(env, kErrBadParam,
+                         "setStyleContour(id,effect,xs,ys,corners,range) requires 6 args");
+    }
+    double id = 0;
+    double effect = 0;
+    double range = 0.5;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok ||
+        napi_get_value_double(env, argv[1], &effect) != napi_ok) {
+        return makeError(env, kErrBadParam, "setStyleContour: invalid args");
+    }
+    if (argc >= 6 && napi_get_value_double(env, argv[5], &range) != napi_ok) {
+        return makeError(env, kErrBadParam, "setStyleContour: invalid range");
+    }
+    if (effect < 0 || effect > 6) {
+        return makeError(env, kErrBadParam, "setStyleContour: bad effect index");
+    }
+    const auto readF32Array = [&](const napi_value& arr, std::vector<float>& out,
+                                  double lo, double hi) -> bool {
+        bool isArr = false;
+        napi_is_array(env, arr, &isArr);
+        if (!isArr) {
+            return false;
+        }
+        uint32_t n = 0;
+        if (napi_get_array_length(env, arr, &n) != napi_ok) {
+            return false;  // @State 代理数组（M10a）：长度探测失败按无效处理
+        }
+        if (n > 32) {
+            return false;
+        }
+        out.resize(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            napi_value ev = nullptr;
+            double v = 0;
+            if (napi_get_element(env, arr, i, &ev) != napi_ok ||
+                napi_get_value_double(env, ev, &v) != napi_ok || v < lo || v > hi) {
+                return false;
+            }
+            out[i] = static_cast<float>(v);
+        }
+        return true;
+    };
+    std::vector<float> xs, ys;
+    if (!readF32Array(argv[2], xs, 0.0, 1.0) || !readF32Array(argv[3], ys, 0.0, 1.0) ||
+        xs.size() != ys.size()) {
+        return makeError(env, kErrBadParam, "setStyleContour: bad xs/ys");
+    }
+    std::vector<float> cf;
+    bool cornersOk = readF32Array(argv[4], cf, 0.0, 1.0);
+    if (cornersOk && !cf.empty() && cf.size() != xs.size()) {
+        return makeError(env, kErrBadParam, "setStyleContour: corners size mismatch");
+    }
+    std::vector<uint8_t> corners;
+    if (cornersOk && !cf.empty()) {
+        corners.resize(cf.size());
+        for (size_t i = 0; i < cf.size(); ++i) {
+            corners[i] = cf[i] != 0.0f ? 1 : 0;
+        }
+    }
+    const LayerId lid = static_cast<LayerId>(id);
+    const int fx = static_cast<int>(effect);
+    return runStyleCommand(env, "style contour", lid,
+                           [fx, xs, ys, corners, range](Document&, Layer& l,
+                                                        std::string&) -> bool {
+        if (l.style == nullptr) {
+            l.style = std::make_shared<LayerStyle>();
+        } else {
+            l.style = std::make_shared<LayerStyle>(*l.style);  // COW：快照共享指针不可原地改
+        }
+        StyleContour* target = nullptr;
+        switch (fx) {
+            case 0: target = &l.style->shadowContour; break;
+            case 1: target = &l.style->isContour; break;
+            case 2: target = &l.style->ogContour; break;
+            case 3: target = &l.style->igContour; break;
+            case 4: target = &l.style->satinContour; break;
+            case 5: target = &l.style->bevelContour; break;
+            default: target = &l.style->bevelGlossContour; break;
+        }
+        if (xs.empty() && ys.empty()) {
+            // range-only 更新（发光「范围」滑条）：不动点列
+        } else if (xs.size() < 2) {
+            *target = StyleContour{};  // 清回 Linear（恒等）
+        } else {
+            target->custom = true;
+            target->pts.clear();
+            for (size_t i = 0; i < xs.size(); ++i) {
+                target->pts.push_back(xs[i]);
+                target->pts.push_back(ys[i]);
+            }
+            target->corners = corners;
+        }
+        if (fx == 2) {
+            l.style->ogRange = std::clamp(range, 0.01, 1.0);
+        } else if (fx == 3) {
+            l.style->igRange = std::clamp(range, 0.01, 1.0);
+        }
+        return true;
+    });
+}
+
+// setPatternOverlay(id, enabled, patternId, scale, opacity)：图案叠加（patternId 空 = 不渲染）。
+napi_value SetPatternOverlay(napi_env env, napi_callback_info info) {
+    size_t argc = 5;
+    napi_value argv[5] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 5) {
+        return makeError(env, kErrBadParam,
+                         "setPatternOverlay(id,enabled,patternId,scale,opacity) requires 5");
+    }
+    double id = 0;
+    double enabled = 0;
+    double scale = 1.0;
+    double opacity = 1.0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok ||
+        napi_get_value_double(env, argv[1], &enabled) != napi_ok ||
+        napi_get_value_double(env, argv[3], &scale) != napi_ok ||
+        napi_get_value_double(env, argv[4], &opacity) != napi_ok) {
+        return makeError(env, kErrBadParam, "setPatternOverlay: invalid args");
+    }
+    char buf[128];
+    size_t len = 0;
+    if (napi_get_value_string_utf8(env, argv[2], buf, sizeof(buf), &len) != napi_ok) {
+        return makeError(env, kErrBadParam, "setPatternOverlay: invalid patternId");
+    }
+    const std::string patternId(buf, len);
+    const LayerId lid = static_cast<LayerId>(id);
+    return runStyleCommand(env, "pattern overlay", lid,
+                           [enabled, patternId, scale, opacity](Document& doc, Layer& l,
+                                                                std::string& err) -> bool {
+        if (enabled != 0) {
+            bool found = false;
+            for (const DocumentPattern& p : doc.patterns) {
+                if (p.id == patternId) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                err = "pattern not found: " + patternId;
+                return false;
+            }
+        }
+        if (l.style == nullptr) {
+            l.style = std::make_shared<LayerStyle>();
+        } else {
+            l.style = std::make_shared<LayerStyle>(*l.style);  // COW：快照共享指针不可原地改
+        }
+        l.style->patternOverlay = enabled != 0;
+        l.style->patternId = patternId;
+        l.style->poScale = std::clamp(scale, 0.01, 10.0);
+        l.style->poOpacity = std::clamp(opacity, 0.0, 1.0);
+        return true;
+    });
+}
+
+// definePattern()：编辑 → 定义图案（选区 ∩ 活动层原始像素，alpha×选区灰度；无 History
+// ——PS 定义图案不在历史面板，setGlobalLight 同语义；返回 data {id,name,w,h}）。
+napi_value DefinePattern(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    napi_value data = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "definePattern: no document");
+        }
+        if (e.doc.selection == nullptr) {
+            return makeError(env, kErrBadParam, "definePattern: no active selection");
+        }
+        Layer* l = nullptr;
+        for (Layer& li : e.doc.layers) {
+            if (li.id == e.doc.activeId) {
+                l = &li;
+                break;
+            }
+        }
+        if (l == nullptr || l->isGroup || l->pixels == nullptr) {
+            return makeError(env, kErrBadParam, "definePattern: no active layer pixels");
+        }
+        double bx = 0, by = 0, bw = 0, bh = 0;
+        if (!selectionBBox(e.doc, bx, by, bw, bh) || bw < 1 || bh < 1) {
+            return makeError(env, kErrBadParam, "definePattern: empty selection");
+        }
+        if (bw > 4096 || bh > 4096) {
+            return makeError(env, kErrBadParam, "definePattern: selection too large");
+        }
+        const int x0 = static_cast<int>(bx);
+        const int y0 = static_cast<int>(by);
+        const uint32_t w = static_cast<uint32_t>(bw);
+        const uint32_t h = static_cast<uint32_t>(bh);
+        const TileGrid& grid = *l->pixels;
+        TileGridBuilder builder((w + kTileSize - 1) / kTileSize,
+                                (h + kTileSize - 1) / kTileSize);
+        const int gOX = static_cast<int>(std::lround(l->transform.originX));
+        const int gOY = static_cast<int>(std::lround(l->transform.originY));
+        bool anyTile = false;
+        for (uint32_t yy = 0; yy < h; ++yy) {
+            const int docY = y0 + static_cast<int>(yy);
+            const int gy = docY - gOY;
+            for (uint32_t xx = 0; xx < w; ++xx) {
+                const int docX = x0 + static_cast<int>(xx);
+                const int gx = docX - gOX;
+                if (gx < 0 || gy < 0 || gy >= static_cast<int>(grid.rows * kTileSize) ||
+                    gx >= static_cast<int>(grid.cols * kTileSize)) {
+                    continue;
+                }
+                const uint32_t sty2 = static_cast<uint32_t>(gy) / kTileSize;
+                const uint32_t stx = static_cast<uint32_t>(gx) / kTileSize;
+                auto it = grid.tiles.find(sty2 * grid.cols + stx);
+                if (it == grid.tiles.end() || it->second == nullptr ||
+                    it->second->pixels == nullptr) {
+                    continue;
+                }
+                const uint8_t* ps = it->second->pixels->mapCpu();
+                if (ps == nullptr) {
+                    continue;
+                }
+                const uint8_t* sp =
+                    ps + static_cast<size_t>(static_cast<uint32_t>(gy) % kTileSize) *
+                             it->second->pixels->rowBytes() +
+                         static_cast<size_t>(static_cast<uint32_t>(gx) % kTileSize) * 4;
+                const uint8_t sg = selectionGrayAt(*e.doc.selection, docX, docY);
+                const uint32_t a = static_cast<uint32_t>(sp[3]) * sg / 255u;
+                if (a == 0 && sp[0] == 0 && sp[1] == 0 && sp[2] == 0) {
+                    continue;
+                }
+                const uint32_t tx = xx / kTileSize;
+                const uint32_t ty = yy / kTileSize;
+                EngineBuffer& tile = builder.ensureTile(tx, ty);
+                uint8_t* dp = tile.mapCpuWrite() +
+                              static_cast<size_t>(yy % kTileSize) * tile.rowBytes() +
+                              static_cast<size_t>(xx % kTileSize) * 4;
+                dp[0] = sp[0];
+                dp[1] = sp[1];
+                dp[2] = sp[2];
+                dp[3] = static_cast<uint8_t>(std::min<uint32_t>(255u, a));
+                anyTile = true;
+            }
+        }
+        if (!anyTile) {
+            return makeError(env, kErrBadParam, "definePattern: nothing under selection");
+        }
+        DocumentPattern p;
+        e.patternSeq += 1;
+        p.id = "pat_" + std::to_string(e.patternSeq);
+        p.name = "图案 " + std::to_string(e.patternSeq);
+        p.w = w;
+        p.h = h;
+        p.pixels = builder.publish(nextGridRevision());
+        e.doc.patterns.push_back(std::move(p));
+        e.bumpRevisionLocked();  // 图案列表刷新（docVersion 事件；不入 History）
+        napi_create_object(env, &data);
+        napi_value sid = nullptr;
+        napi_create_string_utf8(env, e.doc.patterns.back().id.c_str(), NAPI_AUTO_LENGTH, &sid);
+        napi_set_named_property(env, data, "id", sid);
+        napi_value sname = nullptr;
+        napi_create_string_utf8(env, e.doc.patterns.back().name.c_str(), NAPI_AUTO_LENGTH,
+                                &sname);
+        napi_set_named_property(env, data, "name", sname);
+        napi_set_named_property(env, data, "w", makeDouble(env, w));
+        napi_set_named_property(env, data, "h", makeDouble(env, h));
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Pattern",
+                     "define %{public}s %{public}ux%{public}u", e.doc.patterns.back().id.c_str(),
+                     w, h);
+    }
+    e.requestRender();
+    return makeOk(env, data);
+}
+
+// getPatterns() → [{id,name,w,h}, …]（文档图案列表，样式对话框图案选择器用）
+napi_value GetPatterns(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    napi_value arr = nullptr;
+    napi_create_array_with_length(env, e.doc.patterns.size(), &arr);
+    for (size_t i = 0; i < e.doc.patterns.size(); ++i) {
+        const DocumentPattern& p = e.doc.patterns[i];
+        napi_value obj = nullptr;
+        napi_create_object(env, &obj);
+        napi_value sid = nullptr;
+        napi_create_string_utf8(env, p.id.c_str(), NAPI_AUTO_LENGTH, &sid);
+        napi_set_named_property(env, obj, "id", sid);
+        napi_value sname = nullptr;
+        napi_create_string_utf8(env, p.name.c_str(), NAPI_AUTO_LENGTH, &sname);
+        napi_set_named_property(env, obj, "name", sname);
+        napi_set_named_property(env, obj, "w", makeDouble(env, p.w));
+        napi_set_named_property(env, obj, "h", makeDouble(env, p.h));
+        napi_set_element(env, arr, static_cast<uint32_t>(i), obj);
+    }
+    return arr;
 }
 
 // getSelectionBounds() → data {ok,x,y,w,h}（文档域精确 alpha 包围盒）

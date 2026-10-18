@@ -10,10 +10,20 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "engine/document.h"
 
 namespace montage {
+
+// M17d 等高线 LUT（photocraft contour_lut/contour_curve_lut 对拍）：4096 项 0..1 传递表。
+// custom=false → 空（恒等）；点列 ≥2 → 自然样条（photocraft curve_lut 同式：三对角解二阶
+// 导数），角点按段各自成样条（全角点 = 折线）；不足 2 点 → 空。宿主测试直接断言数值。
+std::vector<float> buildContourLut(const StyleContour& c);
+
+// M17d 发光 Range（photocraft ranged_lut/glow_lut）：contour(min(v / range, 1))。
+// range 钳 0.01..1；c 非 custom 且 range≥0.999 → 空（恒等，photocraft None 语义）。
+std::vector<float> buildRangedLut(const StyleContour& c, double range);
 
 // 重算派生渲染（样式/填充层）。样式禁用/无效果项 → styledRender = nullptr（走回原像素）。
 // rev = 网格发布序号（调用方保证单调）。返回 false = 网格域超预算等硬错误（保守拒绝）。

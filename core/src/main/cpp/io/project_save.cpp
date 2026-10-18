@@ -453,6 +453,14 @@ struct ChannelSnapshot {
     std::shared_ptr<const TileGrid> mask;  // 文档域灰度网格
 };
 
+struct PatternSnapshot {  // v11：文档图案（M17d）
+    std::string id;
+    std::string name;
+    uint32_t w = 0;
+    uint32_t h = 0;
+    std::shared_ptr<const TileGrid> pixels;
+};
+
 struct DocSnapshot {
     uint32_t width = 0;
     uint32_t height = 0;
@@ -466,7 +474,33 @@ struct DocSnapshot {
     bool guidesLocked = false;
     bool guidesVisible = true;
     double globalLightAngle = 120.0;  // v10（M17b）
+    std::vector<PatternSnapshot> patterns;  // v11（M17d；空则整块不写——v10 包字节不变）
 };
+
+// M17d 等高线 JSON（非 custom 不写）：{"pts": [x0,y0,…], "corners": [0/1,…]}
+std::string contourJson(const StyleContour& c) {
+    if (!c.custom || c.pts.size() < 4) {
+        return "";
+    }
+    char num[32];
+    std::string j = "{\"pts\": [";
+    for (size_t i = 0; i < c.pts.size(); ++i) {
+        std::snprintf(num, sizeof(num), "%.6g", c.pts[i]);
+        j += num;
+        if (i + 1 < c.pts.size()) {
+            j += ", ";
+        }
+    }
+    j += "], \"corners\": [";
+    for (size_t i = 0; i < c.corners.size(); ++i) {
+        j += (c.corners[i] != 0) ? "1" : "0";
+        if (i + 1 < c.corners.size()) {
+            j += ", ";
+        }
+    }
+    j += "]}";
+    return j;
+}
 
 std::string jsonEscape(const std::string& in) {
     std::string out;
@@ -777,6 +811,39 @@ std::string buildManifest(const DocSnapshot& doc) {
                     sf += ",\n      \"bvUseGL\": false";
                 }
             }
+            // v11 等高线/Range/图案叠加（M17d）：非默认才写（读兼容 v1–v10）
+            const auto pushContour = [&](const char* key, const StyleContour& c) {
+                const std::string cj = contourJson(c);
+                if (!cj.empty()) {
+                    sf += std::string(",\n      \"") + key + "\": " + cj;
+                }
+            };
+            pushContour("shContour", st.shadowContour);
+            pushContour("isContour", st.isContour);
+            pushContour("ogContour", st.ogContour);
+            pushContour("igContour", st.igContour);
+            pushContour("saContour", st.satinContour);
+            pushContour("bvContour", st.bevelContour);
+            pushContour("bvGlossContour", st.bevelGlossContour);
+            if (st.ogRange != 0.5) {
+                char num[32];
+                std::snprintf(num, sizeof(num), "%.6g", st.ogRange);
+                sf += std::string(",\n      \"ogRange\": ") + num;
+            }
+            if (st.igRange != 0.5) {
+                char num[32];
+                std::snprintf(num, sizeof(num), "%.6g", st.igRange);
+                sf += std::string(",\n      \"igRange\": ") + num;
+            }
+            if (st.patternOverlay) {
+                sf += ",\n      \"poOn\": true";
+                sf += ",\n      \"poId\": " + jsonEscape(st.patternId);
+                char num[32];
+                std::snprintf(num, sizeof(num), "%.6g", st.poScale);
+                sf += std::string(",\n      \"poScale\": ") + num;
+                std::snprintf(num, sizeof(num), "%.6g", st.poOpacity);
+                sf += std::string(",\n      \"poOpacity\": ") + num;
+            }
             fields.push_back(std::string("      \"style\": {\n") + sf + "\n      }");
         }
         if (l.fill != nullptr) {
@@ -915,6 +982,24 @@ std::string buildManifest(const DocSnapshot& doc) {
         std::snprintf(num, sizeof(num), "%.6g", doc.globalLightAngle);
         j += std::string(",\n  \"globalLight\": ") + num + "\n";
     }
+    // v11：文档图案（M17d；像素走 images/pattern_<id>.png，空表不写 = v10 包字节不变）
+    if (!doc.patterns.empty()) {
+        j += ",\n  \"patterns\": [\n";
+        for (size_t i = 0; i < doc.patterns.size(); ++i) {
+            const PatternSnapshot& p = doc.patterns[i];
+            char num[32];
+            j += "    {\"id\": " + jsonEscape(p.id) + ", \"name\": " + jsonEscape(p.name);
+            std::snprintf(num, sizeof(num), "%u", p.w);
+            j += std::string(", \"w\": ") + num;
+            std::snprintf(num, sizeof(num), "%u", p.h);
+            j += std::string(", \"h\": ") + num + "}";
+            if (i + 1 < doc.patterns.size()) {
+                j += ",";
+            }
+            j += "\n";
+        }
+        j += "  ]\n";
+    }
     j += "}\n";
     return j;
 }
@@ -937,6 +1022,17 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
         snap.name = e.doc.name;
         snap.activeId = e.doc.activeId;
         snap.globalLightAngle = e.doc.globalLightAngle;
+        for (const DocumentPattern& p : e.doc.patterns) {
+            if (p.pixels != nullptr && p.w > 0 && p.h > 0) {
+                PatternSnapshot ps;
+                ps.id = p.id;
+                ps.name = p.name;
+                ps.w = p.w;
+                ps.h = p.h;
+                ps.pixels = p.pixels;
+                snap.patterns.push_back(std::move(ps));
+            }
+        }
         for (const AlphaChannel& c : e.doc.channels) {
             if (c.mask != nullptr) {
                 ChannelSnapshot cs;
@@ -1120,6 +1216,14 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
         const ChannelSnapshot& c = snap.channels[i];
         if (!encodeGridPng(*c.mask, snap.width, snap.height,
                            "channels/" + std::to_string(i) + ".png")) {
+            close(fd);
+            return false;
+        }
+    }
+
+    // v11：文档图案 PNG（M17d，整幅 images/pattern_<id>.png）
+    for (const PatternSnapshot& p : snap.patterns) {
+        if (!encodeGridPng(*p.pixels, p.w, p.h, "images/pattern_" + p.id + ".png")) {
             close(fd);
             return false;
         }

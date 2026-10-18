@@ -59,6 +59,14 @@ export interface GuidesData {
 }
 
 /** 图层内容精确包围盒（getLayerBounds/getSelectionBounds 的 data，M15a/b；ok=false 时数值无意义）。 */
+/** M17d 文档图案（getPatterns/definePattern 的 data；样式对话框图案选择器用）。 */
+export interface PatternInfo {
+  id: string;
+  name: string;
+  w: number;
+  h: number;
+}
+
 export interface LayerBoundsData {
   ok: boolean;
   x: number;

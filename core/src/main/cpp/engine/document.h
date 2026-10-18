@@ -172,6 +172,32 @@ struct LayerAdjustment {
     float p3 = 0.0f;
 };
 
+// M17d 等高线（photocraft Contour）：效果覆盖度的传递曲线（PS「等高线」编辑器）。
+// custom=false = Linear（恒等，等价无等高线）；custom=true 时 pts 为 x,y 交错点列（0..1，
+// x 单调），corners 与点一一对应（1 = 角点：曲线在该点折角，photocraft contour_curve_lut
+// 按角点分段各自自然样条）。
+struct StyleContour {
+    bool custom = false;
+    std::vector<float> pts;        // x0,y0,x1,y1,…（0..1，长度 = 2×点数）
+    std::vector<uint8_t> corners;  // 与点一一对应（0/1）
+
+    bool operator==(const StyleContour& o) const {
+        return custom == o.custom && pts == o.pts && corners == o.corners;
+    }
+    bool operator!=(const StyleContour& o) const { return !(*this == o); }
+};
+
+// M17d 图案资源（文档级，对齐 PS「编辑 → 定义图案」产物）：图案叠加效果与（后续）图案
+// 图章/填充引用。随 Document 快照走（快照拷贝仅 id/name/w/h + shared_ptr，廉价）；变更经
+// definePattern 命令不入 History（setGlobalLight 同语义——PS 定义图案不在历史面板）。
+struct DocumentPattern {
+    std::string id;     // 稳定 id（"pat_<n>"，进程内单调；.montage v11 持久化）
+    std::string name;   // 显示名（「图案 1」）
+    uint32_t w = 0;
+    uint32_t h = 0;
+    std::shared_ptr<const TileGrid> pixels;  // 直 alpha 瓦片网格（w×h，通常单瓦片）
+};
+
 // M14c 图层样式第一批（PS 语义子集）：投影 / 描边（v1 外部）/ 颜色叠加。
 // 参数直存（角度+距离由 UI 换算 offset？——直存角度/距离保持 PS 参数语义，渲染核换算）。
 // 随 Layer 走 History 快照（COW 换指针）；渲染 = styledRender 派生网格（蒙版 composeMasked
@@ -248,6 +274,25 @@ struct LayerStyle {
     double bevelHiOpacity = 1.0;
     float bevelShColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     double bevelShOpacity = 1.0;
+    // M17d 等高线（photocraft Contour：阴影/光泽 = coverage 传递、发光 = contour(min(v/range,1))、
+    // 斜面 = 高度图轮廓 + 明暗图光泽等高线）。custom=false = Linear 恒等；Range 仅发光有
+    //（PS UI「范围」，默认 50% = photocraft Glow::default——对 v10 及以前无 Range 的文档，
+    // 读取补默认 0.5，发光渲染相对 M17a 增强为 PS 语义，登记）。
+    StyleContour shadowContour;
+    StyleContour isContour;
+    StyleContour ogContour;
+    StyleContour igContour;
+    StyleContour satinContour;      // PS 光泽「等高线」
+    StyleContour bevelContour;      // PS 斜面「等高线」（高度图轮廓，photocraft bevel_contour_lut）
+    StyleContour bevelGlossContour; // PS 斜面「光泽等高线」（明暗图传递）
+    double ogRange = 0.5;
+    double igRange = 0.5;
+    // M17d 图案叠加（photocraft FxPaint::Pattern）：图案按 ink bbox 左上锚定平铺
+    //（PS「与图层对齐」默认语义），nearest 采样 × scale；patternId 空 = 未选图案（不渲染）。
+    bool patternOverlay = false;
+    std::string patternId;
+    double poScale = 1.0;    // 0.01..10
+    double poOpacity = 1.0;  // 0..1
 };
 
 // M14c 填充图层（非破坏内容层）：无像素，渲染 = 全文档域派生网格（改参重生成）。
@@ -359,6 +404,8 @@ struct Document {
     // M17b 全局光角度（度；投影/内阴影/斜面 useGL=true 时引用。PS 文档级设置——
     // 改动经 setGlobalLight 命令全文档重样式，不走 History；.montage v10 可选持久化）
     double globalLightAngle = 120.0;
+    // M17d 图案资源（编辑 → 定义图案；不入 History，随文档替换清空；.montage v11 持久化）
+    std::vector<DocumentPattern> patterns;
 };
 
 // 视口：pan = 视口左上角的文档坐标（doc px），screen = (doc - pan) * zoom。

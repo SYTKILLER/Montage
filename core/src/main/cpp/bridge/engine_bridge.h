@@ -177,6 +177,10 @@ napi_value PasteLayerStyle(napi_env env, napi_callback_info info);
 napi_value SetLayerEffectsEnabled(napi_env env, napi_callback_info info);
 // M17b 光泽/斜面浮雕/全局光
 napi_value SetSatin(napi_env env, napi_callback_info info);
+napi_value SetStyleContour(napi_env env, napi_callback_info info);
+napi_value SetPatternOverlay(napi_env env, napi_callback_info info);
+napi_value DefinePattern(napi_env env, napi_callback_info info);
+napi_value GetPatterns(napi_env env, napi_callback_info info);
 napi_value SetBevel(napi_env env, napi_callback_info info);
 napi_value SetGlobalLight(napi_env env, napi_callback_info info);
 napi_value AddFillLayer(napi_env env, napi_callback_info info);

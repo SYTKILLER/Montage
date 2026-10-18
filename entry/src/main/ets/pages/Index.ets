@@ -4,7 +4,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
 import { window } from '@kit.ArkUI';
-import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, RawDevelopData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData } from 'core';
+import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, RawDevelopData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo } from 'core';
 import { AppPrefs, RecentProject, ThemeMode } from '../editor/AppPrefs';
 import { leafItem, MenuGroupVM, MenuItemVM, subItem, ToolVM } from '../editor/MenuModel';
 import { SWATCHES } from '../editor/components/OptionsBar';
@@ -220,6 +220,22 @@ struct Index {
   @State styBevelHiColor: string = '#FFFFFF';
   @State styBevelShOp: number = 100;
   @State styBevelShColor: string = '#000000';
+  // M17d 等高线/Range/图案叠加（对话框 last-applied 会话态；等高线编辑器共享画布）
+  @State styOgRange: number = 50;       // 发光「范围」PS 默认 50%
+  @State styIgRange: number = 50;
+  @State showContour: boolean = false;  // 等高线编辑器（独立模态，七类目标共用）
+  @State ctTarget: number = 0;          // 0=投影 1=内阴影 2=外发光 3=内发光 4=光泽 5=斜面轮廓 6=斜面光泽
+  @State ctPts: number[] = [0, 0, 1, 1];  // x,y 交错 0..1
+  @State ctCorners: number[] = [0, 0];    // 与点一一对应（1=角点）
+  @State ctRange: number = 50;
+  @State ctDrag: number = -1;
+  @State styPatternOn: boolean = false;
+  @State styPatternId: string = '';
+  @State styPatternScale: number = 100;
+  @State styPatternOp: number = 100;
+  @State patternList: PatternInfo[] = [];  // 文档图案（getPatterns 镜像）
+  private contourCtx: CanvasRenderingContext2D = new CanvasRenderingContext2D(
+    new RenderingContextSettings(true));
   @State showGlobalLight: boolean = false;
   @State globalLightAngle: number = 120;
   @State fillKind: number = 0;          // 填充层参数（活动层 isFill 时在样式对话框编辑）
@@ -2292,6 +2308,329 @@ struct Index {
     this.log(`inner glow on=${this.styInnerGlowOn}: ${ok}`);
   }
 
+  // ---------- M17d 等高线 / 图案叠加 / Range ----------
+
+  private applyPatternOverlay(): void {
+    const a = this.activeLayer();
+    if (a === undefined) {
+      return;
+    }
+    const ok = this.engine.setPatternOverlay(a.id, this.styPatternOn, this.styPatternId,
+      this.styPatternScale / 100, this.styPatternOp / 100);
+    this.log(`pattern overlay on=${this.styPatternOn}: ${ok}`);
+  }
+
+  // 发光「范围」滑条：range-only 更新（xs/ys 空数组 = 桥接约定不动点列）
+  private applyGlowRange(target: number, pct: number): void {
+    const a = this.activeLayer();
+    if (a === undefined) {
+      return;
+    }
+    const ok = this.engine.setStyleContour(a.id, target, [], [], [], pct / 100);
+    this.log(`glow range t=${target} ${Math.round(pct)}%: ${ok}`);
+  }
+
+  private openContour(target: number): void {
+    this.ctTarget = target;
+    this.ctPts = [0, 0, 1, 1];
+    this.ctCorners = [0, 0];
+    this.ctRange = target === 2 ? this.styOgRange : (target === 3 ? this.styIgRange : 50);
+    this.ctDrag = -1;
+    this.showContour = true;
+  }
+
+  private ctLabel(): string {
+    switch (this.ctTarget) {
+      case 0:
+        return '投影';
+      case 1:
+        return '内阴影';
+      case 2:
+        return '外发光';
+      case 3:
+        return '内发光';
+      case 4:
+        return '光泽';
+      case 5:
+        return '斜面轮廓';
+      default:
+        return '斜面光泽等高线';
+    }
+  }
+
+  // 自然样条二阶导（镜像 style_ops contourCurveLut：三对角追赶解 m2）
+  private ctSplineM2(xs: number[], ys: number[]): number[] {
+    const n = xs.length;
+    const m2: number[] = new Array<number>(n).fill(0);
+    if (n < 3) {
+      return m2;
+    }
+    const c: number[] = new Array<number>(n).fill(0);
+    const d: number[] = new Array<number>(n).fill(0);
+    for (let i = 1; i + 1 < n; ++i) {
+      const h0 = xs[i] - xs[i - 1];
+      const h1 = xs[i + 1] - xs[i];
+      const a = h0 / 6;
+      const b = (h0 + h1) / 3;
+      const cc = h1 / 6;
+      const r = (ys[i + 1] - ys[i]) / h1 - (ys[i] - ys[i - 1]) / h0;
+      const den = b - a * c[i - 1];
+      c[i] = cc / den;
+      d[i] = (r - a * d[i - 1]) / den;
+    }
+    for (let i = n - 2; i >= 1; --i) {
+      m2[i] = d[i] - c[i] * m2[i + 1];
+    }
+    return m2;
+  }
+
+  private ctSplineEval(xs: number[], ys: number[], x: number): number {
+    const n = xs.length;
+    if (n < 2) {
+      return x;
+    }
+    if (x <= xs[0]) {
+      return ys[0];
+    }
+    if (x >= xs[n - 1]) {
+      return ys[n - 1];
+    }
+    let i = n - 2;
+    for (let k = 0; k + 1 < n; ++k) {
+      if (x <= xs[k + 1]) {
+        i = k;
+        break;
+      }
+    }
+    const m2 = this.ctSplineM2(xs, ys);
+    const h = xs[i + 1] - xs[i];
+    const A = (xs[i + 1] - x) / h;
+    const B = (x - xs[i]) / h;
+    const y = A * ys[i] + B * ys[i + 1] +
+      ((A * A * A - A) * m2[i] + (B * B * B - B) * m2[i + 1]) * h * h / 6;
+    return Math.min(1, Math.max(0, y));
+  }
+
+  // 预览采样（镜像 buildContourLut：角点分段各自成样条，段间平台 = 前段末值）
+  private ctSample(x: number): number {
+    const n = this.ctPts.length / 2;
+    if (n < 2) {
+      return x;
+    }
+    const idx: number[] = [];
+    for (let k = 0; k < n; ++k) {
+      idx.push(k);
+    }
+    idx.sort((a: number, b: number): number => this.ctPts[a * 2] - this.ctPts[b * 2]);
+    let anyCorner = false;
+    for (const cv of this.ctCorners) {
+      if (cv !== 0) {
+        anyCorner = true;
+      }
+    }
+    if (!anyCorner) {
+      const xs: number[] = [];
+      const ys: number[] = [];
+      for (const k of idx) {
+        xs.push(this.ctPts[k * 2]);
+        ys.push(this.ctPts[k * 2 + 1]);
+      }
+      return this.ctSplineEval(xs, ys, x);
+    }
+    let start = 0;
+    const segs: number[][] = [];
+    for (let i = 1; i < idx.length; ++i) {
+      const ci = idx[i];
+      const isCorner = ci < this.ctCorners.length && this.ctCorners[ci] !== 0;
+      if (isCorner || i === idx.length - 1) {
+        const seg: number[] = [];
+        for (let j = start; j <= i; ++j) {
+          seg.push(this.ctPts[idx[j] * 2]);
+          seg.push(this.ctPts[idx[j] * 2 + 1]);
+        }
+        segs.push(seg);
+        start = i;
+      }
+    }
+    let prevEndY = 0;
+    for (const g of segs) {
+      const m = g.length / 2;
+      if (x < g[0]) {
+        return prevEndY;
+      }
+      if (x <= g[(m - 1) * 2]) {
+        const xs: number[] = [];
+        const ys: number[] = [];
+        for (let k = 0; k < m; ++k) {
+          xs.push(g[k * 2]);
+          ys.push(g[k * 2 + 1]);
+        }
+        return this.ctSplineEval(xs, ys, x);
+      }
+      prevEndY = g[(m - 1) * 2 + 1];
+    }
+    return prevEndY;
+  }
+
+  private drawContour(): void {
+    const c = this.contourCtx;
+    const P = 12;
+    const SZ = 120;
+    c.clearRect(0, 0, 220, 150);
+    c.strokeStyle = '#333333';
+    c.lineWidth = 1;
+    for (let i = 0; i <= 4; ++i) {
+      const p = P + SZ * i / 4;
+      c.beginPath();
+      c.moveTo(p, P);
+      c.lineTo(p, P + SZ);
+      c.stroke();
+      c.beginPath();
+      c.moveTo(P, p);
+      c.lineTo(P + SZ, p);
+      c.stroke();
+    }
+    c.strokeStyle = '#555555';
+    c.beginPath();
+    c.moveTo(P, P + SZ);
+    c.lineTo(P + SZ, P);
+    c.stroke();
+    c.strokeStyle = '#00E5FF';
+    c.lineWidth = 2;
+    c.beginPath();
+    for (let i = 0; i <= 64; ++i) {
+      const x = i / 64;
+      const y = this.ctSample(x);
+      const cx = P + x * SZ;
+      const cy = P + (1 - y) * SZ;
+      if (i === 0) {
+        c.moveTo(cx, cy);
+      } else {
+        c.lineTo(cx, cy);
+      }
+    }
+    c.stroke();
+    const n = this.ctPts.length / 2;
+    for (let k = 0; k < n; ++k) {
+      const px = P + this.ctPts[k * 2] * SZ;
+      const py = P + (1 - this.ctPts[k * 2 + 1]) * SZ;
+      const corner = k < this.ctCorners.length && this.ctCorners[k] !== 0;
+      if (k === this.ctDrag) {
+        c.fillStyle = '#FFB300';
+      } else {
+        c.fillStyle = '#FFFFFF';
+      }
+      if (corner) {
+        c.fillRect(px - 4, py - 4, 8, 8);
+      } else {
+        c.beginPath();
+        c.arc(px, py, 4.5, 0, 6.283);
+        c.fill();
+      }
+    }
+  }
+
+  private ctTouch(e: TouchEvent): void {
+    if (e.touches.length < 1 && e.changedTouches.length < 1) {
+      return;
+    }
+    const t: TouchObject = e.changedTouches.length > 0 ? e.changedTouches[0] : e.touches[0];
+    const P = 12;
+    const SZ = 120;
+    if (e.type === TouchType.Down) {
+      let hit = -1;
+      let best = 14;
+      for (let k = 0; k < this.ctPts.length / 2; ++k) {
+        const d = Math.hypot(P + this.ctPts[k * 2] * SZ - t.x,
+          P + (1 - this.ctPts[k * 2 + 1]) * SZ - t.y);
+        if (d < best) {
+          best = d;
+          hit = k;
+        }
+      }
+      if (hit >= 0) {
+        this.ctDrag = hit;
+      } else {
+        const x = Math.min(1, Math.max(0, (t.x - P) / SZ));
+        const y = Math.min(1, Math.max(0, 1 - (t.y - P) / SZ));
+        let ins = this.ctPts.length / 2;
+        for (let k = 0; k < this.ctPts.length / 2; ++k) {
+          if (this.ctPts[k * 2] > x) {
+            ins = k;
+            break;
+          }
+        }
+        this.ctPts.splice(ins * 2, 0, x, y);
+        this.ctCorners.splice(ins, 0, 0);
+        this.ctDrag = ins;
+        this.ctCommit();
+        this.drawContour();
+      }
+      this.drawContour();
+    } else if (e.type === TouchType.Move && this.ctDrag >= 0) {
+      const x = Math.min(1, Math.max(0, (t.x - P) / SZ));
+      const y = Math.min(1, Math.max(0, 1 - (t.y - P) / SZ));
+      let nx = x;
+      if (this.ctDrag > 0) {
+        nx = Math.max(this.ctPts[(this.ctDrag - 1) * 2] + 0.02, nx);
+      }
+      if (this.ctDrag < this.ctPts.length / 2 - 1) {
+        nx = Math.min(this.ctPts[(this.ctDrag + 1) * 2] - 0.02, nx);
+      }
+      this.ctPts[this.ctDrag * 2] = nx;
+      this.ctPts[this.ctDrag * 2 + 1] = y;
+      this.drawContour();
+    } else if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.ctDrag >= 0) {
+      this.ctDrag = -1;
+      this.ctCommit();
+      this.drawContour();
+    }
+  }
+
+  private ctCommit(): void {
+    const a = this.activeLayer();
+    if (a === undefined) {
+      return;
+    }
+    const xs: number[] = [];
+    const ys: number[] = [];
+    for (let k = 0; k < this.ctPts.length / 2; ++k) {
+      xs.push(this.ctPts[k * 2]);
+      ys.push(this.ctPts[k * 2 + 1]);
+    }
+    const ok = this.engine.setStyleContour(a.id, this.ctTarget, xs, ys,
+      this.ctCorners.slice(), this.ctRange / 100);
+    this.log(`contour t=${this.ctTarget} pts=${xs.length}: ${ok}`);
+  }
+
+  private ctToggleCorner(): void {
+    if (this.ctDrag < 0 || this.ctDrag >= this.ctCorners.length) {
+      return;
+    }
+    this.ctCorners[this.ctDrag] = this.ctCorners[this.ctDrag] !== 0 ? 0 : 1;
+    this.ctCommit();
+    this.drawContour();
+  }
+
+  private ctDeletePoint(): void {
+    if (this.ctDrag < 0 || this.ctPts.length / 2 <= 2) {
+      return;
+    }
+    this.ctPts.splice(this.ctDrag * 2, 2);
+    this.ctCorners.splice(this.ctDrag, 1);
+    this.ctDrag = -1;
+    this.ctCommit();
+    this.drawContour();
+  }
+
+  private ctResetLinear(): void {
+    this.ctPts = [0, 0, 1, 1];
+    this.ctCorners = [0, 0];
+    this.ctDrag = -1;
+    this.ctCommit();
+    this.drawContour();
+  }
+
   private applyGradientOverlay(): void {
     const a = this.activeLayer();
     if (a === undefined) {
@@ -2601,6 +2940,7 @@ struct Index {
         break;
       }
       case 'layer.style': {
+        this.patternList = this.engine.getPatterns();  // M17d：图案选择器数据
         this.showStyle = true;
         break;
       }
@@ -2826,6 +3166,17 @@ struct Index {
           this.toast('需要先建立选区');
         }
         break;
+      case 'edit.definePattern': {
+        const p = this.engine.definePattern();
+        if (p !== null) {
+          this.patternList = this.engine.getPatterns();
+          this.toast(`已定义 ${p.name}`);
+          this.log(`定义图案: ${p.id} ${p.w}x${p.h}`);
+        } else {
+          this.toast('定义图案失败（需要选区与活动层像素）');
+        }
+        break;
+      }
       case 'image.rotate90cw':
         this.docOp((): boolean => this.engine.rotateDocument90(true), '旋转 90° 顺时针');
         break;
@@ -3263,6 +3614,7 @@ struct Index {
       leafItem('edit.clear', '清除', '', d && this.hasSelectionFlag),
       leafItem('edit.fill', '填充…', 'Shift+F5', d),
       leafItem('edit.stroke', '描边…', '', d && this.hasSelectionFlag),
+      leafItem('edit.definePattern', '定义图案', '', d && this.hasSelectionFlag),
     ];
     const imageMenu: MenuItemVM[] = [
       leafItem('image.canvasSize', '画布大小…', '', d),
@@ -3509,7 +3861,7 @@ struct Index {
       return;
     }
     // 对话框打开时：Esc 关闭，其余不抢
-    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform || this.showModify || this.showStoreSel || this.showLoadSel || this.showFill || this.showStyle || this.showFilter || this.showDevelop || this.showGlobalLight) {
+    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform || this.showModify || this.showStoreSel || this.showLoadSel || this.showFill || this.showStyle || this.showFilter || this.showDevelop || this.showGlobalLight || this.showContour) {
       if (e.keyCode === KC_ESC) {
         this.showTransform = false;
         this.showExport = false;
@@ -3526,6 +3878,7 @@ struct Index {
         this.showFill = false;
         this.showStyle = false;
         this.showGlobalLight = false;
+        this.showContour = false;
         this.cancelFilterDialog();
       }
       return;
@@ -4865,6 +5218,67 @@ struct Index {
             .border({ width: 1, color: $r('app.color.border') }).width(400)
         }.width('100%').height('100%')
       }
+      if (this.showContour) {
+        Stack() {
+          Column().width('100%').height('100%').backgroundColor('#66000000')
+            .onClick((): void => { this.showContour = false; })
+          Column({ space: 12 }) {
+            Text(`等高线 · ${this.ctLabel()}`).fontSize(16).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+            Canvas(this.contourCtx)
+              .width(220).height(150)
+              .onReady((): void => this.drawContour())
+              .onTouch((e: TouchEvent): void => this.ctTouch(e))
+            Text('拖点调整 · 空白单击加点 · 选中后「角点」切换折角')
+              .fontSize(10).fontColor($r('app.color.text_secondary'))
+            Row({ space: 8 }) {
+              Button('线性').fontSize(12).height(32)
+                .backgroundColor($r('app.color.surface'))
+                .fontColor($r('app.color.text_primary'))
+                .border({ width: 1, color: $r('app.color.border') })
+                .onClick((): void => { this.ctResetLinear(); })
+              Button('角点').fontSize(12).height(32)
+                .backgroundColor($r('app.color.surface'))
+                .fontColor($r('app.color.text_primary'))
+                .border({ width: 1, color: $r('app.color.border') })
+                .onClick((): void => { this.ctToggleCorner(); })
+              Button('删除点').fontSize(12).height(32)
+                .backgroundColor($r('app.color.surface'))
+                .fontColor($r('app.color.danger'))
+                .border({ width: 1, color: $r('app.color.border') })
+                .onClick((): void => { this.ctDeletePoint(); })
+            }
+            if (this.ctTarget === 2 || this.ctTarget === 3) {
+              Row({ space: 10 }) {
+                Text('范围').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                Slider({ value: this.ctRange, min: 1, max: 100, step: 1 })
+                  .layoutWeight(1)
+                  .onChange((v: number, mode: SliderChangeMode): void => {
+                    if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                      this.ctRange = v;
+                      if (this.ctTarget === 2) {
+                        this.styOgRange = v;
+                      } else if (this.ctTarget === 3) {
+                        this.styIgRange = v;
+                      }
+                      this.ctCommit();
+                      this.drawContour();
+                    }
+                  })
+                Text(`${Math.round(this.ctRange)}%`).fontSize(12).width(44)
+                  .textAlign(TextAlign.End).fontColor($r('app.color.text_primary'))
+              }
+            }
+            Row({ space: 12 }) {
+              Button('关闭').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.accent'))
+                .fontColor($r('app.color.on_accent'))
+                .onClick((): void => { this.showContour = false; })
+            }.justifyContent(FlexAlign.End).width('100%')
+          }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
+            .border({ width: 1, color: $r('app.color.border') }).width(400)
+        }.width('100%').height('100%')
+      }
       if (this.showFill) {
         Stack() {
           Column().width('100%').height('100%').backgroundColor('#66000000')
@@ -5052,6 +5466,15 @@ struct Index {
                     .fontColor($r('app.color.text_primary'))
                 }.width('100%')
                 Row({ space: 6 }) {
+                  Text('等高线').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Blank()
+                  Button('编辑…').fontSize(11).height(24)
+                    .backgroundColor($r('app.color.surface'))
+                    .fontColor($r('app.color.accent'))
+                    .border({ width: 1, color: $r('app.color.border') })
+                    .onClick((): void => { this.openContour(0); })
+                }.width('100%')
+                Row({ space: 6 }) {
                   Text('颜色').fontSize(12).fontColor($r('app.color.text_secondary'))
                   ForEach(SWATCHES, (sw: string) => {
                     Column()
@@ -5235,6 +5658,15 @@ struct Index {
                     .fontColor($r('app.color.text_primary'))
                 }.width('100%')
                 Row({ space: 6 }) {
+                  Text('等高线').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Blank()
+                  Button('编辑…').fontSize(11).height(24)
+                    .backgroundColor($r('app.color.surface'))
+                    .fontColor($r('app.color.accent'))
+                    .border({ width: 1, color: $r('app.color.border') })
+                    .onClick((): void => { this.openContour(1); })
+                }.width('100%')
+                Row({ space: 6 }) {
                   Text('颜色').fontSize(12).fontColor($r('app.color.text_secondary'))
                   ForEach(SWATCHES, (sw: string) => {
                     Column()
@@ -5302,6 +5734,28 @@ struct Index {
                     .fontColor($r('app.color.text_primary'))
                 }.width('100%')
                 Row({ space: 6 }) {
+                  Text('范围').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styOgRange, min: 1, max: 100, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styOgRange = v;
+                        this.applyGlowRange(2, v);
+                      }
+                    })
+                  Text(`${Math.round(this.styOgRange)}%`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('等高线').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Blank()
+                  Button('编辑…').fontSize(11).height(24)
+                    .backgroundColor($r('app.color.surface'))
+                    .fontColor($r('app.color.accent'))
+                    .border({ width: 1, color: $r('app.color.border') })
+                    .onClick((): void => { this.openContour(2); })
+                }.width('100%')
+                Row({ space: 6 }) {
                   Text('颜色').fontSize(12).fontColor($r('app.color.text_secondary'))
                   ForEach(SWATCHES, (sw: string) => {
                     Column()
@@ -5366,6 +5820,28 @@ struct Index {
                     })
                   Text(`${Math.round(this.styIgOp)}%`).fontSize(11).width(36)
                     .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('范围').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styIgRange, min: 1, max: 100, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styIgRange = v;
+                        this.applyGlowRange(3, v);
+                      }
+                    })
+                  Text(`${Math.round(this.styIgRange)}%`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('等高线').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Blank()
+                  Button('编辑…').fontSize(11).height(24)
+                    .backgroundColor($r('app.color.surface'))
+                    .fontColor($r('app.color.accent'))
+                    .border({ width: 1, color: $r('app.color.border') })
+                    .onClick((): void => { this.openContour(3); })
                 }.width('100%')
                 Row({ space: 6 }) {
                   Text('颜色').fontSize(12).fontColor($r('app.color.text_secondary'))
@@ -5522,6 +5998,15 @@ struct Index {
                     .fontColor($r('app.color.text_primary'))
                 }.width('100%')
                 Row({ space: 6 }) {
+                  Text('等高线').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Blank()
+                  Button('编辑…').fontSize(11).height(24)
+                    .backgroundColor($r('app.color.surface'))
+                    .fontColor($r('app.color.accent'))
+                    .border({ width: 1, color: $r('app.color.border') })
+                    .onClick((): void => { this.openContour(4); })
+                }.width('100%')
+                Row({ space: 6 }) {
                   Text('颜色').fontSize(12).fontColor($r('app.color.text_secondary'))
                   ForEach(SWATCHES, (sw: string) => {
                     Column()
@@ -5664,6 +6149,90 @@ struct Index {
                       })
                       .onClick((): void => { this.styBevelShColor = sw; this.applyBevel(); })
                   }, (sw: string): string => sw)
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('等高线').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Blank()
+                  Button('编辑…').fontSize(11).height(24)
+                    .backgroundColor($r('app.color.surface'))
+                    .fontColor($r('app.color.accent'))
+                    .border({ width: 1, color: $r('app.color.border') })
+                    .onClick((): void => { this.openContour(5); })
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('等高线').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Blank()
+                  Button('编辑…').fontSize(11).height(24)
+                    .backgroundColor($r('app.color.surface'))
+                    .fontColor($r('app.color.accent'))
+                    .border({ width: 1, color: $r('app.color.border') })
+                    .onClick((): void => { this.openContour(6); })
+                }.width('100%')
+              }
+              .width('100%').padding(10).borderRadius(8)
+              .backgroundColor($r('app.color.surface'))
+              .border({ width: 1, color: $r('app.color.border') })
+              // M17d 图案叠加（图案来源 = 编辑菜单「定义图案」；渲染序 = 渐变后颜色叠加前）
+              Column({ space: 6 }) {
+                Row({ space: 8 }) {
+                  Toggle({ type: ToggleType.Checkbox, isOn: this.styPatternOn })
+                    .onChange((on: boolean): void => {
+                      this.styPatternOn = on;
+                      this.applyPatternOverlay();
+                    })
+                  Text('图案叠加').fontSize(13).fontColor($r('app.color.text_primary'))
+                }
+                Row({ space: 6 }) {
+                  Text('图案').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  if (this.patternList.length === 0) {
+                    Text('无图案：编辑菜单 → 定义图案').fontSize(11)
+                      .fontColor($r('app.color.text_secondary'))
+                  } else {
+                    Flex({ wrap: FlexWrap.Wrap }) {
+                      ForEach(this.patternList, (pt: PatternInfo) => {
+                        Text(pt.name)
+                          .fontSize(10)
+                          .fontColor(this.styPatternId === pt.id
+                            ? $r('app.color.on_accent') : $r('app.color.text_primary'))
+                          .backgroundColor(this.styPatternId === pt.id
+                            ? $r('app.color.accent') : $r('app.color.surface'))
+                          .borderRadius(6)
+                          .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+                          .margin(2)
+                          .onClick((): void => {
+                            this.styPatternId = pt.id;
+                            this.styPatternOn = true;
+                            this.applyPatternOverlay();
+                          })
+                      }, (pt: PatternInfo): string => pt.id)
+                    }.layoutWeight(1)
+                  }
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('缩放').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styPatternScale, min: 25, max: 500, step: 5 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styPatternScale = v;
+                        this.applyPatternOverlay();
+                      }
+                    })
+                  Text(`${Math.round(this.styPatternScale)}%`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                Row({ space: 6 }) {
+                  Text('不透明度').fontSize(12).fontColor($r('app.color.text_secondary'))
+                  Slider({ value: this.styPatternOp, min: 0, max: 100, step: 1 })
+                    .layoutWeight(1).height(24)
+                    .onChange((v: number, mode: SliderChangeMode): void => {
+                      if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                        this.styPatternOp = v;
+                        this.applyPatternOverlay();
+                      }
+                    })
+                  Text(`${Math.round(this.styPatternOp)}%`).fontSize(11).width(36)
+                    .fontColor($r('app.color.text_primary'))
                 }.width('100%')
               }
               .width('100%').padding(10).borderRadius(8)

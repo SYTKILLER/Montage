@@ -138,6 +138,8 @@ class Engine {
     // M4a 撤销
     History history;
     std::atomic<uint32_t> historyVersion{0};
+    // M17d 图案 id 计数（definePattern 锁内单调发号；openProject 按包内最大后缀回填防撞号）
+    uint64_t patternSeq = 0;
 
     // 渲染帧快照携带的笔画瓦片（docMutex 内拷贝，避免渲染线程跨锁悬挂）。
     // 修复①（对拍 Compositor identity 去重）：tiles 只带自上帧以来 workRev_ 变化的瓦片，
