@@ -140,6 +140,24 @@ export interface LayerDTO {
   textY: number;
   textW: number;       // 最近栅格化像素尺寸（空内容 = 0）
   textH: number;
+  // M18 形状层字段（非形状层为常量缺省）
+  isShape: boolean;
+  shapeLiveKind: number;  // 0=None 1=Rect 2=Ellipse 3=Polygon 4=Line
+  shapeRect: number[];    // [x,y,w,h]
+  shapeRadii: number[];   // [tl,tr,br,bl]
+  shapeSides: number;
+  shapeStar: number;
+  shapeFrom: number[];    // [x,y]（Line）
+  shapeTo: number[];
+  shapeWeight: number;
+  shapeFillKind: number;  // 0=无 1=纯色
+  shapeFill: string;      // #AARRGGBB
+  shapeStrokeOn: boolean;
+  shapeStrokeColor: string;
+  shapeStrokeWidth: number;
+  // M18d 矢量蒙版
+  hasVectorMask: boolean;
+  vectorMaskOn: boolean;
   thumbToken: number;
 }
 

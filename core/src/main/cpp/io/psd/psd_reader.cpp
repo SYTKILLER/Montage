@@ -158,6 +158,125 @@ struct RawLayer {
     std::vector<std::string> skippedFx;
 };
 
+// ---- M18d PSD 路径记录（photocraft psd/path.rs 对拍，MIT OR Apache-2.0） ----
+// 26 字节/记录：u16 selector + 24B 数据；knot 坐标 = 有符号 8.24 定点（先 y 后 x），
+// 为文档宽高的分数。length 记录 data[2..4] = 路径运算（-1/1 combine、2 subtract、
+// 3 intersect、0 exclude——psd-tools 非公开语义）。
+constexpr uint32_t kPsdPathRecordLen = 26;
+
+inline double psdFixed24(const uint8_t* b) {
+    const int32_t v = (static_cast<int32_t>(b[0]) << 24) | (static_cast<int32_t>(b[1]) << 16) |
+                      (static_cast<int32_t>(b[2]) << 8) | static_cast<int32_t>(b[3]);
+    return static_cast<double>(v) / 16777216.0;
+}
+
+// 记录列表 → 子路径（宽松：无 length 记录的 knot 延续前一子路径）。layerSemantics =
+// vmsk 读法（photocraft layer_path_from_records）：首子路径 subtract → inverted，
+// 其余运算取补对偶（combine↔subtract）；否则资源读法（initial_fill = inverted）。
+static bool pathFromPsdRecords(const std::vector<uint8_t>& data, uint32_t w, uint32_t h,
+                               bool layerSemantics, VectorPath& out) {
+    out = VectorPath{};
+    const size_t n = data.size() / kPsdPathRecordLen;
+    if (n > 4000000) {
+        return false;
+    }
+    bool initialFill = false;
+    struct RawSub {
+        bool closed = false;
+        int32_t op = 1;
+        struct RawKnot {
+            bool linked = false;
+            double pre[2] = {0, 0};
+            double anchor[2] = {0, 0};
+            double post[2] = {0, 0};
+        };
+        std::vector<RawKnot> knots;
+    };
+    std::vector<RawSub> subs;
+    size_t remaining = 0;
+    auto knotSel = [](uint16_t sel) { return sel == 1 || sel == 2 || sel == 4 || sel == 5; };
+    for (size_t i = 0; i < n; i++) {
+        const uint8_t* r = data.data() + i * kPsdPathRecordLen;
+        const uint16_t sel = static_cast<uint16_t>((r[0] << 8) | r[1]);
+        if (sel == 0 || sel == 3) {  // closed/open length
+            RawSub sub;
+            sub.closed = sel == 0;
+            sub.op = static_cast<int16_t>(static_cast<uint16_t>((r[4] << 8) | r[5]));
+            remaining = static_cast<size_t>((r[2] << 8) | r[3]);
+            subs.push_back(std::move(sub));
+        } else if (knotSel(sel)) {
+            const bool closed = sel <= 2;
+            if (remaining == 0 && (subs.empty() || subs.back().closed != closed)) {
+                RawSub sub;
+                sub.closed = closed;
+                sub.op = -1;
+                subs.push_back(std::move(sub));
+            }
+            if (remaining > 0) {
+                remaining--;
+            }
+            if (subs.empty()) {
+                continue;
+            }
+            RawSub::RawKnot k;
+            k.linked = sel == 1 || sel == 4;
+            // 先 y 后 x：pt(i) = (fixed(i*8+4), fixed(i*8))——x 在每对第二个
+            const auto pt = [&r](int idx, double* out) {
+                out[0] = psdFixed24(r + 2 + idx * 8 + 4);  // x
+                out[1] = psdFixed24(r + 2 + idx * 8);      // y
+            };
+            pt(0, k.pre);
+            pt(1, k.anchor);
+            pt(2, k.post);
+            subs.back().knots.push_back(k);
+        } else if (sel == 8) {  // initial fill
+            initialFill = (r[2] | (r[3] << 8)) != 0;
+        }
+        // selector 6/7（fill rule/clipboard）忽略
+    }
+    const double fw = static_cast<double>(w > 0 ? w : 1);
+    const double fh = static_cast<double>(h > 0 ? h : 1);
+    bool inverted = false;
+    for (size_t i = 0; i < subs.size(); i++) {
+        if (subs[i].knots.empty()) {
+            continue;
+        }
+        PathOp op = PathOp::Combine;
+        switch (subs[i].op) {
+            case 0: op = PathOp::Exclude; break;
+            case 2: op = PathOp::Subtract; break;
+            case 3: op = PathOp::Intersect; break;
+            case -1: op = PathOp::Join; break;
+            default: op = PathOp::Combine; break;
+        }
+        if (layerSemantics && i == 0 && op == PathOp::Subtract) {
+            // vmsk：首分量 subtract = 从全画布起步（模型 inverted + 补对偶）
+            inverted = true;
+            op = PathOp::Combine;
+        } else if (layerSemantics && inverted && op == PathOp::Combine && i > 0) {
+            op = PathOp::Subtract;
+        } else if (layerSemantics && inverted && op == PathOp::Subtract && i > 0) {
+            op = PathOp::Combine;
+        }
+        Subpath sp;
+        sp.closed = subs[i].closed;
+        sp.op = op;
+        for (const auto& k : subs[i].knots) {
+            Knot kn;
+            kn.anchor = vpt(k.anchor[0] * fw, k.anchor[1] * fh);
+            kn.inCtrl = vpt(k.pre[0] * fw, k.pre[1] * fh);
+            kn.outCtrl = vpt(k.post[0] * fw, k.post[1] * fh);
+            kn.smooth = k.linked;
+            sp.knots.push_back(kn);
+        }
+        out.subpaths.push_back(std::move(sp));
+    }
+    if (!layerSemantics) {
+        out.inverted = initialFill;
+    }
+    return !out.subpaths.empty() || initialFill;
+}
+
 bool readRecord(Cursor& c, bool isPSB, RawLayer& layer, std::string& err) {
     int32_t v = 0;
     if (!c.i32(&v)) { err = "truncated"; return false; }
@@ -656,6 +775,8 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
     if (!c.u32(&colorModeLen)) { err = "truncated"; return false; }
     if (!c.skip(colorModeLen)) { err = "truncated"; return false; }
 
+
+
     // image resources（取 1005 分辨率）
     uint32_t resourcesLength = 0;
     if (!c.u32(&resourcesLength)) { err = "truncated"; return false; }
@@ -672,6 +793,23 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
         uint32_t len = 0;
         if (!c.u32(&len)) { err = "truncated"; return false; }
         const uint64_t dataStart = c.offset;
+        if ((id == 1025 || (id >= 2000 && id <= 2997)) && len >= 26 && len <= 16u * 1024 * 1024) {
+            // M18d：路径资源（1025 = 工作路径、2000–2997 = 保存路径）
+            std::vector<uint8_t> pdata(static_cast<size_t>(len));
+            if (c.bytes(pdata.data(), static_cast<size_t>(len))) {
+                VectorPath vp;
+                if (pathFromPsdRecords(pdata, w, h, false, vp)) {  // 局部 w/h：out.width 在图层段后才赋值
+                    if (id == 1025) {
+                        out.workPath = std::move(vp);
+                    } else {
+                        NamedPathEntry entry;
+                        entry.name = "路径 " + std::to_string(out.paths.size() + 1);
+                        entry.path = std::move(vp);
+                        out.paths.push_back(std::move(entry));
+                    }
+                }
+            }
+        }
         if (id == 1005 && len >= 4) {
             uint32_t fixed = 0;
             if (!c.u32(&fixed)) { err = "truncated"; return false; }
@@ -861,6 +999,35 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
         rec.name = layer.name;
         rec.hasStyle = layer.hasStyle;   // M17c：lrFX 效果
         rec.style = layer.style;
+        // M18d：vmsk/vsms 矢量蒙版（u32 version=3 + u32 flags(bit0 invert/1 not-linked/2
+        // disabled) + 路径记录；vmsk 读法 = 首子路径 subtract → inverted + 补对偶）
+        for (const char* vk : {"vmsk", "vsms"}) {
+            auto it = layer.extra.find(vk);
+            if (it == layer.extra.end() || it->second.size() < 8) {
+                continue;
+            }
+            const std::vector<uint8_t>& d = it->second;
+            const uint32_t flags = (static_cast<uint32_t>(d[4]) << 24) | (static_cast<uint32_t>(d[5]) << 16) |
+                                   (static_cast<uint32_t>(d[6]) << 8) | static_cast<uint32_t>(d[7]);
+            VectorPath vp;
+            std::vector<uint8_t> records(d.begin() + 8, d.end());
+            if (pathFromPsdRecords(records, static_cast<uint32_t>(out.width),
+                                   static_cast<uint32_t>(out.height), true, vp)) {
+                auto vmk = std::make_shared<VectorMaskData>();
+                vmk->path = std::move(vp);
+                vmk->path.inverted = vmk->path.inverted || (flags & 1u) != 0;
+                vmk->enabled = (flags & 4u) == 0;
+                vmk->linked = (flags & 2u) == 0;
+                rec.vectorMask = std::move(vmk);
+            } else if ((flags & 1u) != 0) {
+                // 无子路径 + invert = 反转全显（PS 初始填充语义）
+                auto vmk = std::make_shared<VectorMaskData>();
+                vmk->path.inverted = true;
+                vmk->enabled = (flags & 4u) == 0;
+                rec.vectorMask = std::move(vmk);
+            }
+            break;
+        }
         for (const std::string& k : layer.skippedFx) {
             if (k == "lfx2-only") {
                 rec.notes.push_back("Layer effects in lfx2 format only were skipped.");

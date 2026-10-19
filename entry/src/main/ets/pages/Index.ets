@@ -22,6 +22,7 @@ import { FILTER_CATALOG, FilterDef, FilterParamDef } from '../editor/FilterCatal
 import { TextPanel } from '../editor/components/TextPanel';
 import { ABOUT_TEXT, InfoDialog, SHORTCUT_ROWS } from '../editor/components/InfoDialog';
 import { RulerStrip, GridGuidesOverlay, RULER_BG, RULER_VP } from '../editor/components/ViewOverlays';
+import { PathsPanel } from '../editor/components/PathsPanel';
 import { HistoryPanel } from '../editor/components/HistoryPanel';
 import { HistogramPanel } from '../editor/components/HistogramPanel';
 import { InfoPanel } from '../editor/components/InfoPanel';
@@ -91,6 +92,7 @@ const KC_J: number = 2026;   // KEYCODE_J（A=2017 起序列；KC_X=2040/KC_G=20
 const KC_T_KEY: number = 2036;
 const KC_U: number = 2037;  // KEYCODE_U（SDK 核验，2026-10-11）
 const KC_R: number = 2034;  // KEYCODE_R（SDK 核验，2026-10-11；KC_O=2031 见上）
+const KC_P: number = 2032;  // KEYCODE_P（M18 钢笔工具，PS 惯例）
 const KC_X_KEY: number = 2040;
 const KC_ENTER: number = 2054;
 const KC_UP: number = 2012;
@@ -263,7 +265,13 @@ struct Index {
   @State shapeStroke: boolean = false;
   @State shapeStrokeWidth: number = 4;
   @State shapePreview: number[] | null = null;  // 非空 = 拖拽中
+  @State shapeLiveRadius: number = 0;   // M18：活动 live 矩形圆角（0 = 无 live 矩形活动层）
   private shapeDragging: boolean = false;
+  // M18c 钢笔工具：进行中锚点（文档域扁平 [x,y,…]）+ 闭合标志 + 已闭合提交缓存
+  @State penPoints: number[] = [];
+  @State penClosed: boolean = false;
+  @State workPathNonEmpty: number = 0;  // M18：菜单使能镜像（引擎工作路径非空）
+  @State hasCustomShapes: boolean = false;  // M18：自定义形状库非空
   private shapeStartDocX: number = 0;
   private shapeStartDocY: number = 0;
   @State cloneAligned: boolean = true;   // M11d 仿制图章对齐开关
@@ -714,6 +722,9 @@ struct Index {
     if (active !== undefined) {
       this.blendSel = active.blendMode;
       this.layerOpacity = Math.round(active.opacity * 100);
+      // M18：活动形状层 live 圆角镜像（撤销/换层后回退；非 live 矩形 = 0 隐藏滑条）
+      this.shapeLiveRadius = (active.isShape && active.shapeLiveKind === 1) ? active.shapeRadii[0] : 0;
+      this.hasCustomShapes = this.engine.getCustomShapes().length > 0;
       this.adjBlack = Math.round(active.adjBlack * 255);
       this.adjWhite = Math.round(active.adjWhite * 255);
       this.adjGamma = active.adjGamma;
@@ -1003,6 +1014,9 @@ struct Index {
         break;
       case 'shape':
         this.shapeTouch(e, docX, docY);
+        break;
+      case 'pen':
+        this.penTouch(e, docX, docY);
         break;
       case 'text':
         this.textTouch(e, docX, docY);
@@ -1308,11 +1322,151 @@ struct Index {
         this.toast('拖拽过短');
         return;
       }
-      const ok = this.engine.rasterizeShape(this.shapeKind, this.shapeStartDocX,
-        this.shapeStartDocY, docX, docY,
-        this.shapeKind === 1 ? Math.min(w, h) * 0.25 : 0,
-        this.shapeFill, this.shapeStroke, this.shapeStrokeWidth);
-      this.log(`形状(${this.shapeKindLabel()}): ${ok ? '已绘制' : '失败'}`);
+      // M18：形状工具默认建形状层（非破坏矢量；live 可再编辑）
+      const f = this.hexToRgb(this.brushColor);
+      const b = this.hexToRgb(this.bgColor);
+      const kind = this.engineShapeKind();  // 1=Rect 2=Ellipse 3=Polygon 4=Line
+      const radius = this.shapeKind === 1 ? Math.min(w, h) * 0.25 : 0;
+      const sides = this.shapeKind === 4 ? 5 : 6;
+      const star = this.shapeKind === 4 ? 0.5 : 1.0;
+      const weight = Math.max(4, this.shapeStrokeWidth);
+      const newId = this.engine.createShapeLayer(kind, this.shapeStartDocX,
+        this.shapeStartDocY, docX, docY, radius, sides, star, weight,
+        this.shapeFill ? 1 : 0, f[0], f[1], f[2], 1.0,
+        this.shapeStroke ? 1 : 0, b[0], b[1], b[2], 1.0, this.shapeStrokeWidth);
+      this.log(`形状层(${this.shapeKindLabel()}): ${newId > 0 ? `已创建 #${newId}` : '失败'}`);
+      if (newId > 0) {
+        this.refreshLayers();
+      }
+    }
+  }
+
+  /** M18：live 矩形圆角再编辑（选项条滑条；一步撤销）。 */
+  private applyShapeRadius(v: number): void {
+    const a = this.activeLayer();
+    if (a === undefined || !a.isShape || a.shapeLiveKind !== 1) {
+      return;
+    }
+    const x0 = a.shapeRect[0];
+    const y0 = a.shapeRect[1];
+    const ok = this.engine.setShapeLive(a.id, 1, x0, y0, x0 + a.shapeRect[2], y0 + a.shapeRect[3],
+      Math.max(0, v), a.shapeSides, a.shapeStar, a.shapeWeight);
+    this.log(`圆角=${v.toFixed(0)}: ${ok ? '已更新' : '失败'}`);
+  }
+
+  // ---------- M18c 钢笔工具 ----------
+
+  // 点击加角点锚点；点击首锚点附近闭合；选项条按钮提交（成形状层/存为路径/取消）
+  private penTouch(e: TouchEvent, docX: number, docY: number): void {
+    if (e.type !== TouchType.Down) {
+      return;
+    }
+    if (this.penClosed) {
+      return;  // 已闭合待提交
+    }
+    const k = this.pxPerVp();
+    const tol = 12 / this.zoom * k / this.zoom;  // 视口 12vp 对应文档距离
+    const n = this.penPoints.length;
+    if (n >= 6) {
+      const dx = docX - this.penPoints[0];
+      const dy = docY - this.penPoints[1];
+      if (Math.sqrt(dx * dx + dy * dy) <= 12 * k / this.zoom) {
+        this.penClosed = true;
+        this.pushWorkPath();
+        this.log(`钢笔: 路径已闭合（${n / 2} 锚点）`);
+        return;
+      }
+    }
+    this.penPoints.push(docX);
+    this.penPoints.push(docY);
+    this.pushWorkPath();
+  }
+
+  /** 进行中锚点 → 引擎工作路径（扁平 op 格式；会话态无历史事务）。 */
+  private pushWorkPath(): void {
+    const n = this.penPoints.length / 2;
+    if (n === 0) {
+      this.engine.setWorkPath([]);
+      this.workPathNonEmpty = 0;
+      return;
+    }
+    const flat: number[] = [1, this.penClosed ? 1 : 0, 0, n];
+    for (let i = 0; i + 1 < this.penPoints.length; i += 2) {
+      const x = this.penPoints[i];
+      const y = this.penPoints[i + 1];
+      flat.push(x, y, x, y, x, y, 0);  // 角点：锚点=双柄
+    }
+    this.engine.setWorkPath(flat);
+    this.workPathNonEmpty = 1;
+  }
+
+  private penCancel(): void {
+    this.penPoints = [];
+    this.penClosed = false;
+    this.engine.setWorkPath([]);
+    this.workPathNonEmpty = 0;
+    this.log('钢笔: 已取消');
+  }
+
+  private penCommitShape(): void {
+    if (this.penPoints.length < 6) {
+      this.toast('至少 3 个锚点');
+      return;
+    }
+    if (!this.penClosed) {
+      this.penClosed = true;
+      this.pushWorkPath();
+    }
+    const f = this.hexToRgb(this.brushColor);
+    const newId = this.engine.commitWorkPathAsShape(1, f[0], f[1], f[2], 1.0,
+      0, 0, 0, 0, 0, 3);
+    this.log(`钢笔→形状层: ${newId > 0 ? `#${newId}` : '失败'}`);
+    this.penPoints = [];
+    this.penClosed = false;
+    if (newId > 0) {
+      this.refreshLayers();
+    }
+  }
+
+  private penSavePath(): void {
+    if (this.penPoints.length < 6) {
+      this.toast('至少 3 个锚点');
+      return;
+    }
+    if (!this.penClosed) {
+      this.penClosed = true;
+      this.pushWorkPath();
+    }
+    if (this.engine.saveWorkPath('')) {
+      this.penPoints = [];
+      this.penClosed = false;
+      this.log('钢笔: 已存为路径');
+    }
+  }
+
+  /** 钢笔预览视口点列（Polyline）。 */
+  private penViewportPts(): number[][] {
+    const k = this.pxPerVp();
+    const out: number[][] = [];
+    for (let i = 0; i + 1 < this.penPoints.length; i += 2) {
+      out.push([(this.penPoints[i] - this.panX) * this.zoom / k,
+                (this.penPoints[i + 1] - this.panY) * this.zoom / k]);
+    }
+    return out;
+  }
+
+  /** UI shapeKind（0=矩形 1=圆角 2=椭圆 3=多边形 4=星形 5=直线）→ 引擎 LiveShape kind。 */
+  private engineShapeKind(): number {
+    switch (this.shapeKind) {
+      case 2:
+        return 2;  // Ellipse
+      case 3:
+      case 4:
+        return 3;  // Polygon/Star
+      case 5:
+        return 4;  // Line
+      default:
+        return 1;  // Rect/RoundedRect
     }
   }
 
@@ -1675,7 +1829,7 @@ struct Index {
   }
 
   private shapeKindLabel(): string {
-    const labels: string[] = ['矩形', '圆角矩形', '椭圆', '直线'];
+    const labels: string[] = ['矩形', '圆角矩形', '椭圆', '多边形', '星形', '直线'];
     return labels[this.shapeKind] ?? '形状';
   }
 
@@ -2234,6 +2388,11 @@ struct Index {
     if (this.gradDragging) {
       this.gradDragging = false;  // 换工具丢弃未完成拖线
       this.gradientLine = null;
+    }
+    if (this.penPoints.length > 0) {
+      this.penPoints = [];  // 换工具丢弃未完成路径
+      this.penClosed = false;
+      this.engine.setWorkPath([]);
     }
     if (this.shapeDragging) {
       this.shapeDragging = false;  // 换工具丢弃未完成形状
@@ -3283,6 +3442,52 @@ struct Index {
       case 'layer.globalLight':
         this.showGlobalLight = true;
         break;
+      case 'edit.defineCustomShape':
+        if (this.engine.defineCustomShape('')) {
+          this.log('已定义自定形状');
+        }
+        break;
+      case 'edit.placeCustomSub':
+        break;
+      case 'layer.vectorMaskFromPath': {
+        const a = this.activeLayer();
+        if (a !== undefined) {
+          const flat = this.engine.getWorkPath();
+          const ok = this.engine.setLayerVectorMask(a.id, flat);
+          this.log(`矢量蒙版: ${ok ? '已添加（自工作路径）' : '失败'}`);
+          if (ok) {
+            this.refreshLayers();
+          }
+        }
+        break;
+      }
+      case 'layer.vectorMaskToggle': {
+        const a = this.activeLayer();
+        if (a !== undefined && a.hasVectorMask) {
+          this.engine.setVectorMaskEnabled(a.id, !a.vectorMaskOn);
+          this.refreshLayers();
+        }
+        break;
+      }
+      case 'layer.vectorMaskRemove': {
+        const a = this.activeLayer();
+        if (a !== undefined && a.hasVectorMask) {
+          this.engine.setLayerVectorMask(a.id, []);
+          this.refreshLayers();
+        }
+        break;
+      }
+      case 'layer.rasterizeShape': {
+        const a = this.activeLayer();
+        if (a !== undefined && a.isShape) {
+          const ok = this.engine.rasterizeShapeLayer(a.id);
+          this.log(`栅格化形状: ${ok ? '完成' : '失败'}`);
+          if (ok) {
+            this.refreshLayers();
+          }
+        }
+        break;
+      }
       case 'image.revealAll':
         this.docOp((): Promise<boolean> => this.engine.revealAll(), '显示全部');
         break;
@@ -3429,11 +3634,23 @@ struct Index {
       case 'theme.dark':
         this.applyTheme(id.slice(6) as ThemeMode);
         break;
-      default:
+      default: {
+        // M18d：放置自定形状（edit.placeCustom:<id> 动态项）
+        if (id.startsWith('edit.placeCustom:')) {
+          const cid = id.slice('edit.placeCustom:'.length);
+          const newId = this.engine.placeCustomShape(cid, this.docW / 2, this.docH / 2,
+            this.docW / 2, this.docH / 2);
+          this.log(`放置自定形状 ${cid}: ${newId > 0 ? `#${newId}` : '失败'}`);
+          if (newId > 0) {
+            this.refreshLayers();
+          }
+          break;
+        }
         // 占位命令（M8/M10/M14+）：提示并登记
         this.toast('该功能在后续里程碑提供');
         this.log(`命令占位: ${id}`);
         break;
+      }
     }
   }
 
@@ -3713,6 +3930,11 @@ struct Index {
       leafItem('edit.fill', '填充…', 'Shift+F5', d),
       leafItem('edit.stroke', '描边…', '', d && this.hasSelectionFlag),
       leafItem('edit.definePattern', '定义图案', '', d && this.hasSelectionFlag),
+      leafItem('edit.defineCustomShape', '定义自定形状', '',
+        d && this.workPathNonEmpty === 1),
+      subItem('edit.placeCustomSub', '放置自定形状', d && this.hasCustomShapes,
+        this.engine.getCustomShapes().map((id: string): MenuItemVM =>
+          leafItem(`edit.placeCustom:${id}`, id, '', d))),
     ];
     const imageMenu: MenuItemVM[] = [
       leafItem('image.canvasSize', '画布大小…', '', d),
@@ -3749,6 +3971,15 @@ struct Index {
         d && this.activeLayer()?.hasStyle === true,
         this.activeLayer()?.hasStyle === true && this.activeLayer()?.styleOn === false),
       leafItem('layer.globalLight', '全局光角度…', '', d),
+      leafItem('layer.vectorMaskFromPath', '矢量蒙版（自工作路径）', '',
+        d && this.workPathNonEmpty === 1),
+      leafItem('layer.vectorMaskToggle', '启用/停用矢量蒙版', '',
+        d && this.activeLayer()?.hasVectorMask === true,
+        this.activeLayer()?.hasVectorMask === true && this.activeLayer()?.vectorMaskOn === false),
+      leafItem('layer.vectorMaskRemove', '删除矢量蒙版', '',
+        d && this.activeLayer()?.hasVectorMask === true),
+      leafItem('layer.rasterizeShape', '栅格化形状', '',
+        d && this.activeLayer()?.isShape === true),
       leafItem('layer.fillSolid', '新建纯色填充图层', '', d),
       leafItem('layer.fillGrad', '新建渐变填充图层', '', d),
       leafItem('layer.linkToggle', '链接图层 / 解除链接', '',
@@ -3894,6 +4125,7 @@ struct Index {
       { id: 'gradient', label: '渐变', symbol: $r('sys.symbol.rectangle_righthalf_inset_filled'), enabled: true },
       { id: 'bucket', label: '油漆桶', symbol: $r('sys.symbol.paint_bucket'), enabled: true },
       { id: 'shape', label: '形状', symbol: $r('sys.symbol.circle_on_square'), enabled: true },
+      { id: 'pen', label: '钢笔', symbol: $r('sys.symbol.pen_tip'), enabled: true },
       { id: 'stamp', label: '仿制图章', symbol: $r('sys.symbol.seal'), enabled: true },
       { id: 'blur', label: '模糊', symbol: $r('sys.symbol.hand_draw'), enabled: true },
       { id: 'dodge', label: '减淡', symbol: $r('sys.symbol.contrast'), enabled: true },
@@ -4152,7 +4384,7 @@ struct Index {
     }
     if (e.keyCode === KC_U && this.shiftHeld) {
       // Shift+U 循环形状种类（矩形→圆角→椭圆→直线）
-      this.shapeKind = (this.shapeKind + 1) % 4;
+      this.shapeKind = (this.shapeKind + 1) % 6;
       this.log(`形状种类: ${this.shapeKindLabel()}`);
       return;
     }
@@ -4183,6 +4415,10 @@ struct Index {
       case KC_S:
         // Ctrl+S 已在 Ctrl 分支处理；单键 S = 仿制图章（PS 语义）
         this.pickTool('stamp');
+        break;
+      case KC_P:
+        // M18：P = 钢笔（PS 惯例）
+        this.pickTool('pen');
         break;
       case KC_R:
         // R = 模糊组（Shift+R 循环 模糊→锐化→涂抹）
@@ -4486,7 +4722,9 @@ struct Index {
         `${this.screenMode}${this.guidesMirror.visible ? 1 : 0}${this.guidesMirror.locked ? 1 : 0}` +
         `${this.historyVisible ? 1 : 0}${this.histogramVisible ? 1 : 0}${this.infoVisible ? 1 : 0}` +
         `${this.historyCurrent}${this.historyLabels.length}` +
-        `${this.hasRawDevelop ? 1 : 0}`)  // M15e：RAW 显影菜单项使能随会话 RAW 翻转
+        `${this.hasRawDevelop ? 1 : 0}`  // M15e：RAW 显影菜单项使能随会话 RAW 翻转
+        + `${this.workPathNonEmpty}${this.activeLayer()?.isShape ? 1 : 0}` +
+        `${this.activeLayer()?.hasVectorMask ? 1 : 0}${this.hasCustomShapes ? 1 : 0}`)  // M18：矢量菜单使能位
     }
     .width('100%')
     .height(36)
@@ -4525,6 +4763,28 @@ struct Index {
           shapeFill: $shapeFill,
           shapeStroke: $shapeStroke,
           shapeStrokeWidth: $shapeStrokeWidth,
+          shapeLiveRadius: $shapeLiveRadius,
+          onShapeRadiusCommit: (v: number): void => {
+            this.applyShapeRadius(v);
+          },
+          penPending: this.penPoints.length,
+          penClosed: this.penClosed,
+          onPenClose: (): void => {
+            if (this.penPoints.length >= 6 && !this.penClosed) {
+              this.penClosed = true;
+              this.pushWorkPath();
+              this.log('钢笔: 路径已闭合');
+            }
+          },
+          onPenCommit: (): void => {
+            this.penCommitShape();
+          },
+          onPenSave: (): void => {
+            this.penSavePath();
+          },
+          onPenCancel: (): void => {
+            this.penCancel();
+          },
           cloneAligned: $cloneAligned,
           cloneSourceSet: this.cloneSourceSet,
           clonePicking: this.clonePicking,
@@ -4718,6 +4978,25 @@ struct Index {
                   .hitTestBehavior(HitTestMode.None)
               }, (p: number[], idx: number): string => `${idx}|${p[0]}|${p[1]}`)
             }
+            // M18c 钢笔路径预览：白折线 + 青锚点 + 首锚点大圈（闭合热点）
+            if (this.penPoints.length >= 4) {
+              Polyline()
+                .width('100%')
+                .height('100%')
+                .points(this.penViewportPts())
+                .stroke('#FFFFFF')
+                .strokeWidth(1)
+                .fillOpacity(0)
+                .hitTestBehavior(HitTestMode.None)
+            }
+            ForEach(this.penViewportPts(), (p: number[], idx: number) => {
+              Circle()
+                .width(idx === 0 ? 12 : 7)
+                .height(idx === 0 ? 12 : 7)
+                .fill(idx === 0 ? '#00E5FF' : '#FFFFFF')
+                .position({ x: p[0] - (idx === 0 ? 6 : 3.5), y: p[1] - (idx === 0 ? 6 : 3.5) })
+                .hitTestBehavior(HitTestMode.None)
+            }, (p: number[], idx: number): string => `pen${idx}|${p[0]}|${p[1]}`)
             // M11c 形状拖拽预览：青色虚线框（纯视觉，None 防拦截触摸）
             if (this.shapePreview !== null) {
               Column()
@@ -4882,6 +5161,17 @@ struct Index {
                 ChannelsPanel({
                   engine: this.engine,
                   onChanged: (): void => this.refreshChannelCount(),
+                })
+              }
+              // M18c 路径面板（钢笔工具激活或工作路径非空时显示）
+              if (this.tool === 'pen' || this.engine.getWorkPath().length > 1) {
+                PathsPanel({
+                  engine: this.engine,
+                  fgHex: this.brushColor,
+                  onChanged: (): void => {
+                    this.refreshLayers();
+                    this.refreshStats();
+                  }
                 })
               }
               // M12 文字面板（T 工具激活或活动层为文本层时显示）

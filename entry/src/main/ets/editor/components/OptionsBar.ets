@@ -60,10 +60,20 @@ export struct OptionsBar {
   @Link gradientTarget: number;  // 0=像素 1=图层蒙版
   @Prop hasMaskOnActiveForGrad: boolean = false;
   // M11c 形状工具
-  @Link shapeKind: number;       // 0=矩形 1=圆角矩形 2=椭圆 3=直线
+  @Link shapeKind: number;       // 0=矩形 1=圆角矩形 2=椭圆 3=多边形 4=星形 5=直线
   @Link shapeFill: boolean;
   @Link shapeStroke: boolean;
   @Link shapeStrokeWidth: number;
+  // M18 live 形状再编辑（>0 = 活动 live 矩形存在，圆角滑条可用）
+  @Link shapeLiveRadius: number;
+  onShapeRadiusCommit: (v: number) => void = (_v: number) => {};
+  // M18c 钢笔（pending = 进行中锚点数）
+  @Prop penPending: number = 0;
+  @Prop penClosed: boolean = false;
+  onPenClose: () => void = () => {};
+  onPenCommit: () => void = () => {};
+  onPenSave: () => void = () => {};
+  onPenCancel: () => void = () => {};
   // M11d 仿制图章
   @Link cloneAligned: boolean;
   @Prop cloneSourceSet: boolean = false;
@@ -374,9 +384,9 @@ export struct OptionsBar {
     .height(36)
   }
 
-  // M11c 形状选项：种类循环 / 填充描边 / 描边宽
+  // M11c/M18 形状选项：种类循环 / 填充描边 / 描边宽 / live 圆角再编辑
   private shapeKindLabel(): string {
-    const labels: string[] = ['矩形', '圆角矩形', '椭圆', '直线'];
+    const labels: string[] = ['矩形', '圆角矩形', '椭圆', '多边形', '星形', '直线'];
     return labels[this.shapeKind] ?? '形状';
   }
 
@@ -421,7 +431,7 @@ export struct OptionsBar {
         .fontColor($r('app.color.text_primary'))
         .border({ width: 1, color: $r('app.color.border') })
         .onClick((): void => {
-          this.shapeKind = (this.shapeKind + 1) % 4;
+          this.shapeKind = (this.shapeKind + 1) % 6;
         })
       Row({ space: 4 }) {
         Text('填充')
@@ -450,7 +460,56 @@ export struct OptionsBar {
         value: $shapeStrokeWidth,
         suffix: 'px'
       })
-      Text('填充=前景 · 描边=背景 · 拖拽绘制')
+      Text('填充=前景 · 描边=背景 · 拖拽建形状层')
+        .fontSize(11)
+        .fontColor($r('app.color.text_secondary'))
+      if (this.shapeLiveRadius > 0) {
+        OptionSlider({
+          label: '圆角',
+          min: 0,
+          max: 200,
+          step: 1,
+          value: $shapeLiveRadius,
+          suffix: 'px',
+          onCommitted: (v: number): void => {
+            this.onShapeRadiusCommit(v);
+          }
+        })
+      }
+    }
+    .height(36)
+  }
+
+  // M18c 钢笔选项：锚点计数 + 闭合/提交/存路径/取消
+  @Builder
+  penOptions() {
+    Row({ space: 10 }) {
+      Text(`锚点 ${Math.floor(this.penPending / 2)}${this.penClosed ? ' · 已闭合' : ''}`)
+        .fontSize(12)
+        .fontColor($r('app.color.text_secondary'))
+      Button('闭合')
+        .fontSize(12).height(28)
+        .onClick((): void => {
+          this.onPenClose();
+        })
+      Button('成形状层')
+        .fontSize(12).height(28)
+        .backgroundColor($r('app.color.accent'))
+        .fontColor($r('app.color.on_accent'))
+        .onClick((): void => {
+          this.onPenCommit();
+        })
+      Button('存为路径')
+        .fontSize(12).height(28)
+        .onClick((): void => {
+          this.onPenSave();
+        })
+      Button('取消')
+        .fontSize(12).height(28)
+        .onClick((): void => {
+          this.onPenCancel();
+        })
+      Text('点击加锚点 · 点首点闭合')
         .fontSize(11)
         .fontColor($r('app.color.text_secondary'))
     }
@@ -568,6 +627,8 @@ export struct OptionsBar {
         this.bucketOptions()
       } else if (this.tool === 'shape') {
         this.shapeOptions()
+      } else if (this.tool === 'pen') {
+        this.penOptions()
       } else if (this.tool === 'stamp') {
         this.stampOptions()
       } else if (this.tool === 'historyBrush') {

@@ -10,6 +10,9 @@
 
 #include "engine/filter_ops.h"
 #include "engine/filters.h"
+#include "engine/vector_render.h"
+#include "engine/vector_raster.h"
+#include "engine/vector_flatten.h"
 #include "io/image_export.h"
 
 namespace montage {
@@ -20,9 +23,78 @@ constexpr double kMaxBlurBudget = 64.0;   // 单项扩展上限（px）——防
 constexpr double kMaxPadBudget = 200.0;   // 派生域 pad 总上限
 constexpr double kMaxDomainPixels = 64e6; // 派生域像素预算（M13 同量级）
 
-// 底片（绕开样式派生——蒙版合成结果，蒙版未启用回原像素）
+// 底片（绕开样式派生——矢量蒙版派生（已含像素蒙版）→ 蒙版合成结果 → 形状缓存/原像素。
+// M18：形状层无 pixels，样式作用于形状派生结果——PS「效果栅格化后的形状」语义）
 std::shared_ptr<const TileGrid> basePixels(const Layer& l) {
-    return (l.mask != nullptr && l.mask->enabled && l.render != nullptr) ? l.render : l.pixels;
+    if (l.vectorMask != nullptr && l.vectorMask->enabled && l.vectorRender != nullptr) {
+        return l.vectorRender;
+    }
+    if (l.mask != nullptr && l.mask->enabled && l.render != nullptr) {
+        return l.render;
+    }
+    if (l.shape != nullptr) {
+        return l.shapeCache;
+    }
+    return l.pixels;
+}
+
+// 网格局部坐标读 RGBA（缺瓦片返回 nullptr；调用方勿存指针）
+const uint8_t* gridPixelAt(const TileGrid& g, uint32_t x, uint32_t y) {
+    auto it = g.tiles.find((y / kTileSize) * g.cols + (x / kTileSize));
+    if (it == g.tiles.end() || it->second == nullptr || it->second->pixels == nullptr) {
+        return nullptr;
+    }
+    const uint8_t* base = it->second->pixels->mapCpu();
+    return base + (static_cast<size_t>(y % kTileSize) * kTileSize + (x % kTileSize)) * 4;
+}
+
+// M18d 矢量蒙版重派生（enabled=false / 路径空 → vectorRender = null）。域同底片、
+// origin 同底片（alpha × 路径覆盖度；空路径 = 全显不派生——PS「添加矢量蒙版」语义）。
+void restyleVectorMask(Layer& l, uint64_t rev) {
+    l.vectorRender = nullptr;
+    if (l.vectorMask == nullptr || !l.vectorMask->enabled) {
+        return;
+    }
+    const VectorPath& vp = l.vectorMask->path;
+    if (vp.empty() && !vp.inverted) {
+        return;  // 全显
+    }
+    const std::shared_ptr<const TileGrid> base =
+        (l.mask != nullptr && l.mask->enabled && l.render != nullptr)
+            ? l.render
+            : (l.shape != nullptr ? l.shapeCache : l.pixels);
+    if (base == nullptr) {
+        return;
+    }
+    uint32_t bx = 0, by = 0, bw = 0, bh = 0;
+    if (!layerContentBBox(*base, bx, by, bw, bh)) {
+        return;
+    }
+    const int gx0 = static_cast<int>(bx);
+    const int gy0 = static_cast<int>(by);
+    VectorRasterizer r = fillRasterizer(vp, kVectorTolerance);
+    auto cov = r.render(gx0, gy0, gx0 + static_cast<int32_t>(bw), gy0 + static_cast<int32_t>(bh));
+    // 底片 alpha × 覆盖度（域外覆盖度 = inverted ? 1 : 0）
+    std::vector<uint8_t> strip(static_cast<size_t>(bw) * bh * 4, 0);
+    const int gOriginXi = static_cast<int>(std::lround(l.shape != nullptr ? l.shapeOriginX : l.transform.originX));
+    const int gOriginYi = static_cast<int>(std::lround(l.shape != nullptr ? l.shapeOriginY : l.transform.originY));
+    (void)gOriginXi;
+    (void)gOriginYi;
+    for (uint32_t y = 0; y < bh; ++y) {
+        for (uint32_t x = 0; x < bw; ++x) {
+            const uint8_t* src = gridPixelAt(*base, bx + x, by + y);
+            if (src == nullptr || src[3] == 0) {
+                continue;
+            }
+            const float m = cov[static_cast<size_t>(y) * bw + x];
+            uint8_t* p = strip.data() + (static_cast<size_t>(y) * bw + x) * 4;
+            p[0] = src[0];
+            p[1] = src[1];
+            p[2] = src[2];
+            p[3] = static_cast<uint8_t>(std::lround(src[3] * std::min(std::max(m, 0.0f), 1.0f)));
+        }
+    }
+    l.vectorRender = filterStripToGrid(strip, bw, bh, rev);
 }
 
 // van Herk 一维 max 滤波（O(N)，方形 SE 两趟正交）。r=0 时原样拷贝。
@@ -984,6 +1056,14 @@ void restyleDocument(Document& doc) {
     static std::atomic<uint64_t> rev{1};
     std::string err;
     for (Layer& l : doc.layers) {
+        if (l.shape != nullptr) {
+            // M18：形状缓存先重派生（带样式的形状层其底片 = shapeCache）
+            shapeRenderLayer(doc, l, err);
+        }
+        if (l.vectorMask != nullptr) {
+            // M18d：矢量蒙版派生（带样式的形状层其底片 = vectorRender）
+            restyleVectorMask(l, rev.fetch_add(1));
+        }
         if (l.style != nullptr || l.fill != nullptr) {
             restyleLayer(doc, l, rev.fetch_add(1), err);
         }
@@ -991,6 +1071,11 @@ void restyleDocument(Document& doc) {
 }
 
 void shiftLayerOrigins(Layer& l, double dx, double dy) {
+    if (l.shape != nullptr) {
+        // M18：形状层几何真源 = 路径点（translateShapeLayer 内含 live 参数域）。
+        translateShapeLayer(l, dx, dy);
+        return;
+    }
     l.transform.originX += dx;
     l.transform.originY += dy;
     if (l.styledRender != nullptr) {

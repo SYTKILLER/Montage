@@ -17,6 +17,13 @@ add_library(compositor SHARED
         engine/style_ops.cpp
         engine/history.cpp
         engine/shape_ops.cpp
+        engine/vector_path.cpp
+        engine/vector_flatten.cpp
+        engine/vector_shapes.cpp
+        engine/vector_raster.cpp
+        engine/vector_stroke.cpp
+        engine/vector_edit.cpp
+        engine/vector_render.cpp
         engine/filter_ops.cpp
         engine/filters.cpp
         engine/text_ops.cpp

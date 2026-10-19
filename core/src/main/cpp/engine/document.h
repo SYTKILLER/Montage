@@ -14,6 +14,8 @@
 
 #include <native_buffer/native_buffer.h>
 
+#include "engine/vector_path.h"
+
 namespace montage {
 
 constexpr uint32_t kTileSize = 256;  // 定案 R2：256px（256KB/瓦片 RGBA8888）
@@ -321,6 +323,41 @@ struct TextLayerState {
     double rasterH = 0.0;
 };
 
+// M18 形状层状态（非破坏矢量内容层）：path（文档域坐标）+ 填充 + 描边 + live（参数形状，
+// kind != None = 可再编辑；路径经钢笔/直接选择编辑后 live 清 None）。渲染 = shapeRender
+// 派生网格（文字层/样式层同架构：shapeCache 随 History 快照走，变更点主动维护）。
+// v1 填充/描边 paint = 纯色（渐变/图案登记后续批，随 M11 stops 遗留合并）。
+struct ShapeLayerState {
+    VectorPath path;
+    int fillKind = 1;  // 0=无填充 1=纯色
+    float fillColor[4] = {1.0f, 0.0f, 0.0f, 1.0f};  // 直 alpha
+    bool hasStroke = false;
+    ShapeStroke stroke;
+    LiveShape live;
+    uint64_t cacheHash = 0;  // 最近渲染指纹（path+fill+stroke；0 = 从未渲染）
+};
+
+// M18 路径面板条目（文档级保存路径；工作路径单独挂 Document.workPath）。
+struct NamedPathEntry {
+    std::string name;
+    VectorPath path;
+};
+inline bool operator==(const NamedPathEntry& a, const NamedPathEntry& b) {
+    return a.name == b.name && a.path == b.path;
+}
+
+// M18 自定义形状库（编辑 → 定义自定形状；文档级，.montage v12 持久化；定义动作不入
+// History——「定义图案」同语义）。
+struct CustomShapeEntry {
+    std::string id;  // "csh_<n>" 进程内单调
+    std::string name;
+    VectorPath path;  // 以原点为中心的规范域（定义时归一）
+};
+inline bool operator==(const CustomShapeEntry& a, const CustomShapeEntry& b) {
+    return a.id == b.id && a.name == b.name && a.path == b.path;
+}
+
+
 // 图层（值语义，对齐源 ImageLayer；M2 子集：蒙版/剪贴 M5、调整层 M6a、文本层 M12）。
 struct Layer {
     LayerId id = 0;
@@ -338,6 +375,16 @@ struct Layer {
     std::shared_ptr<TextLayerState> text = nullptr;  // M12：非空 = 文本层（pixels = 栅格结果）
     std::shared_ptr<LayerStyle> style = nullptr;     // M14c：非空 = 带样式（渲染走 styledRender）
     std::shared_ptr<FillLayerState> fill = nullptr;  // M14c：非空 = 填充层（渲染走 styledRender）
+    std::shared_ptr<ShapeLayerState> shape = nullptr;  // M18：非空 = 形状层（pixels 恒 null，
+                                                       // 渲染走 shapeCache 派生网格）
+    std::shared_ptr<VectorMaskData> vectorMask = nullptr;  // M18d：非空 = 矢量蒙版
+    // M18 形状派生渲染结果（文档域；origin 独立——域 = 形状包围盒 ∩ 画布）。
+    std::shared_ptr<const TileGrid> shapeCache = nullptr;
+    double shapeOriginX = 0.0;
+    double shapeOriginY = 0.0;
+    // M18d 矢量蒙版派生（底片 = 蒙版合成 → 形状缓存/原像素 × 路径覆盖度；域同底片、
+    // origin 同底片；enabled=false 或路径空时为 null）。随 History 快照走。
+    std::shared_ptr<const TileGrid> vectorRender = nullptr;
     // M14c 样式/填充派生渲染结果（域可超出原网格——投影/描边扩展；origin 独立于 transform）。
     // 样式参数/像素/蒙版变更点重算；随 History 快照走（undo 即恢复）。
     std::shared_ptr<const TileGrid> styledRender = nullptr;
@@ -352,24 +399,43 @@ struct Layer {
     // M14b 链接层：同一非零 linkId 的层随移动工具联动平移（对齐 PS 链接语义）。
     // 会话态 v1：.montage 不持久化（PSD 链接导出随 M15 评估），随 History 快照走。
     uint64_t linkId = 0;
-    // M14c 渲染/缩略图取数优先级：样式/填充派生（含独立 origin，经 effectiveRenderOrigin）
-    // → 蒙版合成 → 原像素
+    // M14c/M18 渲染/缩略图取数优先级：样式/填充派生（含独立 origin，经 effectiveRenderOrigin）
+    // → 矢量蒙版派生（已含像素蒙版）→ 蒙版合成 → 形状派生 → 原像素
     std::shared_ptr<const TileGrid> effectivePixels() const {
         if ((style != nullptr || fill != nullptr) && styledRender != nullptr &&
             (style == nullptr || style->enabled)) {
             return styledRender;
         }
-        return (mask != nullptr && mask->enabled && render != nullptr) ? render : pixels;
+        if (vectorMask != nullptr && vectorMask->enabled && vectorRender != nullptr) {
+            return vectorRender;
+        }
+        if (mask != nullptr && mask->enabled && render != nullptr) {
+            return render;
+        }
+        if (shape != nullptr && shapeCache != nullptr) {
+            return shapeCache;
+        }
+        return pixels;
     }
 
     // 派生渲染生效时的文档落点（与 transform.origin 分离——投影/描边扩展域偏移）
     double effectiveOriginX() const {
-        return (style != nullptr && style->enabled && styledRender != nullptr) ? styledOriginX
-                                                                               : transform.originX;
+        if (style != nullptr && style->enabled && styledRender != nullptr) {
+            return styledOriginX;
+        }
+        if (shape != nullptr) {
+            return shapeOriginX;  // render/vectorRender（启用时）由 shapeCache 派生、域相同
+        }
+        return transform.originX;
     }
     double effectiveOriginY() const {
-        return (style != nullptr && style->enabled && styledRender != nullptr) ? styledOriginY
-                                                                               : transform.originY;
+        if (style != nullptr && style->enabled && styledRender != nullptr) {
+            return styledOriginY;
+        }
+        if (shape != nullptr) {
+            return shapeOriginY;
+        }
+        return transform.originY;
     }
 };
 
@@ -406,6 +472,12 @@ struct Document {
     double globalLightAngle = 120.0;
     // M17d 图案资源（编辑 → 定义图案；不入 History，随文档替换清空；.montage v11 持久化）
     std::vector<DocumentPattern> patterns;
+    // M18 矢量（路径面板/形状库；workPath = 工作路径会话态、随文档替换清空；v12 持久化；
+    // 两者均不入 History——PS 路径面板同理，路径编辑经形状层命令走历史）
+    VectorPath workPath;
+    std::vector<NamedPathEntry> paths;
+    std::vector<CustomShapeEntry> customShapes;
+    uint32_t customShapeSeq = 0;  // csh_N 单调号（openProject 回填防撞号）
 };
 
 // 视口：pan = 视口左上角的文档坐标（doc px），screen = (doc - pan) * zoom。

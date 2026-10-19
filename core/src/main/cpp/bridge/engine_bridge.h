@@ -214,6 +214,31 @@ napi_value GetLayerBounds(napi_env env, napi_callback_info info);
 napi_value GetHistoryList(napi_env env, napi_callback_info info);
 napi_value SetHistoryState(napi_env env, napi_callback_info info);
 napi_value GetSelectionBounds(napi_env env, napi_callback_info info);
+// M18 矢量与形状层：形状层命令 + 路径面板 + 矢量蒙版 + 自定义形状。
+// 路径跨桥格式 = 扁平 number[]：[子路径数, (closed, op, knot数, knot×7[ax,ay,ix,iy,ox,oy,smooth])×n]
+napi_value CreateShapeLayer(napi_env env, napi_callback_info info);
+napi_value SetShapeLive(napi_env env, napi_callback_info info);
+napi_value SetShapeFill(napi_env env, napi_callback_info info);
+napi_value SetShapeStroke(napi_env env, napi_callback_info info);
+napi_value RasterizeShapeLayer(napi_env env, napi_callback_info info);
+napi_value SetShapePath(napi_env env, napi_callback_info info);
+napi_value SetWorkPath(napi_env env, napi_callback_info info);
+napi_value GetWorkPath(napi_env env, napi_callback_info info);
+napi_value CommitWorkPathAsShape(napi_env env, napi_callback_info info);
+napi_value PathToSelection(napi_env env, napi_callback_info info);
+napi_value FillPath(napi_env env, napi_callback_info info);
+napi_value StrokePath(napi_env env, napi_callback_info info);
+napi_value SaveWorkPath(napi_env env, napi_callback_info info);
+napi_value DeleteSavedPath(napi_env env, napi_callback_info info);
+napi_value GetSavedPaths(napi_env env, napi_callback_info info);
+napi_value LoadSavedPath(napi_env env, napi_callback_info info);
+napi_value SelectionToWorkPath(napi_env env, napi_callback_info info);
+napi_value DefineCustomShape(napi_env env, napi_callback_info info);
+napi_value GetCustomShapes(napi_env env, napi_callback_info info);
+napi_value DeleteCustomShape(napi_env env, napi_callback_info info);
+napi_value PlaceCustomShape(napi_env env, napi_callback_info info);
+napi_value SetLayerVectorMask(napi_env env, napi_callback_info info);
+napi_value SetVectorMaskEnabled(napi_env env, napi_callback_info info);
 // 页面销毁时释放回调与渲染线程
 napi_value Dispose(napi_env env, napi_callback_info info);
 

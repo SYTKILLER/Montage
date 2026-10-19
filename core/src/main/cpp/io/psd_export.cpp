@@ -487,10 +487,105 @@ struct EncodedLayer {
     std::string adjKey;             // "levl"/"curv"/"nvrt"；空 = 无
     std::vector<uint8_t> adjPayload;
     std::vector<uint8_t> lrfx;      // M17c：图层效果（非空 = 附加信息写 lrFX 块）
+    std::vector<uint8_t> vmsk;      // M18d：矢量蒙版（非空 = 附加信息写 vmsk 块）
 };
 
 }  // namespace
 
+// ---- M18d：PSD 路径记录写出（photocraft psd/path.rs from_subpaths 对拍） ----
+// 26 字节/记录：u16 selector + 24B 数据；knot 坐标 = 8.24 定点分数（先 y 后 x）。
+inline void beU16(std::vector<uint8_t>& out, uint16_t v) {
+    out.push_back(static_cast<uint8_t>(v >> 8));
+    out.push_back(static_cast<uint8_t>(v & 0xFF));
+}
+
+inline void beU32(std::vector<uint8_t>& out, uint32_t v) {
+    out.push_back(static_cast<uint8_t>(v >> 24));
+    out.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+    out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+    out.push_back(static_cast<uint8_t>(v & 0xFF));
+}
+
+inline void beI32(std::vector<uint8_t>& out, int32_t v) {
+    beU32(out, static_cast<uint32_t>(v));
+}
+
+inline int32_t f64ToFixed24(double v) {
+    const double scaled = v * 16777216.0;
+    if (scaled >= 2147483647.0) {
+        return 2147483647;
+    }
+    if (scaled <= -2147483648.0) {
+        return -2147483648;
+    }
+    return static_cast<int32_t>(std::llround(scaled));
+}
+
+// 模型路径 → 记录列表字节（fill rule + initial fill + 各子路径 length/knots）。
+std::vector<uint8_t> pathToPsdRecords(const VectorPath& path, uint32_t w, uint32_t h) {
+    std::vector<uint8_t> out;
+    const double fw = static_cast<double>(w > 0 ? w : 1);
+    const double fh = static_cast<double>(h > 0 ? h : 1);
+    // fill rule 记录（selector 6，全零）
+    beU16(out, 6);
+    out.insert(out.end(), 24, 0);
+    // initial fill 记录（selector 8，u16 = inverted）
+    beU16(out, 8);
+    beU16(out, path.inverted ? 1 : 0);
+    out.insert(out.end(), 22, 0);
+    auto opToPsd = [](PathOp op) -> int16_t {
+        switch (op) {
+            case PathOp::Subtract: return 2;
+            case PathOp::Intersect: return 3;
+            case PathOp::Exclude: return 0;
+            case PathOp::Join: return -1;
+            default: return 1;
+        }
+    };
+    for (const Subpath& sp : path.subpaths) {
+        // length 记录
+        beU16(out, sp.closed ? 0 : 3);
+        beU16(out, static_cast<uint16_t>(std::min(sp.knots.size(), static_cast<size_t>(0xFFFF))));
+        beU16(out, static_cast<uint16_t>(opToPsd(sp.op)));
+        beU16(out, 1);  // psd-tools 默认（Photoshop 写 1）
+        out.insert(out.end(), 18, 0);
+        for (const Knot& kn : sp.knots) {
+            uint16_t sel;
+            if (sp.closed) {
+                sel = kn.smooth ? 1 : 2;
+            } else {
+                sel = kn.smooth ? 4 : 5;
+            }
+            beU16(out, sel);
+            const VPt* pts[3] = {&kn.inCtrl, &kn.anchor, &kn.outCtrl};
+            for (int i = 0; i < 3; i++) {
+                beI32(out, f64ToFixed24(pts[i]->y / fh));  // 先 y
+                beI32(out, f64ToFixed24(pts[i]->x / fw));
+            }
+        }
+    }
+    return out;
+}
+
+// 矢量蒙版块字节（u32 version=3 + u32 flags + 路径记录）。
+std::vector<uint8_t> buildVmsk(const VectorMaskData& vm, uint32_t w, uint32_t h) {
+    std::vector<uint8_t> out;
+    beU32(out, 3);
+    uint32_t flags = 0;
+    if (vm.path.inverted) {
+        flags |= 1u;
+    }
+    if (!vm.linked) {
+        flags |= 2u;
+    }
+    if (!vm.enabled) {
+        flags |= 4u;
+    }
+    beU32(out, flags);
+    const std::vector<uint8_t> records = pathToPsdRecords(vm.path, w, h);
+    out.insert(out.end(), records.begin(), records.end());
+    return out;
+}
 PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
     PsdExportResult res;
     if (snap.width == 0 || snap.height == 0) {
@@ -656,6 +751,10 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
             if (l.style != nullptr) {
                 el.lrfx = buildLrfx(*l.style);
             }
+            // M18d：矢量蒙版 → vmsk 块（与样式无关）
+            if (l.vectorMask != nullptr) {
+                el.vmsk = buildVmsk(*l.vectorMask, snap.width, snap.height);
+            }
             if (encodePixel(l, &el)) {
                 layers.push_back(std::move(el));
             }
@@ -747,9 +846,33 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
     w.u32(snap.width);
     w.u16(8);
     w.u16(3);
-    // Color Mode Data / Image Resources
+    // Color Mode Data
     w.u32(0);
-    w.u32(0);
+    // Image Resources（M18d：路径资源——工作路径 1025、保存路径 2000+）
+    {
+        std::vector<uint8_t> res;
+        auto addPathRes = [&](uint16_t id, const VectorPath& path) {
+            const std::vector<uint8_t> data = pathToPsdRecords(path, snap.width, snap.height);
+            res.insert(res.end(), {'8', 'B', 'I', 'M'});
+            beU16(res, id);
+            res.push_back(0);  // pascal 名长 0
+            // 名填充至偶（0 长名 = 1 字节 + 1 填充）
+            res.push_back(0);
+            beU32(res, static_cast<uint32_t>(data.size()));
+            res.insert(res.end(), data.begin(), data.end());
+            if (data.size() % 2 == 1) {
+                res.push_back(0);
+            }
+        };
+        if (!snap.workPath.subpaths.empty()) {
+            addPathRes(1025, snap.workPath);
+        }
+        for (size_t i = 0; i < snap.paths.size() && i < 998; ++i) {
+            addPathRes(static_cast<uint16_t>(2000 + i), snap.paths[i].path);
+        }
+        w.u32(static_cast<uint32_t>(res.size()));
+        w.raw(res);
+    }
 
     // Layer & Mask Info（占位回填）
     const size_t lmLenAt = w.size();
@@ -896,6 +1019,15 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
             w.u32(static_cast<uint32_t>(el.lrfx.size()));
             w.raw(el.lrfx);
             w.pad2In(w.size() - el.lrfx.size());
+        }
+
+        // M18d：矢量蒙版（vmsk；version 3 布局，PS 5.5+ 读）
+        if (!el.vmsk.empty()) {
+            w.ascii("8BIM", 4);
+            w.ascii("vmsk", 4);
+            w.u32(static_cast<uint32_t>(el.vmsk.size()));
+            w.raw(el.vmsk);
+            w.pad2In(w.size() - el.vmsk.size());
         }
         w.patchU32(extraAt, static_cast<uint32_t>(w.size() - extraAt - 4));
     }

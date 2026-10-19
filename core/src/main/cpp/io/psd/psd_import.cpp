@@ -236,6 +236,7 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
         layer.clipping = rec.clipping;
         layer.parentId = parent;
         layer.transform.originX = rec.left;
+        layer.vectorMask = rec.vectorMask;  // M18d：vmsk 矢量蒙版非破坏导入
         layer.transform.originY = rec.top;
         layer.transform.width = rec.width;
         layer.transform.height = rec.height;
@@ -389,6 +390,9 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
                                   ? 0
                                   : engine.doc.layers[engine.doc.layers.size() - 1].id;
         // M17c：带 lrFX 样式的层重建派生网格（openProject 同款收尾）
+        // M18d：PSD 路径资源 → 路径面板（保存路径 + 工作路径；不入 History）
+        engine.doc.paths = doc.paths;
+        engine.doc.workPath = doc.workPath;
         restyleDocument(engine.doc);
         engine.bumpRevisionLocked();
         engine.requestRender();

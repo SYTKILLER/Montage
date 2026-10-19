@@ -69,6 +69,8 @@ struct Record {
     };
     bool hasStyle = false;
     std::vector<PsdStyleEffect> style;
+    // M18d：vmsk/vsms 图层矢量蒙版（vmsk3 路径记录；语义见 psd_reader.cpp 解析）
+    std::shared_ptr<VectorMaskData> vectorMask;
 };
 
 struct PsdDocument {
@@ -76,6 +78,9 @@ struct PsdDocument {
     int height = 0;
     double resolution = 72.0;
     std::vector<Record> layers;      // bottom → top
+    // M18d：保存路径（资源 2000–2997）与工作路径（资源 1025）→ 路径面板
+    std::vector<NamedPathEntry> paths;
+    VectorPath workPath;
     std::vector<std::string> notes;  // 全局提示
 };
 

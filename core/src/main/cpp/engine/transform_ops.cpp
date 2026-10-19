@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "engine/style_ops.h"
+#include "engine/vector_render.h"
 
 namespace montage {
 
@@ -280,6 +281,14 @@ bool flipDocument(Document& doc, bool horizontal) {
         return false;
     }
     for (Layer& l : doc.layers) {
+        // M18：形状层路径同仿射（几何真源 = 路径点；hash 变化 → 收尾 restyleDocument 重派生）
+        if (l.shape != nullptr) {
+            if (horizontal) {
+                affineShapeLayer(l, -1.0, 0.0, 0.0, 1.0, 0.0, static_cast<double>(doc.width));
+            } else {
+                affineShapeLayer(l, 1.0, 0.0, 0.0, -1.0, 0.0, static_cast<double>(doc.height));
+            }
+        }
         if (l.pixels != nullptr) {
             if (horizontal) {
                 l.pixels = flipGridH(*l.pixels);
@@ -315,6 +324,14 @@ bool rotateDocument90(Document& doc, bool clockwise) {
     for (Layer& l : doc.layers) {
         const double ox = l.transform.originX;
         const double oy = l.transform.originY;
+        // M18：形状层路径同仿射（CW: x'=−y+oldH, y'=x；CCW: x'=y, y'=−x+oldW）
+        if (l.shape != nullptr) {
+            if (clockwise) {
+                affineShapeLayer(l, 0.0, 1.0, -1.0, 0.0, static_cast<double>(oldH), 0.0);
+            } else {
+                affineShapeLayer(l, 0.0, -1.0, 1.0, 0.0, 0.0, static_cast<double>(oldW));
+            }
+        }
         if (l.pixels != nullptr) {
             l.pixels = rotateGrid90(*l.pixels, clockwise);
             const double gh = static_cast<double>(l.pixels->rows) * kTile;

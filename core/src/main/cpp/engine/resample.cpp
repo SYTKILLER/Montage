@@ -1,5 +1,7 @@
 #include "engine/resample.h"
 
+#include "engine/vector_render.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -157,6 +159,10 @@ bool resampleDocument(Document& doc, uint32_t newW, uint32_t newH) {
             std::ceil(static_cast<double>(l.pixels ? l.pixels->cols : 1) * sx)));
         const uint32_t newRows = std::max(1u, static_cast<uint32_t>(
             std::ceil(static_cast<double>(l.pixels ? l.pixels->rows : 1) * sy)));
+        if (l.shape != nullptr) {
+            // M18：形状路径同步缩放（x'=sx·x, y'=sy·y）
+            affineShapeLayer(l, sx, 0.0, 0.0, sy, 0.0, 0.0);
+        }
         if (l.pixels != nullptr) {
             l.pixels = warpGridAffine(*l.pixels, m, newCols, newRows);
         }
@@ -218,6 +224,10 @@ bool rotateDocumentArbitrary(Document& doc, double degreesCw) {
         // origin 映射（含包围盒平移）
         l.transform.originX = c * ox - s * oy - minX;
         l.transform.originY = s * ox + c * oy - minY;
+        // M18：形状路径同仿射（doc 域：x'=c·x−s·y−minX, y'=s·x+c·y−minY）
+        if (l.shape != nullptr) {
+            affineShapeLayer(l, c, s, -s, c, -minX, -minY);
+        }
         if (l.pixels != nullptr) {
             // 层网格内容同矩阵；新网格尺寸覆盖旋转后的层包围盒
             const double gw = static_cast<double>(l.pixels->cols * kTile);
@@ -296,7 +306,15 @@ bool bakeLayerMatrix(Document& doc, LayerId id, const double m[6]) {
             break;
         }
     }
-    if (target == nullptr || target->pixels == nullptr) {
+    if (target == nullptr) {
+        return false;
+    }
+    if (target->shape != nullptr) {
+        // M18：形状层烘焙 = 路径点直接吃 doc 域矩阵（内容 doc 位置 = 路径坐标本身）。
+        affineShapeLayer(*target, m[0], m[1], m[2], m[3], m[4], m[5]);
+        return true;
+    }
+    if (target->pixels == nullptr) {
         return false;
     }
     Layer& l = *target;

@@ -13,6 +13,7 @@
 #include <hilog/log.h>
 
 #include "engine/document.h"
+#include "engine/vector_render.h"
 #include "engine/engine.h"
 
 namespace montage {
@@ -22,7 +23,7 @@ namespace {
 constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Save";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
-constexpr int kFormatVersion = 11;  // v11：+等高线/Range/图案叠加/文档图案（M17d）；v10：+图层样式效果扩展（M17a 内阴影/外发光/内发光/渐变叠加，非默认才写）；v9：+参考线 guides 块（M15a，空则不写兼容 v8 包）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
+constexpr int kFormatVersion = 12;  // v12：+形状层/矢量蒙版/工作路径/保存路径/自定义形状（M18，可选字段读兼容 v1–v11）；v11：+等高线/Range/图案叠加/文档图案（M17d）；v10：+图层样式效果扩展（M17a 内阴影/外发光/内发光/渐变叠加，非默认才写）；v9：+参考线 guides 块（M15a，空则不写兼容 v8 包）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
 constexpr int kDeflateLevel = 6;
 // 04 §1.3 格式上限（沿用上游档位，与引擎运行预算分立）
 constexpr uint32_t kMaxSide = 30000;
@@ -446,6 +447,10 @@ struct LayerSnapshot {
     // M14c 图层样式 / 填充图层（null = 无）
     std::shared_ptr<LayerStyle> style;
     std::shared_ptr<FillLayerState> fill;
+    // M18 形状层 / 矢量蒙版（null = 无；pixels 已存 shapeCache 派生结果）
+    std::shared_ptr<ShapeLayerState> shape;
+    std::shared_ptr<VectorMaskData> vectorMask;
+    bool vectorMaskEnabled = true;
 };
 
 struct ChannelSnapshot {
@@ -475,6 +480,11 @@ struct DocSnapshot {
     bool guidesVisible = true;
     double globalLightAngle = 120.0;  // v10（M17b）
     std::vector<PatternSnapshot> patterns;  // v11（M17d；空则整块不写——v10 包字节不变）
+    // v12（M18 矢量；空则整块不写——v11 包字节不变）
+    VectorPath workPath;
+    std::vector<NamedPathEntry> paths;
+    std::vector<CustomShapeEntry> customShapes;
+    uint32_t customShapeSeq = 0;
 };
 
 // M17d 等高线 JSON（非 custom 不写）：{"pts": [x0,y0,…], "corners": [0/1,…]}
@@ -551,6 +561,38 @@ bool computeBbox(const TileGrid& grid, uint32_t& px, uint32_t& py, uint32_t& pw,
     pw = (tx1 - tx0 + 1u) * kTileSize;
     ph = (ty1 - ty0 + 1u) * kTileSize;
     return true;
+}
+
+// ---- M18 v12 路径序列化（扁平数组，坐标 %.17g 保 double 往返） ----
+
+std::string jsonNumber(double v) {
+    char num[40];
+    std::snprintf(num, sizeof(num), "%.17g", v);
+    return std::string(num);
+}
+
+std::string pathToJson(const VectorPath& p, const char* indent) {
+    // [子路径数, (closed, op, knot数, [ax,ay,ix,iy,ox,oy,smooth])×n]
+    std::string j = "[";
+    j += std::to_string(p.subpaths.size());
+    for (const Subpath& sp : p.subpaths) {
+        j += std::string(",\n") + indent + (sp.closed ? "1" : "0");
+        j += std::string(", ") + std::to_string(static_cast<int32_t>(sp.op));
+        j += ", " + std::to_string(sp.knots.size());
+        for (const Knot& kn : sp.knots) {
+            j += std::string(",\n") + indent;
+            const double vals[7] = {kn.anchor.x, kn.anchor.y, kn.inCtrl.x, kn.inCtrl.y,
+                                    kn.outCtrl.x, kn.outCtrl.y, kn.smooth ? 1.0 : 0.0};
+            for (int i = 0; i < 7; i++) {
+                j += jsonNumber(vals[i]);
+                if (i < 6) {
+                    j += ", ";
+                }
+            }
+        }
+    }
+    j += "\n" + std::string(indent) + "]";
+    return j;
 }
 
 std::string buildManifest(const DocSnapshot& doc) {
@@ -925,6 +967,80 @@ std::string buildManifest(const DocSnapshot& doc) {
             tf += num;
             fields.push_back("      \"text\": {\n" + tf + "\n      }");
         }
+        if (l.shape != nullptr) {
+            // v12 形状层（M18）：path 扁平数组 + 填充 + 描边 + live（坐标 %.17g 保往返）
+            const ShapeLayerState& sh = *l.shape;
+            std::string sf;
+            sf += "      \"path\": " + pathToJson(sh.path, "        ");
+            sf += std::string(",\n      \"fillKind\": ") + std::to_string(sh.fillKind);
+            sf += ",\n      \"fillColor\": [";
+            for (int ci = 0; ci < 4; ++ci) {
+                sf += jsonNumber(sh.fillColor[ci]);
+                if (ci < 3) sf += ", ";
+            }
+            sf += "]";
+            sf += std::string(",\n      \"hasStroke\": ") + (sh.hasStroke ? "true" : "false");
+            if (sh.hasStroke) {
+                const ShapeStroke& st = sh.stroke;
+                sf += ",\n      \"stroke\": {";
+                sf += "\"width\": " + jsonNumber(st.width);
+                sf += ", \"color\": [";
+                for (int ci = 0; ci < 4; ++ci) {
+                    sf += jsonNumber(st.color[ci]);
+                    if (ci < 3) sf += ", ";
+                }
+                sf += "]";
+                sf += std::string(", \"opacity\": ") + jsonNumber(st.opacity);
+                sf += std::string(", \"align\": ") + std::to_string(static_cast<int32_t>(st.align));
+                sf += std::string(", \"cap\": ") + std::to_string(static_cast<int32_t>(st.cap));
+                sf += std::string(", \"join\": ") + std::to_string(static_cast<int32_t>(st.join));
+                sf += ", \"miter\": " + jsonNumber(st.miterLimit);
+                sf += ", \"dashes\": [";
+                for (size_t di = 0; di < st.dashes.size(); ++di) {
+                    sf += jsonNumber(st.dashes[di]);
+                    if (di + 1 < st.dashes.size()) sf += ", ";
+                }
+                sf += "]";
+                sf += ", \"dashOffset\": " + jsonNumber(st.dashOffset);
+                sf += "}";
+            }
+            if (sh.live.kind != ShapeLiveKind::None) {
+                const LiveShape& lv = sh.live;
+                sf += std::string(",\n      \"live\": {\"kind\": ") +
+                      std::to_string(static_cast<int32_t>(lv.kind));
+                sf += ", \"rect\": [";
+                for (int ci = 0; ci < 4; ++ci) {
+                    sf += jsonNumber(lv.rect[ci]);
+                    if (ci < 3) sf += ", ";
+                }
+                sf += "]";
+                if (lv.kind == ShapeLiveKind::Rect) {
+                    sf += ", \"radii\": [";
+                    for (int ci = 0; ci < 4; ++ci) {
+                        sf += jsonNumber(lv.radii[ci]);
+                        if (ci < 3) sf += ", ";
+                    }
+                    sf += "]";
+                }
+                if (lv.kind == ShapeLiveKind::Polygon) {
+                    sf += std::string(", \"sides\": ") + std::to_string(lv.sides);
+                    sf += ", \"star\": " + jsonNumber(lv.starRatio);
+                }
+                if (lv.kind == ShapeLiveKind::Line) {
+                    sf += ", \"from\": [" + jsonNumber(lv.from[0]) + ", " + jsonNumber(lv.from[1]) + "]";
+                    sf += ", \"to\": [" + jsonNumber(lv.to[0]) + ", " + jsonNumber(lv.to[1]) + "]";
+                    sf += ", \"weight\": " + jsonNumber(lv.weight);
+                }
+                sf += "}";
+            }
+            fields.push_back("      \"shape\": {\n" + sf + "\n      }");
+        }
+        if (l.vectorMask != nullptr) {
+            // v12 矢量蒙版（M18d）：路径 + enabled
+            fields.push_back("      \"vectorMask\": {\"enabled\": " +
+                             std::string(l.vectorMaskEnabled ? "true" : "false") +
+                             ", \"path\": " + pathToJson(l.vectorMask->path, "           ") + "}");
+        }
         if (l.pixels != nullptr) {
             // 图像以内容包围盒存出；originX/Y = 包围盒左上角在文档坐标系的落点（load 据此重建 Transform）
             fields.push_back("      \"originX\": " + std::to_string(static_cast<int64_t>(l.originX)));
@@ -1015,6 +1131,51 @@ std::string buildManifest(const DocSnapshot& doc) {
         }
         j += "  ]\n";
     }
+    // v12：矢量文档级（M18；全空不写 = v11 包字节不变）
+    const bool hasVector = !doc.workPath.subpaths.empty() || !doc.paths.empty() ||
+                           !doc.customShapes.empty();
+    if (hasVector) {
+        j += ",\n  \"vector\": {\n";
+        bool first = true;
+        if (!doc.workPath.subpaths.empty()) {
+            j += "    \"workPath\": " + pathToJson(doc.workPath, "      ");
+            first = false;
+        }
+        if (!doc.paths.empty()) {
+            if (!first) {
+                j += ",\n";
+            }
+            j += "    \"paths\": [\n";
+            for (size_t i = 0; i < doc.paths.size(); ++i) {
+                j += "      {\"name\": " + jsonEscape(doc.paths[i].name) + ", \"path\": " +
+                     pathToJson(doc.paths[i].path, "        ") + "}";
+                if (i + 1 < doc.paths.size()) {
+                    j += ",";
+                }
+                j += "\n";
+            }
+            j += "    ]";
+            first = false;
+        }
+        if (!doc.customShapes.empty()) {
+            if (!first) {
+                j += ",\n";
+            }
+            j += "    \"customShapes\": [\n";
+            for (size_t i = 0; i < doc.customShapes.size(); ++i) {
+                const CustomShapeEntry& c = doc.customShapes[i];
+                j += "      {\"id\": " + jsonEscape(c.id) + ", \"name\": " + jsonEscape(c.name) +
+                     ", \"path\": " + pathToJson(c.path, "        ") + "}";
+                if (i + 1 < doc.customShapes.size()) {
+                    j += ",";
+                }
+                j += "\n";
+            }
+            j += "    ],\n";
+            j += "    \"customShapeSeq\": " + std::to_string(doc.customShapeSeq) + "\n";
+        }
+        j += "  }\n";
+    }
     j += "}\n";
     return j;
 }
@@ -1060,6 +1221,10 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
         snap.guidesV = e.doc.guidesV;
         snap.guidesLocked = e.doc.guidesLocked;
         snap.guidesVisible = e.doc.guidesVisible;
+        snap.workPath = e.doc.workPath;
+        snap.paths = e.doc.paths;
+        snap.customShapes = e.doc.customShapes;
+        snap.customShapeSeq = e.doc.customShapeSeq;
         snap.layers.reserve(e.doc.layers.size());
         for (const Layer& l : e.doc.layers) {
             LayerSnapshot s;
@@ -1088,6 +1253,17 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
             s.collapsed = l.collapsed;
             s.style = l.style;
             s.fill = l.fill;
+            s.shape = l.shape;
+            if (l.shape != nullptr && s.pixels == nullptr) {
+                // M18：形状层像素 = shapeCache 派生结果、origin = shapeOrigin（PNG 编码复用）
+                s.pixels = l.shapeCache;
+                s.originX = l.shapeOriginX;
+                s.originY = l.shapeOriginY;
+            }
+            if (l.vectorMask != nullptr) {
+                s.vectorMask = l.vectorMask;
+                s.vectorMaskEnabled = l.vectorMask->enabled;
+            }
             snap.layers.push_back(std::move(s));
         }
     }

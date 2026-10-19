@@ -17,6 +17,7 @@
 #include <hilog/log.h>
 
 #include "engine/document.h"
+#include "engine/vector_render.h"
 #include "engine/style_ops.h"
 #include "engine/engine.h"
 #include "io/png_decode.h"
@@ -29,7 +30,7 @@ constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Open";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
 constexpr int kMinVersion = 1;
-constexpr int kMaxVersion = 11;  // v11：+等高线/Range/图案叠加/文档图案（M17d，可选字段读兼容 v1–v10）；v10：+图层样式效果扩展（M17a，可选字段读兼容 v1–v9）；v9：+参考线 guides 块（M15a）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
+constexpr int kMaxVersion = 12;  // v11：+等高线/Range/图案叠加/文档图案（M17d，可选字段读兼容 v1–v10）；v10：+图层样式效果扩展（M17a，可选字段读兼容 v1–v9）；v9：+参考线 guides 块（M15a）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
 constexpr uint32_t kMaxSide = 30000;
 constexpr uint64_t kMaxTotalPixels = 100ull * 1000 * 1000;
 constexpr size_t kMaxLayers = 10000;
@@ -515,6 +516,8 @@ struct LayerRecord {
     std::shared_ptr<TextLayerState> text;  // v6（M12）
     std::shared_ptr<LayerStyle> style;  // v8（M14c）
     std::shared_ptr<FillLayerState> fill;  // v8（M14c）
+    std::shared_ptr<ShapeLayerState> shape;  // v12（M18）
+    std::shared_ptr<VectorMaskData> vectorMask;  // v12（M18d）
     // v7（M14a）
     bool isGroup = false;
     uint64_t parentId = 0;
@@ -544,6 +547,63 @@ bool getDouble(const JValue& v, double& out) {
     }
     out = v.num;
     return true;
+}
+
+// M18 v12：扁平数组 → 路径（[子路径数, (closed, op, knot数, knot×7)×n]；结构/有限性校验）
+static bool parsePathFlat(const JValue& v, VectorPath& out) {
+    out = VectorPath{};
+    if (v.type != JValue::Arr || v.arr.empty()) {
+        return false;
+    }
+    auto asNum = [](const JValue& x, double& d) {
+        if (x.type != JValue::Num || !std::isfinite(x.num)) {
+            return false;
+        }
+        d = x.num;
+        return true;
+    };
+    size_t idx = 0;
+    double subCount = 0;
+    if (!asNum(v.arr[0], subCount) || subCount < 0 || subCount > 4096) {
+        return false;
+    }
+    idx = 1;
+    for (size_t si = 0; si < static_cast<size_t>(subCount); si++) {
+        if (idx + 3 > v.arr.size()) {
+            return false;
+        }
+        double closed = 0, op = 0, knotCount = 0;
+        if (!asNum(v.arr[idx], closed) || !asNum(v.arr[idx + 1], op) || !asNum(v.arr[idx + 2], knotCount)) {
+            return false;
+        }
+        idx += 3;
+        if (knotCount < 0 || knotCount > 4096 || op < 0 || op > 4) {
+            return false;
+        }
+        Subpath sp;
+        sp.closed = closed > 0.5;
+        sp.op = static_cast<PathOp>(static_cast<int32_t>(op));
+        for (size_t ki = 0; ki < static_cast<size_t>(knotCount); ki++) {
+            if (idx + 7 > v.arr.size()) {
+                return false;
+            }
+            Knot kn;
+            double vals[7];
+            for (int vi = 0; vi < 7; vi++) {
+                if (!asNum(v.arr[idx + static_cast<size_t>(vi)], vals[vi])) {
+                    return false;
+                }
+            }
+            idx += 7;
+            kn.anchor = vpt(vals[0], vals[1]);
+            kn.inCtrl = vpt(vals[2], vals[3]);
+            kn.outCtrl = vpt(vals[4], vals[5]);
+            kn.smooth = vals[6] > 0.5;
+            sp.knots.push_back(kn);
+        }
+        out.subpaths.push_back(std::move(sp));
+    }
+    return idx == v.arr.size();
 }
 
 bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector<LayerRecord>& layers,
@@ -929,6 +989,232 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
             l.collapsed = jcol->b;
         }
         // v8 图层样式（M14c，可选字段——旧版无此字段 = 无样式）
+        // v12 形状层（M18；可选字段，旧版无此字段 = 普通层）
+        const JValue* jsh = item.find("shape");
+        if (jsh != nullptr && jsh->type == JValue::Obj) {
+            auto sh = std::make_shared<ShapeLayerState>();
+            const JValue* jpath = jsh->find("path");
+            if (jpath == nullptr || !parsePathFlat(*jpath, sh->path)) {
+                err = "bad shape path";
+                return false;
+            }
+            const JValue* jfk = jsh->find("fillKind");
+            if (jfk != nullptr) {
+                double fk = 1;
+                if (!getDouble(*jfk, fk) || fk < 0 || fk > 1) {
+                    err = "bad shape fillKind";
+                    return false;
+                }
+                sh->fillKind = static_cast<int32_t>(fk);
+            }
+            const JValue* jfc = jsh->find("fillColor");
+            if (jfc != nullptr) {
+                if (jfc->type != JValue::Arr || jfc->arr.size() != 4) {
+                    err = "bad shape fillColor";
+                    return false;
+                }
+                for (int ci = 0; ci < 4; ++ci) {
+                    double cv = 0;
+                    if (!getDouble(jfc->arr[ci], cv) || !std::isfinite(cv) || cv < 0 || cv > 1) {
+                        err = "bad shape fillColor";
+                        return false;
+                    }
+                    sh->fillColor[ci] = static_cast<float>(cv);
+                }
+            }
+            const JValue* jhs = jsh->find("hasStroke");
+            if (jhs != nullptr && jhs->type == JValue::Bool && jhs->b) {
+                const JValue* jst2 = jsh->find("stroke");
+                if (jst2 == nullptr || jst2->type != JValue::Obj) {
+                    err = "bad shape stroke";
+                    return false;
+                }
+                ShapeStroke ss;
+                const JValue* jw = jst2->find("width");
+                double w = 3.0;
+                if (jw != nullptr && (!getDouble(*jw, w) || !std::isfinite(w) || w < 0 || w > 100000)) {
+                    err = "bad stroke width";
+                    return false;
+                }
+                ss.width = w;
+                const JValue* jc = jst2->find("color");
+                if (jc != nullptr) {
+                    if (jc->type != JValue::Arr || jc->arr.size() != 4) {
+                        err = "bad stroke color";
+                        return false;
+                    }
+                    for (int ci = 0; ci < 4; ++ci) {
+                        double cv = 0;
+                        if (!getDouble(jc->arr[ci], cv) || !std::isfinite(cv) || cv < 0 || cv > 1) {
+                            err = "bad stroke color";
+                            return false;
+                        }
+                        ss.color[ci] = static_cast<float>(cv);
+                    }
+                }
+                const JValue* jop = jst2->find("opacity");
+                double op = 1.0;
+                if (jop != nullptr && (!getDouble(*jop, op) || !std::isfinite(op) || op < 0 || op > 1)) {
+                    err = "bad stroke opacity";
+                    return false;
+                }
+                ss.opacity = op;
+                auto readEnum = [&](const char* key, double lo, double hi, double& out) {
+                    const JValue* je = jst2->find(key);
+                    if (je != nullptr) {
+                        double ev = 0;
+                        if (!getDouble(*je, ev) || ev < lo || ev > hi) {
+                            return false;
+                        }
+                        out = ev;
+                    }
+                    return true;
+                };
+                double ev = 1.0;
+                if (!readEnum("align", 0, 2, ev)) {
+                    err = "bad stroke align";
+                    return false;
+                }
+                ss.align = static_cast<StrokeAlign>(static_cast<int32_t>(ev));
+                ev = 0.0;
+                if (!readEnum("cap", 0, 2, ev)) {
+                    err = "bad stroke cap";
+                    return false;
+                }
+                ss.cap = static_cast<LineCap>(static_cast<int32_t>(ev));
+                ev = 0.0;
+                if (!readEnum("join", 0, 2, ev)) {
+                    err = "bad stroke join";
+                    return false;
+                }
+                ss.join = static_cast<LineJoin>(static_cast<int32_t>(ev));
+                const JValue* jml = jst2->find("miter");
+                double ml = 100.0;
+                if (jml != nullptr && (!getDouble(*jml, ml) || !std::isfinite(ml) || ml < 1 || ml > 500)) {
+                    err = "bad stroke miter";
+                    return false;
+                }
+                ss.miterLimit = ml;
+                const JValue* jda = jst2->find("dashes");
+                if (jda != nullptr) {
+                    if (jda->type != JValue::Arr || jda->arr.size() > 32) {
+                        err = "bad stroke dashes";
+                        return false;
+                    }
+                    for (const JValue& dv : jda->arr) {
+                        double dd = 0;
+                        if (!getDouble(dv, dd) || !std::isfinite(dd) || dd < 0 || dd > 10000) {
+                            err = "bad stroke dash";
+                            return false;
+                        }
+                        ss.dashes.push_back(dd);
+                    }
+                }
+                const JValue* jdo = jst2->find("dashOffset");
+                double dof = 0.0;
+                if (jdo != nullptr && (!getDouble(*jdo, dof) || !std::isfinite(dof) || std::fabs(dof) > 100000)) {
+                    err = "bad stroke dashOffset";
+                    return false;
+                }
+                ss.dashOffset = dof;
+                sh->stroke = ss;
+                sh->hasStroke = true;
+            }
+            const JValue* jlv = jsh->find("live");
+            if (jlv != nullptr && jlv->type == JValue::Obj) {
+                const JValue* jkind = jlv->find("kind");
+                double kind = 0;
+                if (jkind != nullptr && getDouble(*jkind, kind) && kind >= 1 && kind <= 4) {
+                    sh->live.kind = static_cast<ShapeLiveKind>(static_cast<int32_t>(kind));
+                    auto read4 = [&](const char* key, double* out) {
+                        const JValue* ja = jlv->find(key);
+                        if (ja != nullptr) {
+                            if (ja->type != JValue::Arr || ja->arr.size() != 4) {
+                                return false;
+                            }
+                            for (int ci = 0; ci < 4; ++ci) {
+                                if (!getDouble(ja->arr[ci], out[ci]) || !std::isfinite(out[ci])) {
+                                    return false;
+                                }
+                            }
+                        }
+                        return true;
+                    };
+                    double rect[4] = {0, 0, 0, 0};
+                    if (!read4("rect", rect)) {
+                        err = "bad live rect";
+                        return false;
+                    }
+                    for (int ci = 0; ci < 4; ++ci) {
+                        sh->live.rect[ci] = rect[ci];
+                    }
+                    if (sh->live.kind == ShapeLiveKind::Rect) {
+                        double radii[4] = {0, 0, 0, 0};
+                        if (!read4("radii", radii)) {
+                            err = "bad live radii";
+                            return false;
+                        }
+                        for (int ci = 0; ci < 4; ++ci) {
+                            sh->live.radii[ci] = radii[ci];
+                        }
+                    }
+                    if (sh->live.kind == ShapeLiveKind::Polygon) {
+                        const JValue* jsides = jlv->find("sides");
+                        double sides = 5;
+                        if (jsides != nullptr && (!getDouble(*jsides, sides) || sides < 3 || sides > 100)) {
+                            err = "bad live sides";
+                            return false;
+                        }
+                        sh->live.sides = static_cast<uint32_t>(sides);
+                        const JValue* jstar = jlv->find("star");
+                        double star = 1.0;
+                        if (jstar != nullptr && (!getDouble(*jstar, star) || star < 0 || star > 1)) {
+                            err = "bad live star";
+                            return false;
+                        }
+                        sh->live.starRatio = star;
+                    }
+                    if (sh->live.kind == ShapeLiveKind::Line) {
+                        const JValue* jfrom = jlv->find("from");
+                        const JValue* jto = jlv->find("to");
+                        const JValue* jwt = jlv->find("weight");
+                        if (jfrom != nullptr && jfrom->type == JValue::Arr && jfrom->arr.size() == 2) {
+                            for (int ci = 0; ci < 2; ++ci) {
+                                getDouble(jfrom->arr[ci], sh->live.from[ci]);
+                            }
+                        }
+                        if (jto != nullptr && jto->type == JValue::Arr && jto->arr.size() == 2) {
+                            for (int ci = 0; ci < 2; ++ci) {
+                                getDouble(jto->arr[ci], sh->live.to[ci]);
+                            }
+                        }
+                        double wt = 4.0;
+                        if (jwt != nullptr && (!getDouble(*jwt, wt) || wt < 0)) {
+                            err = "bad live weight";
+                            return false;
+                        }
+                        sh->live.weight = wt;
+                    }
+                }
+            }
+            l.shape = std::move(sh);
+        }
+        // v12 矢量蒙版（M18d；可选字段）
+        const JValue* jvm = item.find("vectorMask");
+        if (jvm != nullptr && jvm->type == JValue::Obj) {
+            auto vm = std::make_shared<VectorMaskData>();
+            vm->enabled = true;
+            const JValue* jve = jvm->find("enabled");
+            if (jve != nullptr && jve->type == JValue::Bool) {
+                vm->enabled = jve->b;
+            }
+            const JValue* jvp = jvm->find("path");
+            if (jvp == nullptr || !parsePathFlat(*jvp, vm->path)) {
+                err = "bad vector mask path";
+                return false;
+            }
+            l.vectorMask = std::move(vm);
+        }
         const JValue* jst = item.find("style");
         if (jst != nullptr) {
             if (jst->type != JValue::Obj) {
@@ -1314,6 +1600,79 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
         }
     }
     // v10：全局光角度（M17b，可选；缺省 120）
+    // v12 矢量文档级（M18；可选块）
+    const JValue* jvec = root.find("vector");
+    if (jvec != nullptr && jvec->type == JValue::Obj) {
+        const JValue* jwp = jvec->find("workPath");
+        if (jwp != nullptr && !parsePathFlat(*jwp, doc.workPath)) {
+            err = "bad workPath";
+            return false;
+        }
+        const JValue* jpaths = jvec->find("paths");
+        if (jpaths != nullptr) {
+            if (jpaths->type != JValue::Arr) {
+                err = "bad paths";
+                return false;
+            }
+            for (const JValue& pv : jpaths->arr) {
+                if (pv.type != JValue::Obj) {
+                    err = "bad path entry";
+                    return false;
+                }
+                NamedPathEntry entry;
+                const JValue* jn = pv.find("name");
+                if (jn != nullptr && jn->type == JValue::Str) {
+                    entry.name = jn->str;
+                }
+                const JValue* jpp = pv.find("path");
+                if (jpp == nullptr || !parsePathFlat(*jpp, entry.path)) {
+                    err = "bad saved path";
+                    return false;
+                }
+                doc.paths.push_back(std::move(entry));
+            }
+        }
+        const JValue* jcsh = jvec->find("customShapes");
+        if (jcsh != nullptr) {
+            if (jcsh->type != JValue::Arr) {
+                err = "bad customShapes";
+                return false;
+            }
+            for (const JValue& cv : jcsh->arr) {
+                if (cv.type != JValue::Obj) {
+                    err = "bad custom shape";
+                    return false;
+                }
+                CustomShapeEntry entry;
+                const JValue* jid = cv.find("id");
+                if (jid != nullptr && jid->type == JValue::Str) {
+                    entry.id = jid->str;
+                    // id 白名单（防路径注入；与 M17d pattern id 同策略）
+                    for (char ch : entry.id) {
+                        if (!(isalnum(static_cast<unsigned char>(ch)) || ch == '_')) {
+                            err = "bad custom shape id";
+                            return false;
+                        }
+                    }
+                }
+                const JValue* jcn = cv.find("name");
+                if (jcn != nullptr && jcn->type == JValue::Str) {
+                    entry.name = jcn->str;
+                }
+                const JValue* jcp = cv.find("path");
+                if (jcp == nullptr || !parsePathFlat(*jcp, entry.path)) {
+                    err = "bad custom shape path";
+                    return false;
+                }
+                doc.customShapes.push_back(std::move(entry));
+            }
+        }
+        const JValue* jseq = jvec->find("customShapeSeq");
+        double seq = 0;
+        if (jseq != nullptr && getDouble(*jseq, seq) && seq >= 0 && seq < 4294967296.0) {
+            doc.customShapeSeq = static_cast<uint32_t>(seq);
+        }
+    }
     const JValue* jgl = root.find("globalLight");
     if (jgl != nullptr && jgl->type == JValue::Num && std::isfinite(jgl->num)) {
         doc.globalLightAngle = std::clamp(jgl->num, 0.0, 360.0);
@@ -1443,6 +1802,8 @@ bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
         l.collapsed = rec.collapsed;
         l.style = rec.style;
         l.fill = rec.fill;
+        l.shape = rec.shape;
+        l.vectorMask = rec.vectorMask;
         l.transform.originX = rec.originX;
         l.transform.originY = rec.originY;
         if (rec.hasImage) {
@@ -1584,6 +1945,10 @@ bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
         engine.doc.guidesLocked = doc.guidesLocked;
         engine.doc.guidesVisible = doc.guidesVisible;
         engine.doc.patterns = std::move(doc.patterns);  // M17d：图案资源随工程恢复
+        engine.doc.workPath = std::move(doc.workPath);  // M18：路径面板/自定义形状随工程恢复
+        engine.doc.paths = std::move(doc.paths);
+        engine.doc.customShapes = std::move(doc.customShapes);
+        engine.doc.customShapeSeq = doc.customShapeSeq;
         // M14c：样式/填充派生渲染重建（styledRender 不入库，读入后按参数重生成）
         restyleDocument(engine.doc);
         engine.bumpRevisionLocked();

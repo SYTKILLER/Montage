@@ -45,6 +45,7 @@ struct PsdLayerSnap {
     bool isFill = false;      // 降级 note（styledRender 像素导出）
     bool hasStyle = false;    // 降级 note（样式已合成进像素——不可 lrFX 表示的路径）
     std::shared_ptr<const LayerStyle> style;  // M17c 非空 = 效果全可 lrFX 表示（像素走原始+lrFX）
+    std::shared_ptr<const VectorMaskData> vectorMask;  // M18d 非空 = 写 vmsk 块
     // 调整层参数（isAdjustment 时；kind 对齐 AdjustmentKind 枚举）
     int32_t adjKind = 0;      // 0=Levels 1=Curves 3=Invert 可直写；其余跳过 + note
     float adjInBlack = 0.0f;
@@ -61,6 +62,10 @@ struct PsdDocSnap {
     std::vector<PsdLayerSnap> layers;  // bottom → top
     // 合成图（ImageData 段；null = 导出时从可见层现场扁平化）
     std::shared_ptr<std::vector<uint8_t>> flattenedRgba;
+
+    // M18d：保存路径/工作路径 → 路径资源 2000+ / 1025
+    std::vector<NamedPathEntry> paths;
+    VectorPath workPath;
 };
 
 struct PsdExportResult {

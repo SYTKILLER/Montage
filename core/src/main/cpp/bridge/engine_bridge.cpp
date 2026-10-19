@@ -13,6 +13,11 @@
 #include <hilog/log.h>
 #include <multimedia/image_framework/image/pixelmap_native.h>
 
+#include "engine/vector_render.h"
+#include "engine/vector_raster.h"
+#include "engine/vector_flatten.h"
+#include "engine/vector_edit.h"
+#include "engine/vector_shapes.h"
 #include "engine/engine.h"
 #include "engine/filter_ops.h"
 #include "engine/group_ops.h"
@@ -837,6 +842,63 @@ napi_value makeLayerDto(napi_env env, const Layer& l, bool isActive) {
     napi_set_named_property(env, obj, "styleOn",
                             makeBool(env, l.style != nullptr && l.style->enabled));  // M17a
     napi_set_named_property(env, obj, "isFill", makeBool(env, l.fill != nullptr));
+    // M18 形状层字段（非形状层给常量缺省，DTO 形状稳定）
+    napi_set_named_property(env, obj, "isShape", makeBool(env, l.shape != nullptr));
+    if (l.shape != nullptr) {
+        const ShapeLayerState& sh = *l.shape;
+        napi_set_named_property(env, obj, "shapeLiveKind", makeInt32(env, static_cast<int32_t>(sh.live.kind)));
+        napi_value rectArr = nullptr;
+        napi_create_array(env, &rectArr);
+        for (int i = 0; i < 4; i++) {
+            napi_set_element(env, rectArr, static_cast<uint32_t>(i), makeDouble(env, sh.live.rect[i]));
+        }
+        napi_set_named_property(env, obj, "shapeRect", rectArr);
+        napi_value radArr = nullptr;
+        napi_create_array(env, &radArr);
+        for (int i = 0; i < 4; i++) {
+            napi_set_element(env, radArr, static_cast<uint32_t>(i), makeDouble(env, sh.live.radii[i]));
+        }
+        napi_set_named_property(env, obj, "shapeRadii", radArr);
+        napi_set_named_property(env, obj, "shapeSides", makeDouble(env, static_cast<double>(sh.live.sides)));
+        napi_set_named_property(env, obj, "shapeStar", makeDouble(env, sh.live.starRatio));
+        napi_value fromArr = nullptr;
+        napi_create_array(env, &fromArr);
+        napi_set_element(env, fromArr, 0, makeDouble(env, sh.live.from[0]));
+        napi_set_element(env, fromArr, 1, makeDouble(env, sh.live.from[1]));
+        napi_set_named_property(env, obj, "shapeFrom", fromArr);
+        napi_value toArr = nullptr;
+        napi_create_array(env, &toArr);
+        napi_set_element(env, toArr, 0, makeDouble(env, sh.live.to[0]));
+        napi_set_element(env, toArr, 1, makeDouble(env, sh.live.to[1]));
+        napi_set_named_property(env, obj, "shapeTo", toArr);
+        napi_set_named_property(env, obj, "shapeWeight", makeDouble(env, sh.live.weight));
+        napi_set_named_property(env, obj, "shapeFillKind", makeInt32(env, sh.fillKind));
+        char fillHex[10] = "#FF0000";
+        if (sh.fillKind == 1) {
+            std::snprintf(fillHex, sizeof(fillHex), "#%02X%02X%02X%02X",
+                          static_cast<int>(std::lround(std::min(1.0f, std::max(0.0f, sh.fillColor[3])) * 255.0f)),
+                          static_cast<int>(std::lround(std::min(1.0f, std::max(0.0f, sh.fillColor[0])) * 255.0f)),
+                          static_cast<int>(std::lround(std::min(1.0f, std::max(0.0f, sh.fillColor[1])) * 255.0f)),
+                          static_cast<int>(std::lround(std::min(1.0f, std::max(0.0f, sh.fillColor[2])) * 255.0f)));
+        }
+        napi_set_named_property(env, obj, "shapeFill", makeString(env, fillHex));
+        napi_set_named_property(env, obj, "shapeStrokeOn", makeBool(env, sh.hasStroke));
+        char stHex[10] = "#000000";
+        if (sh.hasStroke) {
+            std::snprintf(stHex, sizeof(stHex), "#%02X%02X%02X%02X",
+                          static_cast<int>(std::lround(std::min(1.0f, std::max(0.0f, sh.stroke.color[3])) * 255.0f)),
+                          static_cast<int>(std::lround(std::min(1.0f, std::max(0.0f, sh.stroke.color[0])) * 255.0f)),
+                          static_cast<int>(std::lround(std::min(1.0f, std::max(0.0f, sh.stroke.color[1])) * 255.0f)),
+                          static_cast<int>(std::lround(std::min(1.0f, std::max(0.0f, sh.stroke.color[2])) * 255.0f)));
+        }
+        napi_set_named_property(env, obj, "shapeStrokeColor", makeString(env, stHex));
+        napi_set_named_property(env, obj, "shapeStrokeWidth",
+                                makeDouble(env, sh.hasStroke ? sh.stroke.width : 3.0));
+    }
+    napi_set_named_property(env, obj, "hasVectorMask",
+                            makeBool(env, l.vectorMask != nullptr));  // M18d
+    napi_set_named_property(env, obj, "vectorMaskOn",
+                            makeBool(env, l.vectorMask != nullptr && l.vectorMask->enabled));
     napi_set_named_property(env, obj, "hasMask", makeBool(env, l.mask != nullptr));
     napi_set_named_property(env, obj, "maskEnabled", makeBool(env, l.mask != nullptr && l.mask->enabled));
     napi_set_named_property(env, obj, "clipping", makeBool(env, l.clipping));
@@ -1116,7 +1178,12 @@ napi_value SetLayerMaskEnabled(napi_env env, napi_callback_info info) {
         auto m = std::make_shared<LayerMask>(*l->mask);  // COW：快照安全
         m->enabled = v;
         l->mask = std::move(m);
-        l->render = (v && l->pixels != nullptr) ? composeMasked(l->pixels, *l->mask) : nullptr;
+        {
+            // M18：形状层底片 = shapeCache（像素层 = pixels）
+            const std::shared_ptr<const TileGrid> base =
+                l->shape != nullptr ? l->shapeCache : l->pixels;
+            l->render = (v && base != nullptr) ? composeMasked(base, *l->mask) : nullptr;
+        }
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();
         e.requestRender();
@@ -1549,7 +1616,12 @@ napi_value AddLayerMask(napi_env env, napi_callback_info info) {
         m->enabled = true;
         m->linked = true;
         l->mask = std::move(m);
-        l->render = composeMasked(l->pixels, *l->mask);
+        {
+            // M18：形状层底片 = shapeCache
+            const std::shared_ptr<const TileGrid> base =
+                l->shape != nullptr ? l->shapeCache : l->pixels;
+            l->render = base != nullptr ? composeMasked(base, *l->mask) : nullptr;
+        }
         e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();
         e.requestRender();
@@ -3799,6 +3871,8 @@ napi_value ExportPsd(napi_env env, napi_callback_info info) {
             return makeError(env, kErrNoDoc, "exportPsd: no document");
         }
         io::PsdDocSnap snap;
+        snap.workPath = e.doc.workPath;  // M18d：路径资源导出
+        snap.paths = e.doc.paths;
         snap.width = e.doc.width;
         snap.height = e.doc.height;
         snap.name = e.doc.name;
@@ -3823,6 +3897,7 @@ napi_value ExportPsd(napi_env env, napi_callback_info info) {
                 pl.maskEnabled = l.mask->enabled;
             }
             pl.isAdjustment = l.adjustment != nullptr;
+            pl.vectorMask = l.vectorMask;  // M18d：vmsk 导出
             // M15c（PSD-2）：组树 + 降级标记 + 调整层参数
             pl.id = l.id;
             pl.parentId = l.parentId;
@@ -6226,6 +6301,1106 @@ napi_value GetSelectionBounds(napi_env env, napi_callback_info info) {
     napi_set_named_property(env, data, "w", makeDouble(env, w));
     napi_set_named_property(env, data, "h", makeDouble(env, h));
     return makeOk(env, data);
+}
+
+
+// ---------- M18 矢量与形状层 ----------
+
+// 路径 → 扁平跨桥数组：[子路径数, (closed, op, knot数, knot×7)×n]
+napi_value pathToFlatArray(napi_env env, const VectorPath& p) {
+    napi_value arr = nullptr;
+    napi_create_array(env, &arr);
+    uint32_t k = 0;
+    auto pushD = [&](double v) { napi_set_element(env, arr, k++, makeDouble(env, v)); };
+    pushD(static_cast<double>(p.subpaths.size()));
+    for (const Subpath& sp : p.subpaths) {
+        pushD(sp.closed ? 1.0 : 0.0);
+        pushD(static_cast<double>(static_cast<int32_t>(sp.op)));
+        pushD(static_cast<double>(sp.knots.size()));
+        for (const Knot& kn : sp.knots) {
+            pushD(kn.anchor.x);
+            pushD(kn.anchor.y);
+            pushD(kn.inCtrl.x);
+            pushD(kn.inCtrl.y);
+            pushD(kn.outCtrl.x);
+            pushD(kn.outCtrl.y);
+            pushD(kn.smooth ? 1.0 : 0.0);
+        }
+    }
+    return arr;
+}
+
+// 扁平数组 → 路径（长度/结构校验；脏数据返回 false）。ArkTS 代理数组 is_array 失败兜底
+// 同 readLayerIdArray（逐元素探测，M10a 实证）。
+bool flatArrayToPath(napi_env env, napi_value v, VectorPath& out) {
+    uint32_t n = 0;
+    napi_get_array_length(env, v, &n);
+    if (n == 0) {
+        const uint32_t kMaxProbe = 65536;
+        for (uint32_t i = 0; i < kMaxProbe; ++i) {
+            napi_value e = nullptr;
+            if (napi_get_element(env, v, i, &e) != napi_ok || e == nullptr) {
+                break;
+            }
+            napi_valuetype vt = napi_undefined;
+            napi_typeof(env, e, &vt);
+            if (vt != napi_number) {
+                break;
+            }
+            n = i + 1;
+        }
+    }
+    out = VectorPath{};
+    size_t idx = 0;
+    auto next = [&](double& d) {
+        if (idx >= n) {
+            return false;
+        }
+        napi_value e = nullptr;
+        if (napi_get_element(env, v, static_cast<uint32_t>(idx), &e) != napi_ok) {
+            return false;
+        }
+        if (napi_get_value_double(env, e, &d) != napi_ok) {
+            return false;
+        }
+        idx++;
+        return true;
+    };
+    double subCount = 0;
+    if (!next(subCount) || subCount < 0.0 || subCount > 4096.0) {
+        return false;
+    }
+    for (size_t si = 0; si < static_cast<size_t>(subCount); si++) {
+        double closed = 0, op = 0, knotCount = 0;
+        if (!next(closed) || !next(op) || !next(knotCount)) {
+            return false;
+        }
+        if (knotCount < 0.0 || knotCount > 4096.0 || op < -1.0 || op > 4.0) {
+            return false;
+        }
+        Subpath sp;
+        sp.closed = closed > 0.5;
+        sp.op = static_cast<PathOp>(static_cast<int32_t>(op));
+        for (size_t ki = 0; ki < static_cast<size_t>(knotCount); ki++) {
+            double vals[7];
+            for (double& val : vals) {
+                if (!next(val)) {
+                    return false;
+                }
+                if (!std::isfinite(val)) {
+                    return false;
+                }
+            }
+            Knot kn;
+            kn.anchor = vpt(vals[0], vals[1]);
+            kn.inCtrl = vpt(vals[2], vals[3]);
+            kn.outCtrl = vpt(vals[4], vals[5]);
+            kn.smooth = vals[6] > 0.5;
+            sp.knots.push_back(kn);
+        }
+        out.subpaths.push_back(std::move(sp));
+    }
+    return true;
+}
+
+napi_value CreateShapeLayer(napi_env env, napi_callback_info info) {
+    // createShapeLayer(kind, x0, y0, x1, y1, radius, sides, starRatio, weight,
+    //                  fillKind, fr, fg, fb, fa, hasStroke, sr, sg, sb, sa, strokeWidth)
+    size_t argc = 20;
+    napi_value argv[20] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 20) {
+        return makeError(env, kErrBadParam, "createShapeLayer requires 20 args");
+    }
+    double a[20] = {0};
+    for (size_t i = 0; i < 20; i++) {
+        if (napi_get_value_double(env, argv[i], &a[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "createShapeLayer: invalid args");
+        }
+    }
+    auto& e = Engine::get();
+    double newId = 0;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "createShapeLayer: no document");
+        }
+        auto state = std::make_shared<ShapeLayerState>();
+        LiveShape& lv = state->live;
+        lv.kind = static_cast<ShapeLiveKind>(static_cast<int32_t>(a[0]));
+        if (lv.kind < ShapeLiveKind::Rect || lv.kind > ShapeLiveKind::Line) {
+            return makeError(env, kErrBadParam, "createShapeLayer: bad kind");
+        }
+        const double x0 = a[1], y0 = a[2], x1 = a[3], y1 = a[4];
+        if (!std::isfinite(x0) || !std::isfinite(y0) || !std::isfinite(x1) || !std::isfinite(y1)) {
+            return makeError(env, kErrBadParam, "createShapeLayer: bad rect");
+        }
+        switch (lv.kind) {
+            case ShapeLiveKind::Rect:
+                lv.rect[0] = std::min(x0, x1);
+                lv.rect[1] = std::min(y0, y1);
+                lv.rect[2] = std::fabs(x1 - x0);
+                lv.rect[3] = std::fabs(y1 - y0);
+                lv.radii[0] = lv.radii[1] = lv.radii[2] = lv.radii[3] = std::max(0.0, a[5]);
+                break;
+            case ShapeLiveKind::Ellipse:
+                lv.rect[0] = std::min(x0, x1);
+                lv.rect[1] = std::min(y0, y1);
+                lv.rect[2] = std::fabs(x1 - x0);
+                lv.rect[3] = std::fabs(y1 - y0);
+                break;
+            case ShapeLiveKind::Polygon: {
+                lv.rect[0] = std::min(x0, x1);
+                lv.rect[1] = std::min(y0, y1);
+                lv.rect[2] = std::fabs(x1 - x0);
+                lv.rect[3] = std::fabs(y1 - y0);
+                const double sides = std::min(std::max(a[6], 3.0), 100.0);
+                lv.sides = static_cast<uint32_t>(sides);
+                lv.starRatio = std::min(std::max(a[7], 0.0), 1.0);
+                if (lv.starRatio >= 1.0) {
+                    lv.starRatio = 1.0;
+                }
+                break;
+            }
+            case ShapeLiveKind::Line:
+                lv.from[0] = x0;
+                lv.from[1] = y0;
+                lv.to[0] = x1;
+                lv.to[1] = y1;
+                lv.weight = std::max(1.0, a[8]);
+                break;
+            default:
+                break;
+        }
+        state->path = liveShapePath(lv);
+        state->fillKind = static_cast<int32_t>(a[9]);
+        state->fillColor[0] = static_cast<float>(a[10]);
+        state->fillColor[1] = static_cast<float>(a[11]);
+        state->fillColor[2] = static_cast<float>(a[12]);
+        state->fillColor[3] = static_cast<float>(a[13]);
+        state->hasStroke = a[14] > 0.5;
+        if (state->hasStroke) {
+            state->stroke.width = std::max(1.0, a[19]);
+            state->stroke.color[0] = static_cast<float>(a[15]);
+            state->stroke.color[1] = static_cast<float>(a[16]);
+            state->stroke.color[2] = static_cast<float>(a[17]);
+            state->stroke.color[3] = static_cast<float>(a[18]);
+        }
+        std::string err;
+        if (!validateShape(state->path, state->hasStroke ? &state->stroke : nullptr, err)) {
+            return makeError(env, kErrBadParam, ("createShapeLayer: " + err).c_str());
+        }
+        Layer layer;
+        layer.id = e.nextLayerId();
+        layer.name = shapeLayerDisplayName(*state);
+        layer.shape = std::move(state);
+        size_t at = e.doc.layers.size();
+        for (size_t i = 0; i < e.doc.layers.size(); ++i) {
+            if (e.doc.layers[i].id == e.doc.activeId) {
+                at = i + 1;
+                break;
+            }
+        }
+        e.history.beginEdit(e.doc, layer.name, static_cast<uint64_t>(e.docRevision));
+        e.doc.layers.insert(e.doc.layers.begin() + static_cast<long>(at), std::move(layer));
+        Layer& inserted = e.doc.layers[at];
+        e.doc.activeId = inserted.id;
+        if (!shapeRenderLayer(e.doc, inserted, err)) {
+            { uint64_t rv = 0; std::string lb; e.history.undo(e.doc, rv, lb); (void)rv; (void)lb; }  // 渲染失败回滚（预算拒绝等）
+            return makeError(env, kErrBadParam, ("createShapeLayer: " + err).c_str());
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        newId = static_cast<double>(inserted.id);
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "id", makeDouble(env, newId));
+    return makeOk(env, data);
+}
+
+napi_value SetShapeLive(napi_env env, napi_callback_info info) {
+    // setShapeLive(id, kind, x0, y0, x1, y1, radius, sides, starRatio, weight)
+    size_t argc = 10;
+    napi_value argv[10] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 10) {
+        return makeError(env, kErrBadParam, "setShapeLive requires 10 args");
+    }
+    double a[10] = {0};
+    for (size_t i = 0; i < 10; i++) {
+        if (napi_get_value_double(env, argv[i], &a[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "setShapeLive: invalid args");
+        }
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(a[0]));
+        if (l == nullptr || l->shape == nullptr) {
+            return makeError(env, kErrBadParam, "setShapeLive: shape layer not found");
+        }
+        auto next = std::make_shared<ShapeLayerState>(*l->shape);  // COW
+        LiveShape& lv = next->live;
+        lv.kind = static_cast<ShapeLiveKind>(static_cast<int32_t>(a[1]));
+        const double x0 = a[2], y0 = a[3], x1 = a[4], y1 = a[5];
+        switch (lv.kind) {
+            case ShapeLiveKind::Rect:
+                lv.rect[0] = std::min(x0, x1);
+                lv.rect[1] = std::min(y0, y1);
+                lv.rect[2] = std::fabs(x1 - x0);
+                lv.rect[3] = std::fabs(y1 - y0);
+                lv.radii[0] = lv.radii[1] = lv.radii[2] = lv.radii[3] = std::max(0.0, a[6]);
+                break;
+            case ShapeLiveKind::Ellipse:
+                lv.rect[0] = std::min(x0, x1);
+                lv.rect[1] = std::min(y0, y1);
+                lv.rect[2] = std::fabs(x1 - x0);
+                lv.rect[3] = std::fabs(y1 - y0);
+                break;
+            case ShapeLiveKind::Polygon:
+                lv.rect[0] = std::min(x0, x1);
+                lv.rect[1] = std::min(y0, y1);
+                lv.rect[2] = std::fabs(x1 - x0);
+                lv.rect[3] = std::fabs(y1 - y0);
+                lv.sides = static_cast<uint32_t>(std::min(std::max(a[7], 3.0), 100.0));
+                lv.starRatio = std::min(std::max(a[8], 0.0), 1.0);
+                if (lv.starRatio >= 1.0) {
+                    lv.starRatio = 1.0;
+                }
+                break;
+            case ShapeLiveKind::Line:
+                lv.from[0] = x0;
+                lv.from[1] = y0;
+                lv.to[0] = x1;
+                lv.to[1] = y1;
+                lv.weight = std::max(1.0, a[9]);
+                break;
+            default:
+                return makeError(env, kErrBadParam, "setShapeLive: bad kind");
+        }
+        next->path = liveShapePath(lv);
+        std::string err;
+        if (!validateShape(next->path, next->hasStroke ? &next->stroke : nullptr, err)) {
+            return makeError(env, kErrBadParam, ("setShapeLive: " + err).c_str());
+        }
+        e.history.beginEdit(e.doc, "编辑形状", static_cast<uint64_t>(e.docRevision));
+        l->shape = std::move(next);
+        shapeRenderLayer(e.doc, *l, err);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value SetShapeFill(napi_env env, napi_callback_info info) {
+    // setShapeFill(id, kind, r, g, b, a)
+    size_t argc = 6;
+    napi_value argv[6] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 6) {
+        return makeError(env, kErrBadParam, "setShapeFill requires 6 args");
+    }
+    double a[6] = {0};
+    for (size_t i = 0; i < 6; i++) {
+        if (napi_get_value_double(env, argv[i], &a[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "setShapeFill: invalid args");
+        }
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(a[0]));
+        if (l == nullptr || l->shape == nullptr) {
+            return makeError(env, kErrBadParam, "setShapeFill: shape layer not found");
+        }
+        auto next = std::make_shared<ShapeLayerState>(*l->shape);
+        next->fillKind = static_cast<int32_t>(a[1]);
+        next->fillColor[0] = static_cast<float>(a[2]);
+        next->fillColor[1] = static_cast<float>(a[3]);
+        next->fillColor[2] = static_cast<float>(a[4]);
+        next->fillColor[3] = static_cast<float>(a[5]);
+        e.history.beginEdit(e.doc, "形状填充", static_cast<uint64_t>(e.docRevision));
+        l->shape = std::move(next);
+        std::string err;
+        shapeRenderLayer(e.doc, *l, err);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value SetShapeStroke(napi_env env, napi_callback_info info) {
+    // setShapeStroke(id, on, r, g, b, a, width, align?, cap?, join?)
+    size_t argc = 10;
+    napi_value argv[10] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 7) {
+        return makeError(env, kErrBadParam, "setShapeStroke requires 7+ args");
+    }
+    double a[10] = {0};
+    for (size_t i = 0; i < argc && i < 10; i++) {
+        if (napi_get_value_double(env, argv[i], &a[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "setShapeStroke: invalid args");
+        }
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(a[0]));
+        if (l == nullptr || l->shape == nullptr) {
+            return makeError(env, kErrBadParam, "setShapeStroke: shape layer not found");
+        }
+        auto next = std::make_shared<ShapeLayerState>(*l->shape);
+        next->hasStroke = a[1] > 0.5;
+        next->stroke.color[0] = static_cast<float>(a[2]);
+        next->stroke.color[1] = static_cast<float>(a[3]);
+        next->stroke.color[2] = static_cast<float>(a[4]);
+        next->stroke.color[3] = static_cast<float>(a[5]);
+        next->stroke.width = std::max(1.0, a[6]);
+        if (argc >= 8) {
+            next->stroke.align = static_cast<StrokeAlign>(
+                static_cast<int32_t>(std::min(std::max(a[7], 0.0), 2.0)));
+        }
+        if (argc >= 9) {
+            next->stroke.cap =
+                static_cast<LineCap>(static_cast<int32_t>(std::min(std::max(a[8], 0.0), 2.0)));
+        }
+        if (argc >= 10) {
+            next->stroke.join =
+                static_cast<LineJoin>(static_cast<int32_t>(std::min(std::max(a[9], 0.0), 2.0)));
+        }
+        std::string err;
+        if (next->hasStroke && !validateShape(next->path, &next->stroke, err)) {
+            return makeError(env, kErrBadParam, ("setShapeStroke: " + err).c_str());
+        }
+        e.history.beginEdit(e.doc, "形状描边", static_cast<uint64_t>(e.docRevision));
+        l->shape = std::move(next);
+        shapeRenderLayer(e.doc, *l, err);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value RasterizeShapeLayer(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "rasterizeShapeLayer(id) requires 1 arg");
+    }
+    double id = 0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "rasterizeShapeLayer: invalid args");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        if (l == nullptr || l->shape == nullptr) {
+            return makeError(env, kErrBadParam, "rasterizeShapeLayer: shape layer not found");
+        }
+        e.history.beginEdit(e.doc, "栅格化形状", static_cast<uint64_t>(e.docRevision));
+        rasterizeShapeLayerToPixels(*l);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value SetShapePath(napi_env env, napi_callback_info info) {
+    // setShapePath(id, flat[])：路径编辑提交（live 清 None）
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "setShapePath(id, flat) requires 2 args");
+    }
+    double id = 0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "setShapePath: invalid args");
+    }
+    VectorPath path;
+    if (!flatArrayToPath(env, argv[1], path)) {
+        return makeError(env, kErrBadParam, "setShapePath: bad path array");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        if (l == nullptr || l->shape == nullptr) {
+            return makeError(env, kErrBadParam, "setShapePath: shape layer not found");
+        }
+        auto next = std::make_shared<ShapeLayerState>(*l->shape);
+        std::string err;
+        if (!validateShape(path, next->hasStroke ? &next->stroke : nullptr, err)) {
+            return makeError(env, kErrBadParam, ("setShapePath: " + err).c_str());
+        }
+        next->path = std::move(path);
+        next->live = LiveShape{};  // 路径编辑后不再是参数形状
+        e.history.beginEdit(e.doc, "编辑路径", static_cast<uint64_t>(e.docRevision));
+        l->shape = std::move(next);
+        shapeRenderLayer(e.doc, *l, err);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value SetWorkPath(napi_env env, napi_callback_info info) {
+    // setWorkPath(flat[])：会话态（无历史事务，PS 路径面板同语义）
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "setWorkPath(flat) requires 1 arg");
+    }
+    VectorPath path;
+    if (!flatArrayToPath(env, argv[0], path)) {
+        return makeError(env, kErrBadParam, "setWorkPath: bad path array");
+    }
+    std::string err;
+    if (!path.empty() && !validateShape(path, nullptr, err)) {
+        return makeError(env, kErrBadParam, ("setWorkPath: " + err).c_str());
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        e.doc.workPath = std::move(path);
+        e.bumpRevisionLocked();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value GetWorkPath(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    return makeOk(env, pathToFlatArray(env, e.doc.workPath));
+}
+
+napi_value CommitWorkPathAsShape(napi_env env, napi_callback_info info) {
+    // commitWorkPathAsShape(fillKind,fr,fg,fb,fa, hasStroke, sr,sg,sb,sa, sw) → 新形状层
+    size_t argc = 11;
+    napi_value argv[11] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 11) {
+        return makeError(env, kErrBadParam, "commitWorkPathAsShape requires 11 args");
+    }
+    double a[11] = {0};
+    for (size_t i = 0; i < 11; i++) {
+        if (napi_get_value_double(env, argv[i], &a[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "commitWorkPathAsShape: invalid args");
+        }
+    }
+    auto& e = Engine::get();
+    double newId = 0;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "commitWorkPathAsShape: no document");
+        }
+        if (e.doc.workPath.empty()) {
+            return makeError(env, kErrBadParam, "commitWorkPathAsShape: no work path");
+        }
+        auto state = std::make_shared<ShapeLayerState>();
+        state->path = e.doc.workPath;
+        state->fillKind = static_cast<int32_t>(a[0]);
+        state->fillColor[0] = static_cast<float>(a[1]);
+        state->fillColor[1] = static_cast<float>(a[2]);
+        state->fillColor[2] = static_cast<float>(a[3]);
+        state->fillColor[3] = static_cast<float>(a[4]);
+        state->hasStroke = a[5] > 0.5;
+        if (state->hasStroke) {
+            state->stroke.width = std::max(1.0, a[10]);
+            state->stroke.color[0] = static_cast<float>(a[6]);
+            state->stroke.color[1] = static_cast<float>(a[7]);
+            state->stroke.color[2] = static_cast<float>(a[8]);
+            state->stroke.color[3] = static_cast<float>(a[9]);
+        }
+        std::string err;
+        if (!validateShape(state->path, state->hasStroke ? &state->stroke : nullptr, err)) {
+            return makeError(env, kErrBadParam, ("commitWorkPathAsShape: " + err).c_str());
+        }
+        Layer layer;
+        layer.id = e.nextLayerId();
+        layer.name = shapeLayerDisplayName(*state);
+        layer.shape = std::move(state);
+        size_t at = e.doc.layers.size();
+        for (size_t i = 0; i < e.doc.layers.size(); ++i) {
+            if (e.doc.layers[i].id == e.doc.activeId) {
+                at = i + 1;
+                break;
+            }
+        }
+        e.history.beginEdit(e.doc, layer.name, static_cast<uint64_t>(e.docRevision));
+        e.doc.layers.insert(e.doc.layers.begin() + static_cast<long>(at), std::move(layer));
+        Layer& inserted = e.doc.layers[at];
+        e.doc.activeId = inserted.id;
+        if (!shapeRenderLayer(e.doc, inserted, err)) {
+            { uint64_t rv = 0; std::string lb; e.history.undo(e.doc, rv, lb); (void)rv; (void)lb; }
+            return makeError(env, kErrBadParam, ("commitWorkPathAsShape: " + err).c_str());
+        }
+        e.doc.workPath = VectorPath{};  // PS 语义：成形状层后工作路径清空
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        newId = static_cast<double>(inserted.id);
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "id", makeDouble(env, newId));
+    return makeOk(env, data);
+}
+
+napi_value PathToSelection(napi_env env, napi_callback_info info) {
+    // pathToSelection(op)——工作路径（空则活动形状层路径）→ 选区
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int32_t op = 0;
+    if (argc >= 1 && napi_get_value_int32(env, argv[0], &op) != napi_ok) {
+        return makeError(env, kErrBadParam, "pathToSelection: invalid op");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "pathToSelection: no document");
+        }
+        VectorPath source = e.doc.workPath;
+        if (source.empty()) {
+            Layer* l = findLayerLocked(e.doc, e.doc.activeId);
+            if (l != nullptr && l->shape != nullptr) {
+                source = l->shape->live.kind == ShapeLiveKind::None
+                             ? l->shape->path
+                             : liveShapePath(l->shape->live);
+            }
+        }
+        if (source.empty()) {
+            return makeError(env, kErrBadParam, "pathToSelection: no path");
+        }
+        auto mask = pathToSelectionMask(source, e.doc.width, e.doc.height);
+        if (mask == nullptr) {
+            return makeError(env, kErrBadParam, "pathToSelection: empty result");
+        }
+        auto merged = tiles::combineSelection(e.doc, std::move(mask),
+                                              static_cast<tiles::SelectionOp>(op));
+        e.history.beginEdit(e.doc, "路径转选区", static_cast<uint64_t>(e.docRevision));
+        e.doc.selection = std::move(merged);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value FillPath(napi_env env, napi_callback_info info) {
+    // fillPath(r,g,b,a)：工作路径域 × 颜色填充到活动层（与既有选区相交，PS 语义；
+    // 临时 swap 选区走 M11a fillWithColor 核——半透明覆盖度自动获得）
+    size_t argc = 4;
+    napi_value argv[4] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 4) {
+        return makeError(env, kErrBadParam, "fillPath(r,g,b,a) requires 4 args");
+    }
+    double c[4] = {0};
+    for (size_t i = 0; i < 4; i++) {
+        if (napi_get_value_double(env, argv[i], &c[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "fillPath: invalid args");
+        }
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "fillPath: no document");
+        }
+        Layer* l = findLayerLocked(e.doc, e.doc.activeId);
+        if (l == nullptr || l->shape != nullptr || l->fill != nullptr) {
+            return makeError(env, kErrBadParam, "fillPath: active layer must be a pixel layer");
+        }
+        if (e.doc.workPath.empty()) {
+            return makeError(env, kErrBadParam, "fillPath: no work path");
+        }
+        auto mask = pathToSelectionMask(e.doc.workPath, e.doc.width, e.doc.height);
+        if (mask == nullptr) {
+            return makeError(env, kErrBadParam, "fillPath: empty result");
+        }
+        std::shared_ptr<const TileGrid> saved = e.doc.selection;
+        if (saved != nullptr) {
+            e.doc.selection = mask;
+            mask = tiles::combineSelection(e.doc, saved, tiles::SelectionOp::Intersect);
+            if (mask == nullptr) {
+                e.doc.selection = saved;
+                return makeOk(env, nullptr);  // 不相交 = 无事发生
+            }
+        }
+        e.history.beginEdit(e.doc, "填充路径", static_cast<uint64_t>(e.docRevision));
+        std::shared_ptr<const TileGrid> savedNow = e.doc.selection;
+        e.doc.selection = mask;
+        std::string err;
+        const bool ok = fillWithColor(e.doc, l->id, FillSource::Foreground,
+                                      static_cast<float>(c[0]), static_cast<float>(c[1]),
+                                      static_cast<float>(c[2]), 0, 0, 0, err);
+        e.doc.selection = savedNow;
+        if (!ok) {
+            { uint64_t rv = 0; std::string lb; e.history.undo(e.doc, rv, lb); (void)rv; (void)lb; }
+            e.doc.selection = saved;
+            return makeError(env, kErrBadParam, ("fillPath: " + err).c_str());
+        }
+        e.doc.selection = saved;
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value StrokePath(napi_env env, napi_callback_info info) {
+    // strokePath(r,g,b,a,width)：工作路径轮廓带 × 颜色描边到活动层（覆盖度→灰度掩码→
+    // 临时 swap 选区走 fillWithColor 核）
+    size_t argc = 5;
+    napi_value argv[5] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 5) {
+        return makeError(env, kErrBadParam, "strokePath(r,g,b,a,width) requires 5 args");
+    }
+    double c[5] = {0};
+    for (size_t i = 0; i < 5; i++) {
+        if (napi_get_value_double(env, argv[i], &c[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "strokePath: invalid args");
+        }
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "strokePath: no document");
+        }
+        Layer* l = findLayerLocked(e.doc, e.doc.activeId);
+        if (l == nullptr || l->shape != nullptr || l->fill != nullptr) {
+            return makeError(env, kErrBadParam, "strokePath: active layer must be a pixel layer");
+        }
+        if (e.doc.workPath.empty()) {
+            return makeError(env, kErrBadParam, "strokePath: no work path");
+        }
+        const double width = std::min(std::max(1.0, c[4]), 250.0);
+        VectorRasterizer r = strokeRasterizer(e.doc.workPath, width, LineCap::Butt, LineJoin::Miter,
+                                              4.0, {}, 0.0, kVectorTolerance);
+        int32_t bx0, by0, bx1, by1;
+        if (!r.pixelBounds(bx0, by0, bx1, by1)) {
+            return makeOk(env, nullptr);
+        }
+        int32_t x0 = std::max(0, bx0);
+        int32_t y0 = std::max(0, by0);
+        int32_t x1 = std::min(static_cast<int32_t>(e.doc.width), bx1);
+        int32_t y1 = std::min(static_cast<int32_t>(e.doc.height), by1);
+        if (x0 >= x1 || y0 >= y1) {
+            return makeOk(env, nullptr);
+        }
+        auto cov = r.render(x0, y0, x1, y1);
+        auto band = coverageToMaskGrid(cov, x0, y0, x1 - x0, y1 - y0, e.doc.width, e.doc.height);
+        if (band == nullptr) {
+            return makeError(env, kErrBadParam, "strokePath: empty band");
+        }
+        std::shared_ptr<const TileGrid> saved = e.doc.selection;
+        if (saved != nullptr) {
+            e.doc.selection = band;
+            band = tiles::combineSelection(e.doc, saved, tiles::SelectionOp::Intersect);
+            if (band == nullptr) {
+                e.doc.selection = saved;
+                return makeOk(env, nullptr);
+            }
+        }
+        e.history.beginEdit(e.doc, "描边路径", static_cast<uint64_t>(e.docRevision));
+        std::shared_ptr<const TileGrid> savedNow = e.doc.selection;
+        e.doc.selection = band;
+        std::string err;
+        const bool ok = fillWithColor(e.doc, l->id, FillSource::Foreground,
+                                      static_cast<float>(c[0]), static_cast<float>(c[1]),
+                                      static_cast<float>(c[2]), 0, 0, 0, err);
+        e.doc.selection = savedNow;
+        if (!ok) {
+            { uint64_t rv = 0; std::string lb; e.history.undo(e.doc, rv, lb); (void)rv; (void)lb; }
+            e.doc.selection = saved;
+            return makeError(env, kErrBadParam, ("strokePath: " + err).c_str());
+        }
+        e.doc.selection = saved;
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value SaveWorkPath(napi_env env, napi_callback_info info) {
+    // saveWorkPath(name?)：工作路径 → 保存路径（同名覆盖）
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    char name[96] = {0};
+    if (argc >= 1) {
+        size_t len = 0;
+        napi_get_value_string_utf8(env, argv[0], name, sizeof(name), &len);
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.workPath.empty()) {
+            return makeError(env, kErrBadParam, "saveWorkPath: no work path");
+        }
+        std::string nm =
+            name[0] != '\0' ? std::string(name) : ("路径 " + std::to_string(e.doc.paths.size() + 1));
+        bool replaced = false;
+        for (NamedPathEntry& p : e.doc.paths) {
+            if (p.name == nm) {
+                p.path = e.doc.workPath;
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) {
+            NamedPathEntry entry;
+            entry.name = nm;
+            entry.path = e.doc.workPath;
+            e.doc.paths.push_back(std::move(entry));
+        }
+        e.doc.workPath = VectorPath{};
+        e.bumpRevisionLocked();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value DeleteSavedPath(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double idx = -1;
+    if (argc < 1 || napi_get_value_double(env, argv[0], &idx) != napi_ok) {
+        return makeError(env, kErrBadParam, "deleteSavedPath(i) requires 1 arg");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (idx < 0 || static_cast<size_t>(idx) >= e.doc.paths.size()) {
+            return makeError(env, kErrBadParam, "deleteSavedPath: bad index");
+        }
+        e.doc.paths.erase(e.doc.paths.begin() + static_cast<long>(idx));
+        e.bumpRevisionLocked();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value GetSavedPaths(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    napi_value arr = nullptr;
+    napi_create_array(env, &arr);
+    for (size_t i = 0; i < e.doc.paths.size(); i++) {
+        napi_value obj = nullptr;
+        napi_create_object(env, &obj);
+        napi_set_named_property(env, obj, "name", makeString(env, e.doc.paths[i].name));
+        napi_set_named_property(env, obj, "flat", pathToFlatArray(env, e.doc.paths[i].path));
+        napi_set_element(env, arr, static_cast<uint32_t>(i), obj);
+    }
+    return makeOk(env, arr);
+}
+
+napi_value LoadSavedPath(napi_env env, napi_callback_info info) {
+    // loadSavedPath(i)：保存路径 → 工作路径
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double idx = -1;
+    if (argc < 1 || napi_get_value_double(env, argv[0], &idx) != napi_ok) {
+        return makeError(env, kErrBadParam, "loadSavedPath(i) requires 1 arg");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (idx < 0 || static_cast<size_t>(idx) >= e.doc.paths.size()) {
+            return makeError(env, kErrBadParam, "loadSavedPath: bad index");
+        }
+        e.doc.workPath = e.doc.paths[static_cast<size_t>(idx)].path;
+        e.bumpRevisionLocked();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value SelectionToWorkPath(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.selection == nullptr) {
+            return makeError(env, kErrBadParam, "selectionToWorkPath: no selection");
+        }
+        VectorPath traced;
+        if (!traceSelectionToPath(*e.doc.selection, traced, 1024)) {
+            return makeError(env, kErrBadParam, "selectionToWorkPath: empty trace");
+        }
+        e.doc.workPath = std::move(traced);
+        e.bumpRevisionLocked();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value DefineCustomShape(napi_env env, napi_callback_info info) {
+    // defineCustomShape(name?)：工作路径（空则活动形状层路径）→ 自定义形状库
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    char name[96] = {0};
+    if (argc >= 1) {
+        size_t len = 0;
+        napi_get_value_string_utf8(env, argv[0], name, sizeof(name), &len);
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        VectorPath source = e.doc.workPath;
+        if (source.empty()) {
+            Layer* l = findLayerLocked(e.doc, e.doc.activeId);
+            if (l != nullptr && l->shape != nullptr) {
+                source = l->shape->live.kind == ShapeLiveKind::None
+                             ? l->shape->path
+                             : liveShapePath(l->shape->live);
+            }
+        }
+        if (source.empty()) {
+            return makeError(env, kErrBadParam, "defineCustomShape: no path");
+        }
+        // 归一化到以原点为中心、最长边 = 1 的规范域（放置时按目标尺寸缩放）
+        double x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        if (!source.controlBounds(x0, y0, x1, y1)) {
+            return makeError(env, kErrBadParam, "defineCustomShape: empty bounds");
+        }
+        const double w = x1 - x0;
+        const double h = y1 - y0;
+        const double scale = 1.0 / std::max(1e-9, std::max(w, h));
+        const double cx = (x0 + x1) / 2.0;
+        const double cy = (y0 + y1) / 2.0;
+        for (Subpath& sp : source.subpaths) {
+            for (Knot& kn : sp.knots) {
+                kn.anchor = vpt((kn.anchor.x - cx) * scale, (kn.anchor.y - cy) * scale);
+                kn.inCtrl = vpt((kn.inCtrl.x - cx) * scale, (kn.inCtrl.y - cy) * scale);
+                kn.outCtrl = vpt((kn.outCtrl.x - cx) * scale, (kn.outCtrl.y - cy) * scale);
+            }
+        }
+        CustomShapeEntry entry;
+        e.doc.customShapeSeq++;
+        entry.id = "csh_" + std::to_string(e.doc.customShapeSeq);
+        entry.name =
+            name[0] != '\0' ? std::string(name) : ("自定形状 " + std::to_string(e.doc.customShapeSeq));
+        entry.path = std::move(source);
+        e.doc.customShapes.push_back(std::move(entry));
+        e.bumpRevisionLocked();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value GetCustomShapes(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    napi_value arr = nullptr;
+    napi_create_array(env, &arr);
+    for (size_t i = 0; i < e.doc.customShapes.size(); i++) {
+        const CustomShapeEntry& c = e.doc.customShapes[i];
+        napi_value obj = nullptr;
+        napi_create_object(env, &obj);
+        napi_set_named_property(env, obj, "id", makeString(env, c.id));
+        napi_set_named_property(env, obj, "name", makeString(env, c.name));
+        napi_set_named_property(env, obj, "flat", pathToFlatArray(env, c.path));
+        napi_set_element(env, arr, static_cast<uint32_t>(i), obj);
+    }
+    return makeOk(env, arr);
+}
+
+napi_value DeleteCustomShape(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    char id[64] = {0};
+    if (argc >= 1) {
+        size_t len = 0;
+        napi_get_value_string_utf8(env, argv[0], id, sizeof(id), &len);
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        for (size_t i = 0; i < e.doc.customShapes.size(); i++) {
+            if (e.doc.customShapes[i].id == id) {
+                e.doc.customShapes.erase(e.doc.customShapes.begin() + static_cast<long>(i));
+                e.bumpRevisionLocked();
+                return makeOk(env, nullptr);
+            }
+        }
+        return makeError(env, kErrBadParam, "deleteCustomShape: id not found");
+    }
+}
+
+napi_value PlaceCustomShape(napi_env env, napi_callback_info info) {
+    // placeCustomShape(id, cx, cy, w, h)：自定义形状 → 新形状层（以 (cx,cy) 为中心、
+    // 内切 w×h；v1 等比取 min(w,h)）。
+    size_t argc = 5;
+    napi_value argv[5] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 5) {
+        return makeError(env, kErrBadParam, "placeCustomShape requires 5 args");
+    }
+    char id[64] = {0};
+    size_t len = 0;
+    napi_get_value_string_utf8(env, argv[0], id, sizeof(id), &len);
+    double a[4] = {0};
+    for (size_t i = 0; i < 4; i++) {
+        if (napi_get_value_double(env, argv[i + 1], &a[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "placeCustomShape: invalid args");
+        }
+    }
+    auto& e = Engine::get();
+    double newId = 0;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "placeCustomShape: no document");
+        }
+        const CustomShapeEntry* found = nullptr;
+        for (const CustomShapeEntry& c : e.doc.customShapes) {
+            if (c.id == id) {
+                found = &c;
+                break;
+            }
+        }
+        if (found == nullptr) {
+            return makeError(env, kErrBadParam, "placeCustomShape: id not found");
+        }
+        const double cx = a[0];
+        const double cy = a[1];
+        const double half = std::max(1.0, std::min(std::fabs(a[2]), std::fabs(a[3]))) / 2.0;
+        auto state = std::make_shared<ShapeLayerState>();
+        state->path = found->path;
+        // 规范域 [-0.5,0.5]² → 目标域（half 缩放 + 中心平移）
+        for (Subpath& sp : state->path.subpaths) {
+            for (Knot& kn : sp.knots) {
+                kn.anchor = vpt(cx + kn.anchor.x * half * 2.0, cy + kn.anchor.y * half * 2.0);
+                kn.inCtrl = vpt(cx + kn.inCtrl.x * half * 2.0, cy + kn.inCtrl.y * half * 2.0);
+                kn.outCtrl = vpt(cx + kn.outCtrl.x * half * 2.0, cy + kn.outCtrl.y * half * 2.0);
+            }
+        }
+        state->fillKind = 1;
+        state->fillColor[0] = e.fgColor[0];
+        state->fillColor[1] = e.fgColor[1];
+        state->fillColor[2] = e.fgColor[2];
+        state->fillColor[3] = 1.0f;
+        std::string err;
+        if (!validateShape(state->path, nullptr, err)) {
+            return makeError(env, kErrBadParam, ("placeCustomShape: " + err).c_str());
+        }
+        Layer layer;
+        layer.id = e.nextLayerId();
+        layer.name = found->name;
+        layer.shape = std::move(state);
+        size_t at = e.doc.layers.size();
+        for (size_t i = 0; i < e.doc.layers.size(); ++i) {
+            if (e.doc.layers[i].id == e.doc.activeId) {
+                at = i + 1;
+                break;
+            }
+        }
+        e.history.beginEdit(e.doc, layer.name, static_cast<uint64_t>(e.docRevision));
+        e.doc.layers.insert(e.doc.layers.begin() + static_cast<long>(at), std::move(layer));
+        Layer& inserted = e.doc.layers[at];
+        e.doc.activeId = inserted.id;
+        if (!shapeRenderLayer(e.doc, inserted, err)) {
+            { uint64_t rv = 0; std::string lb; e.history.undo(e.doc, rv, lb); (void)rv; (void)lb; }
+            return makeError(env, kErrBadParam, ("placeCustomShape: " + err).c_str());
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        newId = static_cast<double>(inserted.id);
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "id", makeDouble(env, newId));
+    return makeOk(env, data);
+}
+
+napi_value SetLayerVectorMask(napi_env env, napi_callback_info info) {
+    // setLayerVectorMask(id, flat[])——flat 空数组 = 删除矢量蒙版
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "setLayerVectorMask(id, flat) requires 2 args");
+    }
+    double id = 0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "setLayerVectorMask: invalid id");
+    }
+    VectorPath path;
+    if (!flatArrayToPath(env, argv[1], path)) {
+        return makeError(env, kErrBadParam, "setLayerVectorMask: bad path array");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        if (l == nullptr) {
+            return makeError(env, kErrBadParam, "setLayerVectorMask: layer not found");
+        }
+        e.history.beginEdit(e.doc, "矢量蒙版", static_cast<uint64_t>(e.docRevision));
+        if (path.empty() && !path.inverted) {
+            l->vectorMask = nullptr;
+        } else {
+            auto m = std::make_shared<VectorMaskData>();
+            m->path = std::move(path);
+            l->vectorMask = std::move(m);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        restyleDocument(e.doc);  // M18d：矢量蒙版设置后立即重派生
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+napi_value SetVectorMaskEnabled(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "setVectorMaskEnabled(id, v) requires 2 args");
+    }
+    double id = 0;
+    bool v = false;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok ||
+        napi_get_value_bool(env, argv[1], &v) != napi_ok) {
+        return makeError(env, kErrBadParam, "setVectorMaskEnabled: invalid args");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        if (l == nullptr || l->vectorMask == nullptr) {
+            return makeError(env, kErrBadParam, "setVectorMaskEnabled: no vector mask");
+        }
+        auto m = std::make_shared<VectorMaskData>(*l->vectorMask);
+        m->enabled = v;
+        e.history.beginEdit(e.doc, "矢量蒙版开关", static_cast<uint64_t>(e.docRevision));
+        l->vectorMask = std::move(m);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        restyleDocument(e.doc);  // M18d：矢量蒙版变更立即重派生
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
 }
 
 }  // namespace bridge

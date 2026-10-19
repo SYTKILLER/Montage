@@ -161,6 +161,22 @@ function narrowLayer(r: Record<string, Object>): LayerDTO {
     hasStyle: boolOf(r, 'hasStyle'),
     styleOn: boolOf(r, 'styleOn'),
     isFill: boolOf(r, 'isFill'),
+    isShape: boolOf(r, 'isShape'),
+    shapeLiveKind: num(r, 'shapeLiveKind'),
+    shapeRect: numArr(r, 'shapeRect'),
+    shapeRadii: numArr(r, 'shapeRadii'),
+    shapeSides: num(r, 'shapeSides'),
+    shapeStar: num(r, 'shapeStar'),
+    shapeFrom: numArr(r, 'shapeFrom'),
+    shapeTo: numArr(r, 'shapeTo'),
+    shapeWeight: num(r, 'shapeWeight'),
+    shapeFillKind: num(r, 'shapeFillKind'),
+    shapeFill: str(r, 'shapeFill'),
+    shapeStrokeOn: boolOf(r, 'shapeStrokeOn'),
+    shapeStrokeColor: str(r, 'shapeStrokeColor'),
+    shapeStrokeWidth: num(r, 'shapeStrokeWidth'),
+    hasVectorMask: boolOf(r, 'hasVectorMask'),
+    vectorMaskOn: boolOf(r, 'vectorMaskOn'),
     hasMask: boolOf(r, 'hasMask'),
     maskEnabled: boolOf(r, 'maskEnabled'),
     clipping: boolOf(r, 'clipping'),
@@ -890,6 +906,282 @@ export class CompositorEngine {
       return false;
     }
     return true;
+  }
+
+  // ---- M18 矢量与形状层 ----
+
+  createShapeLayer(kind: number, x0: number, y0: number, x1: number, y1: number,
+    radius: number, sides: number, starRatio: number, weight: number,
+    fillKind: number, fr: number, fg: number, fb: number, fa: number,
+    hasStroke: number, sr: number, sg: number, sb: number, sa: number,
+    strokeWidth: number): number {
+    const r = narrowResult(native.createShapeLayer(kind, x0, y0, x1, y1, radius, sides,
+      starRatio, weight, fillKind, fr, fg, fb, fa, hasStroke, sr, sg, sb, sa,
+      strokeWidth) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'createShapeLayer failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return 0;
+    }
+    const d = r.data as Record<string, Object>;
+    return d['id'] as number;
+  }
+
+  setShapeLive(id: number, kind: number, x0: number, y0: number, x1: number, y1: number,
+    radius: number, sides: number, starRatio: number, weight: number): boolean {
+    const r = narrowResult(native.setShapeLive(id, kind, x0, y0, x1, y1, radius, sides,
+      starRatio, weight) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setShapeLive failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  setShapeFill(id: number, kind: number, r: number, g: number, b: number, a: number): boolean {
+    const rr = narrowResult(native.setShapeFill(id, kind, r, g, b, a) as Object);
+    if (!rr.ok) {
+      hilog.error(DOMAIN, TAG, 'setShapeFill failed: %{public}s',
+        rr.error !== null ? rr.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  setShapeStroke(id: number, on: boolean, r: number, g: number, b: number, a: number,
+    width: number): boolean {
+    const rr = narrowResult(native.setShapeStroke(id, on ? 1 : 0, r, g, b, a, width) as Object);
+    if (!rr.ok) {
+      hilog.error(DOMAIN, TAG, 'setShapeStroke failed: %{public}s',
+        rr.error !== null ? rr.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  rasterizeShapeLayer(id: number): boolean {
+    const r = narrowResult(native.rasterizeShapeLayer(id) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'rasterizeShapeLayer failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  setShapePath(id: number, flat: number[]): boolean {
+    const r = narrowResult(native.setShapePath(id, flat) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setShapePath failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  setWorkPath(flat: number[]): boolean {
+    const r = narrowResult(native.setWorkPath(flat) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setWorkPath failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  getWorkPath(): number[] {
+    try {
+      const r = narrowResult(native.getWorkPath() as Object);
+      if (!r.ok) {
+        return [];
+      }
+      const d = r.data as Object;
+      const out: number[] = [];
+      const arr = d as Array<Object>;
+      for (const v of arr) {
+        out.push(typeof v === 'number' ? v : 0);
+      }
+      return out;
+    } catch (e) {
+      hilog.error(DOMAIN, TAG, 'getWorkPath failed: %{public}s',
+        e instanceof Error ? e.message : String(e));
+      return [];
+    }
+  }
+
+  commitWorkPathAsShape(fillKind: number, fr: number, fg: number, fb: number, fa: number,
+    hasStroke: number, sr: number, sg: number, sb: number, sa: number,
+    strokeWidth: number): number {
+    const r = narrowResult(native.commitWorkPathAsShape(fillKind, fr, fg, fb, fa, hasStroke,
+      sr, sg, sb, sa, strokeWidth) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'commitWorkPathAsShape failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return 0;
+    }
+    const d = r.data as Record<string, Object>;
+    return d['id'] as number;
+  }
+
+  pathToSelection(op: number): boolean {
+    const r = narrowResult(native.pathToSelection(op) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'pathToSelection failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  fillPath(r: number, g: number, b: number, a: number): boolean {
+    const rr = narrowResult(native.fillPath(r, g, b, a) as Object);
+    if (!rr.ok) {
+      hilog.error(DOMAIN, TAG, 'fillPath failed: %{public}s',
+        rr.error !== null ? rr.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  strokePath(r: number, g: number, b: number, a: number, width: number): boolean {
+    const rr = narrowResult(native.strokePath(r, g, b, a, width) as Object);
+    if (!rr.ok) {
+      hilog.error(DOMAIN, TAG, 'strokePath failed: %{public}s',
+        rr.error !== null ? rr.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  saveWorkPath(name: string): boolean {
+    const r = narrowResult(native.saveWorkPath(name) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'saveWorkPath failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  deleteSavedPath(index: number): boolean {
+    const r = narrowResult(native.deleteSavedPath(index) as Object);
+    if (!r.ok) {
+      return false;
+    }
+    return true;
+  }
+
+  loadSavedPath(index: number): boolean {
+    const r = narrowResult(native.loadSavedPath(index) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'loadSavedPath failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  selectionToWorkPath(): boolean {
+    const r = narrowResult(native.selectionToWorkPath() as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'selectionToWorkPath failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  defineCustomShape(name: string): boolean {
+    const r = narrowResult(native.defineCustomShape(name) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'defineCustomShape failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  setLayerVectorMask(id: number, flat: number[]): boolean {
+    const r = narrowResult(native.setLayerVectorMask(id, flat) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setLayerVectorMask failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  setVectorMaskEnabled(id: number, v: boolean): boolean {
+    const r = narrowResult(native.setVectorMaskEnabled(id, v) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setVectorMaskEnabled failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  /** M18d：放置自定义形状 → 新形状层（画布中心 50% 尺寸）。 */
+  placeCustomShape(id: string, cx: number, cy: number, w: number, h: number): number {
+    const r = narrowResult(native.placeCustomShape(id, cx, cy, w, h) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'placeCustomShape failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return 0;
+    }
+    const d = r.data as Record<string, Object>;
+    return d['id'] as number;
+  }
+
+  /** M18c：保存路径名列表（路径面板）。 */
+  getSavedPaths(): string[] {
+    try {
+      const r = narrowResult(native.getSavedPaths() as Object);
+      if (!r.ok) {
+        return [];
+      }
+      const out: string[] = [];
+      const d2 = r.data;
+      const arrObj: Object = d2 !== null ? d2 : ({} as Record<string, Object>);
+      const arr = arrObj as Array<Object>;
+      if (Array.isArray(arr)) {
+        for (const item of arr) {
+          const d = item as Record<string, Object>;
+          out.push(d['name'] as string);
+        }
+      }
+      return out;
+    } catch (e) {
+      hilog.error(DOMAIN, TAG, 'getSavedPaths failed: %{public}s',
+        e instanceof Error ? e.message : String(e));
+      return [];
+    }
+  }
+
+  /** M18d：自定义形状名列表（id 数组）。 */
+  getCustomShapes(): string[] {
+    try {
+      const r = narrowResult(native.getCustomShapes() as Object);
+      if (!r.ok) {
+        return [];
+      }
+      const out: string[] = [];
+      const d2 = r.data;
+      const arrObj: Object = d2 !== null ? d2 : ({} as Record<string, Object>);
+      const arr = arrObj as Array<Object>;
+      if (Array.isArray(arr)) {
+        for (const item of arr) {
+          const d = item as Record<string, Object>;
+          out.push(d['id'] as string);
+        }
+      }
+      return out;
+    } catch (e) {
+      hilog.error(DOMAIN, TAG, 'getCustomShapes failed: %{public}s',
+        e instanceof Error ? e.message : String(e));
+      return [];
+    }
   }
 
   beginTextSession(id: number): boolean {
