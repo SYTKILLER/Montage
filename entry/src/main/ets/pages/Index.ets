@@ -272,6 +272,21 @@ struct Index {
   @State penClosed: boolean = false;
   @State workPathNonEmpty: number = 0;  // M18：菜单使能镜像（引擎工作路径非空）
   @State hasCustomShapes: boolean = false;  // M18：自定义形状库非空
+  // M18.1 直接选择：工作副本扁平路径 + 选中集 [sub,knot,…] + 单选手柄
+  @State dsPath: number[] = [];
+  @State dsSelected: number[] = [];
+  @State dsHandleOf: number[] = [];  // 单选锚点 [sub,knot] 显示其手柄；空 = 不显示
+  @State dsPreviewPts: number[][] = [];  // 视口折线（路径抽样）
+  @State dsAnchorPts: number[][] = [];   // 视口锚点 [x,y,sel]
+  @State dsHandlePts: number[][] = [];   // 视口手柄 [x,y,stemX,stemY]
+  @State dsMarqueeRect: number[] | null = null;  // 视口 [x,y,w,h]
+  private dsDragKind: number = 0;  // 0=无 1=锚点 2=手柄 3=框选 4=段
+  private dsDragTargets: number[] = [];   // 拖动涉及的锚点 [sub,knot,…]
+  private dsDragHandle: number[] = [];    // [sub,knot,isIn]
+  private dsDragSeg: number[] = [];       // [sub,knot(段序),t]
+  private dsDragStartDoc: number[] = [0, 0];
+  private dsDragLastDoc: number[] = [0, 0];
+  private dsLoadedRev: number = -1;  // 镜像装载时的 docVersion（undo/提交后强制重载）
   private shapeStartDocX: number = 0;
   private shapeStartDocY: number = 0;
   @State cloneAligned: boolean = true;   // M11d 仿制图章对齐开关
@@ -499,6 +514,9 @@ struct Index {
     this.strokeEndGuardUntil = 0;  // 修复③：提交/撤销完成（含重样式发布），取色护栏解除
     this.refreshLayers();
     this.refreshStats();  // M10d：撤销跨 Q 边界时同步快速蒙版镜像（canUndo/Redo 同步受益）
+    if (this.tool === 'directSelect') {
+      this.dsReloadPath();  // M18.1：撤销/换文档后路径镜像跟随
+    }
     this.scheduleHistogram();
     this.refreshGuides();  // M15a：打开工程/撤销到其他文档状态时同步参考线镜像
     this.refreshHistory();      // M15b：历史面板镜像（撤销/重做/跳转/编辑后同步）
@@ -1018,6 +1036,9 @@ struct Index {
       case 'pen':
         this.penTouch(e, docX, docY);
         break;
+      case 'directSelect':
+        this.dsTouch(e, docX, docY);
+        break;
       case 'text':
         this.textTouch(e, docX, docY);
         break;
@@ -1400,6 +1421,456 @@ struct Index {
     this.workPathNonEmpty = 1;
   }
 
+  // ---------- M18.1 直接选择（几何镜像内核 vector_edit 公式——宿主 test_vector 为 oracle） ----------
+
+  /** 工作路径重载（工具切入/文档版本变更/换层）。非形状层清空编辑态。 */
+  private dsReloadPath(): void {
+    const a = this.activeLayer();
+    if (a === undefined || !a.isShape) {
+      this.dsPath = [];
+      this.dsSelected = [];
+      this.dsHandleOf = [];
+      this.dsRefreshPreview();
+      return;
+    }
+    this.dsPath = this.engine.getShapePath(a.id);
+    this.dsSelected = [];
+    this.dsHandleOf = [];
+    this.dsLoadedRev = this.docVersion;
+    this.dsRefreshPreview();
+  }
+
+  /** 扁平路径 → 可变结构（knots = [ax,ay,ix,iy,ox,oy,smooth]×n）。 */
+  private dsParse(flat: number[]): number[][][] {
+    const subs: number[][][] = [];
+    if (flat.length < 1) {
+      return subs;
+    }
+    const subCount = Math.floor(flat[0]);
+    let idx = 1;
+    for (let si = 0; si < subCount && idx + 3 <= flat.length; si++) {
+      const closed = flat[idx] > 0.5;
+      const op = flat[idx + 1];
+      const knotCount = Math.floor(flat[idx + 2]);
+      idx += 3;
+      const sub: number[][] = [closed ? [1] : [0], [op]];
+      const knots: number[] = [];
+      for (let k = 0; k < knotCount && idx + 7 <= flat.length; k++) {
+        for (let v = 0; v < 7; v++) {
+          knots.push(flat[idx + v]);
+        }
+        idx += 7;
+      }
+      sub.push(knots);
+      subs.push(sub);
+    }
+    return subs;
+  }
+
+  /** 可变结构 → 扁平路径（setShapePath 跨桥格式）。 */
+  private dsSerialize(subs: number[][][]): number[] {
+    const flat: number[] = [subs.length];
+    for (const sub of subs) {
+      const knots = sub[2];
+      flat.push(sub[0][0], sub[1][0], knots.length / 7);
+      for (const v of knots) {
+        flat.push(v);
+      }
+    }
+    return flat;
+  }
+
+  /** 三次贝塞尔求值（seg = [p0,c1,c2,p1] 扁平 8 数）。 */
+  private dsEval(seg: number[], t: number): number[] {
+    const mt = 1.0 - t;
+    const a = mt * mt * mt;
+    const b = 3.0 * mt * mt * t;
+    const c = 3.0 * mt * t * t;
+    const d = t * t * t;
+    return [a * seg[0] + b * seg[2] + c * seg[4] + d * seg[6],
+      a * seg[1] + b * seg[3] + c * seg[5] + d * seg[7]];
+  }
+
+  /** 子路径段列表 [p0,c1,c2,p1]（每段 8 数，含段序）。 */
+  private dsSegments(sub: number[][]): number[][] {
+    const knots = sub[2];
+    const n = knots.length / 7;
+    const out: number[][] = [];
+    if (n < 2) {
+      return out;
+    }
+    const count = sub[0][0] > 0.5 ? n : n - 1;
+    for (let i = 0; i < count; i++) {
+      const a = i * 7;
+      const b = ((i + 1) % n) * 7;
+      out.push([knots[a], knots[a + 1], knots[a + 3], knots[a + 4],
+        knots[b + 2], knots[b + 3], knots[b], knots[b + 1]]);
+    }
+    return out;
+  }
+
+  /** 平滑 knot 保持对侧柄共线等长（内核 keepSmooth 同式）。 */
+  private dsKeepSmooth(knots: number[], ki: number, movedIn: boolean): void {
+    if (knots[ki + 6] < 0.5) {
+      return;
+    }
+    const ax = knots[ki], ay = knots[ki + 1];
+    const mx = movedIn ? knots[ki + 2] : knots[ki + 4];
+    const my = movedIn ? knots[ki + 3] : knots[ki + 5];
+    const oi = movedIn ? ki + 4 : ki + 2;
+    const len = Math.hypot(knots[oi] - ax, knots[oi + 1] - ay);
+    const d = Math.hypot(mx - ax, my - ay);
+    if (len > 1e-9 && d > 1e-9) {
+      knots[oi] = ax - (mx - ax) / d * len;
+      knots[oi + 1] = ay - (my - ay) / d * len;
+    }
+  }
+
+  /** 预览重建：路径抽样折线 + 锚点 + 单选手柄（视口坐标）。 */
+  private dsRefreshPreview(): void {
+    const k = this.pxPerVp();
+    const toVp = (x: number, y: number): number[] =>
+      [(x - this.panX) * this.zoom / k, (y - this.panY) * this.zoom / k];
+    const pts: number[][] = [];
+    const anchors: number[][] = [];
+    const handles: number[][] = [];
+    const subs = this.dsParse(this.dsPath);
+    for (let si = 0; si < subs.length; si++) {
+      const segs = this.dsSegments(subs[si]);
+      for (const seg of segs) {
+        for (let j = 0; j <= 12; j++) {
+          const p = this.dsEval(seg, j / 12);
+          pts.push(toVp(p[0], p[1]));
+        }
+      }
+      const knots = subs[si][2];
+      const n = knots.length / 7;
+      for (let ki = 0; ki < n; ki++) {
+        let sel = 0;
+        for (let s2 = 0; s2 + 1 < this.dsSelected.length; s2 += 2) {
+          if (this.dsSelected[s2] === si && this.dsSelected[s2 + 1] === ki) {
+            sel = 1;
+          }
+        }
+        const vp = toVp(knots[ki * 7], knots[ki * 7 + 1]);
+        anchors.push([vp[0], vp[1], sel]);
+      }
+    }
+    if (this.dsHandleOf.length === 2) {
+      const si = this.dsHandleOf[0];
+      const ki = this.dsHandleOf[1];
+      if (si < subs.length) {
+        const knots = subs[si][2];
+        if ((ki + 1) * 7 <= knots.length) {
+          const vp = toVp(knots[ki * 7], knots[ki * 7 + 1]);
+          for (const isIn of [true, false]) {
+            const hx = isIn ? knots[ki * 7 + 2] : knots[ki * 7 + 4];
+            const hy = isIn ? knots[ki * 7 + 3] : knots[ki * 7 + 5];
+            const hv = toVp(hx, hy);
+            handles.push([hv[0], hv[1], vp[0], vp[1]]);
+          }
+        }
+      }
+    }
+    this.dsPreviewPts = pts;
+    this.dsAnchorPts = anchors;
+    this.dsHandlePts = handles;
+  }
+
+  /** 命中测试：单选手柄 → 选中锚点 → 任意锚点 → 段（64 采样）。返回 [kind,sub,knot,extra]。 */
+  private dsHitTest(docX: number, docY: number, tol: number): number[] {
+    const subs = this.dsParse(this.dsPath);
+    // 手柄最上层（仅单选时显示）
+    if (this.dsHandleOf.length === 2) {
+      const si = this.dsHandleOf[0];
+      const ki = this.dsHandleOf[1];
+      if (si < subs.length) {
+        const knots = subs[si][2];
+        if ((ki + 1) * 7 <= knots.length) {
+          for (const isIn of [true, false]) {
+            const hx = isIn ? knots[ki * 7 + 2] : knots[ki * 7 + 4];
+            const hy = isIn ? knots[ki * 7 + 3] : knots[ki * 7 + 5];
+            if (Math.hypot(hx - docX, hy - docY) <= tol) {
+              return [2, si, ki, isIn ? 1 : 0];
+            }
+          }
+        }
+      }
+    }
+    // 选中锚点 → 任意锚点
+    for (let s2 = 0; s2 + 1 < this.dsSelected.length; s2 += 2) {
+      const si = this.dsSelected[s2];
+      const ki = this.dsSelected[s2 + 1];
+      if (si < subs.length) {
+        const knots = subs[si][2];
+        if ((ki + 1) * 7 <= knots.length &&
+          Math.hypot(knots[ki * 7] - docX, knots[ki * 7 + 1] - docY) <= tol) {
+          return [1, si, ki, 0];
+        }
+      }
+    }
+    let bestAnchor: number[] = [];
+    let bestD = tol;
+    for (let si = 0; si < subs.length; si++) {
+      const knots = subs[si][2];
+      const n = knots.length / 7;
+      for (let ki = 0; ki < n; ki++) {
+        const d = Math.hypot(knots[ki * 7] - docX, knots[ki * 7 + 1] - docY);
+        if (d <= bestD) {
+          bestD = d;
+          bestAnchor = [1, si, ki, 0];
+        }
+      }
+    }
+    if (bestAnchor.length > 0) {
+      return bestAnchor;
+    }
+    // 段（64 采样最近，含参数 t）
+    let bestSeg: number[] = [];
+    let segD = tol;
+    for (let si = 0; si < subs.length; si++) {
+      const segs = this.dsSegments(subs[si]);
+      for (let k = 0; k < segs.length; k++) {
+        for (let j = 0; j <= 64; j++) {
+          const t = j / 64;
+          const pt = this.dsEval(segs[k], t);
+          const d = Math.hypot(pt[0] - docX, pt[1] - docY);
+          if (d <= segD) {
+            segD = d;
+            bestSeg = [4, si, k, t];
+          }
+        }
+      }
+    }
+    return bestSeg;
+  }
+
+  /** 位移应用到选中锚点集（每个只动一次）。 */
+  private dsMoveSelected(subs: number[][][], dx: number, dy: number): void {
+    for (let s2 = 0; s2 + 1 < this.dsDragTargets.length; s2 += 2) {
+      const si = this.dsDragTargets[s2];
+      const ki = this.dsDragTargets[s2 + 1];
+      if (si >= subs.length) {
+        continue;
+      }
+      const knots = subs[si][2];
+      if ((ki + 1) * 7 > knots.length) {
+        continue;
+      }
+      for (const off of [0, 2, 4]) {
+        knots[ki * 7 + off] += dx;
+        knots[ki * 7 + off + 1] += dy;
+      }
+    }
+  }
+
+  /** 直接选择触控（文档域）。 */
+  private dsTouch(e: TouchEvent, docX: number, docY: number): void {
+    const k = this.pxPerVp();
+    const tol = 12 * k / this.zoom;
+    if (e.type === TouchType.Down) {
+      if (this.docVersion !== this.dsLoadedRev) {
+        this.dsReloadPath();  // 引擎侧已变（撤销/提交/外部编辑）→ 镜像以引擎为准
+      }
+      if (this.dsPath.length === 0) {
+        if (this.dsPath.length === 0) {
+          this.toast('直接选择：先选中形状层');
+          return;
+        }
+      }
+      const hit = this.dsHitTest(docX, docY, tol);
+      this.dsDragStartDoc = [docX, docY];
+      this.dsDragLastDoc = [docX, docY];
+      if (hit.length === 0) {
+        this.dsDragKind = 3;  // 框选
+        this.dsMarqueeRect = [0, 0, 0, 0];
+        return;
+      }
+      const kind = hit[0];
+      if (kind === 2) {
+        this.dsDragKind = 2;
+        this.dsDragHandle = [hit[1], hit[2], hit[3]];
+        return;
+      }
+      if (kind === 1) {
+        // Shift+点击切换选中；点中未选锚点 = 单选它（含清空旧选）
+        let already = false;
+        for (let p2 = 0; p2 + 1 < this.dsSelected.length; p2 += 2) {
+          if (this.dsSelected[p2] === hit[1] && this.dsSelected[p2 + 1] === hit[2]) {
+            already = true;
+          }
+        }
+        if (this.shiftHeld) {
+          if (already) {
+            const at = this.dsSelected.indexOf(hit[1]);
+            this.dsSelected.splice(at, 2);
+          } else {
+            this.dsSelected.push(hit[1], hit[2]);
+          }
+        } else if (!already) {
+          this.dsSelected = [hit[1], hit[2]];
+        }
+        this.dsHandleOf = this.dsSelected.length === 2 ? [hit[1], hit[2]] : [];
+        this.dsDragKind = 1;
+        this.dsDragTargets = this.dsSelected.slice();
+        this.dsRefreshPreview();
+        return;
+      }
+      if (kind === 4) {
+        this.dsDragKind = 4;
+        this.dsDragSeg = [hit[1], hit[2], hit[3]];
+        return;
+      }
+    } else if (e.type === TouchType.Move && this.dsDragKind !== 0) {
+      const dx = docX - this.dsDragLastDoc[0];
+      const dy = docY - this.dsDragLastDoc[1];
+      this.dsDragLastDoc = [docX, docY];
+      const subs = this.dsParse(this.dsPath);
+      if (this.dsDragKind === 1) {
+        this.dsMoveSelected(subs, dx, dy);
+      } else if (this.dsDragKind === 2) {
+        const si = this.dsDragHandle[0];
+        const ki = this.dsDragHandle[1];
+        if (si < subs.length) {
+          const knots = subs[si][2];
+          if ((ki + 1) * 7 <= knots.length) {
+            const isIn = this.dsDragHandle[2] > 0.5;
+            const off = isIn ? 2 : 4;
+            knots[ki * 7 + off] += dx;
+            knots[ki * 7 + off + 1] += dy;
+            if (this.altHeld) {
+              knots[ki * 7 + 6] = 0;  // Alt 拖柄 = 断开平滑（内核 independent）
+            }
+            this.dsKeepSmooth(knots, ki * 7, isIn);
+          }
+        }
+      } else if (this.dsDragKind === 4) {
+        // 拖段：权重公式（内核 bendSegment；t 钳 0.05..0.95）
+        const si = this.dsDragSeg[0];
+        const segIdx = this.dsDragSeg[1];
+        if (si < subs.length) {
+          const knots = subs[si][2];
+          const n = knots.length / 7;
+          const closed = subs[si][0][0] > 0.5;
+          const a = segIdx * 7;
+          const bIdx = (segIdx + 1) % n;
+          const b = bIdx * 7;
+          const outRetracted = Math.hypot(knots[a + 4] - knots[a], knots[a + 5] - knots[a + 1]) < 1e-9;
+          const inRetracted = Math.hypot(knots[b + 2] - knots[b], knots[b + 3] - knots[b + 1]) < 1e-9;
+          if (outRetracted && inRetracted) {
+            for (const off of [0, 2, 4]) {
+              knots[a + off] += dx;
+              knots[a + off + 1] += dy;
+              knots[b + off] += dx;
+              knots[b + off + 1] += dy;
+            }
+          } else {
+            const t = Math.min(Math.max(this.dsDragSeg[2], 0.05), 0.95);
+            const u = 1.0 - t;
+            const sc = 1.0 / (3.0 * t * u * (u * u + t * t));
+            const w1 = u * sc;
+            const w2 = t * sc;
+            knots[a + 4] += dx * w1;
+            knots[a + 5] += dy * w1;
+            this.dsKeepSmooth(knots, a, false);
+            knots[b + 2] += dx * w2;
+            knots[b + 3] += dy * w2;
+            this.dsKeepSmooth(knots, b, true);
+          }
+        }
+      } else if (this.dsDragKind === 3) {
+        const x0v = (Math.min(this.dsDragStartDoc[0], docX) - this.panX) * this.zoom / k;
+        const y0v = (Math.min(this.dsDragStartDoc[1], docY) - this.panY) * this.zoom / k;
+        this.dsMarqueeRect = [x0v, y0v,
+          Math.abs(docX - this.dsDragStartDoc[0]) * this.zoom / k,
+          Math.abs(docY - this.dsDragStartDoc[1]) * this.zoom / k];
+        return;
+      }
+      this.dsPath = this.dsSerialize(subs);
+      this.dsRefreshPreview();
+    } else if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.dsDragKind !== 0) {
+      if (this.dsDragKind === 3) {
+        // 框选收口：盒内锚点全选
+        const x0 = Math.min(this.dsDragStartDoc[0], docX);
+        const x1 = Math.max(this.dsDragStartDoc[0], docX);
+        const y0 = Math.min(this.dsDragStartDoc[1], docY);
+        const y1 = Math.max(this.dsDragStartDoc[1], docY);
+        const sel: number[] = [];
+        const subs = this.dsParse(this.dsPath);
+        for (let si = 0; si < subs.length; si++) {
+          const knots = subs[si][2];
+          const n = knots.length / 7;
+          for (let ki = 0; ki < n; ki++) {
+            const ax = knots[ki * 7];
+            const ay = knots[ki * 7 + 1];
+            if (ax >= x0 && ax <= x1 && ay >= y0 && ay <= y1) {
+              sel.push(si, ki);
+            }
+          }
+        }
+        this.dsSelected = sel;
+        this.dsHandleOf = sel.length === 2 ? [sel[0], sel[1]] : [];
+        this.dsMarqueeRect = null;
+        this.dsRefreshPreview();
+      } else if (this.dsDragKind !== 0) {
+        // 提交（一步「编辑路径」事务；live 清 None——PS 直接选择同语义）
+        const a = this.activeLayer();
+        if (a !== undefined && a.isShape) {
+          const ok = this.engine.setShapePath(a.id, this.dsPath);
+          this.log(`编辑路径: ${ok ? '已提交' : '失败'}`);
+        }
+      }
+      this.dsDragKind = 0;
+    }
+  }
+
+  /** 删除选中锚点（内核 deleteAnchor 语义：子路径末锚删子路径；全路径末锚拒绝）。 */
+  private dsDeleteSelected(): void {
+    if (this.dsSelected.length === 0) {
+      return;
+    }
+    const subs = this.dsParse(this.dsPath);
+    let total = 0;
+    for (const sub of subs) {
+      total += sub[2].length / 7;
+    }
+    if (total <= this.dsSelected.length / 2) {
+      this.toast('不能删除路径的全部锚点');
+      return;
+    }
+    // 从后往前删（索引不漂移）
+    const order: number[] = this.dsSelected.slice();
+    const pairs: number[][] = [];
+    for (let i = 0; i + 1 < order.length; i += 2) {
+      pairs.push([order[i], order[i + 1]]);
+    }
+    pairs.sort((p, q): number => q[1] - p[1] !== 0 ? q[1] - p[1] : q[0] - p[0]);
+    for (const pr of pairs) {
+      if (pr[0] >= subs.length) {
+        continue;
+      }
+      const knots = subs[pr[0]][2];
+      if (knots.length / 7 <= 1) {
+        subs.splice(pr[0], 1);
+      } else {
+        knots.splice(pr[1] * 7, 7);
+      }
+    }
+    this.dsPath = this.dsSerialize(subs);
+    this.dsSelected = [];
+    this.dsHandleOf = [];
+    this.dsRefreshPreview();
+    const a = this.activeLayer();
+    if (a !== undefined && a.isShape) {
+      const ok = this.engine.setShapePath(a.id, this.dsPath);
+      this.log(`删除锚点: ${ok ? '已提交' : '失败'}`);
+    }
+  }
+
+  /** 视口锚点/手柄/折线 → 触摸事件前的路径预览换算（同 pen 预览）。 */
+  private dsViewportPts(): number[][] {
+    return this.dsPreviewPts;
+  }
   private penCancel(): void {
     this.penPoints = [];
     this.penClosed = false;
@@ -4126,6 +4597,7 @@ struct Index {
       { id: 'bucket', label: '油漆桶', symbol: $r('sys.symbol.paint_bucket'), enabled: true },
       { id: 'shape', label: '形状', symbol: $r('sys.symbol.circle_on_square'), enabled: true },
       { id: 'pen', label: '钢笔', symbol: $r('sys.symbol.pen_tip'), enabled: true },
+      { id: 'directSelect', label: '直接选择', symbol: $r('sys.symbol.arrow_up_left'), enabled: true },
       { id: 'stamp', label: '仿制图章', symbol: $r('sys.symbol.seal'), enabled: true },
       { id: 'blur', label: '模糊', symbol: $r('sys.symbol.hand_draw'), enabled: true },
       { id: 'dodge', label: '减淡', symbol: $r('sys.symbol.contrast'), enabled: true },
@@ -4419,6 +4891,10 @@ struct Index {
       case KC_P:
         // M18：P = 钢笔（PS 惯例）
         this.pickTool('pen');
+        break;
+      case KC_A:
+        // M18.1：A = 直接选择（PS 惯例）
+        this.pickTool('directSelect');
         break;
       case KC_R:
         // R = 模糊组（Shift+R 循环 模糊→锐化→涂抹）
@@ -4769,6 +5245,10 @@ struct Index {
           },
           penPending: this.penPoints.length,
           penClosed: this.penClosed,
+          dsSelectedCount: this.dsSelected.length / 2,
+          onDsDelete: (): void => {
+            this.dsDeleteSelected();
+          },
           onPenClose: (): void => {
             if (this.penPoints.length >= 6 && !this.penClosed) {
               this.penClosed = true;
@@ -4997,6 +5477,48 @@ struct Index {
                 .position({ x: p[0] - (idx === 0 ? 6 : 3.5), y: p[1] - (idx === 0 ? 6 : 3.5) })
                 .hitTestBehavior(HitTestMode.None)
             }, (p: number[], idx: number): string => `pen${idx}|${p[0]}|${p[1]}`)
+            // M18.1 直接选择预览：白折线 + 锚点方点（选中=青）+ 单选手柄线
+            if (this.tool === 'directSelect' && this.dsPreviewPts.length >= 2) {
+              Polyline()
+                .width('100%')
+                .height('100%')
+                .points(this.dsViewportPts())
+                .stroke('#FFFFFF')
+                .strokeWidth(1)
+                .fillOpacity(0)
+                .hitTestBehavior(HitTestMode.None)
+              ForEach(this.dsAnchorPts, (p: number[], idx: number) => {
+                Rect()
+                  .width(p[2] > 0.5 ? 10 : 7)
+                  .height(p[2] > 0.5 ? 10 : 7)
+                  .fill(p[2] > 0.5 ? '#00E5FF' : '#FFFFFF')
+                  .position({ x: p[0] - (p[2] > 0.5 ? 5 : 3.5), y: p[1] - (p[2] > 0.5 ? 5 : 3.5) })
+                  .hitTestBehavior(HitTestMode.None)
+              }, (p: number[], idx: number): string => `dsa${idx}|${p[0]}|${p[1]}|${p[2]}`)
+              ForEach(this.dsHandlePts, (p: number[], idx: number) => {
+                Line()
+                  .startPoint([p[2], p[3]])
+                  .endPoint([p[0], p[1]])
+                  .stroke('#888888')
+                  .strokeWidth(1)
+                  .hitTestBehavior(HitTestMode.None)
+                Circle()
+                  .width(7)
+                  .height(7)
+                  .fill('#00E5FF')
+                  .position({ x: p[0] - 3.5, y: p[1] - 3.5 })
+                  .hitTestBehavior(HitTestMode.None)
+              }, (p: number[], idx: number): string => `dsh${idx}|${p[0]}|${p[1]}`)
+            }
+            if (this.dsMarqueeRect !== null) {
+              Column()
+                .position({ x: this.dsMarqueeRect[0], y: this.dsMarqueeRect[1] })
+                .width(this.dsMarqueeRect[2])
+                .height(this.dsMarqueeRect[3])
+                .border({ width: 1, color: '#00E5FF' })
+                .backgroundColor('#10000000')
+                .hitTestBehavior(HitTestMode.None)
+            }
             // M11c 形状拖拽预览：青色虚线框（纯视觉，None 防拦截触摸）
             if (this.shapePreview !== null) {
               Column()

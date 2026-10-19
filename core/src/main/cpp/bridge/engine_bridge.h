@@ -216,6 +216,7 @@ napi_value SetHistoryState(napi_env env, napi_callback_info info);
 napi_value GetSelectionBounds(napi_env env, napi_callback_info info);
 // M18 矢量与形状层：形状层命令 + 路径面板 + 矢量蒙版 + 自定义形状。
 // 路径跨桥格式 = 扁平 number[]：[子路径数, (closed, op, knot数, knot×7[ax,ay,ix,iy,ox,oy,smooth])×n]
+napi_value GetShapePath(napi_env env, napi_callback_info info);
 napi_value CreateShapeLayer(napi_env env, napi_callback_info info);
 napi_value SetShapeLive(napi_env env, napi_callback_info info);
 napi_value SetShapeFill(napi_env env, napi_callback_info info);

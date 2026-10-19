@@ -1122,6 +1122,27 @@ export class CompositorEngine {
     return true;
   }
 
+  /** M18.1：读形状层路径（live 解析后扁平数组；非形状层返回空）。 */
+  getShapePath(id: number): number[] {
+    try {
+      const r = narrowResult(native.getShapePath(id) as Object);
+      if (!r.ok) {
+        return [];
+      }
+      const out: number[] = [];
+      const d2 = r.data;
+      const arrObj: Object = d2 !== null ? d2 : ({} as Record<string, Object>);
+      const arr = arrObj as Array<Object>;
+      for (const v of arr) {
+        out.push(typeof v === 'number' ? v : 0);
+      }
+      return out;
+    } catch (e) {
+      hilog.error(DOMAIN, TAG, 'getShapePath failed: %{public}s',
+        e instanceof Error ? e.message : String(e));
+      return [];
+    }
+  }
   /** M18d：放置自定义形状 → 新形状层（画布中心 50% 尺寸）。 */
   placeCustomShape(id: string, cx: number, cy: number, w: number, h: number): number {
     const r = narrowResult(native.placeCustomShape(id, cx, cy, w, h) as Object);

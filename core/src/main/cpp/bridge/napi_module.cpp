@@ -139,6 +139,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"setTextLayerContent", nullptr, montage::bridge::SetTextLayerContent, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setTextLayerStyle", nullptr, montage::bridge::SetTextLayerStyle, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"rasterizeTextLayer", nullptr, montage::bridge::RasterizeTextLayer, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getShapePath", nullptr, montage::bridge::GetShapePath, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"createShapeLayer", nullptr, montage::bridge::CreateShapeLayer, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setShapeLive", nullptr, montage::bridge::SetShapeLive, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setShapeFill", nullptr, montage::bridge::SetShapeFill, nullptr, nullptr, nullptr, napi_default, nullptr},

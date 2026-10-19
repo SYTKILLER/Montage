@@ -67,6 +67,9 @@ export struct OptionsBar {
   // M18 live 形状再编辑（>0 = 活动 live 矩形存在，圆角滑条可用）
   @Link shapeLiveRadius: number;
   onShapeRadiusCommit: (v: number) => void = (_v: number) => {};
+  // M18.1 直接选择
+  @Prop dsSelectedCount: number = 0;
+  onDsDelete: () => void = () => {};
   // M18c 钢笔（pending = 进行中锚点数）
   @Prop penPending: number = 0;
   @Prop penClosed: boolean = false;
@@ -516,6 +519,25 @@ export struct OptionsBar {
     .height(36)
   }
 
+  // M18.1 直接选择选项：选中计数 + 删除锚点 + 提示
+  @Builder
+  dsOptions() {
+    Row({ space: 10 }) {
+      Text(`选中 ${this.dsSelectedCount} 锚点`)
+        .fontSize(12)
+        .fontColor($r('app.color.text_secondary'))
+      Button('删除锚点')
+        .fontSize(12).height(28)
+        .enabled(this.dsSelectedCount > 0)
+        .onClick((): void => {
+          this.onDsDelete();
+        })
+      Text('拖锚点/手柄/段 · 空白框选 · Shift 加选 · Alt+拖柄断开平滑')
+        .fontSize(11)
+        .fontColor($r('app.color.text_secondary'))
+    }
+    .height(36)
+  }
   // M11e 效果工具选项：直径/不透明度 + 提示（强度 v1 固定 50%）
   @Builder
   effectOptions() {
@@ -629,6 +651,8 @@ export struct OptionsBar {
         this.shapeOptions()
       } else if (this.tool === 'pen') {
         this.penOptions()
+      } else if (this.tool === 'directSelect') {
+        this.dsOptions()
       } else if (this.tool === 'stamp') {
         this.stampOptions()
       } else if (this.tool === 'historyBrush') {

@@ -6403,6 +6403,29 @@ bool flatArrayToPath(napi_env env, napi_value v, VectorPath& out) {
     return true;
 }
 
+napi_value GetShapePath(napi_env env, napi_callback_info info) {
+    // getShapePath(id) → 扁平路径（live 形状返回生成路径——直接选择拖拽后经 setShapePath
+    // 提交会清 live，PS 同语义）。非形状层返回空数组。
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "getShapePath(id) requires 1 arg");
+    }
+    double id = 0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "getShapePath: invalid id");
+    }
+    auto& e = Engine::get();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    const Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+    VectorPath out;
+    if (l != nullptr && l->shape != nullptr) {
+        out = l->shape->live.kind == ShapeLiveKind::None ? l->shape->path
+                                                         : liveShapePath(l->shape->live);
+    }
+    return makeOk(env, pathToFlatArray(env, out));
+}
 napi_value CreateShapeLayer(napi_env env, napi_callback_info info) {
     // createShapeLayer(kind, x0, y0, x1, y1, radius, sides, starRatio, weight,
     //                  fillKind, fr, fg, fb, fa, hasStroke, sr, sg, sb, sa, strokeWidth)
