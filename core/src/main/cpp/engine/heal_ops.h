@@ -21,6 +21,10 @@ bool contentAwareFill(Document& doc, std::string& err);
 // M19b 内容感知移动：选区内容按 (dx,dy) 泊松融入新址；extend=false 时旧址内容感知填充。
 bool contentAwareMove(Document& doc, int dx, int dy, bool extend, std::string& err);
 
+// M19c 内容感知比例：活动图层像素缝雕刻到 newW×newH（选区灰度作保护图，若有），
+// 画布随缩放至 (0,0,newW,newH)。图层像素 ≤16MP 预算。
+bool contentAwareScale(Document& doc, uint32_t newW, uint32_t newH, std::string& err);
+
 }  // namespace montage
 
 #endif  // MONTAGE_ENGINE_HEAL_OPS_H

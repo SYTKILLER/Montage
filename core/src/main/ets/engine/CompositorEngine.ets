@@ -1825,6 +1825,13 @@ export class CompositorEngine {
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
+  // M19c 内容感知比例：活动图层缝雕刻到 w×h（选区灰度作保护图；画布随缩放；异步）
+  async contentAwareScale(w: number, h: number): Promise<boolean> {
+    const value: Object = await (native.contentAwareScale(w, h) as Promise<Object>);
+    const r = narrowResult(value);
+    return r.ok && r.data !== null && boolOf(r.data, 'changed');
+  }
+
   /** 变换 overlay bbox（M8.1；进入 overlay 态）。 */
   beginTransformOverlay(): TransformOverlayBox | null {
     const r = narrowResult(native.beginTransformOverlay() as Object);

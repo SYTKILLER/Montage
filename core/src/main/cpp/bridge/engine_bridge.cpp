@@ -3115,11 +3115,12 @@ struct DocGeomCtx {
     Document docSnap;   // 锁内整档拷贝（shared_ptr 共享瓦片，O(层数)）
     uint64_t epoch = 0;
     int64_t revision = 0;
-    int op = 0;         // 0=rot90 1=flip 2=trim 3=revealAll 4=resample 5=rotArb
+    int op = 0;         // 0=rot90 1=flip 2=trim 3=revealAll 4=resample 5=rotArb 6=caScale
     bool flag = true;   // clockwise / horizontal
     double deg = 0;     // rotArb
-    uint32_t w = 0, h = 0;  // resample
+    uint32_t w = 0, h = 0;  // resample / caScale
     bool changed = false;
+    std::string err;    // caScale 失败原因
 };
 
 napi_value DocGeomAsync(napi_env env, napi_callback_info info, int op) {
@@ -3133,19 +3134,23 @@ napi_value DocGeomAsync(napi_env env, napi_callback_info info, int op) {
         if (argc >= 1) {
             napi_get_value_bool(env, argv[0], &ctx->flag);
         }
-    } else if (op == 4) {
+    } else if (op == 4 || op == 6) {
         size_t argc = 2;
         napi_value argv[2] = {nullptr, nullptr};
         napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
         if (argc < 2) {
             delete ctx;
-            return makeError(env, kErrBadParam, "resampleDocument(w, h) requires 2 args");
+            return makeError(env, kErrBadParam,
+                             op == 4 ? "resampleDocument(w, h) requires 2 args"
+                                     : "contentAwareScale(w, h) requires 2 args");
         }
         double w = 0, h = 0;
         if (napi_get_value_double(env, argv[0], &w) != napi_ok ||
             napi_get_value_double(env, argv[1], &h) != napi_ok || w < 1 || h < 1) {
             delete ctx;
-            return makeError(env, kErrBadParam, "resampleDocument: invalid size");
+            return makeError(env, kErrBadParam,
+                             op == 4 ? "resampleDocument: invalid size"
+                                     : "contentAwareScale: invalid size");
         }
         ctx->w = static_cast<uint32_t>(w);
         ctx->h = static_cast<uint32_t>(h);
@@ -3222,6 +3227,9 @@ napi_value DocGeomAsync(napi_env env, napi_callback_info info, int op) {
                     rotateDocumentArbitrary(work, c->deg);
                     c->changed = true;
                     break;
+                case 6:
+                    c->changed = contentAwareScale(work, c->w, c->h, c->err);
+                    break;
                 default:
                     break;
             }
@@ -3239,6 +3247,7 @@ napi_value DocGeomAsync(napi_env env, napi_callback_info info, int op) {
                                     : c->op == 2 ? "trim"
                                     : c->op == 3 ? "reveal all"
                                     : c->op == 4 ? "image size"
+                                    : c->op == 6 ? "content-aware scale"
                                                  : "rotate arbitrary";
                 eg.history.beginEdit(eg.doc, label, static_cast<uint64_t>(eg.docRevision));
                 eg.doc = std::move(work);
@@ -4018,6 +4027,11 @@ napi_value GetHistogram(napi_env env, napi_callback_info /*info*/) {
 // M8c：图像大小重采样（history 事务；异步 work，同 DocGeomAsync）
 napi_value ResampleDocument(napi_env env, napi_callback_info info) {
     return DocGeomAsync(env, info, 4);
+}
+
+// M19c：内容感知比例（活动图层缝雕刻到 w×h，选区灰度作保护图；画布随缩放；异步 work）
+napi_value ContentAwareScale(napi_env env, napi_callback_info info) {
+    return DocGeomAsync(env, info, 6);
 }
 
 // M8c：任意角旋转（度，顺时针；history 事务；异步 work，同 DocGeomAsync）

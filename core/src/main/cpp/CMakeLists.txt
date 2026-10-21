@@ -15,6 +15,7 @@ add_library(compositor SHARED
         engine/content_aware_ops.cpp
         engine/poisson_ops.cpp
         engine/inpaint_ops.cpp
+        engine/seam_ops.cpp
         engine/gradient_ops.cpp
         engine/group_ops.cpp
         engine/layer_ops.cpp

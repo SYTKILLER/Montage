@@ -351,6 +351,8 @@ struct Index {
   @State showTheme: boolean = false;
   @State renameText: string = '';
   @State showImageSize: boolean = false;
+  // 尺寸对话框模式（0 重采样/1 内容感知比例——M19c 复用同对话框）
+  @State imageSizeMode: number = 0;
   @State imgWText: string = '';
   @State imgHText: string = '';
   @State channelsCount: number = 0;       // M10c Alpha 通道数（镜像，驱动菜单使能）
@@ -4188,6 +4190,16 @@ struct Index {
         if (this.docOpen) {
           this.imgWText = `${this.docW}`;
           this.imgHText = `${this.docH}`;
+          this.imageSizeMode = 0;
+          this.showImageSize = true;
+        }
+        break;
+      case 'image.contentAwareScale':
+        // M19c 内容感知比例：活动图层缝雕刻到新尺寸（选区灰度作保护图；异步）
+        if (this.docOpen) {
+          this.imgWText = `${this.docW}`;
+          this.imgHText = `${this.docH}`;
+          this.imageSizeMode = 1;
           this.showImageSize = true;
         }
         break;
@@ -4248,7 +4260,13 @@ struct Index {
       return;
     }
     this.showImageSize = false;
-    this.docOp((): Promise<boolean> => this.engine.resampleDocument(w, h), `图像大小 ${w}×${h}`);
+    if (this.imageSizeMode === 1) {
+      // M19c 内容感知比例（活动图层缝雕刻；DocGeom 异步）
+      this.docOp((): Promise<boolean> => this.engine.contentAwareScale(w, h),
+        `内容感知比例 ${w}×${h}`);
+    } else {
+      this.docOp((): Promise<boolean> => this.engine.resampleDocument(w, h), `图像大小 ${w}×${h}`);
+    }
   }
 
   // M10c 通道数镜像刷新（存储/删除后调用；驱动载入选区菜单使能）
@@ -4526,6 +4544,7 @@ struct Index {
     const imageMenu: MenuItemVM[] = [
       leafItem('image.canvasSize', '画布大小…', '', d),
       leafItem('image.imageSize', '图像大小…', '', d),
+      leafItem('image.contentAwareScale', '内容感知比例…', '', d),
       leafItem('image.rotate90cw', '顺时针旋转 90°', '', d),
       leafItem('image.rotate90ccw', '逆时针旋转 90°', '', d),
       leafItem('image.rotate180', '旋转 180°', '', d),
@@ -6073,8 +6092,14 @@ struct Index {
           Column().width('100%').height('100%').backgroundColor('#66000000')
             .onClick((): void => { this.showImageSize = false; })
           Column({ space: 14 }) {
-            Text('图像大小').fontSize(16).fontWeight(FontWeight.Bold)
+            Text(this.imageSizeMode === 1 ? '内容感知比例' : '图像大小')
+              .fontSize(16).fontWeight(FontWeight.Bold)
               .fontColor($r('app.color.text_primary'))
+            if (this.imageSizeMode === 1) {
+              Text('活动图层缝雕刻到新尺寸 · 选区=保护区')
+                .fontSize(11)
+                .fontColor($r('app.color.text_secondary'))
+            }
             Row({ space: 10 }) {
               Text('宽').fontSize(13).fontColor($r('app.color.text_secondary'))
               TextInput({ text: this.imgWText }).width(120).height(40)

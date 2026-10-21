@@ -11,6 +11,8 @@
 #include "engine/content_aware_ops.h"
 #include "engine/inpaint_ops.h"
 #include "engine/poisson_ops.h"
+#include "engine/seam_ops.h"
+#include "engine/transform_ops.h"
 
 namespace montage {
 namespace {
@@ -656,6 +658,127 @@ bool contentAwareMove(Document& doc, int dx, int dy, bool extend, std::string& e
     ctx.layer->pixels = outGrid;
     if (ctx.layer->mask != nullptr && ctx.layer->mask->enabled) {
         ctx.layer->render = composeMasked(ctx.layer->pixels, *ctx.layer->mask);
+    }
+    return true;
+}
+
+// ---- M19c 内容感知比例 ----
+
+bool contentAwareScale(Document& doc, uint32_t newW, uint32_t newH, std::string& err) {
+    Layer* layer = nullptr;
+    for (Layer& l : doc.layers) {
+        if (l.id == doc.activeId) {
+            layer = &l;
+            break;
+        }
+    }
+    if (layer == nullptr || layer->pixels == nullptr) {
+        err = "no active layer pixels";
+        return false;
+    }
+    if (newW == 0 || newH == 0 || newW > 16384 || newH > 16384) {
+        err = "invalid size";
+        return false;
+    }
+    const TileGrid* grid = layer->pixels.get();
+    const int gw = static_cast<int>(grid->cols * kTile);
+    const int gh = static_cast<int>(grid->rows * kTile);
+    const int ox = static_cast<int>(std::lround(layer->transform.originX));
+    const int oy = static_cast<int>(std::lround(layer->transform.originY));
+    // 全图层网格雕刻（PS 语义：层内容含透明区整体缩放——按内容 bbox 雕会改变内容纵横比）
+    const size_t w = static_cast<size_t>(gw), h = static_cast<size_t>(gh);
+    if (w == 0 || h == 0) {
+        err = "active layer has no pixels";
+        return false;
+    }
+    if (w * h > 20e6) {
+        err = "layer too large for content-aware scale (20MP budget)";
+        return false;
+    }
+    std::vector<float> img(w * h * 4);
+    bool any = false;
+    for (size_t y = 0; y < h; ++y) {
+        for (size_t x = 0; x < w; ++x) {
+            const uint8_t* d = sampleAt(grid, static_cast<int>(x), static_cast<int>(y));
+            if (d != nullptr) {
+                for (int c = 0; c < 4; ++c) {
+                    img[(y * w + x) * 4 + c] = d[c] / 255.0f;
+                }
+                any = any || d[3] > 0;
+            }
+        }
+    }
+    if (!any) {
+        err = "active layer has no pixels";
+        return false;
+    }
+    // 保护图 = 选区灰度（文档域 → 网格域；无选区 = 无保护）
+    std::vector<float> protect;
+    const bool hasProt = doc.selection != nullptr;
+    if (hasProt) {
+        protect.assign(w * h, 0.0f);
+        for (size_t y = 0; y < h; ++y) {
+            for (size_t x = 0; x < w; ++x) {
+                const uint8_t* sg = sampleAt(doc.selection.get(),
+                                             static_cast<int>(x) + ox,
+                                             static_cast<int>(y) + oy);
+                protect[y * w + x] =
+                    sg != nullptr ? static_cast<float>(sg[0]) / 255.0f : 0.0f;
+            }
+        }
+    }
+    const std::vector<float> carved =
+        seam::carve(w, h, 4, img, hasProt ? &protect : nullptr, newW, newH);
+    if (carved.empty() || carved.size() != newW * newH * 4) {
+        err = "carve failed";
+        return false;
+    }
+    // 重建图层网格（内容 (0,0) 锚定新尺寸）
+    const size_t tw = (newW + kTile - 1) / kTile, th = (newH + kTile - 1) / kTile;
+    auto outGrid = std::make_shared<TileGrid>();
+    outGrid->cols = static_cast<uint32_t>(tw);
+    outGrid->rows = static_cast<uint32_t>(th);
+    outGrid->revision = grid->revision + 1;
+    for (size_t tyI = 0; tyI < th; ++tyI) {
+        for (size_t txI = 0; txI < tw; ++txI) {
+            std::vector<uint8_t> buf(static_cast<size_t>(kTile) * kTile * 4u, 0);
+            bool any = false;
+            for (uint32_t r = 0; r < kTile; ++r) {
+                const size_t y = tyI * kTile + r;
+                if (y >= newH) {
+                    break;
+                }
+                for (uint32_t c = 0; c < kTile; ++c) {
+                    const size_t x = txI * kTile + c;
+                    if (x >= newW) {
+                        break;
+                    }
+                    std::memcpy(&buf[(static_cast<size_t>(r) * kTile + c) * 4u],
+                                &carved[(y * newW + x) * 4], 4u);
+                    any = any || buf[(static_cast<size_t>(r) * kTile + c) * 4u + 3u] > 0;
+                }
+            }
+            if (any) {
+                auto tile = std::make_shared<Tile>();
+                auto ebuf = std::make_unique<EngineBuffer>(kTile, kTile);
+                std::memcpy(ebuf->mapCpuWrite(), buf.data(), buf.size());
+                tile->pixels = std::move(ebuf);
+                outGrid->tiles[static_cast<uint32_t>(tyI) * outGrid->cols +
+                               static_cast<uint32_t>(txI)] = std::move(tile);
+            }
+        }
+    }
+    layer->pixels = outGrid;
+    layer->render = nullptr;  // 蒙版/样式派生域随内容重投影：由 restyleDocument 重建
+    if (layer->mask != nullptr) {
+        // 蒙版域不再对齐新内容几何：保留原蒙版非破坏语义由后续批处理，v1 随内容清蒙版登记
+        // （与几何变换清派生栅格同类；像素蒙版重采样登记后续）
+        layer->mask->enabled = false;
+    }
+    // 画布随缩放（0,0 锚定），几何命令派生态清理（与 resample 同不变式）
+    if (!resizeCanvas(doc, 0, 0, static_cast<int>(newW), static_cast<int>(newH))) {
+        err = "canvas resize failed";
+        return false;
     }
     return true;
 }
