@@ -54,6 +54,8 @@ napi_value Init(napi_env env, napi_value exports) {
         {"setBrushEffect", nullptr, montage::bridge::SetBrushEffect, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setBrushHeal", nullptr, montage::bridge::SetBrushHeal, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"patchSelection", nullptr, montage::bridge::PatchSelection, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"contentAwareFill", nullptr, montage::bridge::ContentAwareFill, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"contentAwareMove", nullptr, montage::bridge::ContentAwareMove, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setHistoryBrush", nullptr, montage::bridge::SetHistoryBrush, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"storeSelection", nullptr, montage::bridge::StoreSelection, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"loadSelection", nullptr, montage::bridge::LoadSelection, nullptr, nullptr, nullptr, napi_default, nullptr},

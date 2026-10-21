@@ -102,6 +102,9 @@ export struct OptionsBar {
   @Prop multiSelectCount: number = 1;
   onAlignPick: (mode: number, isAlign: boolean) => void =
     (_mode: number, _isAlign: boolean) => {};
+  // M19b 内容感知移动（move 工具选项条三态：0 普通/1 感知移动/2 感知扩展）
+  @Prop caMoveMode: number = 0;
+  onCaMoveMode: (m: number) => void = (_m: number) => {};
 
   @Builder
   alignButton(symbol: string, mode: number, isAlign: boolean) {
@@ -750,7 +753,23 @@ export struct OptionsBar {
       } else if (this.tool === 'move') {
         Row({ space: 10 }) {
           this.moveAlignOptions()
-          Text('拖拽移动图层 · 方向键微调（Shift=10px）')
+          Row({ space: 6 }) {
+            Button('普通').fontSize(12).height(28)
+              .backgroundColor(this.caMoveMode === 0 ? $r('app.color.accent') : $r('app.color.surface'))
+              .fontColor(this.caMoveMode === 0 ? $r('app.color.on_accent') : $r('app.color.text_primary'))
+              .onClick((): void => this.onCaMoveMode(0))
+            Button('感知移动').fontSize(12).height(28)
+              .backgroundColor(this.caMoveMode === 1 ? $r('app.color.accent') : $r('app.color.surface'))
+              .fontColor(this.caMoveMode === 1 ? $r('app.color.on_accent') : $r('app.color.text_primary'))
+              .onClick((): void => this.onCaMoveMode(1))
+            Button('感知扩展').fontSize(12).height(28)
+              .backgroundColor(this.caMoveMode === 2 ? $r('app.color.accent') : $r('app.color.surface'))
+              .fontColor(this.caMoveMode === 2 ? $r('app.color.on_accent') : $r('app.color.text_primary'))
+              .onClick((): void => this.onCaMoveMode(2))
+          }
+          .height(28)
+          Text(this.caMoveMode === 0 ? '拖拽移动图层 · 方向键微调（Shift=10px）'
+            : '选区内拖拽 → 松手感知应用（需选区）')
             .fontSize(11)
             .fontColor($r('app.color.text_secondary'))
         }

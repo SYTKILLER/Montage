@@ -2466,6 +2466,119 @@ napi_value PatchSelection(napi_env env, napi_callback_info info) {
     return makeOk(env, nullptr);
 }
 
+// M19b：内容感知填充/移动——异步 Promise（PatchMatch 秒级，同步会 ANR；
+// DocGeomAsync 同范式：锁内快照 → 锁外求解 → 发布段 docEpoch+docRevision 复核）
+struct CaOpCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    Document docSnap;
+    uint64_t epoch = 0;
+    int64_t revision = 0;
+    int op = 0;  // 0=fill 1=move
+    int dx = 0, dy = 0;
+    bool extend = false;
+    bool changed = false;
+    std::string err;
+};
+
+napi_value CaOpAsync(napi_env env, napi_callback_info info, int op) {
+    auto& e = Engine::get();
+    auto* ctx = new CaOpCtx();
+    ctx->op = op;
+    if (op == 1) {
+        size_t argc = 3;
+        napi_value argv[3] = {nullptr, nullptr, nullptr};
+        napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+        if (argc < 2) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "contentAwareMove(dx, dy, extend?) requires 2+ args");
+        }
+        double dx = 0, dy = 0, extendNum = 0;
+        if (napi_get_value_double(env, argv[0], &dx) != napi_ok ||
+            napi_get_value_double(env, argv[1], &dy) != napi_ok) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "contentAwareMove: invalid args");
+        }
+        if (argc >= 3 && napi_get_value_double(env, argv[2], &extendNum) != napi_ok) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "contentAwareMove: invalid extend");
+        }
+        ctx->dx = static_cast<int>(std::lround(dx));
+        ctx->dy = static_cast<int>(std::lround(dy));
+        ctx->extend = extendNum != 0;
+    }
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0) {
+            delete ctx;
+            return makeError(env, kErrNoDoc, op == 0 ? "contentAwareFill: no document"
+                                                     : "contentAwareMove: no document");
+        }
+        ctx->docSnap = e.doc;
+        ctx->epoch = e.docEpoch;
+        ctx->revision = e.docRevision;
+    }
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value workName = nullptr;
+    napi_create_string_utf8(env, "montageCaOp", NAPI_AUTO_LENGTH, &workName);
+    napi_status st = napi_create_async_work(
+        env, nullptr, workName,
+        [](napi_env /*env*/, void* data) {
+            auto* c = static_cast<CaOpCtx*>(data);
+            Document work = c->docSnap;
+            if (c->op == 0) {
+                c->changed = contentAwareFill(work, c->err);
+            } else {
+                c->changed = contentAwareMove(work, c->dx, c->dy, c->extend, c->err);
+            }
+            if (c->changed) {
+                restyleDocument(work);
+            }
+            auto& eg = Engine::get();
+            std::lock_guard<std::mutex> lk(eg.docMutex);
+            if (c->changed && eg.docEpoch == c->epoch && eg.docRevision == c->revision) {
+                eg.history.beginEdit(eg.doc, c->op == 0 ? "content-aware fill" : "content-aware move",
+                                     static_cast<uint64_t>(eg.docRevision));
+                eg.doc = std::move(work);
+                eg.history.endEdit(eg.doc, static_cast<uint64_t>(eg.docRevision));
+                eg.bumpRevisionLocked();
+                eg.requestRender();
+            } else {
+                c->changed = false;
+            }
+        },
+        [](napi_env env, napi_status status, void* data) {
+            auto* c = static_cast<CaOpCtx*>(data);
+            auto& eg = Engine::get();
+            if (status == napi_ok && c->changed) {
+                eg.historyVersion.fetch_add(1);
+            }
+            napi_value dataObj = nullptr;
+            napi_create_object(env, &dataObj);
+            napi_set_named_property(env, dataObj, "changed",
+                                    makeBool(env, status == napi_ok && c->changed));
+            napi_resolve_deferred(env, c->deferred, makeOk(env, dataObj));
+            napi_delete_async_work(env, c->work);
+            delete c;
+        },
+        ctx, &ctx->work);
+    if (st != napi_ok) {
+        delete ctx;
+        return makeError(env, kErrInternal, "create async work failed");
+    }
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+napi_value ContentAwareFill(napi_env env, napi_callback_info info) {
+    return CaOpAsync(env, info, 0);
+}
+
+napi_value ContentAwareMove(napi_env env, napi_callback_info info) {
+    return CaOpAsync(env, info, 1);
+}
+
 // M11f：历史画笔源（steps 0=关闭；1=最近一次编辑前快照…；笔画时实时取快照）
 napi_value SetHistoryBrush(napi_env env, napi_callback_info info) {
     size_t argc = 1;

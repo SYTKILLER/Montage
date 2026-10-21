@@ -428,6 +428,13 @@ struct Index {
   private patchDragging: boolean = false;
   private patchStartX: number = 0;
   private patchStartY: number = 0;
+  // M19b 内容感知移动（move 工具选项条三态：0 关闭/1 移动/2 扩展）
+  @State caMoveMode: number = 0;
+  private caDragging: boolean = false;
+  private caStartX: number = 0;
+  private caStartY: number = 0;
+  private caCurX: number = 0;
+  private caCurY: number = 0;
   // M19a 污点修复模式（0 内容识别/1 创建纹理/2 接近匹配；引擎 kind = 2 + 模式）
   @State spotHealMode: number = 0;
   // M15a 参考线交互态（画布内拖动 + 标尺拖拽创建）
@@ -1274,6 +1281,36 @@ struct Index {
   }
 
   private moveTouch(e: TouchEvent, docX: number, docY: number): void {
+    // M19b 内容感知移动（caMoveMode 1=移动 2=扩展）：拖拽只累计位移，松手一步事务
+    //（无实时预览——感知补全是秒级异步量级，登记 v1 取舍）
+    if (this.caMoveMode > 0) {
+      if (e.type === TouchType.Down) {
+        if (!this.hasSelectionFlag) {
+          this.log('感知移动：需先用选区工具建立选区');
+          return;
+        }
+        this.caDragging = true;
+        this.caStartX = docX;
+        this.caStartY = docY;
+      } else if (e.type === TouchType.Move && this.caDragging) {
+        this.caCurX = docX;
+        this.caCurY = docY;
+      } else if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.caDragging) {
+        this.caDragging = false;
+        const dx = Math.round(this.caCurX - this.caStartX);
+        const dy = Math.round(this.caCurY - this.caStartY);
+        if (dx === 0 && dy === 0) {
+          this.log('感知移动：位移为 0，已取消');
+          return;
+        }
+        this.toast('感知移动计算中…');
+        this.engine.contentAwareMove(dx, dy, this.caMoveMode === 2, (changed: boolean): void => {
+          this.log(`感知移动(${this.caMoveMode === 2 ? '扩展' : '移动'}): ` +
+            `(${dx},${dy}) → ${changed ? '已应用' : '失败（见日志）'}`);
+        });
+      }
+      return;
+    }
     if (e.type === TouchType.Down) {
       this.engine.translateLayer(0, 0, 0, 0);
       this.moveActive = true;
@@ -3930,6 +3967,20 @@ struct Index {
           this.showFill = true;
         }
         break;
+      case 'edit.contentAwareFill':
+        // M19b 内容感知填充：选区 = 孔，采样窗口内受限源补全（异步求解，一步撤销）
+        if (this.docOpen && this.hasSelectionFlag) {
+          this.toast('内容识别填充计算中…');
+          this.engine.contentAwareFill((changed: boolean): void => {
+            this.log(`内容识别填充: ${changed ? '已应用' : '失败（需要选区与活动层像素）'}`);
+            if (!changed) {
+              this.toast('内容识别填充失败');
+            }
+          });
+        } else {
+          this.toast('需要先建立选区');
+        }
+        break;
       case 'edit.stroke':
         if (this.docOpen && this.hasSelectionFlag) {
           this.modifyKind = 'stroke';
@@ -4463,6 +4514,7 @@ struct Index {
       leafItem('edit.paste', '粘贴', 'Ctrl+V', d),
       leafItem('edit.clear', '清除', '', d && this.hasSelectionFlag),
       leafItem('edit.fill', '填充…', 'Shift+F5', d),
+      leafItem('edit.contentAwareFill', '内容识别填充', '', d && this.hasSelectionFlag),
       leafItem('edit.stroke', '描边…', '', d && this.hasSelectionFlag),
       leafItem('edit.definePattern', '定义图案', '', d && this.hasSelectionFlag),
       leafItem('edit.defineCustomShape', '定义自定形状', '',
@@ -5380,6 +5432,11 @@ struct Index {
           onCropCommand: (cmd: string): void => this.runCommand(`crop.${cmd}`),
           multiSelectCount: this.alignTargetIds().length,
           onAlignPick: (mode: number, isAlign: boolean): void => this.onAlignPick(mode, isAlign),
+          caMoveMode: this.caMoveMode,
+          onCaMoveMode: (m: number): void => {
+            this.caMoveMode = m;
+            this.log(`移动模式: ${m === 0 ? '普通' : m === 1 ? '感知移动' : '感知扩展'}`);
+          },
         })
         }
         Row() {

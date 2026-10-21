@@ -73,6 +73,9 @@ napi_value SetBrushEffect(napi_env env, napi_callback_info info);
 // M19a 修复族：setBrushHeal(kind 0..4，对齐 HealKind 枚举) / patchSelection(dx,dy) 修补工具
 napi_value SetBrushHeal(napi_env env, napi_callback_info info);
 napi_value PatchSelection(napi_env env, napi_callback_info info);
+// M19b 内容感知：contentAwareFill() 选区填充 / contentAwareMove(dx,dy,extend) 选区感知移动
+napi_value ContentAwareFill(napi_env env, napi_callback_info info);
+napi_value ContentAwareMove(napi_env env, napi_callback_info info);
 // M11f 历史画笔：setHistoryBrush(steps 0=关闭，1=最近一次编辑前快照…)
 napi_value SetHistoryBrush(napi_env env, napi_callback_info info);
 // M10c Alpha 通道：存储/载入/删除 + 列表（v1 通道面板只读）

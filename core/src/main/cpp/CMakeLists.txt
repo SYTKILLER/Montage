@@ -12,6 +12,7 @@ add_library(compositor SHARED
         engine/document.cpp
         engine/engine.cpp
         engine/heal_ops.cpp
+        engine/content_aware_ops.cpp
         engine/poisson_ops.cpp
         engine/inpaint_ops.cpp
         engine/gradient_ops.cpp

@@ -1509,6 +1509,49 @@ export class CompositorEngine {
     return r.ok;
   }
 
+  // M19b 内容感知填充：选区 = 孔，采样窗口内受限源补全。异步 Promise（PatchMatch 秒级，
+  // 同步会 ANR——与 bakeLayerMatrix 同范式）；受理即返回 true，结果经 onCaOpDone 回调。
+  contentAwareFill(onDone?: (changed: boolean) => void): boolean {
+    const p = native.contentAwareFill() as Promise<Object>;
+    p.then((v: Object): void => {
+      const r = narrowResult(v);
+      const changed = r.ok && r.data !== null && boolOf(r.data, 'changed');
+      if (!r.ok && r.error !== null) {
+        hilog.error(DOMAIN, TAG, 'contentAwareFill rejected: %{public}s', r.error.message);
+      }
+      if (onDone !== undefined) {
+        onDone(changed);
+      }
+    }).catch((e: Object): void => {
+      hilog.error(DOMAIN, TAG, 'contentAwareFill failed: %{public}s', String(e));
+      if (onDone !== undefined) {
+        onDone(false);
+      }
+    });
+    return true;
+  }
+
+  // M19b 内容感知移动：选区内容 (dx,dy) 泊松融入新址；extend=1 复制模式。异步同上。
+  contentAwareMove(dx: number, dy: number, extend: boolean, onDone?: (changed: boolean) => void): boolean {
+    const p = native.contentAwareMove(dx, dy, extend ? 1 : 0) as Promise<Object>;
+    p.then((v: Object): void => {
+      const r = narrowResult(v);
+      const changed = r.ok && r.data !== null && boolOf(r.data, 'changed');
+      if (!r.ok && r.error !== null) {
+        hilog.error(DOMAIN, TAG, 'contentAwareMove rejected: %{public}s', r.error.message);
+      }
+      if (onDone !== undefined) {
+        onDone(changed);
+      }
+    }).catch((e: Object): void => {
+      hilog.error(DOMAIN, TAG, 'contentAwareMove failed: %{public}s', String(e));
+      if (onDone !== undefined) {
+        onDone(false);
+      }
+    });
+    return true;
+  }
+
   // M11c 形状栅格化（kind 0=矩形/1=圆角/2=椭圆/3=直线；fill/stroke 0/1 number；前景填充/背景描边）
   rasterizeShape(kind: number, x0: number, y0: number, x1: number, y1: number,
     cornerRadius: number, fill: boolean, stroke: boolean, strokeWidth: number): boolean {

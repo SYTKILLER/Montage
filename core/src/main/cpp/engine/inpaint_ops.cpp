@@ -566,7 +566,8 @@ Level downsample(const Level& l, size_t ch) {
     for (size_t y = 0; y < out.h; ++y) {
         for (size_t x = 0; x < out.w; ++x) {
             float n = 0.0f;
-            const size_t o = x * ch;
+            // 平面缓冲行主序（photocraft 的 irow 行切片 + 行内偏移 x*ch 的等价式）
+            const size_t o = (y * out.w + x) * ch;
             bool hole = false, allSource = true, any = false;
             for (auto [dx, dy] : {std::pair{0u, 0u}, {1u, 0u}, {0u, 1u}, {1u, 1u}}) {
                 const size_t sx = x * 2 + dx, sy = y * 2 + dy;
@@ -1344,7 +1345,7 @@ CompleteResult completeCow(size_t w, size_t h, size_t ch, std::vector<float>&& i
             }
         }
         donePx += lev.w * lev.h;
-        prev = Coarser{lev.w, lev.h, std::move(lev.img), std::move(field), tb};
+                prev = Coarser{lev.w, lev.h, std::move(lev.img), std::move(field), tb};
     }
     if (!prev) {
         return CompleteResult{CompleteStatus::Ok, {}};
