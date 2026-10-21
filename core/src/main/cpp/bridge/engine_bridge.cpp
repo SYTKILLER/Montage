@@ -19,6 +19,7 @@
 #include "engine/vector_edit.h"
 #include "engine/vector_shapes.h"
 #include "engine/engine.h"
+#include "engine/heal_ops.h"
 #include "engine/filter_ops.h"
 #include "engine/group_ops.h"
 #include "engine/layer_ops.h"
@@ -2399,6 +2400,69 @@ napi_value SetBrushEffect(napi_env env, napi_callback_info info) {
             e.brushIsClone = false;  // 效果与克隆互斥（工具切换互斥的引擎侧兜底）
         }
     }
+    return makeOk(env, nullptr);
+}
+
+// M19a：修复族工具切换（kind 对齐 HealKind：0 无/1 修复画笔/2-4 污点三模式；非 0 时与
+// 克隆/效果/历史画笔互斥——工具切换互斥的引擎侧兜底）
+napi_value SetBrushHeal(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "setBrushHeal(kind) requires 1 arg");
+    }
+    double kind = 0;
+    if (napi_get_value_double(env, argv[0], &kind) != napi_ok) {
+        return makeError(env, kErrBadParam, "setBrushHeal: invalid arg");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        const int k = static_cast<int>(kind);
+        e.brushHealKind = (k >= 0 && k <= 4) ? k : 0;
+        if (e.brushHealKind != 0) {
+            e.brushIsClone = false;
+            e.brushEffect = BrushEffect::None;
+            e.historyBrushSteps = 0;
+        }
+    }
+    return makeOk(env, nullptr);
+}
+
+// M19a：修补工具（选区 = 目标，(dx,dy) 平移取源，泊松融入选区；一步撤销事务）
+napi_value PatchSelection(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "patchSelection(dx, dy) requires 2 args");
+    }
+    double dx = 0, dy = 0;
+    if (napi_get_value_double(env, argv[0], &dx) != napi_ok ||
+        napi_get_value_double(env, argv[1], &dy) != napi_ok) {
+        return makeError(env, kErrBadParam, "patchSelection: invalid args");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lg(e.docMutex);
+        if (e.doc.width == 0) {
+            return makeError(env, kErrNoDoc, "patchSelection: no document");
+        }
+        e.history.beginEdit(e.doc, "patch", static_cast<uint64_t>(e.docRevision));
+        std::string err;
+        const bool ok = patchSelection(e.doc, static_cast<int>(std::lround(dx)),
+                                       static_cast<int>(std::lround(dy)), err);
+        if (!ok) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, "patchSelection: " + err);
+        }
+        restyleDocument(e.doc);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    e.historyVersion.fetch_add(1);
     return makeOk(env, nullptr);
 }
 

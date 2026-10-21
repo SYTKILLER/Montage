@@ -63,6 +63,7 @@ class Engine {
     bool brushOnMask = false;               // M5b：落笔目标 = 活动图层蒙版（setBrushTarget 写入）
     bool brushIsClone = false;              // M11d：仿制图章工具激活（setBrushClone 写入）
     BrushEffect brushEffect = BrushEffect::None;  // M11e：效果工具（setBrushEffect 写入）
+    int brushHealKind = 0;                  // M19a：修复族（0 无/1 修复画笔/2-4 污点三模式；setBrushHeal 写入）
     int historyBrushSteps = 0;              // M11f：历史画笔源步数（0=未激活；setHistoryBrush 写入）
 
     // M11d 仿制图章克隆源（会话态：不随快照/持久化走；Alt+点击设置）

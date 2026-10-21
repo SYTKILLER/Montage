@@ -11,6 +11,9 @@ add_library(compositor SHARED
         engine/clipboard_ops.cpp
         engine/document.cpp
         engine/engine.cpp
+        engine/heal_ops.cpp
+        engine/poisson_ops.cpp
+        engine/inpaint_ops.cpp
         engine/gradient_ops.cpp
         engine/group_ops.cpp
         engine/layer_ops.cpp

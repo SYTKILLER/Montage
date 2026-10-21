@@ -107,6 +107,11 @@ void Engine::strokeThreadMain() {
                     // M10d：快速蒙版模式（doc.quickMask 非 null）= 落笔目标即通道，
                     // 由文档状态推导（撤销跨 Q 边界回退时自动跟随，无独立标志位失同步）
                     const bool qm = doc.quickMask != nullptr;
+                    // M19a：修复族落笔语义（QM/蒙版目标不可修复——降级普通笔）
+                    HealKind healKind = HealKind::None;
+                    if (!qm && !brushOnMask && brushHealKind > 0) {
+                        healKind = static_cast<HealKind>(brushHealKind);
+                    }
                     // M11d：克隆模式 = 图章工具激活 + 克隆源已设（QM 优先；蒙版目标与克隆互斥，
                     // UI 侧切换工具时已互斥置位）
                     StrokeDraft::CloneParams cloneParams;
@@ -131,7 +136,9 @@ void Engine::strokeThreadMain() {
                                          historyBrushSteps);
                         }
                     }
-                    if (useClone) {
+                    // 修复画笔与图章共用克隆源/偏移机制（photocraft clone_mapping 同源）
+                    const bool healNeedsSrc = healKind == HealKind::Heal;
+                    if (useClone || healNeedsSrc) {
                         const Layer* srcLayer = nullptr;
                         for (const Layer& l : doc.layers) {
                             if (l.id == cloneSource.layerId) {
@@ -159,11 +166,19 @@ void Engine::strokeThreadMain() {
                                 }
                             }
                         } else {
-                            OH_LOG_Print(LOG_APP, LOG_WARN, 0x4D30, "Montage.Clone",
-                                         "clone source layer missing, fallback to brush");
+                            if (healNeedsSrc) {
+                                OH_LOG_Print(LOG_APP, LOG_WARN, 0x4D30, "Montage.Heal",
+                                             "healing brush without clone source, fallback to brush");
+                                healKind = HealKind::None;  // 无源降级普通笔
+                            } else {
+                                OH_LOG_Print(LOG_APP, LOG_WARN, 0x4D30, "Montage.Clone",
+                                             "clone source layer missing, fallback to brush");
+                            }
                         }
                     }
-                    history.beginEdit(doc, useHistoryBrush ? "history brush"
+                    history.beginEdit(doc, healKind == HealKind::Heal ? "healing brush"
+                                        : healKind != HealKind::None ? "spot healing"
+                                        : useHistoryBrush ? "history brush"
                                         : useClone ? "clone stamp"
                                         : qm ? "quick mask"
                                         : (brushOnMask ? "mask brush"
@@ -173,8 +188,9 @@ void Engine::strokeThreadMain() {
                     ++draftGen_;  // 渲染快照去重状态换代（copyStrokeSnapshotLocked 侦测）
                     std::string err;
                     if (!draft->begin(doc, doc.activeId, brush, !qm && brushOnMask, qm,
-                                      (useClone || useHistoryBrush) ? &cloneParams : nullptr, err,
-                                      qm ? BrushEffect::None : brushEffect)) {
+                                      (useClone || useHistoryBrush ||
+                                       healKind == HealKind::Heal) ? &cloneParams : nullptr,
+                                      err, qm ? BrushEffect::None : brushEffect, healKind)) {
                         OH_LOG_Print(LOG_APP, LOG_WARN, 0x4D30, "Montage.Brush",
                                      "draft begin failed: %{public}s", err.c_str());
                         history.endEdit(doc, static_cast<uint64_t>(docRevision));

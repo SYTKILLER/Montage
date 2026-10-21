@@ -85,6 +85,9 @@ export struct OptionsBar {
   onClonePickToggle: () => void = () => {};
   // M11f 历史画笔
   @Link historyBrushSteps: number;
+  // M19a 修复族
+  @Prop spotHealMode: number = 0;  // 0 内容识别/1 创建纹理/2 接近匹配
+  onSpotHealMode: (m: number) => void = (_m: number) => {};
   @Prop cropPending: boolean = false;
   // M10a 选区增强：布尔四态 + 选框形状
   @Link selOp: number;
@@ -425,6 +428,63 @@ export struct OptionsBar {
     .height(36)
   }
 
+  // M19a 修复画笔选项：取源（复用克隆源机制）+ 提示
+  @Builder
+  healOptions() {
+    Row({ space: 10 }) {
+      Button(this.clonePicking ? '点击画布取源…' : '取源')
+        .fontSize(12).height(28).width(this.clonePicking ? 130 : 56)
+        .backgroundColor(this.clonePicking ? $r('app.color.accent') : $r('app.color.surface'))
+        .fontColor(this.clonePicking ? $r('app.color.on_accent') : $r('app.color.text_primary'))
+        .border({ width: 1, color: $r('app.color.border') })
+        .onClick((): void => {
+          this.onClonePickToggle();
+        })
+      Text(this.cloneSourceSet ? '已取源 · 涂抹修复（纹理保留 · 光照自适应）' :
+        'Alt+点击或取源模式选点 → 涂抹修复')
+        .fontSize(11)
+        .fontColor(this.cloneSourceSet ? $r('app.color.text_secondary') : $r('app.color.danger'))
+    }
+    .height(36)
+  }
+
+  // M19a 污点修复选项：三模式切换 + 提示（无源，提交时计算）
+  @Builder
+  spotHealOptions() {
+    Row({ space: 10 }) {
+      Row({ space: 6 }) {
+        Button('内容识别').fontSize(12).height(28)
+          .backgroundColor(this.spotHealMode === 0 ? $r('app.color.accent') : $r('app.color.surface'))
+          .fontColor(this.spotHealMode === 0 ? $r('app.color.on_accent') : $r('app.color.text_primary'))
+          .onClick((): void => this.onSpotHealMode(0))
+        Button('创建纹理').fontSize(12).height(28)
+          .backgroundColor(this.spotHealMode === 1 ? $r('app.color.accent') : $r('app.color.surface'))
+          .fontColor(this.spotHealMode === 1 ? $r('app.color.on_accent') : $r('app.color.text_primary'))
+          .onClick((): void => this.onSpotHealMode(1))
+        Button('接近匹配').fontSize(12).height(28)
+          .backgroundColor(this.spotHealMode === 2 ? $r('app.color.accent') : $r('app.color.surface'))
+          .fontColor(this.spotHealMode === 2 ? $r('app.color.on_accent') : $r('app.color.text_primary'))
+          .onClick((): void => this.onSpotHealMode(2))
+      }
+      .height(28)
+      Text('涂抹污点，松手即修复')
+        .fontSize(11)
+        .fontColor($r('app.color.text_secondary'))
+    }
+    .height(36)
+  }
+
+  // M19a 修补工具选项：提示
+  @Builder
+  patchOptions() {
+    Row({ space: 10 }) {
+      Text('先建选区 → 在选区内拖向纹理源 → 松手应用')
+        .fontSize(11)
+        .fontColor($r('app.color.text_secondary'))
+    }
+    .height(36)
+  }
+
   @Builder
   shapeOptions() {
     Row({ space: 10 }) {
@@ -657,6 +717,12 @@ export struct OptionsBar {
         this.stampOptions()
       } else if (this.tool === 'historyBrush') {
         this.historyBrushOptions()
+      } else if (this.tool === 'heal') {
+        this.healOptions()
+      } else if (this.tool === 'spotHeal') {
+        this.spotHealOptions()
+      } else if (this.tool === 'patch') {
+        this.patchOptions()
       } else if (this.tool === 'wand') {
         Row({ space: 10 }) {
           this.selOpButtons()

@@ -424,6 +424,12 @@ struct Index {
   // commit/重样式临界区。护栏期 800ms 兜底，收到 revision 广播即提前解除；
   // Up 事件本身的取色因 strokeDrawing 尚未复位天然跳过，此处只管收笔后的第一波 Move/悬停
   private strokeEndGuardUntil: number = 0;
+  // M19a 修补工具拖拽态（选区内按下 → 拖拽向量 = 源位移，Up 提交）
+  private patchDragging: boolean = false;
+  private patchStartX: number = 0;
+  private patchStartY: number = 0;
+  // M19a 污点修复模式（0 内容识别/1 创建纹理/2 接近匹配；引擎 kind = 2 + 模式）
+  @State spotHealMode: number = 0;
   // M15a 参考线交互态（画布内拖动 + 标尺拖拽创建）
   private guideMoveOrient: number = -2;  // >=0 = 画布内拖动中
   private guideMoveIndex: number = -1;
@@ -955,6 +961,8 @@ struct Index {
       case 'sponge':
       case 'historyBrush':
       case 'stamp':
+      case 'heal':      // M19a 修复画笔（克隆式 live 预览 + 提交泊松融合）
+      case 'spotHeal':  // M19a 污点修复（live 无预览，提交填充）
         return true;
       default:
         return false;
@@ -1026,6 +1034,23 @@ struct Index {
       case 'sponge':
       case 'historyBrush':
         this.strokeTouch(e, t, docX, docY);
+        break;
+      case 'heal':
+      case 'spotHeal':
+        // M19a 修复族：修复画笔同图章取源（Alt+点击/取源模式）；污点无源直画
+        if (this.tool === 'heal' && e.type === TouchType.Down &&
+          (this.altHeld || this.clonePicking)) {
+          if (this.engine.setCloneSource(docX, docY)) {
+            this.cloneSourceSet = true;
+            this.clonePicking = false;
+            this.log(`修复源已设 (${docX.toFixed(0)},${docY.toFixed(0)})`);
+          }
+        } else {
+          this.strokeTouch(e, t, docX, docY);
+        }
+        break;
+      case 'patch':
+        this.patchTouch(e, docX, docY);  // M19a 修补：选区内拖拽 → 位移取源
         break;
       case 'gradient':
         this.gradientTouch(e, docX, docY);
@@ -2304,6 +2329,33 @@ struct Index {
     return labels[this.shapeKind] ?? '形状';
   }
 
+  // M19a 修补工具：选区内按下拖拽，释放时以拖拽向量为源位移提交修补
+  //（PS 语义：拖向的区域即纹理源，选区原位接受泊松融合）
+  private patchTouch(e: TouchEvent, docX: number, docY: number): void {
+    if (e.type === TouchType.Down) {
+      if (!this.hasSelectionFlag) {
+        this.log('修补：需先用选区工具建立选区');
+        return;
+      }
+      this.patchDragging = true;
+      this.patchStartX = docX;
+      this.patchStartY = docY;
+    } else if (e.type === TouchType.Up || e.type === TouchType.Cancel) {
+      if (!this.patchDragging) {
+        return;
+      }
+      this.patchDragging = false;
+      const dx = Math.round(docX - this.patchStartX);
+      const dy = Math.round(docY - this.patchStartY);
+      if (dx === 0 && dy === 0) {
+        this.log('修补：位移为 0，已取消');
+        return;
+      }
+      const ok = this.engine.patchSelection(dx, dy);
+      this.log(`修补: 源位移(${dx},${dy}) → ${ok ? '已应用' : '失败（见日志）'}`);
+    }
+  }
+
   // M11a 渐变拖线：Down 起线 / Move 更新终点（overlay 预览）/ Up 提交单事务
   private gradientTouch(e: TouchEvent, docX: number, docY: number): void {
     if (e.type === TouchType.Down) {
@@ -2845,6 +2897,18 @@ struct Index {
       this.engine.setHistoryBrush(this.historyBrushSteps);
     } else if (this.tool === 'historyBrush') {
       this.engine.setHistoryBrush(0);  // 离开历史画笔归零
+    }
+    if (id === 'heal' || id === 'spotHeal') {
+      // M19a 修复族：互斥克隆/效果/蒙版目标/历史画笔；修复画笔 = kind 1，
+      // 污点修复 = 2 + 模式（内容识别/创建纹理/接近匹配）
+      this.maskTarget = false;
+      this.engine.setBrushTarget(false);
+      this.engine.setBrushClone(false);
+      this.engine.setBrushEffect(0);
+      this.engine.setHistoryBrush(0);
+      this.engine.setBrushHeal(id === 'heal' ? 1 : 2 + this.spotHealMode);
+    } else if (this.tool === 'heal' || this.tool === 'spotHeal') {
+      this.engine.setBrushHeal(0);  // 离开修复族归零
     }
     if (this.effectModeOf(id) > 0) {
       // M11e 效果工具：互斥克隆/蒙版目标，激活对应内核
@@ -4602,6 +4666,9 @@ struct Index {
       { id: 'blur', label: '模糊', symbol: $r('sys.symbol.hand_draw'), enabled: true },
       { id: 'dodge', label: '减淡', symbol: $r('sys.symbol.contrast'), enabled: true },
       { id: 'historyBrush', label: '历史画笔', symbol: $r('sys.symbol.clock'), enabled: true },
+      { id: 'heal', label: '修复画笔', symbol: $r('sys.symbol.cross'), enabled: true },
+      { id: 'spotHeal', label: '污点修复', symbol: $r('sys.symbol.cross_case'), enabled: true },
+      { id: 'patch', label: '修补', symbol: $r('sys.symbol.square_dashed_and_arrow_turn_up_right'), enabled: true },
       { id: '-', label: '', symbol: $r('sys.symbol.minus'), enabled: false },
       { id: 'hand', label: '抓手', symbol: $r('sys.symbol.hand'), enabled: true },
       { id: 'zoom', label: '缩放', symbol: $r('sys.symbol.magnifyingglass'), enabled: true },
@@ -4908,6 +4975,16 @@ struct Index {
         break;
       case KC_Y:
         this.pickTool('historyBrush');  // M11f 历史画笔（PS Y 语义）
+        break;
+      case KC_J:
+        // M19a：J = 修复族（Shift+J 循环 修复画笔→污点→修补；PS J 族语义）
+        if (this.shiftHeld) {
+          const nextJ: string = this.tool === 'heal' ? 'spotHeal'
+            : this.tool === 'spotHeal' ? 'patch' : 'heal';
+          this.pickTool(nextJ);
+        } else {
+          this.pickTool('spotHeal');
+        }
         break;
       case KC_O:
         // O = 减淡组（Shift+O 循环 减淡→加深→海绵）
@@ -5269,6 +5346,14 @@ struct Index {
           cloneSourceSet: this.cloneSourceSet,
           clonePicking: this.clonePicking,
           historyBrushSteps: $historyBrushSteps,
+          spotHealMode: this.spotHealMode,
+          onSpotHealMode: (m: number): void => {
+            this.spotHealMode = m;
+            if (this.tool === 'spotHeal') {
+              this.engine.setBrushHeal(2 + m);  // 活动工具即热切换引擎模式
+            }
+            this.log(`污点修复: ${m === 0 ? '内容识别' : m === 1 ? '创建纹理' : '接近匹配'}`);
+          },
           onCloneAligned: (on: boolean): void => {
             this.engine.setCloneAligned(on);
             this.log(`克隆对齐: ${on ? '开' : '关'}`);

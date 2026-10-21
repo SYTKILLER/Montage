@@ -1493,6 +1493,22 @@ export class CompositorEngine {
     return r.ok;
   }
 
+  // M19a 修复族：kind 对齐 HealKind（0 无/1 修复画笔/2 污点-内容识别/3 创建纹理/4 接近匹配）
+  setBrushHeal(kind: number): boolean {
+    const r = narrowResult(native.setBrushHeal(kind) as Object);
+    return r.ok;
+  }
+
+  // M19a 修补工具：选区 = 目标，(dx,dy) 平移取源，泊松融入选区（一步撤销事务）
+  patchSelection(dx: number, dy: number): boolean {
+    const r = narrowResult(native.patchSelection(dx, dy) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'patchSelection rejected: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
   // M11c 形状栅格化（kind 0=矩形/1=圆角/2=椭圆/3=直线；fill/stroke 0/1 number；前景填充/背景描边）
   rasterizeShape(kind: number, x0: number, y0: number, x1: number, y1: number,
     cornerRadius: number, fill: boolean, stroke: boolean, strokeWidth: number): boolean {

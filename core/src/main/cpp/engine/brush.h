@@ -10,7 +10,12 @@
 // - M3.1 补全：provisional tail（最新样本先以直线尾段连到光标 + 整瓦 coverage 备份，
 //   下一样本/收尾时还原再落最终曲线段——笔画不滞后于光标）；压感调制 dab 直径
 //   （几何安全：不透明度压感会破坏 coverage max/screen 笔画级模型，登记后续）。
-// - 简化（相对源，登记后续里程碑）：无 GPU 路径、无 clone/heal/blur。
+// - 简化（相对源，登记后续里程碑）：无 GPU 路径、无 blur。
+// - M19a 修复族：HealKind（photocraft retouch_cmds 的 healingBrush/spotHealing 语义）——
+//   修复画笔 = 克隆式取源，live 预览显克隆纹理，提交时对笔画域跑 seamlessClone（泊松）；
+//   污点修复三模式 = 无源，提交时在采样窗口内 complete/synthesize/best_offset 填充后再
+//   seamlessClone（photocraft spot_heal_surface 同构）。提交走「base + healed 色源 ×
+//   coverage」重建式单次合成（比常规增量路径精确）。
 
 #include <cmath>
 #include <cstdint>
@@ -48,6 +53,15 @@ enum class BrushEffect : int32_t {
     Sponge = 6,   // 海绵（去饱和）：c' = lum + (c−lum)·(1−covA·0.5)
 };
 
+// M19a 修复族落笔语义（值与 bridge setBrushHeal 对表）。
+enum class HealKind : int32_t {
+    None = 0,
+    Heal = 1,              // 修复画笔（克隆源 + 泊松融合）
+    SpotContentAware = 2,  // 污点-内容识别（PatchMatch EM 补全）
+    SpotTexture = 3,       // 污点-创建纹理（Efros quilting）
+    SpotProximity = 4,     // 污点-接近匹配（环域 SSD 位移 + 拷贝）
+};
+
 class StrokeDraft {
   public:
     // 绑定图层开始笔画。grid = 图层像素网格（origin 平移，1:1）；空图层从触笔区域动态扩展。
@@ -68,7 +82,8 @@ class StrokeDraft {
     };
     bool begin(const Document& doc, LayerId layerId, const BrushSettings& settings, bool onMask,
                bool onQuickMask, const CloneParams* cloneSrc, std::string& err,
-               BrushEffect effect = BrushEffect::None);
+               BrushEffect effect = BrushEffect::None,
+               HealKind heal = HealKind::None);
     // 文档坐标追加样本（Catmull-Rom 落 dab；pressure ∈ [0,1]，调制 dab 直径）
     void append(float docX, float docY, float pressure);
     void end();
@@ -108,6 +123,13 @@ class StrokeDraft {
     void ensureWorking(uint32_t key);
     void allocWorking(uint32_t key, uint32_t tx, uint32_t ty);
     void paintTile(uint32_t key);
+    // M19a 修复族提交：计算 healed 色源（seamlessClone/补全核）并重建式合成 touched 瓦片。
+    // 返回 false = 修复失败（空层/预算超限），回退普通合并。
+    bool commitHeal();
+    void paintTileHeal(uint32_t key);  // healed 色源经 coverage 单次合成
+    // healed 色源：regionX/Y/W/H 网格局部域，RGBA 四通道 u8（alpha 参与膜解；区外 = base 原样）
+    std::vector<uint8_t> healRgb_;
+    int healRx_ = 0, healRy_ = 0, healRw_ = 0, healRh_ = 0;
     static float falloff(float u) {
         constexpr float k = 2.5f;
         const float e = std::exp(-k * u * u);
@@ -131,6 +153,9 @@ class StrokeDraft {
     double srcOffsetY_ = 0.0;
     bool restoreMode_ = false;  // M11f：历史画笔恢复语义（RGBA 直混含 alpha）
     BrushEffect effect_ = BrushEffect::None;  // M11e：dab 内核族
+    HealKind healKind_ = HealKind::None;      // M19a：修复族（Heal 复用克隆 live 采样）
+    int canvasW_ = 0;          // 画布尺寸（污点修复采样窗口钳制用；begin 时捕获）
+    int canvasH_ = 0;
     float smudgeR_ = 0.0f;     // 涂抹 held 颜色（dab 级混入）
     float smudgeG_ = 0.0f;
     float smudgeB_ = 0.0f;

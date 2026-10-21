@@ -1,11 +1,15 @@
 #include "engine/brush.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <map>
 #include <cmath>
 #include <cstring>
 
 #include <hilog/log.h>
+
+#include "engine/inpaint_ops.h"
+#include "engine/poisson_ops.h"
 
 namespace montage {
 namespace {
@@ -18,7 +22,7 @@ constexpr float kSpacingSoft = 0.025f;
 
 bool StrokeDraft::begin(const Document& doc, LayerId layerId, const BrushSettings& settings,
                         bool onMask, bool onQuickMask, const CloneParams* cloneSrc,
-                        std::string& err, BrushEffect effect) {
+                        std::string& err, BrushEffect effect, HealKind heal) {
     const Layer* layer = nullptr;
     for (const Layer& l : doc.layers) {
         if (l.id == layerId) {
@@ -48,8 +52,17 @@ bool StrokeDraft::begin(const Document& doc, LayerId layerId, const BrushSetting
     baseCacheKey_ = 0;
     smudgeHas_ = false;
     smudgeR_ = smudgeG_ = smudgeB_ = smudgeA_ = 0.0f;
+    // M19a：修复族状态（QM/蒙版灰度目标不可修复——engine 侧已过滤；Heal 需克隆源）
+    healKind_ = heal;
+    healRgb_.clear();
+    healRx_ = healRy_ = healRw_ = healRh_ = 0;
+    canvasW_ = static_cast<int>(doc.width);
+    canvasH_ = static_cast<int>(doc.height);
     // M11e：效果族仅像素目标生效（QM/蒙版灰度域退化普通笔，登记）
     effect_ = (cloneSrc == nullptr && !onMask && !onQuickMask) ? effect : BrushEffect::None;
+    if (healKind_ != HealKind::None) {
+        effect_ = BrushEffect::None;  // 修复与效果族互斥
+    }
     if (cloneSrc != nullptr && cloneSrc->srcGrid != nullptr) {
         // M11d 仿制图章：目标 = 当前层像素网格；源 = 克隆源网格快照（不可变）
         if (layer == nullptr) {
@@ -561,6 +574,13 @@ void StrokeDraft::paintTile(uint32_t key) {
     if (covIt == coverage_.end() || workIt == work_.end()) {
         return;
     }
+    if (healKind_ == HealKind::SpotContentAware || healKind_ == HealKind::SpotTexture ||
+        healKind_ == HealKind::SpotProximity) {
+        // M19a 污点修复：live 无预览（photocraft 同——非 LiveRetouch 族），coverage 只记账，
+        // 提交时在采样窗口跑填充核 + 泊松融合（commitHeal）。work 保持 base 拷贝。
+        ++workRev_[key];
+        return;
+    }
     ++workRev_[key];  // 发布版本递增（渲染快照增量判变依据）
     const uint8_t* cov = covIt->second.data();
     uint8_t* px = workIt->second.data();
@@ -745,6 +765,9 @@ std::shared_ptr<const TileGrid> StrokeDraft::commitGrid(const TileGrid* original
     if (gridCols_ == 0) {
         return nullptr;
     }
+    if (healKind_ != HealKind::None) {
+        commitHeal();  // M19a：失败时 healRgb_ 为空 → paintTileHeal 退化为 base 原色（无操作提交）
+    }
     auto grid = std::make_shared<TileGrid>();
     grid->cols = gridCols_;
     grid->rows = gridRows_;
@@ -758,7 +781,27 @@ std::shared_ptr<const TileGrid> StrokeDraft::commitGrid(const TileGrid* original
         if (coverage_.count(key) == 0) {
             continue;
         }
-        paintTile(key);
+        if (healKind_ != HealKind::None) {
+            // 重建式：work 从 base 重拷再合成（live 期 clone 纹理/尾段残留不二次混色）
+            auto workIt2 = work_.find(key);
+            if (workIt2 != work_.end()) {
+                std::vector<uint8_t> fresh(static_cast<size_t>(kTileSize) * kTileSize * 4u, 0);
+                if (base_ != nullptr) {
+                    auto bit = base_->tiles.find(key);
+                    if (bit != base_->tiles.end() && bit->second != nullptr) {
+                        const uint8_t* src = bit->second->pixels->mapCpu();
+                        if (src != nullptr) {
+                            std::memcpy(fresh.data(), src, fresh.size());
+                        }
+                        bit->second->pixels->unmap();
+                    }
+                }
+                workIt2->second = std::move(fresh);
+            }
+            paintTileHeal(key);
+        } else {
+            paintTile(key);
+        }
         auto it = work_.find(key);
         if (it == work_.end()) {
             continue;
@@ -771,6 +814,289 @@ std::shared_ptr<const TileGrid> StrokeDraft::commitGrid(const TileGrid* original
         grid->tiles[key] = std::move(tile);
     }
     return grid;
+}
+
+// ---- M19a 修复族提交 ----
+
+namespace {
+
+// 网格局部矩形
+struct GridRect {
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    int w() const { return x1 - x0; }
+    int h() const { return y1 - y0; }
+};
+
+// 掩码方形膨胀（photocraft retouch_cmds::dilate 同式）
+void dilateMask(int w, int h, std::vector<bool>& m, int r) {
+    if (r <= 0) {
+        return;
+    }
+    std::vector<bool> tmp(m.size(), false);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            if (m[static_cast<size_t>(y) * w + x]) {
+                for (int xx = std::max(0, x - r); xx < std::min(w, x + r + 1); ++xx) {
+                    tmp[static_cast<size_t>(y) * w + xx] = true;
+                }
+            }
+        }
+    }
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            if (tmp[static_cast<size_t>(y) * w + x]) {
+                for (int yy = std::max(0, y - r); yy < std::min(h, y + r + 1); ++yy) {
+                    m[static_cast<size_t>(yy) * w + x] = true;
+                }
+            }
+        }
+    }
+}
+
+}  // namespace
+
+bool StrokeDraft::commitHeal() {
+    // 笔画覆盖包围盒（网格局部坐标）
+    GridRect bbox{INT32_MAX, INT32_MAX, INT32_MIN, INT32_MIN};
+    for (const auto& [key, cov] : coverage_) {
+        const int tx = static_cast<int>(key % gridCols_) * static_cast<int>(kTileSize);
+        const int ty = static_cast<int>(key / gridCols_) * static_cast<int>(kTileSize);
+        for (uint32_t r = 0; r < kTileSize; ++r) {
+            for (uint32_t c = 0; c < kTileSize; ++c) {
+                if (cov[static_cast<size_t>(r) * kTileSize + c] > 0) {
+                    bbox.x0 = std::min(bbox.x0, tx + static_cast<int>(c));
+                    bbox.y0 = std::min(bbox.y0, ty + static_cast<int>(r));
+                    bbox.x1 = std::max(bbox.x1, tx + static_cast<int>(c) + 1);
+                    bbox.y1 = std::max(bbox.y1, ty + static_cast<int>(r) + 1);
+                }
+            }
+        }
+    }
+    if (bbox.x1 <= bbox.x0) {
+        return false;
+    }
+    const int gw = static_cast<int>(gridCols_ * kTileSize);
+    const int gh = static_cast<int>(gridRows_ * kTileSize);
+    if (healKind_ == HealKind::Heal) {
+        // 修复画笔：bbox+2 域 seamlessClone（源 = 克隆偏移采样，目标 = 笔画前像素）。
+        // RGBA 四通道同解（alpha 参与膜解——透明环境的修复结果透明，photocraft 同）。
+        const GridRect region{std::max(0, bbox.x0 - 2), std::max(0, bbox.y0 - 2),
+                              std::min(gw, bbox.x1 + 2), std::min(gh, bbox.y1 + 2)};
+        const int w = region.w(), h = region.h();
+        if (w <= 0 || h <= 0 || base_ == nullptr) {
+            return false;
+        }
+        std::vector<float> src(static_cast<size_t>(w) * h * 4), dst(static_cast<size_t>(w) * h * 4);
+        std::vector<bool> mask(static_cast<size_t>(w) * h, false);
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                const size_t k = static_cast<size_t>(y) * w + x;
+                const int gx = region.x0 + x, gy = region.y0 + y;
+                const uint8_t* d = baseAt(gx, gy);
+                if (d != nullptr) {
+                    for (int c = 0; c < 4; ++c) {
+                        dst[k * 4 + c] = d[c] / 255.0f;
+                    }
+                }
+                const uint8_t* s = srcAt(gx - static_cast<int>(srcOffsetX_),
+                                         gy - static_cast<int>(srcOffsetY_));
+                if (s != nullptr) {
+                    for (int c = 0; c < 4; ++c) {
+                        src[k * 4 + c] = s[c] / 255.0f;
+                    }
+                }
+                // 源越界/缺瓦片 = 透明（稀疏网格语义：那里本来就是透明像素；
+                // 回退 dst 会零化边界失配使修复变 no-op——E2E 实证）
+                const auto covIt = coverage_.find(
+                    static_cast<uint32_t>(gy / static_cast<int>(kTileSize)) * gridCols_ +
+                    static_cast<uint32_t>(gx / static_cast<int>(kTileSize)));
+                if (covIt != coverage_.end()) {
+                    const uint8_t cv = covIt->second[static_cast<size_t>(gy % static_cast<int>(kTileSize)) *
+                                                     kTileSize + static_cast<uint32_t>(gx % static_cast<int>(kTileSize))];
+                    mask[k] = cv > 0;
+                }
+            }
+        }
+        const std::vector<float> healed = poisson::seamlessClone(
+            static_cast<size_t>(w), static_cast<size_t>(h), 4, src, dst, mask);
+        healRgb_.assign(static_cast<size_t>(w) * h * 4, 0);
+        for (size_t i = 0; i < static_cast<size_t>(w) * h * 4; ++i) {
+            healRgb_[i] = static_cast<uint8_t>(
+                std::lround(std::min(1.0f, std::max(0.0f, healed[i])) * 255.0f));
+        }
+        healRx_ = region.x0;
+        healRy_ = region.y0;
+        healRw_ = w;
+        healRh_ = h;
+        return true;
+    }
+    // 污点修复三模式：采样窗口（PS 语义）内填充 + seamlessClone。
+    const inpaint::RectI holeDoc{bbox.x0 + originX_, bbox.y0 + originY_,
+                                 bbox.x1 + originX_, bbox.y1 + originY_};
+    const inpaint::RectI canvas{0, 0, canvasW_ > 0 ? canvasW_ : gw, canvasH_ > 0 ? canvasH_ : gh};
+    inpaint::RectI win = inpaint::samplingWindow(holeDoc, canvas);
+    // 预算护栏：窗口 ≤16MP（photocraft 修复族上限），超限向孔收缩
+    while (static_cast<double>(win.width()) * win.height() > 16e6 &&
+           (win.width() > holeDoc.width() * 2 || win.height() > holeDoc.height() * 2)) {
+        const int cx = (win.x0 + win.x1) / 2, cy = (win.y0 + win.y1) / 2;
+        const int nw = std::max((win.x1 - win.x0) / 2, holeDoc.width());
+        const int nh = std::max((win.y1 - win.y0) / 2, holeDoc.height());
+        win = inpaint::RectI{std::max(win.x0, cx - nw / 2), std::max(win.y0, cy - nh / 2),
+                             std::min(win.x1, cx - nw / 2 + nw), std::min(win.y1, cy - nh / 2 + nh)};
+    }
+    // 转网格局部并夹到网格
+    const GridRect region{std::max(0, win.x0 - originX_), std::max(0, win.y0 - originY_),
+                          std::min(gw, win.x1 - originX_), std::min(gh, win.y1 - originY_)};
+    const int w = region.w(), h = region.h();
+    if (w <= 0 || h <= 0 || base_ == nullptr) {
+        return false;
+    }
+    std::vector<float> img(static_cast<size_t>(w) * h * 4);
+    std::vector<bool> hole(static_cast<size_t>(w) * h, false);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const size_t k = static_cast<size_t>(y) * w + x;
+            const int gx = region.x0 + x, gy = region.y0 + y;
+            const uint8_t* d = baseAt(gx, gy);
+            if (d != nullptr) {
+                for (int c = 0; c < 4; ++c) {
+                    img[k * 4 + c] = d[c] / 255.0f;
+                }
+            }
+            const auto covIt = coverage_.find(
+                static_cast<uint32_t>(gy / static_cast<int>(kTileSize)) * gridCols_ +
+                static_cast<uint32_t>(gx / static_cast<int>(kTileSize)));
+            if (covIt != coverage_.end()) {
+                hole[k] = covIt->second[static_cast<size_t>(gy % static_cast<int>(kTileSize)) *
+                                        kTileSize + static_cast<uint32_t>(gx % static_cast<int>(kTileSize))] > 0;
+            }
+        }
+    }
+    inpaint::CompleteParams p;
+    const float sizeF = settings_.diameter;
+    auto fillContentAware = [&](const std::vector<float>& base) {
+        inpaint::CompleteResult r =
+            inpaint::complete(static_cast<size_t>(w), static_cast<size_t>(h), 4, base, hole, p);
+        if (r.status == inpaint::CompleteStatus::Ok) {
+            return r.img;
+        }
+        return poisson::membraneFill(static_cast<size_t>(w), static_cast<size_t>(h), 4, base, hole);
+    };
+    std::vector<float> filled;
+    switch (healKind_) {
+        case HealKind::SpotTexture:
+            filled = inpaint::synthesize(static_cast<size_t>(w), static_cast<size_t>(h), 4, img,
+                                         hole,
+                                         static_cast<size_t>(std::min(32.0f, std::max(6.0f, sizeF / 4.0f))),
+                                         0x5eedull);
+            break;
+        case HealKind::SpotProximity: {
+            const int ring = static_cast<int>(std::min(16.0f, std::max(3.0f, sizeF / 8.0f)));
+            const int margin = std::max(std::max(w, h) / 2, 1);
+            auto off = inpaint::bestOffset(static_cast<size_t>(w), static_cast<size_t>(h), 4, img,
+                                           hole, static_cast<size_t>(ring), margin);
+            if (off.has_value()) {
+                // 预修复像素的平移拷贝（重叠位移不重复采已写像素——photocraft 同语义）
+                filled.assign(img.size(), 0.0f);
+                bool ok = true;
+                for (int y = 0; y < h && ok; ++y) {
+                    for (int x = 0; x < w; ++x) {
+                        const size_t k = static_cast<size_t>(y) * w + x;
+                        if (!hole[k]) {
+                            for (int c = 0; c < 4; ++c) {
+                                filled[k * 4 + c] = img[k * 4 + c];
+                            }
+                            continue;
+                        }
+                        const int sx = x + off->first, sy = y + off->second;
+                        if (sx < 0 || sy < 0 || sx >= w || sy >= h) {
+                            ok = false;
+                            break;
+                        }
+                        const size_t s = static_cast<size_t>(sy) * w + sx;
+                        for (int c = 0; c < 4; ++c) {
+                            filled[k * 4 + c] = img[s * 4 + c];
+                        }
+                    }
+                }
+                if (!ok) {
+                    filled = fillContentAware(img);
+                }
+            } else {
+                filled = fillContentAware(img);
+            }
+            break;
+        }
+        default:
+            filled = fillContentAware(img);
+            break;
+    }
+    // 融合域 = 孔外扩 1（合成值与未动环境的失配即膜要修的量——photocraft 同注）
+    std::vector<bool> healMask = hole;
+    dilateMask(w, h, healMask, 1);
+    const std::vector<float> healed = poisson::seamlessClone(static_cast<size_t>(w),
+                                                             static_cast<size_t>(h), 4, filled,
+                                                             img, healMask);
+    healRgb_.assign(static_cast<size_t>(w) * h * 4, 0);
+    for (size_t i = 0; i < static_cast<size_t>(w) * h * 4; ++i) {
+        healRgb_[i] = static_cast<uint8_t>(
+            std::lround(std::min(1.0f, std::max(0.0f, healed[i])) * 255.0f));
+    }
+    healRx_ = region.x0;
+    healRy_ = region.y0;
+    healRw_ = w;
+    healRh_ = h;
+    return true;
+}
+
+// healed 色源（RGBA，alpha 参与膜解）经 coverage 单次「替换式」合成：
+// out = healed × covA + base × (1 − covA)（RGBA 四通道直混——透明修复结果必须能删除
+// 目标墨迹，src-over 会保留原污点，M11f restoreMode 同一语义教训）；色源区外 = base 原样。
+void StrokeDraft::paintTileHeal(uint32_t key) {
+    auto covIt = coverage_.find(key);
+    auto workIt = work_.find(key);
+    if (covIt == coverage_.end() || workIt == work_.end()) {
+        return;
+    }
+    ++workRev_[key];
+    const int tx = static_cast<int>(key % gridCols_) * static_cast<int>(kTileSize);
+    const int ty = static_cast<int>(key / gridCols_) * static_cast<int>(kTileSize);
+    uint8_t* px = workIt->second.data();
+    const uint8_t* cov = covIt->second.data();
+    const float op = settings_.opacity;
+    for (uint32_t r = 0; r < kTileSize; ++r) {
+        for (uint32_t c = 0; c < kTileSize; ++c) {
+            const size_t i = (static_cast<size_t>(r) * kTileSize + c) * 4u;
+            const float covA = (cov[i / 4u] / 255.0f) * op;
+            if (covA <= 0.0f) {
+                continue;
+            }
+            const int gx = tx + static_cast<int>(c), gy = ty + static_cast<int>(r);
+            float srcP[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if (gx >= healRx_ && gy >= healRy_ && gx < healRx_ + healRw_ && gy < healRy_ + healRh_) {
+                const size_t k = (static_cast<size_t>(gy - healRy_) * healRw_ + static_cast<size_t>(gx - healRx_)) * 4u;
+                for (int ch = 0; ch < 4; ++ch) {
+                    srcP[ch] = healRgb_[k + static_cast<size_t>(ch)] / 255.0f;
+                }
+            } else {
+                // 色源区外（heal 计算失败回退）：base 原样 = 无操作
+                const uint8_t* d = baseAt(gx, gy);
+                if (d == nullptr) {
+                    continue;
+                }
+                for (int ch = 0; ch < 4; ++ch) {
+                    srcP[ch] = d[ch] / 255.0f;
+                }
+            }
+            // RGBA 直混（含 alpha 还原/删除）
+            uint8_t* p = px + i;
+            for (int ch = 0; ch < 4; ++ch) {
+                p[static_cast<size_t>(ch)] = static_cast<uint8_t>(std::lround(
+                    (srcP[ch] * covA + p[static_cast<size_t>(ch)] / 255.0f * (1.0f - covA)) *
+                    255.0f));
+            }
+        }
+    }
 }
 
 }  // namespace montage
