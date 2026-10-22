@@ -112,8 +112,14 @@ Field fromStrokes(const RectI& bounds, double cell, const std::vector<Stroke>& s
 // bitDepth 用于宿主 oracle 深度对比（8=引擎），<0 不量化。
 liquify::Img applyLiquifyImage(const liquify::Img& src, const liquify::Field& field, int bitDepth);
 
-// 引擎网格入口：RGBA8 TileGrid → 液化 → 新 TileGrid（revision=src+1）
+// 引擎网格入口：RGBA8 TileGrid → 液化 → 新 TileGrid（revision=src+1；全域 f32 转换）
 std::shared_ptr<const TileGrid> applyLiquifyGrid(const TileGrid& src, const liquify::Field& field);
+
+// 区域化入口（M20b-2 交互路径）：field 以 region 局部坐标建场；region 内渲染、区外原样
+// 保留（触区瓦片 COW 拷贝）；region 须已钳在网格内。源采样在 region 边缘钳制
+//（=photocraft 足迹 ∩ field.bounds 同语义）。
+std::shared_ptr<const TileGrid> applyLiquifyGridRegion(const TileGrid& src, const RectI& region,
+                                                       const liquify::Field& field);
 
 }  // namespace montage
 

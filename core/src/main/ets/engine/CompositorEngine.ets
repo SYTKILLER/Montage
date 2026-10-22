@@ -1,7 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
-import { EngineStats, ExportPngData, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo } from '../model/EngineTypes';
+import { EngineStats, ExportPngData, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -1829,6 +1829,14 @@ export class CompositorEngine {
   // M19c 内容感知比例：活动图层缝雕刻到 w×h（选区灰度作保护图；画布随缩放；异步）
   async contentAwareScale(w: number, h: number): Promise<boolean> {
     const value: Object = await (native.contentAwareScale(w, h) as Promise<Object>);
+    const r = narrowResult(value);
+    return r.ok && r.data !== null && boolOf(r.data, 'changed');
+  }
+
+  /** M20b 液化：一笔一步异步事务（strokes=[{tool,size,density,pressure,rate,points:[[x,y,p]…],amount?}]，
+   * 坐标为层局部像素）。 */
+  async applyLiquify(layerId: number, strokes: LiquifyStrokeDTO[]): Promise<boolean> {
+    const value: Object = await (native.applyLiquify(layerId, strokes) as Promise<Object>);
     const r = narrowResult(value);
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }

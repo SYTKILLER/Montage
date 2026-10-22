@@ -33,6 +33,7 @@
 #include "engine/transform_ops.h"
 #include "engine/resample.h"
 #include "engine/resample_hq.h"
+#include "engine/liquify_ops.h"
 #include "tiles/magic_wand.h"
 #include "tiles/quick_mask.h"
 #include "tiles/selection_ops.h"
@@ -2551,6 +2552,243 @@ napi_value CaOpAsync(napi_env env, napi_callback_info info, int op) {
         },
         [](napi_env env, napi_status status, void* data) {
             auto* c = static_cast<CaOpCtx*>(data);
+            auto& eg = Engine::get();
+            if (status == napi_ok && c->changed) {
+                eg.historyVersion.fetch_add(1);
+            }
+            napi_value dataObj = nullptr;
+            napi_create_object(env, &dataObj);
+            napi_set_named_property(env, dataObj, "changed",
+                                    makeBool(env, status == napi_ok && c->changed));
+            napi_resolve_deferred(env, c->deferred, makeOk(env, dataObj));
+            napi_delete_async_work(env, c->work);
+            delete c;
+        },
+        ctx, &ctx->work);
+    if (st != napi_ok) {
+        delete ctx;
+        return makeError(env, kErrInternal, "create async work failed");
+    }
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+// ---------- M20b 液化（photocraft liquify.rs 命令面）：一笔一步异步事务（CaOp 同范式：
+// 锁内快照 → 锁外重放笔画+渲染 → 发布段 epoch/revision 复核）。笔画=纯数据
+//（工具/笔刷/点列 doc 坐标），TS 侧已转层局部坐标。 ----------
+struct LiquifyCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    Document docSnap;
+    uint64_t epoch = 0;
+    int64_t revision = 0;
+    LayerId layerId = 0;
+    std::vector<liquify::Stroke> strokes;
+    bool changed = false;
+    std::string err;
+};
+
+// napi strokes 数组 → liquify::Stroke
+bool parseLiquifyStrokes(napi_env env, napi_value arr, std::vector<liquify::Stroke>& out) {
+    bool isArr = false;
+    if (napi_is_array(env, arr, &isArr) != napi_ok || !isArr) {
+        return false;
+    }
+    uint32_t n = 0;
+    napi_get_array_length(env, arr, &n);
+    out.reserve(n);
+    for (uint32_t k = 0; k < n; ++k) {
+        napi_value obj = nullptr;
+        if (napi_get_element(env, arr, k, &obj) != napi_ok) {
+            return false;
+        }
+        liquify::Stroke s;
+        auto num = [&](const char* key, double& v) -> bool {
+            napi_value f = nullptr;
+            if (napi_get_named_property(env, obj, key, &f) != napi_ok || f == nullptr) {
+                return false;
+            }
+            return napi_get_value_double(env, f, &v) == napi_ok;
+        };
+        double tool = 0, size = 0, density = 50, pressure = 100, rate = 80;
+        if (!num("tool", tool) || !num("size", size)) {
+            return false;
+        }
+        if (!num("density", density) || !num("pressure", pressure) || !num("rate", rate)) {
+            return false;
+        }
+        s.tool = static_cast<liquify::Tool>(static_cast<int32_t>(tool));
+        s.size = size;
+        s.density = density;
+        s.pressure = pressure;
+        s.rate = rate;
+        napi_value pts = nullptr;
+        double amount = 0;
+        if (napi_get_named_property(env, obj, "amount", &pts) == napi_ok && pts != nullptr) {
+            if (napi_get_value_double(env, pts, &amount) == napi_ok) {
+                s.hasAmount = true;
+                s.amount = amount;
+            }
+        }
+        pts = nullptr;
+        if (napi_get_named_property(env, obj, "points", &pts) != napi_ok || pts == nullptr) {
+            return false;
+        }
+        bool ptsArr = false;
+        if (napi_is_array(env, pts, &ptsArr) != napi_ok || !ptsArr) {
+            return false;
+        }
+        uint32_t pn = 0;
+        napi_get_array_length(env, pts, &pn);
+        for (uint32_t i = 0; i < pn; ++i) {
+            napi_value pt = nullptr;
+            if (napi_get_element(env, pts, i, &pt) != napi_ok) {
+                return false;
+            }
+            bool ptArr = false;
+            if (napi_is_array(env, pt, &ptArr) != napi_ok || !ptArr) {
+                return false;
+            }
+            uint32_t dn = 0;
+            napi_get_array_length(env, pt, &dn);
+            if (dn < 2) {
+                return false;
+            }
+            double x = 0, y = 0, pr = 1.0;
+            napi_value xv = nullptr, yv = nullptr, pv = nullptr;
+            if (napi_get_element(env, pt, 0, &xv) != napi_ok ||
+                napi_get_element(env, pt, 1, &yv) != napi_ok ||
+                napi_get_value_double(env, xv, &x) != napi_ok ||
+                napi_get_value_double(env, yv, &y) != napi_ok) {
+                return false;
+            }
+            if (dn >= 3 && napi_get_element(env, pt, 2, &pv) == napi_ok) {
+                napi_get_value_double(env, pv, &pr);
+            }
+            s.points.push_back({x, y, pr});
+        }
+        if (!s.points.empty()) {
+            out.push_back(std::move(s));
+        }
+    }
+    return true;
+}
+
+napi_value ApplyLiquify(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "applyLiquify(layerId, strokes) requires 2 args");
+    }
+    double layerId = 0;
+    if (napi_get_value_double(env, argv[0], &layerId) != napi_ok || layerId < 1) {
+        return makeError(env, kErrBadParam, "applyLiquify: invalid layerId");
+    }
+    auto* ctx = new LiquifyCtx();
+    ctx->layerId = static_cast<LayerId>(layerId);
+    if (!parseLiquifyStrokes(env, argv[1], ctx->strokes) || ctx->strokes.empty()) {
+        delete ctx;
+        return makeError(env, kErrBadParam, "applyLiquify: invalid strokes");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0) {
+            delete ctx;
+            return makeError(env, kErrNoDoc, "applyLiquify: no document");
+        }
+        if (e.textEditOpen || e.filterPreview.active) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "applyLiquify: edit/preview session open");
+        }
+        ctx->docSnap = e.doc;
+        ctx->epoch = e.docEpoch;
+        ctx->revision = e.docRevision;
+    }
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value workName = nullptr;
+    napi_create_string_utf8(env, "montageLiquify", NAPI_AUTO_LENGTH, &workName);
+    napi_status st = napi_create_async_work(
+        env, nullptr, workName,
+        [](napi_env /*env*/, void* data) {
+            auto* c = static_cast<LiquifyCtx*>(data);
+            Document work = c->docSnap;
+            Layer* layer = nullptr;
+            for (Layer& l : work.layers) {
+                if (l.id == c->layerId) {
+                    layer = &l;
+                    break;
+                }
+            }
+            if (layer == nullptr || layer->pixels == nullptr) {
+                c->err = "no raster layer";
+                return;
+            }
+            // 区域化（M20b-2 交互路径）：场界=笔画 bbox 外扩（笔刷半径+余量），钳到网格。
+            // 只转换/渲染区域行（调试构建整网格 f32 每笔数十秒的教训），触区瓦片 COW。
+            const int gw = static_cast<int>(layer->pixels->cols * kTileSize);
+            const int gh = static_cast<int>(layer->pixels->rows * kTileSize);
+            double pad = 16.0;
+            for (const liquify::Stroke& s : c->strokes) {
+                pad = std::max(pad, s.size * 0.5 + 16.0);
+            }
+            double bx0 = 1e308, by0 = 1e308, bx1 = -1e308, by1 = -1e308;
+            for (const liquify::Stroke& s : c->strokes) {
+                for (const std::array<double, 3>& pt : s.points) {
+                    bx0 = std::min(bx0, pt[0]);
+                    by0 = std::min(by0, pt[1]);
+                    bx1 = std::max(bx1, pt[0]);
+                    by1 = std::max(by1, pt[1]);
+                }
+            }
+            RectI region;
+            region.x0 = std::max(0, static_cast<int>(std::floor(bx0 - pad)));
+            region.y0 = std::max(0, static_cast<int>(std::floor(by0 - pad)));
+            region.x1 = std::min(gw, static_cast<int>(std::ceil(bx1 + pad)));
+            region.y1 = std::min(gh, static_cast<int>(std::ceil(by1 + pad)));
+            if (region.empty()) {
+                return;
+            }
+            const RectI fieldBounds{0, 0, region.width(), region.height()};
+            liquify::Field field(fieldBounds, liquify::autoCell(fieldBounds));
+            for (liquify::Stroke s : c->strokes) {
+                for (std::array<double, 3>& pt : s.points) {
+                    pt[0] -= layer->transform.originX + region.x0;
+                    pt[1] -= layer->transform.originY + region.y0;
+                }
+                field.applyStroke(s);
+            }
+            if (field.isIdentity()) {
+                return;  // 零效果笔画（零压等）：不出事务
+            }
+            auto warped = applyLiquifyGridRegion(*layer->pixels, region, field);
+            if (warped == nullptr) {
+                c->err = "liquify render failed";
+                return;
+            }
+            layer->pixels = warped;
+            if (layer->mask != nullptr && layer->mask->enabled) {
+                layer->render = composeMasked(layer->pixels, *layer->mask);
+            }
+            c->changed = true;
+            restyleDocument(work);
+            auto& eg = Engine::get();
+            std::lock_guard<std::mutex> lk(eg.docMutex);
+            if (eg.docEpoch == c->epoch && eg.docRevision == c->revision) {
+                eg.history.beginEdit(eg.doc, "æ¶²å", static_cast<uint64_t>(eg.docRevision));  // 液化
+                eg.doc = std::move(work);
+                eg.history.endEdit(eg.doc, static_cast<uint64_t>(eg.docRevision));
+                eg.bumpRevisionLocked();
+                eg.requestRender();
+            } else {
+                c->changed = false;
+                c->err = "doc changed during liquify";
+            }
+        },
+        [](napi_env env, napi_status status, void* data) {
+            auto* c = static_cast<LiquifyCtx*>(data);
             auto& eg = Engine::get();
             if (status == napi_ok && c->changed) {
                 eg.historyVersion.fetch_add(1);

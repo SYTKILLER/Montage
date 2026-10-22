@@ -841,4 +841,104 @@ liquify::Img applyLiquifyImage(const liquify::Img& src, const liquify::Field& fi
     return liquify::applyLiquifyImage(src, field, bitDepth);
 }
 
+std::shared_ptr<const TileGrid> applyLiquifyGridRegion(const TileGrid& src, const RectI& region,
+                                                       const liquify::Field& field) {
+    const uint32_t srcW = src.cols * kTileSize;
+    const uint32_t srcH = src.rows * kTileSize;
+    if (srcW == 0 || srcH == 0 || region.empty()) {
+        return nullptr;
+    }
+    const int rx0 = std::max(0, region.x0);
+    const int ry0 = std::max(0, region.y0);
+    const int rx1 = std::min(static_cast<int>(srcW), region.x1);
+    const int ry1 = std::min(static_cast<int>(srcH), region.y1);
+    if (rx1 <= rx0 || ry1 <= ry0) {
+        return nullptr;
+    }
+    const int rw = rx1 - rx0;
+    const int rh = ry1 - ry0;
+    // region 读成 f32
+    liquify::Img in;
+    in.w = rw;
+    in.h = rh;
+    in.px.assign(static_cast<size_t>(rw) * rh * 4u, 0.0f);
+    std::vector<uint8_t> row(static_cast<size_t>(srcW) * 4u);
+    for (int y = ry0; y < ry1; ++y) {
+        const uint32_t ty = static_cast<uint32_t>(y) / kTileSize;
+        const uint32_t inY = static_cast<uint32_t>(y) % kTileSize;
+        std::memset(row.data(), 0, static_cast<size_t>(srcW) * 4u);
+        for (uint32_t tx = 0; tx < src.cols; ++tx) {
+            auto it = src.tiles.find(ty * src.cols + tx);
+            if (it == src.tiles.end() || it->second == nullptr || it->second->pixels == nullptr) {
+                continue;
+            }
+            const uint8_t* sp = it->second->pixels->mapCpu();
+            if (sp == nullptr) {
+                continue;
+            }
+            std::memcpy(row.data() + static_cast<size_t>(tx) * kTileSize * 4u,
+                        sp + static_cast<size_t>(inY) * it->second->pixels->rowBytes(),
+                        static_cast<size_t>(kTileSize) * 4u);
+        }
+        for (int x = rx0; x < rx1; ++x) {
+            float* d = &in.px[(static_cast<size_t>(y - ry0) * rw + (x - rx0)) * 4u];
+            d[0] = static_cast<float>(row[static_cast<size_t>(x) * 4u]) / 255.0f;
+            d[1] = static_cast<float>(row[static_cast<size_t>(x) * 4u + 1u]) / 255.0f;
+            d[2] = static_cast<float>(row[static_cast<size_t>(x) * 4u + 2u]) / 255.0f;
+            d[3] = static_cast<float>(row[static_cast<size_t>(x) * 4u + 3u]) / 255.0f;
+        }
+    }
+    const liquify::Img out = liquify::applyLiquifyImage(in, field, 8);
+    // 触区瓦片 COW：克隆网格（共享瓦片），触区瓦片整片拷贝后写回区域行
+    auto cloned = std::make_shared<TileGrid>(src);
+    std::vector<uint8_t> outRow(static_cast<size_t>(rw) * 4u);
+    for (int y = ry0; y < ry1; ++y) {
+        bool any = false;
+        for (int x = rx0; x < rx1; ++x) {
+            const float* sp = &out.px[(static_cast<size_t>(y - ry0) * rw + (x - rx0)) * 4u];
+            uint8_t* d = &outRow[static_cast<size_t>(x - rx0) * 4u];
+            for (int c = 0; c < 4; ++c) {
+                d[c] = static_cast<uint8_t>(std::lround(std::clamp(sp[c], 0.0f, 1.0f) * 255.0f));
+            }
+            if (d[3] != 0) {
+                any = true;
+            }
+        }
+        (void)any;
+        const uint32_t ty = static_cast<uint32_t>(y) / kTileSize;
+        for (uint32_t tx = static_cast<uint32_t>(rx0) / kTileSize;
+             tx <= static_cast<uint32_t>(rx1 - 1) / kTileSize; ++tx) {
+            const uint32_t key = ty * src.cols + tx;
+            auto it = cloned->tiles.find(key);
+            std::shared_ptr<Tile> tile;
+            if (it == cloned->tiles.end() || it->second == nullptr ||
+                it->second->pixels == nullptr) {
+                tile = std::make_shared<Tile>();
+                tile->pixels.reset(new EngineBuffer(kTileSize, kTileSize));
+            } else {
+                // COW：整片拷贝原瓦片
+                tile = std::make_shared<Tile>();
+                tile->pixels.reset(new EngineBuffer(kTileSize, kTileSize));
+                const uint8_t* oldPx = it->second->pixels->mapCpu();
+                if (oldPx != nullptr) {
+                    std::memcpy(tile->pixels->mapCpuWrite(), oldPx,
+                                static_cast<size_t>(it->second->pixels->rowBytes()) * kTileSize);
+                }
+            }
+            const int x0 = std::max(rx0, static_cast<int>(tx * kTileSize));
+            const int x1 = std::min(rx1, static_cast<int>((tx + 1) * kTileSize));
+            uint8_t* base = tile->pixels->mapCpuWrite();
+            for (int x = x0; x < x1; ++x) {
+                std::memcpy(base + static_cast<size_t>(y % kTileSize) * kTileSize * 4u +
+                                static_cast<size_t>(x % kTileSize) * 4u,
+                            &outRow[static_cast<size_t>(x - rx0) * 4u], 4u);
+            }
+            cloned->tiles[key] = std::move(tile);
+        }
+    }
+    cloned->revision = src.revision + 1;
+    std::shared_ptr<const TileGrid> published = cloned;
+    return published;
+}
+
 }  // namespace montage

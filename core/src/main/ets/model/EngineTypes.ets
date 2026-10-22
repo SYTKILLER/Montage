@@ -96,6 +96,17 @@ export interface OpenFileData {
 }
 
 /** 图层 DTO（02 §5；M2 无组，字段保真常量占位；M5a 起蒙版字段为真值）。 */
+/** M20b 液化笔画（doc 坐标；引擎侧转层局部） */
+export interface LiquifyStrokeDTO {
+  tool: number;
+  size: number;
+  density: number;
+  pressure: number;
+  rate: number;
+  points: number[][];  // [x, y, pressure?]
+  amount?: number;
+}
+
 export interface LayerDTO {
   id: number;
   name: string;

@@ -5,7 +5,7 @@ import { common } from '@kit.AbilityKit';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
 import { window } from '@kit.ArkUI';
-import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, RawDevelopData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo } from 'core';
+import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, RawDevelopData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO } from 'core';
 import { AppPrefs, RecentProject, ThemeMode } from '../editor/AppPrefs';
 import { leafItem, MenuGroupVM, MenuItemVM, subItem, ToolVM } from '../editor/MenuModel';
 import { SWATCHES } from '../editor/components/OptionsBar';
@@ -356,6 +356,12 @@ struct Index {
   @State imgWText: string = '';
   @State imgHText: string = '';
   @State imgResampleMethod: number = 2;  // M20a 重采样方法（默认两次立方）
+  // M20b 液化（工具态；笔画收集即发即弃，每笔一步异步事务）
+  @State liquifyTool: number = 0;        // 0 向前变形/1 重建/2 平滑/3 顺时针/4 逆时针/5 褶皱/6 膨胀/7 左推
+  @State liquifySize: number = 120;
+  @State liquifyPressure: number = 80;
+  private liquifyPoints: number[][] = [];
+  private liquifyDrawing: boolean = false;
   @State channelsCount: number = 0;       // M10c Alpha 通道数（镜像，驱动菜单使能）
   @State showStoreSel: boolean = false;   // 存储选区名字对话框
   @State storeSelText: string = '';
@@ -1061,6 +1067,9 @@ struct Index {
         break;
       case 'patch':
         this.patchTouch(e, docX, docY);  // M19a 修补：选区内拖拽 → 位移取源
+        break;
+      case 'liquify':
+        this.liquifyTouch(e, docX, docY);  // M20b 液化：拖拽收集一笔，松手即异步事务
         break;
       case 'gradient':
         this.gradientTouch(e, docX, docY);
@@ -3496,6 +3505,14 @@ struct Index {
     if (this.editingTextId !== 0) {
       this.commitTextEditing();  // 文本编辑会话独占 history pending 槽：任何命令先提交
     }
+    // M20b 液化：进液化工具（选项条选工具/笔刷，画布拖拽一笔一事务）
+    if (id === 'liquify.enter') {
+      if (this.docOpen) {
+        this.pickTool('liquify');
+        this.log('液化：拖拽变形 · 每笔一步历史 · 选项条换工具');
+      }
+      return;
+    }
     // M13 滤镜命令：'filter.<id>' → 查目录开对话框（proxy 预览）
     if (id.startsWith('filter.')) {
       const def = FILTER_CATALOG.find((f: FilterDef): boolean => f.id === id.substring(7));
@@ -4263,6 +4280,53 @@ struct Index {
     return opts;
   }
 
+  // M20b 液化手势：Down 起笔（定点工具单击=dab），Move 采样（≥4px），Up 提交一笔
+  private liquifyTouch(e: TouchEvent, docX: number, docY: number): void {
+    const a = this.activeLayer();
+    if (a === undefined || a.isText) {
+      return;
+    }
+    if (e.type === TouchType.Down) {
+      this.liquifyPoints = [[docX, docY, 1]];
+      this.liquifyDrawing = true;
+      return;
+    }
+    if (!this.liquifyDrawing) {
+      return;
+    }
+    if (e.type === TouchType.Move) {
+      const last = this.liquifyPoints[this.liquifyPoints.length - 1];
+      if (last === undefined || Math.hypot(docX - last[0], docY - last[1]) >= 4) {
+        this.liquifyPoints.push([docX, docY, 1]);
+      }
+      return;
+    }
+    if (e.type === TouchType.Up || e.type === TouchType.Cancel) {
+      this.liquifyDrawing = false;
+      if (this.liquifyPoints.length === 0) {
+        return;
+      }
+      const stroke: LiquifyStrokeDTO = {
+        tool: this.liquifyTool,
+        size: this.liquifySize,
+        density: 50,
+        pressure: this.liquifyPressure,
+        rate: 80,
+        points: this.liquifyPoints,
+      };
+      const layerId = a.id;
+      const strokes: LiquifyStrokeDTO[] = [stroke];
+      this.liquifyPoints = [];
+      this.engine.applyLiquify(layerId, strokes).then((ok: boolean): void => {
+        if (!ok) {
+          this.toast('液化未生效（空层/并发编辑）');
+        }
+      }).catch((_e: BusinessError): void => {
+        this.toast('液化失败');
+      });
+    }
+  }
+
   // M20a 重采样方法名（对话框下拉与历史标签共用）
   private resampleLabel(m: number): string {
     if (m === 0) { return '最近邻'; }
@@ -4669,6 +4733,7 @@ struct Index {
     }
     const menuOf = (key: string, label: string): MenuItemVM =>
       subItem(`filterGroup.${key}`, label, d, groups[key] ?? []);
+    filterMenus.push(leafItem('liquify.enter', '液化（笔刷变形）…', '', d));
     filterMenus.push(menuOf('blur', '模糊'));
     filterMenus.push(menuOf('sharpen', '锐化'));
     filterMenus.push(menuOf('noise', '杂色'));
@@ -5443,6 +5508,12 @@ struct Index {
           clonePicking: this.clonePicking,
           historyBrushSteps: $historyBrushSteps,
           spotHealMode: this.spotHealMode,
+          liquifyTool: this.liquifyTool,
+          onLiquifyTool: (t: number): void => {
+            this.liquifyTool = t;
+          },
+          liquifySize: $liquifySize,
+          liquifyPressure: $liquifyPressure,
           onSpotHealMode: (m: number): void => {
             this.spotHealMode = m;
             if (this.tool === 'spotHeal') {

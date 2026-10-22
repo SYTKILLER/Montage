@@ -88,6 +88,11 @@ export struct OptionsBar {
   // M19a 修复族
   @Prop spotHealMode: number = 0;  // 0 内容识别/1 创建纹理/2 接近匹配
   onSpotHealMode: (m: number) => void = (_m: number) => {};
+  // M20b 液化
+  @Prop liquifyTool: number = 0;
+  onLiquifyTool: (t: number) => void = (_t: number) => {};
+  @Link liquifySize: number;
+  @Link liquifyPressure: number;
   @Prop cropPending: boolean = false;
   // M10a 选区增强：布尔四态 + 选框形状
   @Link selOp: number;
@@ -451,6 +456,32 @@ export struct OptionsBar {
     .height(36)
   }
 
+  // M20b 液化选项：7 工具切换 + 直径/压力滑条
+  @Builder
+  liquifyOptions() {
+    Row({ space: 10 }) {
+      Button(this.liquifyToolLabel())
+        .fontSize(12).height(28).width(96)
+        .backgroundColor($r('app.color.surface'))
+        .fontColor($r('app.color.text_primary'))
+        .border({ width: 1, color: $r('app.color.border') })
+        .onClick((): void => this.onLiquifyTool((this.liquifyTool + 1) % 8))
+      OptionSlider({ label: '直径', value: $liquifySize, min: 10, max: 600, step: 2,
+        suffix: 'px', onCommitted: (_v: number): void => {} })
+      OptionSlider({ label: '压力', value: $liquifyPressure, min: 1, max: 100, step: 1,
+        suffix: '%', onCommitted: (_v: number): void => {} })
+      Text('拖拽变形 · 每笔一步历史')
+        .fontSize(11)
+        .fontColor($r('app.color.text_secondary'))
+    }
+    .height(36)
+  }
+
+  private liquifyToolLabel(): string {
+    const labels: string[] = ['向前变形', '重建', '平滑', '顺时针扭曲', '逆时针扭曲', '褶皱', '膨胀', '左推'];
+    return labels[this.liquifyTool] ?? '向前变形';
+  }
+
   // M19a 污点修复选项：三模式切换 + 提示（无源，提交时计算）
   @Builder
   spotHealOptions() {
@@ -720,6 +751,8 @@ export struct OptionsBar {
         this.stampOptions()
       } else if (this.tool === 'historyBrush') {
         this.historyBrushOptions()
+      } else if (this.tool === 'liquify') {
+        this.liquifyOptions()
       } else if (this.tool === 'heal') {
         this.healOptions()
       } else if (this.tool === 'spotHeal') {
