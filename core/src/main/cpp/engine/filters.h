@@ -43,8 +43,9 @@ enum FilterKind : int32_t {
     FMaximum,
     FOffset,
     FCustom,
+    FLensCorrection,  // M20d：镜头校正（lens_ops correct；p0..p5 见下）
 };
-constexpr int32_t kFilterKindCount = 28;
+constexpr int32_t kFilterKindCount = 29;
 
 // 参数槽（语义随 kind；与 06 §4 M13 对话框 schema 对齐）：
 //   GaussianBlur   p0=σ(0.1..500)
@@ -74,6 +75,8 @@ constexpr int32_t kFilterKindCount = 28;
 //   Minimum/Maximum p0=radius(1..100) p1=preserve(0方形/1圆盘)
 //   Offset         p0=dx p1=dy
 //   Custom         kernel[25]（5×5 行主序）+ p0=scale p1=offset
+//   LensCorrection p0=RemoveDistortion(−100..100) p1=垂直透视 p2=水平透视 p3=角度°
+//                  p4=缩放%(50..150) p5=暗角数量(−100..100)；色差/中点 v1 固定默认（登记）
 struct FilterParams {
     int32_t kind = 0;
     float p0 = 0.0f;

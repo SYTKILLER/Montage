@@ -4768,15 +4768,27 @@ napi_value SetFilterPreview(napi_env env, napi_callback_info info) {
 
 // M13：结束预览（commit=true → 全分辨率核 + 一步事务；false → 丢弃）
 napi_value EndFilterPreview(napi_env env, napi_callback_info info) {
-    size_t argc = 9;
-    napi_value argv[9];
-    for (size_t i = 0; i < 9; ++i) {
+    size_t argc = 10;
+    napi_value argv[10];
+    for (size_t i = 0; i < 10; ++i) {
         argv[i] = nullptr;
     }
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     int32_t commit = 0;
     if (argc >= 1 && napi_get_value_int32(env, argv[0], &commit) != napi_ok) {
         commit = 0;
+    }
+    // M20-UI：可选第 10 参 = 历史标签（滤镜名；缺省 "filter"）
+    std::string histLabel = "filter";
+    if (argc >= 10 && argv[9] != nullptr) {
+        size_t len = 0;
+        if (napi_get_value_string_utf8(env, argv[9], nullptr, 0, &len) == napi_ok && len > 0 &&
+            len < 128) {
+            char buf[128];
+            if (napi_get_value_string_utf8(env, argv[9], buf, sizeof(buf), &len) == napi_ok) {
+                histLabel = buf;
+            }
+        }
     }
     auto& e = Engine::get();
     {
@@ -4792,7 +4804,7 @@ napi_value EndFilterPreview(napi_env env, napi_callback_info info) {
                     p.colorBg[0] = e.bgColor[0];
                     p.colorBg[1] = e.bgColor[1];
                     p.colorBg[2] = e.bgColor[2];
-                    e.history.beginEdit(e.doc, "filter", static_cast<uint64_t>(e.docRevision));
+                    e.history.beginEdit(e.doc, histLabel, static_cast<uint64_t>(e.docRevision));
                     std::string err;
                     if (applyFilterToLayer(e.doc, fp.layerId, p, err)) {
                         restyleAllLocked(e);

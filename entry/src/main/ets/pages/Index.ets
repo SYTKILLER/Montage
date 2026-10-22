@@ -2259,7 +2259,7 @@ struct Index {
     }
     this.showFilter = false;
     this.engine.endFilterPreview(true, def.kind, vals[0], vals[1], vals[2], vals[3], vals[4],
-      vals[5], this.filterSeed);
+      vals[5], this.filterSeed, def.label);
     this.log(`滤镜已应用: ${def.label}`);
     this.filterDef = null;
   }

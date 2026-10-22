@@ -854,9 +854,9 @@ export class CompositorEngine {
   }
 
   endFilterPreview(commit: boolean, kind: number, p0: number, p1: number, p2: number,
-    p3: number, p4: number, p5: number, seed: number): void {
+    p3: number, p4: number, p5: number, seed: number, label?: string): void {
     const r = narrowResult(native.endFilterPreview(commit ? 1 : 0, kind, p0, p1, p2, p3, p4, p5,
-      seed) as Object);
+      seed, label ?? 'filter') as Object);
     if (!r.ok) {
       hilog.error(DOMAIN, TAG, 'endFilterPreview failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');

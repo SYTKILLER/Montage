@@ -1,5 +1,7 @@
 #include "engine/filters.h"
 
+#include "engine/lens_ops.h"
+
 // M13 滤镜核实现。算法对拍 photocraft algo crate（MIT，07 §3.4 注入，公式语义逐条照抄）：
 // gaussian_kernel/boxes_for_gauss/conv_sep（blur.rs）、unsharp/high_pass（sharpen.rs）、
 // hash01/add（noise.rs）、mosaic/emboss/find_edges（stylize.rs）、min_max（other.rs）。
@@ -761,6 +763,35 @@ bool applyFilter(const uint8_t* src, uint8_t* dst, uint32_t w, uint32_t h,
                         std::clamp(v * (1.0f - v) * 4.0f, 0.0f, 1.0f) * 255.0f + 0.5f);
                 }
                 dst[i * 4u + 3u] = src[i * 4u + 3u];
+            }
+            break;
+        }
+        case FLensCorrection: {
+            // M20d 镜头校正（lens_ops correct 全管线：畸变/透视/角度缩放/暗角；
+            // strip 域 = 层 bbox，边缘延展避免域外透明吃边）
+            lens::Correction lc;
+            lc.distortion = p.p0;
+            lc.vertical = p.p1;
+            lc.horizontal = p.p2;
+            lc.angle = p.p3;
+            lc.scale = p.p4;
+            lc.vignetteAmount = p.p5;
+            lc.edge = lens::EdgeMode::Extension;
+            lens::Img in;
+            in.w = static_cast<int>(w);
+            in.h = static_cast<int>(h);
+            in.px.resize(static_cast<size_t>(n) * 4u);
+            for (size_t i = 0; i < n; ++i) {
+                for (int c = 0; c < 4; ++c) {
+                    in.px[i * 4u + c] = src[i * 4u + c] / 255.0f;
+                }
+            }
+            const lens::Img out = lens::correct(in, inpaint::RectI{0, 0, static_cast<int>(w), static_cast<int>(h)}, lc);
+            for (size_t i = 0; i < n; ++i) {
+                for (int c = 0; c < 4; ++c) {
+                    dst[i * 4u + c] = static_cast<uint8_t>(
+                        std::clamp(out.px[i * 4u + c], 0.0f, 1.0f) * 255.0f + 0.5f);
+                }
             }
             break;
         }

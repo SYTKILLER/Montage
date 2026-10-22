@@ -36,6 +36,12 @@ add_library(compositor SHARED
         engine/transform_ops.cpp
         engine/resample.cpp
         engine/resample_hq.cpp
+        engine/lens_ops.cpp
+        engine/liquify_ops.cpp
+        engine/puppet_ops.cpp
+        engine/perspective_ops.cpp
+        engine/wideangle_ops.cpp
+        engine/vanishing_ops.cpp
         engine/view_ops.cpp
         io/image_import.cpp
         io/image_export.cpp

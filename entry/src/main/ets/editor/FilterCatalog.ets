@@ -170,6 +170,18 @@ export const FILTER_CATALOG: FilterDef[] = [
       { label: '垂直', min: -2000, max: 2000, step: 1, def: 0, unit: 'px' },
     ],
   },
+  {
+    // M20d 镜头校正（lens_ops；色差/暗角中点 v1 固定默认登记）
+    id: 'lensCorrection', label: '镜头校正', kind: 28, menu: 'other', hasSeed: false,
+    params: [
+      { label: ' Remove Distortion', min: -100, max: 100, step: 1, def: 0, unit: '' },
+      { label: '垂直透视', min: -100, max: 100, step: 1, def: 0, unit: '' },
+      { label: '水平透视', min: -100, max: 100, step: 1, def: 0, unit: '' },
+      { label: '角度', min: -180, max: 180, step: 0.5, def: 0, unit: '°' },
+      { label: '缩放', min: 50, max: 150, step: 1, def: 100, unit: '%' },
+      { label: '暗角数量', min: -100, max: 100, step: 1, def: 0, unit: '' },
+    ],
+  },
 ];
 
 export const FILTER_MENU_GROUPS: string[] = ['blur', 'sharpen', 'noise', 'pixelate', 'stylize', 'render', 'other'];
