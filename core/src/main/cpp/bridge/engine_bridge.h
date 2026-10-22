@@ -78,6 +78,9 @@ napi_value ContentAwareFill(napi_env env, napi_callback_info info);
 
 // M20b 液化：一笔一步异步事务（strokes napi 数组）
 napi_value ApplyLiquify(napi_env env, napi_callback_info info);
+
+// M20c 操控变形：钉集一步异步事务
+napi_value ApplyPuppet(napi_env env, napi_callback_info info);
 napi_value ContentAwareMove(napi_env env, napi_callback_info info);
 // M19c 内容感知比例：contentAwareScale(w,h) 活动图层缝雕刻+画布随缩放
 napi_value ContentAwareScale(napi_env env, napi_callback_info info);

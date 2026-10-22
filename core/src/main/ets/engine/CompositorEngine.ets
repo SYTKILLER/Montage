@@ -1,7 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
-import { EngineStats, ExportPngData, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, } from '../model/EngineTypes';
+import { EngineStats, ExportPngData, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -1837,6 +1837,13 @@ export class CompositorEngine {
    * 坐标为层局部像素）。 */
   async applyLiquify(layerId: number, strokes: LiquifyStrokeDTO[]): Promise<boolean> {
     const value: Object = await (native.applyLiquify(layerId, strokes) as Promise<Object>);
+    const r = narrowResult(value);
+    return r.ok && r.data !== null && boolOf(r.data, 'changed');
+  }
+
+  /** M20c 操控变形：钉集一步异步事务（pins doc 坐标；mode 0 刚体/1 正常/2 扭曲；density 0 更少/1 正常/2 较多）。 */
+  async applyPuppet(layerId: number, pins: PuppetPinDTO[], mode: number, density: number): Promise<boolean> {
+    const value: Object = await (native.applyPuppet(layerId, pins, mode, density) as Promise<Object>);
     const r = narrowResult(value);
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }

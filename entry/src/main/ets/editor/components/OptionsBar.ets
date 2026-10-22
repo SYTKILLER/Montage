@@ -93,6 +93,14 @@ export struct OptionsBar {
   onLiquifyTool: (t: number) => void = (_t: number) => {};
   @Link liquifySize: number;
   @Link liquifyPressure: number;
+  // M20c 操控变形
+  @Prop puppetMode: number = 1;
+  onPuppetMode: (m: number) => void = (_m: number) => {};
+  @Prop puppetDensity: number = 1;
+  onPuppetDensity: (d: number) => void = (_d: number) => {};
+  @Prop puppetPinCount: number = 0;
+  onPuppetApply: () => void = () => {};
+  onPuppetCancel: () => void = () => {};
   @Prop cropPending: boolean = false;
   // M10a 选区增强：布尔四态 + 选框形状
   @Link selOp: number;
@@ -456,6 +464,48 @@ export struct OptionsBar {
     .height(36)
   }
 
+  // M20c 操控变形选项：模式/密度切换 + 应用/取消 + 钉数
+  @Builder
+  puppetOptions() {
+    Row({ space: 10 }) {
+      Button(this.puppetModeLabel())
+        .fontSize(12).height(28).width(76)
+        .backgroundColor($r('app.color.surface'))
+        .fontColor($r('app.color.text_primary'))
+        .border({ width: 1, color: $r('app.color.border') })
+        .onClick((): void => this.onPuppetMode((this.puppetMode + 1) % 3))
+      Button(this.puppetDensityLabel())
+        .fontSize(12).height(28).width(76)
+        .backgroundColor($r('app.color.surface'))
+        .fontColor($r('app.color.text_primary'))
+        .border({ width: 1, color: $r('app.color.border') })
+        .onClick((): void => this.onPuppetDensity((this.puppetDensity + 1) % 3))
+      Button('应用').fontSize(12).height(28).width(56)
+        .backgroundColor($r('app.color.accent'))
+        .fontColor($r('app.color.on_accent'))
+        .onClick((): void => this.onPuppetApply())
+      Button('取消').fontSize(12).height(28).width(56)
+        .backgroundColor($r('app.color.surface'))
+        .fontColor($r('app.color.text_primary'))
+        .border({ width: 1, color: $r('app.color.border') })
+        .onClick((): void => this.onPuppetCancel())
+      Text(`钉 ${this.puppetPinCount} · 点击画布加钉，拖钉变形`)
+        .fontSize(11)
+        .fontColor($r('app.color.text_secondary'))
+    }
+    .height(36)
+  }
+
+  private puppetModeLabel(): string {
+    const labels: string[] = ['刚体', '正常', '扭曲'];
+    return labels[this.puppetMode] ?? '正常';
+  }
+
+  private puppetDensityLabel(): string {
+    const labels: string[] = ['更少', '正常', '较多'];
+    return labels[this.puppetDensity] ?? '正常';
+  }
+
   // M20b 液化选项：7 工具切换 + 直径/压力滑条
   @Builder
   liquifyOptions() {
@@ -753,6 +803,8 @@ export struct OptionsBar {
         this.historyBrushOptions()
       } else if (this.tool === 'liquify') {
         this.liquifyOptions()
+      } else if (this.tool === 'puppet') {
+        this.puppetOptions()
       } else if (this.tool === 'heal') {
         this.healOptions()
       } else if (this.tool === 'spotHeal') {

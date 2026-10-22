@@ -96,6 +96,16 @@ export interface OpenFileData {
 }
 
 /** 图层 DTO（02 §5；M2 无组，字段保真常量占位；M5a 起蒙版字段为真值）。 */
+/** M20c 操控变形钉（doc 坐标；rotate<0=自动） */
+export interface PuppetPinDTO {
+  sx: number;
+  sy: number;
+  dx: number;
+  dy: number;
+  rotate?: number;
+  depth?: number;
+}
+
 /** M20b 液化笔画（doc 坐标；引擎侧转层局部） */
 export interface LiquifyStrokeDTO {
   tool: number;

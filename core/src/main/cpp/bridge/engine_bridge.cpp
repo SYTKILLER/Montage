@@ -34,6 +34,7 @@
 #include "engine/resample.h"
 #include "engine/resample_hq.h"
 #include "engine/liquify_ops.h"
+#include "engine/puppet_ops.h"
 #include "tiles/magic_wand.h"
 #include "tiles/quick_mask.h"
 #include "tiles/selection_ops.h"
@@ -2789,6 +2790,193 @@ napi_value ApplyLiquify(napi_env env, napi_callback_info info) {
         },
         [](napi_env env, napi_status status, void* data) {
             auto* c = static_cast<LiquifyCtx*>(data);
+            auto& eg = Engine::get();
+            if (status == napi_ok && c->changed) {
+                eg.historyVersion.fetch_add(1);
+            }
+            napi_value dataObj = nullptr;
+            napi_create_object(env, &dataObj);
+            napi_set_named_property(env, dataObj, "changed",
+                                    makeBool(env, status == napi_ok && c->changed));
+            napi_resolve_deferred(env, c->deferred, makeOk(env, dataObj));
+            napi_delete_async_work(env, c->work);
+            delete c;
+        },
+        ctx, &ctx->work);
+    if (st != napi_ok) {
+        delete ctx;
+        return makeError(env, kErrInternal, "create async work failed");
+    }
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+// ---------- M20c 操控变形命令面：钉集一步异步事务（CaOp 同范式）。钉 doc 坐标，
+// 引擎侧转层局部；网格重定由 applyPuppetGrid 的 outOrigin 回写层 origin。 ----------
+struct PuppetCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    Document docSnap;
+    uint64_t epoch = 0;
+    int64_t revision = 0;
+    LayerId layerId = 0;
+    puppet::Warp warp;
+    bool changed = false;
+    std::string err;
+};
+
+bool parsePuppetPins(napi_env env, napi_value arr, puppet::Warp& w) {
+    bool isArr = false;
+    if (napi_is_array(env, arr, &isArr) != napi_ok || !isArr) {
+        return false;
+    }
+    uint32_t n = 0;
+    napi_get_array_length(env, arr, &n);
+    w.pins.reserve(n);
+    for (uint32_t k = 0; k < n; ++k) {
+        napi_value obj = nullptr;
+        if (napi_get_element(env, arr, k, &obj) != napi_ok) {
+            return false;
+        }
+        puppet::Pin p;
+        auto num = [&](const char* key, double& v) -> bool {
+            napi_value f = nullptr;
+            if (napi_get_named_property(env, obj, key, &f) != napi_ok || f == nullptr) {
+                return false;
+            }
+            return napi_get_value_double(env, f, &v) == napi_ok;
+        };
+        double sx = 0, sy = 0, dx = 0, dy = 0;
+        if (!num("sx", sx) || !num("sy", sy) || !num("dx", dx) || !num("dy", dy)) {
+            return false;
+        }
+        p.src[0] = sx;
+        p.src[1] = sy;
+        p.dst[0] = dx;
+        p.dst[1] = dy;
+        double rot = -1;
+        if (num("rotate", rot) && rot >= 0.0) {
+            p.hasRotate = true;
+            p.rotateDeg = rot;
+        }
+        double depth = 0;
+        if (num("depth", depth)) {
+            p.depth = static_cast<int>(depth);
+        }
+        w.pins.push_back(p);
+    }
+    return true;
+}
+
+napi_value ApplyPuppet(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "applyPuppet(layerId, pins, mode?, density?) requires 2+ args");
+    }
+    double layerId = 0;
+    if (napi_get_value_double(env, argv[0], &layerId) != napi_ok || layerId < 1) {
+        return makeError(env, kErrBadParam, "applyPuppet: invalid layerId");
+    }
+    auto* ctx = new PuppetCtx();
+    ctx->layerId = static_cast<LayerId>(layerId);
+    if (!parsePuppetPins(env, argv[1], ctx->warp) || ctx->warp.pins.empty()) {
+        delete ctx;
+        return makeError(env, kErrBadParam, "applyPuppet: invalid pins");
+    }
+    if (argc >= 3) {
+        double mode = 1;
+        if (napi_get_value_double(env, argv[2], &mode) == napi_ok) {
+            ctx->warp.mode = static_cast<puppet::Mode>(static_cast<int32_t>(mode));
+        }
+    }
+    if (argc >= 4) {
+        double density = 1;
+        if (napi_get_value_double(env, argv[3], &density) == napi_ok) {
+            ctx->warp.density = static_cast<puppet::Density>(static_cast<int32_t>(density));
+        }
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0) {
+            delete ctx;
+            return makeError(env, kErrNoDoc, "applyPuppet: no document");
+        }
+        if (e.textEditOpen || e.filterPreview.active) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "applyPuppet: edit/preview session open");
+        }
+        ctx->docSnap = e.doc;
+        ctx->epoch = e.docEpoch;
+        ctx->revision = e.docRevision;
+    }
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value workName = nullptr;
+    napi_create_string_utf8(env, "montagePuppet", NAPI_AUTO_LENGTH, &workName);
+    napi_status st = napi_create_async_work(
+        env, nullptr, workName,
+        [](napi_env /*env*/, void* data) {
+            auto* c = static_cast<PuppetCtx*>(data);
+            Document work = c->docSnap;
+            Layer* layer = nullptr;
+            for (Layer& l : work.layers) {
+                if (l.id == c->layerId) {
+                    layer = &l;
+                    break;
+                }
+            }
+            if (layer == nullptr || layer->pixels == nullptr) {
+                c->err = "no raster layer";
+                return;
+            }
+            const RectI bounds{0, 0, static_cast<int>(layer->pixels->cols * kTileSize),
+                               static_cast<int>(layer->pixels->rows * kTileSize)};
+            // 钉 doc → 层局部
+            for (puppet::Pin& p : c->warp.pins) {
+                p.src[0] -= layer->transform.originX;
+                p.src[1] -= layer->transform.originY;
+                p.dst[0] -= layer->transform.originX;
+                p.dst[1] -= layer->transform.originY;
+            }
+            double origin[2] = {0.0, 0.0};
+            auto warped = applyPuppetGrid(*layer->pixels, bounds, c->warp, origin);
+            if (warped == nullptr) {
+                c->err = "puppet refused (span limit / empty mesh)";
+                return;
+            }
+            // 恒等快路径：网格尺寸与 origin 未变且像素 revision 相同则不出事务
+            if (warped->cols == layer->pixels->cols && warped->rows == layer->pixels->rows &&
+                std::fabs(origin[0]) < 1e-9 && std::fabs(origin[1]) < 1e-9 &&
+                puppet::warpIsIdentity(c->warp)) {
+                return;
+            }
+            layer->pixels = warped;
+            layer->transform.originX += origin[0];
+            layer->transform.originY += origin[1];
+            if (layer->mask != nullptr && layer->mask->enabled) {
+                layer->render = composeMasked(layer->pixels, *layer->mask);
+            }
+            c->changed = true;
+            restyleDocument(work);
+            auto& eg = Engine::get();
+            std::lock_guard<std::mutex> lk(eg.docMutex);
+            if (eg.docEpoch == c->epoch && eg.docRevision == c->revision) {
+                eg.history.beginEdit(eg.doc, "\xe6\x93\x8d\xe6\x8e\xa7\xe5\x8f\x98\xe5\xbd\xa2",
+                                     static_cast<uint64_t>(eg.docRevision));  // 操控变形
+                eg.doc = std::move(work);
+                eg.history.endEdit(eg.doc, static_cast<uint64_t>(eg.docRevision));
+                eg.bumpRevisionLocked();
+                eg.requestRender();
+            } else {
+                c->changed = false;
+                c->err = "doc changed during puppet";
+            }
+        },
+        [](napi_env env, napi_status status, void* data) {
+            auto* c = static_cast<PuppetCtx*>(data);
             auto& eg = Engine::get();
             if (status == napi_ok && c->changed) {
                 eg.historyVersion.fetch_add(1);

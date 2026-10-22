@@ -5,7 +5,7 @@ import { common } from '@kit.AbilityKit';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
 import { window } from '@kit.ArkUI';
-import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, RawDevelopData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO } from 'core';
+import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, RawDevelopData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO } from 'core';
 import { AppPrefs, RecentProject, ThemeMode } from '../editor/AppPrefs';
 import { leafItem, MenuGroupVM, MenuItemVM, subItem, ToolVM } from '../editor/MenuModel';
 import { SWATCHES } from '../editor/components/OptionsBar';
@@ -362,6 +362,11 @@ struct Index {
   @State liquifyPressure: number = 80;
   private liquifyPoints: number[][] = [];
   private liquifyDrawing: boolean = false;
+  // M20c 操控变形（钉集即数据；应用=一步异步事务）
+  @State puppetMode: number = 1;     // 0 刚体/1 正常/2 扭曲
+  @State puppetDensity: number = 1;  // 0 更少/1 正常/2 较多
+  @State puppetPins: PuppetPinDTO[] = [];
+  @State puppetDragIdx: number = -1;
   @State channelsCount: number = 0;       // M10c Alpha 通道数（镜像，驱动菜单使能）
   @State showStoreSel: boolean = false;   // 存储选区名字对话框
   @State storeSelText: string = '';
@@ -1071,6 +1076,9 @@ struct Index {
       case 'liquify':
         this.liquifyTouch(e, docX, docY);  // M20b 液化：拖拽收集一笔，松手即异步事务
         break;
+      case 'puppet':
+        this.puppetTouch(e, docX, docY);  // M20c 操控变形：点击=钉，拖钉=移动
+        break;
       case 'gradient':
         this.gradientTouch(e, docX, docY);
         break;
@@ -1262,6 +1270,15 @@ struct Index {
       this.lassoPreview = [];
       this.log('多边形套索已取消');
     }
+  }
+
+  // M20c：钉 doc → 视口坐标
+  private pinVpX(docX: number): number {
+    return (docX - this.panX) * this.zoom / this.pxPerVp();
+  }
+
+  private pinVpY(docY: number): number {
+    return (docY - this.panY) * this.zoom / this.pxPerVp();
   }
 
   // M10a：折线预览文档域 → 视口 points（Polyline 组件坐标 = vp）
@@ -3505,6 +3522,14 @@ struct Index {
     if (this.editingTextId !== 0) {
       this.commitTextEditing();  // 文本编辑会话独占 history pending 槽：任何命令先提交
     }
+    // M20c 操控变形：进操控工具（点击=钉，拖钉=变形，选项条应用）
+    if (id === 'puppet.enter') {
+      if (this.docOpen) {
+        this.pickTool('puppet');
+        this.log('操控变形：点击加钉 → 拖钉变形 → 选项条「应用」');
+      }
+      return;
+    }
     // M20b 液化：进液化工具（选项条选工具/笔刷，画布拖拽一笔一事务）
     if (id === 'liquify.enter') {
       if (this.docOpen) {
@@ -4327,6 +4352,62 @@ struct Index {
     }
   }
 
+  // M20c 操控变形手势：点击=加钉，命中钉（16vp 内）=拖移其 dst
+  private puppetTouch(e: TouchEvent, docX: number, docY: number): void {
+    if (e.type === TouchType.Down) {
+      const k = 16 * this.pxPerVp() / this.zoom;
+      for (let i = this.puppetPins.length - 1; i >= 0; --i) {
+        const p = this.puppetPins[i];
+        if (p !== undefined && Math.hypot(docX - p.dx, docY - p.dy) <= k) {
+          this.puppetDragIdx = i;
+          return;
+        }
+      }
+      const pin: PuppetPinDTO = { sx: docX, sy: docY, dx: docX, dy: docY };
+      this.puppetPins.push(pin);
+      this.puppetDragIdx = this.puppetPins.length - 1;
+      return;
+    }
+    if (e.type === TouchType.Move && this.puppetDragIdx >= 0) {
+      const p = this.puppetPins[this.puppetDragIdx];
+      if (p !== undefined) {
+        p.dx = docX;
+        p.dy = docY;
+      }
+      return;
+    }
+    if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.puppetDragIdx >= 0) {
+      this.puppetDragIdx = -1;
+    }
+  }
+
+  // M20c 应用操控变形（钉集一步事务；成功后清钉）
+  private puppetApply(): void {
+    const a = this.activeLayer();
+    if (a === undefined || a.isText) {
+      this.toast('无栅格图层');
+      return;
+    }
+    if (this.puppetPins.length < 2) {
+      this.toast('至少两枚钉（一钉无变形）');
+      return;
+    }
+    const layerId = a.id;
+    const pins = this.puppetPins;
+    this.engine.applyPuppet(layerId, pins, this.puppetMode, this.puppetDensity)
+      .then((ok: boolean): void => {
+        if (ok) {
+          this.puppetPins = [];
+          this.log(`操控变形已应用（${pins.length} 钉）`);
+        } else {
+          this.toast('操控未生效（跨度超限/无变化）');
+        }
+      })
+      .catch((_e: BusinessError): void => {
+        this.toast('操控变形失败');
+      });
+  }
+
   // M20a 重采样方法名（对话框下拉与历史标签共用）
   private resampleLabel(m: number): string {
     if (m === 0) { return '最近邻'; }
@@ -4734,6 +4815,7 @@ struct Index {
     const menuOf = (key: string, label: string): MenuItemVM =>
       subItem(`filterGroup.${key}`, label, d, groups[key] ?? []);
     filterMenus.push(leafItem('liquify.enter', '液化（笔刷变形）…', '', d));
+    filterMenus.push(leafItem('puppet.enter', '操控变形…', '', d));
     filterMenus.push(menuOf('blur', '模糊'));
     filterMenus.push(menuOf('sharpen', '锐化'));
     filterMenus.push(menuOf('noise', '杂色'));
@@ -5514,6 +5596,22 @@ struct Index {
           },
           liquifySize: $liquifySize,
           liquifyPressure: $liquifyPressure,
+          puppetMode: this.puppetMode,
+          onPuppetMode: (m: number): void => {
+            this.puppetMode = m;
+          },
+          puppetDensity: this.puppetDensity,
+          onPuppetDensity: (d2: number): void => {
+            this.puppetDensity = d2;
+          },
+          puppetPinCount: this.puppetPins.length,
+          onPuppetApply: (): void => {
+            this.puppetApply();
+          },
+          onPuppetCancel: (): void => {
+            this.puppetPins = [];
+            this.log('操控变形：钉已清空');
+          },
           onSpotHealMode: (m: number): void => {
             this.spotHealMode = m;
             if (this.tool === 'spotHeal') {
@@ -5714,6 +5812,22 @@ struct Index {
                   .position({ x: p[0] - 5, y: p[1] - 5 })
                   .hitTestBehavior(HitTestMode.None)
               }, (p: number[], idx: number): string => `${idx}|${p[0]}|${p[1]}`)
+            }
+            // M20c 操控变形钉预览：src→dst 细线 + 青dst圆点 + 黄src小点（纯视觉）
+            if (this.tool === 'puppet' && this.puppetPins.length > 0) {
+              ForEach(this.puppetPins, (p: PuppetPinDTO, idx: number): void => {
+                Line()
+                  .width('100%').height('100%')
+                  .startPoint([this.pinVpX(p.sx), this.pinVpY(p.sy)])
+                  .endPoint([this.pinVpX(p.dx), this.pinVpY(p.dy)])
+                  .stroke('#88FFFFFF').strokeWidth(1)
+                  .hitTestBehavior(HitTestMode.None)
+                  .opacity(idx === this.puppetDragIdx ? 0 : 1)
+                Circle()
+                  .width(11).height(11).fill(idx === this.puppetDragIdx ? '#FFD54F' : '#00E5FF')
+                  .position({ x: this.pinVpX(p.dx) - 5, y: this.pinVpY(p.dy) - 5 })
+                  .hitTestBehavior(HitTestMode.None)
+              }, (p: PuppetPinDTO, idx: number): string => `pp|${idx}|${p.dx}|${p.dy}`)
             }
             // M18c 钢笔路径预览：白折线 + 青锚点 + 首锚点大圈（闭合热点）
             if (this.penPoints.length >= 4) {
