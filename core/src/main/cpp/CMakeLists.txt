@@ -35,6 +35,7 @@ add_library(compositor SHARED
         engine/text_raster_oh.cpp
         engine/transform_ops.cpp
         engine/resample.cpp
+        engine/resample_hq.cpp
         engine/view_ops.cpp
         io/image_import.cpp
         io/image_export.cpp

@@ -32,6 +32,7 @@
 #include "engine/text_raster.h"
 #include "engine/transform_ops.h"
 #include "engine/resample.h"
+#include "engine/resample_hq.h"
 #include "tiles/magic_wand.h"
 #include "tiles/quick_mask.h"
 #include "tiles/selection_ops.h"
@@ -3119,6 +3120,7 @@ struct DocGeomCtx {
     bool flag = true;   // clockwise / horizontal
     double deg = 0;     // rotArb
     uint32_t w = 0, h = 0;  // resample / caScale
+    int method = 2;         // resample 重采样方法（M20a，2=Bicubic 默认）
     bool changed = false;
     std::string err;    // caScale 失败原因
 };
@@ -3135,13 +3137,13 @@ napi_value DocGeomAsync(napi_env env, napi_callback_info info, int op) {
             napi_get_value_bool(env, argv[0], &ctx->flag);
         }
     } else if (op == 4 || op == 6) {
-        size_t argc = 2;
-        napi_value argv[2] = {nullptr, nullptr};
+        size_t argc = 3;
+        napi_value argv[3] = {nullptr, nullptr, nullptr};
         napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
         if (argc < 2) {
             delete ctx;
             return makeError(env, kErrBadParam,
-                             op == 4 ? "resampleDocument(w, h) requires 2 args"
+                             op == 4 ? "resampleDocument(w, h, method?) requires 2+ args"
                                      : "contentAwareScale(w, h) requires 2 args");
         }
         double w = 0, h = 0;
@@ -3154,6 +3156,12 @@ napi_value DocGeomAsync(napi_env env, napi_callback_info info, int op) {
         }
         ctx->w = static_cast<uint32_t>(w);
         ctx->h = static_cast<uint32_t>(h);
+        if (op == 4 && argc >= 3 && argv[2] != nullptr) {
+            double m = 0;
+            if (napi_get_value_double(env, argv[2], &m) == napi_ok && m >= 0 && m <= 7) {
+                ctx->method = static_cast<int>(m);
+            }
+        }
     } else if (op == 5) {
         size_t argc = 1;
         napi_value argv[1] = {nullptr};
@@ -3221,7 +3229,9 @@ napi_value DocGeomAsync(napi_env env, napi_callback_info info, int op) {
                     break;
                 }
                 case 4:
-                    c->changed = resampleDocument(work, c->w, c->h);
+                    // M20a：method 化 HQ 重采样（缺省 2=Bicubic；旧双线性=1）
+                    c->changed = resampleDocumentHQ(work, c->w, c->h,
+                                                    static_cast<ResampleMethod>(c->method));
                     break;
                 case 5:
                     rotateDocumentArbitrary(work, c->deg);

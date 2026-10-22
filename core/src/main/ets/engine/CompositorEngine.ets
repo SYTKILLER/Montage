@@ -1818,9 +1818,10 @@ export class CompositorEngine {
     return { luma: pick('luma'), r: pick('r'), g: pick('g'), b: pick('b') };
   }
 
-  /** 图像大小重采样（M8c；双线性；异步 work，审查修复 D2 appfreeze）。 */
-  async resampleDocument(w: number, h: number): Promise<boolean> {
-    const value: Object = await (native.resampleDocument(w, h) as Promise<Object>);
+  /** 图像大小重采样（M8c 引入；M20a 升级 HQ 核：method 0 最近邻/1 双线性/2 两次立方/
+   * 3 平滑/4 锐利/5 自动/6 Lanczos/7 保留细节；异步 work）。 */
+  async resampleDocument(w: number, h: number, method?: number): Promise<boolean> {
+    const value: Object = await (native.resampleDocument(w, h, method ?? 2) as Promise<Object>);
     const r = narrowResult(value);
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }

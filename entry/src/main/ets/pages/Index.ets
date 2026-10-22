@@ -355,6 +355,7 @@ struct Index {
   @State imageSizeMode: number = 0;
   @State imgWText: string = '';
   @State imgHText: string = '';
+  @State imgResampleMethod: number = 2;  // M20a 重采样方法（默认两次立方）
   @State channelsCount: number = 0;       // M10c Alpha 通道数（镜像，驱动菜单使能）
   @State showStoreSel: boolean = false;   // 存储选区名字对话框
   @State storeSelText: string = '';
@@ -4191,6 +4192,7 @@ struct Index {
           this.imgWText = `${this.docW}`;
           this.imgHText = `${this.docH}`;
           this.imageSizeMode = 0;
+          this.imgResampleMethod = 2;
           this.showImageSize = true;
         }
         break;
@@ -4252,6 +4254,27 @@ struct Index {
     }
   }
 
+  // M20a 重采样方法下拉项（PS Image Size 选项同序）
+  private resampleOptions(): SelectOption[] {
+    const opts: SelectOption[] = [];
+    for (let i = 0; i < 8; ++i) {
+      opts.push({ value: this.resampleLabel(i) });
+    }
+    return opts;
+  }
+
+  // M20a 重采样方法名（对话框下拉与历史标签共用）
+  private resampleLabel(m: number): string {
+    if (m === 0) { return '最近邻'; }
+    if (m === 1) { return '双线性'; }
+    if (m === 3) { return '两次立方（较平滑）'; }
+    if (m === 4) { return '两次立方（较锐利）'; }
+    if (m === 5) { return '两次立方（自动）'; }
+    if (m === 6) { return 'Lanczos'; }
+    if (m === 7) { return '保留细节（扩大）'; }
+    return '两次立方';
+  }
+
   private commitImageSize(): void {
     const w = parseInt(this.imgWText);
     const h = parseInt(this.imgHText);
@@ -4265,7 +4288,9 @@ struct Index {
       this.docOp((): Promise<boolean> => this.engine.contentAwareScale(w, h),
         `内容感知比例 ${w}×${h}`);
     } else {
-      this.docOp((): Promise<boolean> => this.engine.resampleDocument(w, h), `图像大小 ${w}×${h}`);
+      const methodName: string = this.resampleLabel(this.imgResampleMethod);
+      this.docOp((): Promise<boolean> => this.engine.resampleDocument(w, h, this.imgResampleMethod),
+        `图像大小 ${w}×${h} · ${methodName}`);
     }
   }
 
@@ -6107,6 +6132,20 @@ struct Index {
               Text('高').fontSize(13).fontColor($r('app.color.text_secondary'))
               TextInput({ text: this.imgHText }).width(120).height(40)
                 .onChange((v: string): void => { this.imgHText = v; })
+            }
+            if (this.imageSizeMode === 0) {
+              // M20a 重采样方法下拉（PS Image Size 选项同序）
+              Row({ space: 10 }) {
+                Text('重新采样').fontSize(13).fontColor($r('app.color.text_secondary'))
+                Select(this.resampleOptions())
+                  .selected(this.imgResampleMethod)
+                  .value(this.resampleLabel(this.imgResampleMethod))
+                  .fontColor($r('app.color.text_primary'))
+                  .font({ size: 13 })
+                  .optionFont({ size: 13 })
+                  .width(200)
+                  .onSelect((idx: number): void => { this.imgResampleMethod = idx; })
+              }.width('100%')
             }
             Row({ space: 12 }) {
               Button('取消').fontSize(14).height(40).width(96)
