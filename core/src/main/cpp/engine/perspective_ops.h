@@ -38,6 +38,16 @@ enum class Straighten : int32_t { Horizontal = 0, Vertical = 1, Auto = 2 };
 // 近水平 dst 边强制水平/近垂直强制垂直（45° 内），链接角点联动
 void straighten(std::vector<Plane>& planes, Straighten mode);
 
+// 3×3 单应（公开供 vanishing_ops 等复用）
+struct Homography {
+    double h[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    Pt apply(double x, double y) const;
+    bool invert(Homography& out) const;
+    Homography mul(const Homography& o) const;
+    // 单位方形 (0,0),(1,0),(1,1),(0,1) → 四边形（rect 参数仅保留语义占位）
+    static bool rectToQuad(const double rect[4], const std::array<Pt, 4>& q, Homography& out);
+};
+
 // 准备好的透视变形（正向映射，源→目标）
 class PerspectiveMap {
    public:
@@ -51,12 +61,6 @@ class PerspectiveMap {
     size_t planeCount() const { return planes_.size(); }
 
    private:
-    struct Homography {
-        double h[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
-        Pt apply(double x, double y) const;
-        bool invert(Homography& out) const;
-    };
-    static bool rectToQuad(const double rect[4], const std::array<Pt, 4>& q, Homography& out);
     struct PlaneMap {
         Homography src;
         Homography srcInv;

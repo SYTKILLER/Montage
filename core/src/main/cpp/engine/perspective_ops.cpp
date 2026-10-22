@@ -18,7 +18,7 @@ double dist2(const Pt& a, const Pt& b) {
 }
 }  // namespace
 
-Pt PerspectiveMap::Homography::apply(double x, double y) const {
+Pt Homography::apply(double x, double y) const {
     const double w = h[6] * x + h[7] * y + h[8];
     if (std::fabs(w) < 1e-15) {
         return {1e308, 1e308};
@@ -26,7 +26,7 @@ Pt PerspectiveMap::Homography::apply(double x, double y) const {
     return {(h[0] * x + h[1] * y + h[2]) / w, (h[3] * x + h[4] * y + h[5]) / w};
 }
 
-bool PerspectiveMap::Homography::invert(Homography& out) const {
+bool Homography::invert(Homography& out) const {
     // 3×3 伴随/行列式
     const double* a = h;
     const double i0 = a[4] * a[8] - a[5] * a[7];
@@ -48,8 +48,22 @@ bool PerspectiveMap::Homography::invert(Homography& out) const {
     return true;
 }
 
+Homography Homography::mul(const Homography& o) const {
+    Homography out;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            double s = 0.0;
+            for (int k = 0; k < 3; ++k) {
+                s += h[i * 3 + k] * o.h[k * 3 + j];
+            }
+            out.h[i * 3 + j] = s;
+        }
+    }
+    return out;
+}
+
 // 单位方形 (0,0),(1,0),(1,1),(0,1) → 四边形（Heckbert 方形到四边形单应）
-bool PerspectiveMap::rectToQuad(const double rect[4], const std::array<Pt, 4>& q, Homography& out) {
+bool Homography::rectToQuad(const double rect[4], const std::array<Pt, 4>& q, Homography& out) {
     (void)rect;  // v1 只用单位方形（plane 坐标即 (u,v)）
     const double x0 = q[0][0], y0 = q[0][1];
     const double x1 = q[1][0], y1 = q[1][1];
@@ -240,13 +254,13 @@ bool PerspectiveMap::build(const std::vector<Plane>& planesIn) {
     for (size_t i = 0; i < ps.size(); ++i) {
         const Plane& p = ps[i];
         PlaneMap pm;
-        if (!rectToQuad(unitRect, p.src, pm.src)) {
+        if (!Homography::rectToQuad(unitRect, p.src, pm.src)) {
             return false;
         }
         if (!pm.src.invert(pm.srcInv)) {
             return false;
         }
-        if (!rectToQuad(unitRect, p.dst, pm.dst)) {
+        if (!Homography::rectToQuad(unitRect, p.dst, pm.dst)) {
             return false;
         }
         pm.quad = p.src;
