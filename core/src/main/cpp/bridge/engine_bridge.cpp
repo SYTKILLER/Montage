@@ -34,7 +34,9 @@
 #include "engine/resample.h"
 #include "engine/resample_hq.h"
 #include "engine/liquify_ops.h"
+#include "engine/perspective_ops.h"
 #include "engine/puppet_ops.h"
+#include "engine/warp_ops.h"
 #include "tiles/magic_wand.h"
 #include "tiles/quick_mask.h"
 #include "tiles/selection_ops.h"
@@ -2977,6 +2979,260 @@ napi_value ApplyPuppet(napi_env env, napi_callback_info info) {
         },
         [](napi_env env, napi_status status, void* data) {
             auto* c = static_cast<PuppetCtx*>(data);
+            auto& eg = Engine::get();
+            if (status == napi_ok && c->changed) {
+                eg.historyVersion.fetch_add(1);
+            }
+            napi_value dataObj = nullptr;
+            napi_create_object(env, &dataObj);
+            napi_set_named_property(env, dataObj, "changed",
+                                    makeBool(env, status == napi_ok && c->changed));
+            napi_resolve_deferred(env, c->deferred, makeOk(env, dataObj));
+            napi_delete_async_work(env, c->work);
+            delete c;
+        },
+        ctx, &ctx->work);
+    if (st != napi_ok) {
+        delete ctx;
+        return makeError(env, kErrInternal, "create async work failed");
+    }
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+// ---------- M20d 透视变形命令面：单平面 src/dst 四角一步异步事务（CaOp 同范式）。
+// 渲染=warp_ops warpMeshImg 以 PerspectiveMap::map（doc→doc 分段连续）为正向映射，
+// 4px 网格细分+双三次+收缩预滤波。输出网格重定（origin=渲染 bbox）。 ----------
+struct PerspectiveCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    Document docSnap;
+    uint64_t epoch = 0;
+    int64_t revision = 0;
+    LayerId layerId = 0;
+    perspective::Plane plane;
+    bool changed = false;
+    std::string err;
+};
+
+napi_value ApplyPerspective(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "applyPerspective(layerId, quad8) requires 2 args");
+    }
+    double layerId = 0;
+    if (napi_get_value_double(env, argv[0], &layerId) != napi_ok || layerId < 1) {
+        return makeError(env, kErrBadParam, "applyPerspective: invalid layerId");
+    }
+    bool isArr = false;
+    if (napi_is_array(env, argv[1], &isArr) != napi_ok || !isArr) {
+        return makeError(env, kErrBadParam, "applyPerspective: quad must be array");
+    }
+    uint32_t n = 0;
+    napi_get_array_length(env, argv[1], &n);
+    if (n != 16) {
+        return makeError(env, kErrBadParam, "applyPerspective: quad8 = [src4*2, dst4*2]");
+    }
+    auto* ctx = new PerspectiveCtx();
+    ctx->layerId = static_cast<LayerId>(layerId);
+    for (uint32_t i = 0; i < 8; ++i) {
+        napi_value v = nullptr;
+        double d = 0;
+        if (napi_get_element(env, argv[1], i, &v) != napi_ok ||
+            napi_get_value_double(env, v, &d) != napi_ok) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "applyPerspective: bad quad");
+        }
+        ctx->plane.src[i / 2][i % 2] = d;
+    }
+    for (uint32_t i = 0; i < 8; ++i) {
+        napi_value v = nullptr;
+        double d = 0;
+        if (napi_get_element(env, argv[1], 8 + i, &v) != napi_ok ||
+            napi_get_value_double(env, v, &d) != napi_ok) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "applyPerspective: bad quad");
+        }
+        ctx->plane.dst[i / 2][i % 2] = d;
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0) {
+            delete ctx;
+            return makeError(env, kErrNoDoc, "applyPerspective: no document");
+        }
+        if (e.textEditOpen || e.filterPreview.active) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "applyPerspective: edit/preview session open");
+        }
+        ctx->docSnap = e.doc;
+        ctx->epoch = e.docEpoch;
+        ctx->revision = e.docRevision;
+    }
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value workName = nullptr;
+    napi_create_string_utf8(env, "montagePerspective", NAPI_AUTO_LENGTH, &workName);
+    napi_status st = napi_create_async_work(
+        env, nullptr, workName,
+        [](napi_env /*env*/, void* data) {
+            auto* c = static_cast<PerspectiveCtx*>(data);
+            Document work = c->docSnap;
+            Layer* layer = nullptr;
+            for (Layer& l : work.layers) {
+                if (l.id == c->layerId) {
+                    layer = &l;
+                    break;
+                }
+            }
+            if (layer == nullptr || layer->pixels == nullptr) {
+                c->err = "no raster layer";
+                return;
+            }
+            uint32_t bx = 0, by = 0, bw = 0, bh = 0;
+            if (!layerContentBBox(*layer->pixels, bx, by, bw, bh)) {
+                c->err = "empty layer";
+                return;
+            }
+            // 内容 doc 域 bbox
+            const RectI content{static_cast<int>(layer->transform.originX + bx),
+                                static_cast<int>(layer->transform.originY + by),
+                                static_cast<int>(layer->transform.originX + bx + bw),
+                                static_cast<int>(layer->transform.originY + by + bh)};
+            // 平面 doc → 局部（网格坐标）
+            perspective::Plane local = c->plane;
+            for (int k = 0; k < 4; ++k) {
+                local.src[k][0] -= layer->transform.originX;
+                local.src[k][1] -= layer->transform.originY;
+                local.dst[k][0] -= layer->transform.originX;
+                local.dst[k][1] -= layer->transform.originY;
+            }
+            perspective::PerspectiveMap map;
+            if (!map.build({local})) {
+                c->err = "degenerate quad";
+                return;
+            }
+            if (perspective::PerspectiveMap::isIdentity({local})) {
+                return;  // 无变形不出事务
+            }
+            // 读内容区为 f32
+            warp::Img src;
+            src.w = content.width();
+            src.h = content.height();
+            src.px.resize(static_cast<size_t>(src.w) * src.h * 4u);
+            std::vector<uint8_t> row(static_cast<size_t>(src.w) * 4u);
+            for (int y = 0; y < src.h; ++y) {
+                const uint32_t gy = content.y0 + y;
+                const uint32_t ty = gy / kTileSize;
+                const uint32_t inY = gy % kTileSize;
+                std::memset(row.data(), 0, static_cast<size_t>(src.w) * 4u);
+                for (uint32_t tx = static_cast<uint32_t>(content.x0) / kTileSize;
+                     tx <= static_cast<uint32_t>(content.x1 - 1) / kTileSize; ++tx) {
+                    auto it = layer->pixels->tiles.find(ty * layer->pixels->cols + tx);
+                    if (it == layer->pixels->tiles.end() || it->second == nullptr ||
+                        it->second->pixels == nullptr) {
+                        continue;
+                    }
+                    const uint8_t* sp = it->second->pixels->mapCpu();
+                    if (sp == nullptr) {
+                        continue;
+                    }
+                    const int x0 = std::max(content.x0, static_cast<int>(tx * kTileSize));
+                    const int x1 = std::min(content.x1, static_cast<int>((tx + 1) * kTileSize));
+                    std::memcpy(row.data() + static_cast<size_t>(x0 - content.x0) * 4u,
+                                sp + static_cast<size_t>(inY) * it->second->pixels->rowBytes() +
+                                    static_cast<size_t>(x0 - static_cast<int>(tx * kTileSize)) * 4u,
+                                static_cast<size_t>(x1 - x0) * 4u);
+                }
+                std::memcpy(&src.px[static_cast<size_t>(y) * src.w * 4u], row.data(),
+                            static_cast<size_t>(src.w) * 4u);
+            }
+            // 正向映射渲染（doc→doc；4px 细分逼近分段单应）
+            const double ox = static_cast<double>(layer->transform.originX);
+            const double oy = static_cast<double>(layer->transform.originY);
+            const warp::TriRender res = warp::warpMeshImg(
+                src, RectI{0, 0, src.w, src.h},
+                [&map, ox, oy](double x, double y) {
+                    const perspective::Pt d = map.map(x + ox, y + oy);
+                    return std::array<double, 2>{d[0] - ox, d[1] - oy};
+                },
+                warp::Interp::Bicubic);
+            if (res.out.w <= 0 || res.out.h <= 0) {
+                c->err = "render failed";
+                return;
+            }
+            // 发布网格
+            const uint32_t cols = std::max(
+                1u, (static_cast<uint32_t>(res.out.w) + kTileSize - 1) / kTileSize);
+            const uint32_t rows = std::max(
+                1u, (static_cast<uint32_t>(res.out.h) + kTileSize - 1) / kTileSize);
+            TileGridBuilder builder(cols, rows);
+            for (int y = 0; y < res.out.h; ++y) {
+                std::vector<uint8_t> outRow(static_cast<size_t>(res.out.w) * 4u);
+                bool any = false;
+                for (int x = 0; x < res.out.w; ++x) {
+                    const float* sp = &res.out.px[(static_cast<size_t>(y) * res.out.w + x) * 4u];
+                    uint8_t* d = &outRow[static_cast<size_t>(x) * 4u];
+                    for (int c2 = 0; c2 < 4; ++c2) {
+                        d[c2] = static_cast<uint8_t>(std::lround(std::clamp(sp[c2], 0.0f, 1.0f) * 255.0f));
+                    }
+                    if (d[3] != 0) {
+                        any = true;
+                    }
+                }
+                if (!any) {
+                    continue;
+                }
+                for (uint32_t tx = 0; tx < cols; ++tx) {
+                    bool tileAny = false;
+                    for (uint32_t k = 0; k < kTileSize; ++k) {
+                        const uint32_t x = tx * kTileSize + k;
+                        if (x < static_cast<uint32_t>(res.out.w) &&
+                            outRow[static_cast<size_t>(x) * 4u + 3u] != 0) {
+                            tileAny = true;
+                            break;
+                        }
+                    }
+                    if (!tileAny) {
+                        continue;
+                    }
+                    uint8_t* dst = builder.ensureTile(tx, static_cast<uint32_t>(y) / kTileSize)
+                                       .mapCpuWrite() +
+                                   (y % kTileSize) * kTileSize * 4u;
+                    const uint32_t span = std::min<uint32_t>(kTileSize, static_cast<uint32_t>(res.out.w) - tx * kTileSize);
+                    std::memcpy(dst, &outRow[static_cast<size_t>(tx) * kTileSize * 4u],
+                                static_cast<size_t>(span) * 4u);
+                }
+            }
+            auto grid = builder.publish(layer->pixels->revision + 1);
+            layer->pixels = grid;
+            // 内容 doc 位置=origin+gridLocal；渲染锚定 res.origin（层局部）→ origin 重定
+            layer->transform.originX += res.originX;
+            layer->transform.originY += res.originY;
+            if (layer->mask != nullptr && layer->mask->enabled) {
+                layer->render = composeMasked(layer->pixels, *layer->mask);
+            }
+            c->changed = true;
+            restyleDocument(work);
+            auto& eg = Engine::get();
+            std::lock_guard<std::mutex> lk(eg.docMutex);
+            if (eg.docEpoch == c->epoch && eg.docRevision == c->revision) {
+                eg.history.beginEdit(eg.doc, "\xe9\x80\x8f\xe8\xa7\x86\xe5\x8f\x98\xe5\xbd\xa2",
+                                     static_cast<uint64_t>(eg.docRevision));  // 透视变形
+                eg.doc = std::move(work);
+                eg.history.endEdit(eg.doc, static_cast<uint64_t>(eg.docRevision));
+                eg.bumpRevisionLocked();
+                eg.requestRender();
+            } else {
+                c->changed = false;
+                c->err = "doc changed during perspective";
+            }
+        },
+        [](napi_env env, napi_status status, void* data) {
+            auto* c = static_cast<PerspectiveCtx*>(data);
             auto& eg = Engine::get();
             if (status == napi_ok && c->changed) {
                 eg.historyVersion.fetch_add(1);

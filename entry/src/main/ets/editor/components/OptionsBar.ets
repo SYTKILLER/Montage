@@ -101,6 +101,10 @@ export struct OptionsBar {
   @Prop puppetPinCount: number = 0;
   onPuppetApply: () => void = () => {};
   onPuppetCancel: () => void = () => {};
+  // M20d 透视变形
+  onPerspectiveStraighten: () => void = () => {};
+  onPerspectiveReset: () => void = () => {};
+  onPerspectiveApply: () => void = () => {};
   @Prop cropPending: boolean = false;
   // M10a 选区增强：布尔四态 + 选框形状
   @Link selOp: number;
@@ -464,6 +468,31 @@ export struct OptionsBar {
     .height(36)
   }
 
+  // M20d 透视选项：拉直/重置/应用
+  @Builder
+  perspectiveOptions() {
+    Row({ space: 10 }) {
+      Button('拉直').fontSize(12).height(28).width(56)
+        .backgroundColor($r('app.color.surface'))
+        .fontColor($r('app.color.text_primary'))
+        .border({ width: 1, color: $r('app.color.border') })
+        .onClick((): void => this.onPerspectiveStraighten())
+      Button('重置').fontSize(12).height(28).width(56)
+        .backgroundColor($r('app.color.surface'))
+        .fontColor($r('app.color.text_primary'))
+        .border({ width: 1, color: $r('app.color.border') })
+        .onClick((): void => this.onPerspectiveReset())
+      Button('应用').fontSize(12).height(28).width(56)
+        .backgroundColor($r('app.color.accent'))
+        .fontColor($r('app.color.on_accent'))
+        .onClick((): void => this.onPerspectiveApply())
+      Text('拖四角变形 · 近水平/垂直边可拉直')
+        .fontSize(11)
+        .fontColor($r('app.color.text_secondary'))
+    }
+    .height(36)
+  }
+
   // M20c 操控变形选项：模式/密度切换 + 应用/取消 + 钉数
   @Builder
   puppetOptions() {
@@ -805,6 +834,8 @@ export struct OptionsBar {
         this.liquifyOptions()
       } else if (this.tool === 'puppet') {
         this.puppetOptions()
+      } else if (this.tool === 'perspective') {
+        this.perspectiveOptions()
       } else if (this.tool === 'heal') {
         this.healOptions()
       } else if (this.tool === 'spotHeal') {

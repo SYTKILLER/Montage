@@ -1848,6 +1848,13 @@ export class CompositorEngine {
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
+  /** M20d 透视变形：单平面四角一步异步事务（quad8=[src4*2, dst4*2] doc 坐标）。 */
+  async applyPerspective(layerId: number, quad8: number[]): Promise<boolean> {
+    const value: Object = await (native.applyPerspective(layerId, quad8) as Promise<Object>);
+    const r = narrowResult(value);
+    return r.ok && r.data !== null && boolOf(r.data, 'changed');
+  }
+
   /** 变换 overlay bbox（M8.1；进入 overlay 态）。 */
   beginTransformOverlay(): TransformOverlayBox | null {
     const r = narrowResult(native.beginTransformOverlay() as Object);

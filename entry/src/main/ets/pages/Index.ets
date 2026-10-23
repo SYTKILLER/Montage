@@ -367,6 +367,10 @@ struct Index {
   @State puppetDensity: number = 1;  // 0 更少/1 正常/2 较多
   @State puppetPins: PuppetPinDTO[] = [];
   @State puppetDragIdx: number = -1;
+  // M20d 透视变形（单平面 v1；四角 doc 坐标 [x0,y0,x1,y1,x2,y2,x3,y3] 顺时针自左上）
+  @State perspectiveQuad: number[] = [];
+  @State perspectiveDragIdx: number = -1;
+  private readonly perspectiveSrcBackup: number[] = [];
   @State channelsCount: number = 0;       // M10c Alpha 通道数（镜像，驱动菜单使能）
   @State showStoreSel: boolean = false;   // 存储选区名字对话框
   @State storeSelText: string = '';
@@ -1079,6 +1083,9 @@ struct Index {
       case 'puppet':
         this.puppetTouch(e, docX, docY);  // M20c 操控变形：点击=钉，拖钉=移动
         break;
+      case 'perspective':
+        this.perspectiveTouch(e, docX, docY);  // M20d 透视：拖四角
+        break;
       case 'gradient':
         this.gradientTouch(e, docX, docY);
         break;
@@ -1279,6 +1286,18 @@ struct Index {
 
   private pinVpY(docY: number): number {
     return (docY - this.panY) * this.zoom / this.pxPerVp();
+  }
+
+  // M20d：透视四角 doc → 视口闭合折线点列
+  private perspectiveViewportPts(): number[] {
+    const pts: number[] = [];
+    for (let i = 0; i < 4; ++i) {
+      pts.push(this.pinVpX(this.perspectiveQuad[8 + i * 2]));
+      pts.push(this.pinVpY(this.perspectiveQuad[8 + i * 2 + 1]));
+    }
+    pts.push(this.pinVpX(this.perspectiveQuad[8]));
+    pts.push(this.pinVpY(this.perspectiveQuad[9]));
+    return pts;
   }
 
   // M10a：折线预览文档域 → 视口 points（Polyline 组件坐标 = vp）
@@ -3522,6 +3541,15 @@ struct Index {
     if (this.editingTextId !== 0) {
       this.commitTextEditing();  // 文本编辑会话独占 history pending 槽：任何命令先提交
     }
+    // M20d 透视变形：进透视工具（拖四角→拉直→应用）
+    if (id === 'perspective.enter') {
+      if (this.docOpen) {
+        this.pickTool('perspective');
+        this.perspectiveEnter();
+        this.log('透视变形：拖四角 → 「拉直」可选 → 「应用」');
+      }
+      return;
+    }
     // M20c 操控变形：进操控工具（点击=钉，拖钉=变形，选项条应用）
     if (id === 'puppet.enter') {
       if (this.docOpen) {
@@ -4408,6 +4436,125 @@ struct Index {
       });
   }
 
+  // M20d 透视手势：命中角（20vp 内）=拖角；拖动中实时更新 dst
+  private perspectiveTouch(e: TouchEvent, docX: number, docY: number): void {
+    if (this.perspectiveQuad.length !== 8) {
+      return;
+    }
+    if (e.type === TouchType.Down) {
+      const k = 20 * this.pxPerVp() / this.zoom;
+      for (let i = 0; i < 4; ++i) {
+        const px = this.perspectiveQuad[8 + i * 2];
+        const py = this.perspectiveQuad[8 + i * 2 + 1];
+        if (Math.hypot(docX - px, docY - py) <= k) {
+          this.perspectiveDragIdx = i;
+          return;
+        }
+      }
+      return;
+    }
+    if (e.type === TouchType.Move && this.perspectiveDragIdx >= 0) {
+      this.perspectiveQuad[8 + this.perspectiveDragIdx * 2] = docX;
+      this.perspectiveQuad[8 + this.perspectiveDragIdx * 2 + 1] = docY;
+      return;
+    }
+    if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.perspectiveDragIdx >= 0) {
+      this.perspectiveDragIdx = -1;
+    }
+  }
+
+  // M20d 拉直：近水平 dst 边 y 取均值 / 近垂直 x 取均值（45° 判别；单平面无链接组）
+  private perspectiveStraighten(): void {
+    const q = this.perspectiveQuad;
+    if (q.length !== 8) {
+      return;
+    }
+    for (let k = 0; k < 4; ++k) {
+      const a = 8 + k * 2;
+      const b = 8 + ((k + 1) % 4) * 2;
+      const dx = Math.abs(q[b] - q[a]);
+      const dy = Math.abs(q[b + 1] - q[a + 1]);
+      if (dy <= dx) {
+        const y = (q[a + 1] + q[b + 1]) / 2;
+        q[a + 1] = y;
+        q[b + 1] = y;
+      } else {
+        const x = (q[a] + q[b]) / 2;
+        q[a] = x;
+        q[b] = x;
+      }
+    }
+    this.log('透视：边已拉直（近水平取平/近垂直取直）');
+  }
+
+  private perspectiveReset(): void {
+    if (this.perspectiveQuad.length === 8) {
+      for (let i = 0; i < 8; ++i) {
+        this.perspectiveQuad[8 + i] = this.perspectiveQuad[i];
+      }
+      this.log('透视：dst 已重置为 src');
+    }
+  }
+
+  private perspectiveEnter(): void {
+    const a = this.activeLayer();
+    if (a === undefined || a.isText) {
+      this.toast('无栅格图层');
+      return;
+    }
+    const b = this.engine.getLayerBounds(a.id);
+    let x0 = 0;
+    let y0 = 0;
+    let x1 = this.docW;
+    let y1 = this.docH;
+    if (b !== null && b.ok && b.w > 0 && b.h > 0) {
+      x0 = b.x;
+      y0 = b.y;
+      x1 = b.x + b.w;
+      y1 = b.y + b.h;
+    }
+    this.perspectiveQuad = [x0, y0, x1, y0, x1, y1, x0, y1, x0, y0, x1, y0, x1, y1, x0, y1];
+    this.perspectiveDragIdx = -1;
+    this.perspectiveSrcBackup.length = 0;
+    for (let i = 0; i < 8; ++i) {
+      this.perspectiveSrcBackup.push(this.perspectiveQuad[i]);
+    }
+  }
+
+  private perspectiveApply(): void {
+    const a = this.activeLayer();
+    if (a === undefined || a.isText) {
+      return;
+    }
+    if (this.perspectiveQuad.length !== 8) {
+      return;
+    }
+    // 恒等跳过
+    let moved = false;
+    for (let i = 0; i < 8; ++i) {
+      if (Math.abs(this.perspectiveQuad[8 + i] - this.perspectiveQuad[i]) > 0.5) {
+        moved = true;
+        break;
+      }
+    }
+    if (!moved) {
+      this.toast('未拖动角点');
+      return;
+    }
+    const layerId = a.id;
+    const quad = this.perspectiveQuad.slice();
+    this.engine.applyPerspective(layerId, quad).then((ok: boolean): void => {
+      if (ok) {
+        this.perspectiveQuad = [];
+        this.log('透视变形已应用');
+      } else {
+        this.toast('透视未生效（退化四边形/无变化）');
+      }
+    }).catch((_e: BusinessError): void => {
+      this.toast('透视变形失败');
+    });
+  }
+
   // M20a 重采样方法名（对话框下拉与历史标签共用）
   private resampleLabel(m: number): string {
     if (m === 0) { return '最近邻'; }
@@ -4816,6 +4963,7 @@ struct Index {
       subItem(`filterGroup.${key}`, label, d, groups[key] ?? []);
     filterMenus.push(leafItem('liquify.enter', '液化（笔刷变形）…', '', d));
     filterMenus.push(leafItem('puppet.enter', '操控变形…', '', d));
+    filterMenus.push(leafItem('perspective.enter', '透视变形…', '', d));
     filterMenus.push(menuOf('blur', '模糊'));
     filterMenus.push(menuOf('sharpen', '锐化'));
     filterMenus.push(menuOf('noise', '杂色'));
@@ -5605,6 +5753,15 @@ struct Index {
             this.puppetDensity = d2;
           },
           puppetPinCount: this.puppetPins.length,
+          onPerspectiveStraighten: (): void => {
+            this.perspectiveStraighten();
+          },
+          onPerspectiveReset: (): void => {
+            this.perspectiveReset();
+          },
+          onPerspectiveApply: (): void => {
+            this.perspectiveApply();
+          },
           onPuppetApply: (): void => {
             this.puppetApply();
           },
@@ -5828,6 +5985,25 @@ struct Index {
                   .position({ x: this.pinVpX(p.dx) - 5, y: this.pinVpY(p.dy) - 5 })
                   .hitTestBehavior(HitTestMode.None)
               }, (p: PuppetPinDTO, idx: number): string => `pp|${idx}|${p.dx}|${p.dy}`)
+            }
+            // M20d 透视四角预览：dst 闭合折线 + 白角点（拖拽中高亮）
+            if (this.tool === 'perspective' && this.perspectiveQuad.length === 8) {
+              Polyline()
+                .width('100%').height('100%')
+                .points(this.perspectiveViewportPts())
+                .stroke('#FFFFFF').strokeWidth(1)
+                .fillOpacity(0)
+                .hitTestBehavior(HitTestMode.None)
+              ForEach([0, 1, 2, 3], (i: number): void => {
+                Circle()
+                  .width(12).height(12)
+                  .fill(i === this.perspectiveDragIdx ? '#FFD54F' : '#FFFFFF')
+                  .position({
+                    x: this.pinVpX(this.perspectiveQuad[8 + i * 2]) - 6,
+                    y: this.pinVpY(this.perspectiveQuad[8 + i * 2 + 1]) - 6
+                  })
+                  .hitTestBehavior(HitTestMode.None)
+              }, (i: number): string => `pq|${i}|${this.perspectiveQuad[8 + i * 2]}|${this.perspectiveQuad[8 + i * 2 + 1]}`)
             }
             // M18c 钢笔路径预览：白折线 + 青锚点 + 首锚点大圈（闭合热点）
             if (this.penPoints.length >= 4) {
