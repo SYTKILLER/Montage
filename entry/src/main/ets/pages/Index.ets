@@ -371,6 +371,12 @@ struct Index {
   @State perspectiveQuad: number[] = [];
   @State perspectiveDragIdx: number = -1;
   private readonly perspectiveSrcBackup: number[] = [];
+  // M20d 自适应广角（v1 对话框：模型/焦距/裁切/缩放；约束线 overlay 登记）
+  @State showWideAngle: boolean = false;
+  @State waModel: number = 2;   // 0 自动/1 鱼眼/2 透视/3 全球形
+  @State waFocal: number = 15;
+  @State waCrop: number = 1;
+  @State waScale: number = 100;
   @State channelsCount: number = 0;       // M10c Alpha 通道数（镜像，驱动菜单使能）
   @State showStoreSel: boolean = false;   // 存储选区名字对话框
   @State storeSelText: string = '';
@@ -3541,6 +3547,13 @@ struct Index {
     if (this.editingTextId !== 0) {
       this.commitTextEditing();  // 文本编辑会话独占 history pending 槽：任何命令先提交
     }
+    // M20d 自适应广角：对话框（模型/焦距/裁切/缩放）
+    if (id === 'wideangle.enter') {
+      if (this.docOpen) {
+        this.showWideAngle = true;
+      }
+      return;
+    }
     // M20d 透视变形：进透视工具（拖四角→拉直→应用）
     if (id === 'perspective.enter') {
       if (this.docOpen) {
@@ -4436,6 +4449,25 @@ struct Index {
       });
   }
 
+  // M20d 自适应广角应用（v1 无约束线；scale≠100 或模型弧形时非恒等）
+  private wideAngleApply(): void {
+    const a = this.activeLayer();
+    if (a === undefined || a.isText) {
+      return;
+    }
+    this.showWideAngle = false;
+    const layerId = a.id;
+    this.docOp((): Promise<boolean> =>
+      this.engine.applyWideAngle(layerId, this.waModel, this.waFocal, this.waCrop, this.waScale, []),
+      `自适应广角 (${this.waModel === 1 ? '鱼眼' : this.waModel === 3 ? '全球形' : '透视'} ${this.waFocal}mm ×${Math.round(this.waCrop * 10) / 10} ${this.waScale}%)`);
+  }
+
+  private waModelLabel(): string {
+    if (this.waModel === 1) { return '鱼眼'; }
+    if (this.waModel === 3) { return '全球形'; }
+    return '透视';
+  }
+
   // M20d 透视手势：命中角（20vp 内）=拖角；拖动中实时更新 dst
   private perspectiveTouch(e: TouchEvent, docX: number, docY: number): void {
     if (this.perspectiveQuad.length !== 8) {
@@ -4964,6 +4996,8 @@ struct Index {
     filterMenus.push(leafItem('liquify.enter', '液化（笔刷变形）…', '', d));
     filterMenus.push(leafItem('puppet.enter', '操控变形…', '', d));
     filterMenus.push(leafItem('perspective.enter', '透视变形…', '', d));
+    filterMenus.push(leafItem('wideangle.enter', '自适应广角…', '', d));
+    filterMenus.push(leafItem('vanishing.enter', '消失点…', '', d, false));
     filterMenus.push(menuOf('blur', '模糊'));
     filterMenus.push(menuOf('sharpen', '锐化'));
     filterMenus.push(menuOf('noise', '杂色'));
@@ -6521,6 +6555,57 @@ struct Index {
             }.justifyContent(FlexAlign.End).width('100%')
           }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
             .border({ width: 1, color: $r('app.color.border') }).width(400)
+        }.width('100%').height('100%')
+      }
+      if (this.showWideAngle) {
+        Stack() {
+          Column().width('100%').height('100%').backgroundColor('#66000000')
+            .onClick((): void => { this.showWideAngle = false; })
+          Column({ space: 14 }) {
+            Text('自适应广角').fontSize(16).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+            Text('拉直广角/鱼眼镜头的弯线 · 约束线 overlay 登记下批')
+              .fontSize(11)
+              .fontColor($r('app.color.text_secondary'))
+            Row({ space: 10 }) {
+              Button(this.waModelLabel()).fontSize(12).height(28).width(76)
+                .backgroundColor($r('app.color.surface'))
+                .fontColor($r('app.color.text_primary'))
+                .border({ width: 1, color: $r('app.color.border') })
+                .onClick((): void => { this.waModel = (this.waModel + 1) % 4; })
+              Text('焦距').fontSize(13).fontColor($r('app.color.text_secondary'))
+              Slider({ value: this.waFocal, min: 5, max: 120, step: 1 })
+                .layoutWeight(1)
+                .onChange((v: number): void => { this.waFocal = Math.round(v); })
+              Text(`${Math.round(this.waFocal)}mm`).fontSize(12).fontColor($r('app.color.text_primary')).width(52)
+            }.width('100%')
+            Row({ space: 10 }) {
+              Text('裁切系数').fontSize(13).fontColor($r('app.color.text_secondary'))
+              Slider({ value: this.waCrop, min: 1, max: 3, step: 0.1 })
+                .layoutWeight(1)
+                .onChange((v: number): void => { this.waCrop = Math.round(v * 10) / 10; })
+              Text(`${Math.round(this.waCrop * 10) / 10}`).fontSize(12).fontColor($r('app.color.text_primary')).width(52)
+            }.width('100%')
+            Row({ space: 10 }) {
+              Text('缩放').fontSize(13).fontColor($r('app.color.text_secondary'))
+              Slider({ value: this.waScale, min: 50, max: 150, step: 1 })
+                .layoutWeight(1)
+                .onChange((v: number): void => { this.waScale = Math.round(v); })
+              Text(`${Math.round(this.waScale)}%`).fontSize(12).fontColor($r('app.color.text_primary')).width(52)
+            }.width('100%')
+            Row({ space: 12 }) {
+              Button('取消').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.surface'))
+                .fontColor($r('app.color.text_primary'))
+                .border({ width: 1, color: $r('app.color.border') })
+                .onClick((): void => { this.showWideAngle = false; })
+              Button('确定').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.accent'))
+                .fontColor($r('app.color.on_accent'))
+                .onClick((): void => this.wideAngleApply())
+            }.justifyContent(FlexAlign.End).width('100%')
+          }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
+            .border({ width: 1, color: $r('app.color.border') }).width(420)
         }.width('100%').height('100%')
       }
       if (this.showModify) {

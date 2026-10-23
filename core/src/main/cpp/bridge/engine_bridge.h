@@ -84,6 +84,9 @@ napi_value ApplyPuppet(napi_env env, napi_callback_info info);
 
 // M20d 透视变形：单平面四角一步异步事务
 napi_value ApplyPerspective(napi_env env, napi_callback_info info);
+
+// M20d 自适应广角：约束线+镜头模型一步异步事务
+napi_value ApplyWideAngle(napi_env env, napi_callback_info info);
 napi_value ContentAwareMove(napi_env env, napi_callback_info info);
 // M19c 内容感知比例：contentAwareScale(w,h) 活动图层缝雕刻+画布随缩放
 napi_value ContentAwareScale(napi_env env, napi_callback_info info);

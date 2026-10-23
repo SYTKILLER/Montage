@@ -100,6 +100,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"applyLiquify", nullptr, montage::bridge::ApplyLiquify, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"applyPuppet", nullptr, montage::bridge::ApplyPuppet, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"applyPerspective", nullptr, montage::bridge::ApplyPerspective, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"applyWideAngle", nullptr, montage::bridge::ApplyWideAngle, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"rotateDocumentArbitrary", nullptr, montage::bridge::RotateDocumentArbitrary, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"bakeLayerTransform", nullptr, montage::bridge::BakeLayerTransform, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"beginTransformOverlay", nullptr, montage::bridge::BeginTransformOverlay, nullptr, nullptr, nullptr, napi_default, nullptr},

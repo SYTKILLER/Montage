@@ -1855,6 +1855,16 @@ export class CompositorEngine {
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
+  /** M20d 自适应广角：约束线+镜头模型一步异步事务（model 0 自动/1 鱼眼/2 透视/3 全球形；
+   * constraints=[{ax,ay,bx,by,orientation 0 自由/1 水平/2 垂直}] doc 坐标）。 */
+  async applyWideAngle(layerId: number, model: number, focal: number, crop: number,
+    scale: number, constraints: Object[]): Promise<boolean> {
+    const value: Object =
+      await (native.applyWideAngle(layerId, model, focal, crop, scale, constraints) as Promise<Object>);
+    const r = narrowResult(value);
+    return r.ok && r.data !== null && boolOf(r.data, 'changed');
+  }
+
   /** 变换 overlay bbox（M8.1；进入 overlay 态）。 */
   beginTransformOverlay(): TransformOverlayBox | null {
     const r = narrowResult(native.beginTransformOverlay() as Object);

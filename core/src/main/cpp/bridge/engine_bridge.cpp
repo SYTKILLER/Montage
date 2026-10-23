@@ -35,6 +35,7 @@
 #include "engine/resample_hq.h"
 #include "engine/liquify_ops.h"
 #include "engine/perspective_ops.h"
+#include "engine/wideangle_ops.h"
 #include "engine/puppet_ops.h"
 #include "engine/warp_ops.h"
 #include "tiles/magic_wand.h"
@@ -3233,6 +3234,266 @@ napi_value ApplyPerspective(napi_env env, napi_callback_info info) {
         },
         [](napi_env env, napi_status status, void* data) {
             auto* c = static_cast<PerspectiveCtx*>(data);
+            auto& eg = Engine::get();
+            if (status == napi_ok && c->changed) {
+                eg.historyVersion.fetch_add(1);
+            }
+            napi_value dataObj = nullptr;
+            napi_create_object(env, &dataObj);
+            napi_set_named_property(env, dataObj, "changed",
+                                    makeBool(env, status == napi_ok && c->changed));
+            napi_resolve_deferred(env, c->deferred, makeOk(env, dataObj));
+            napi_delete_async_work(env, c->work);
+            delete c;
+        },
+        ctx, &ctx->work);
+    if (st != napi_ok) {
+        delete ctx;
+        return makeError(env, kErrInternal, "create async work failed");
+    }
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+// ---------- M20d 自适应广角命令面：约束线+镜头模型一步异步事务（CaOp 同范式）。
+// 渲染=solve 网格 → warp_ops warpTrianglesImg（约束曲线顶点对 (out,src)）。
+// 无约束 = 恒等（拒绝不出事务）。 ----------
+struct WideAngleCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    Document docSnap;
+    uint64_t epoch = 0;
+    int64_t revision = 0;
+    LayerId layerId = 0;
+    wideangle::Params params;
+    bool changed = false;
+    std::string err;
+};
+
+napi_value ApplyWideAngle(napi_env env, napi_callback_info info) {
+    size_t argc = 6;
+    napi_value argv[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 5) {
+        return makeError(env, kErrBadParam,
+                         "applyWideAngle(layerId, model, focal, crop, scale, constraints?) requires 5+ args");
+    }
+    auto* ctx = new WideAngleCtx();
+    auto num = [&](napi_value v, double& out) -> bool {
+        return napi_get_value_double(env, v, &out) == napi_ok;
+    };
+    double layerId = 0, model = 0, focal = 0, crop = 1, scale = 100;
+    if (!num(argv[0], layerId) || !num(argv[1], model) || !num(argv[2], focal) ||
+        !num(argv[3], crop) || !num(argv[4], scale) || layerId < 1) {
+        delete ctx;
+        return makeError(env, kErrBadParam, "applyWideAngle: invalid args");
+    }
+    ctx->layerId = static_cast<LayerId>(layerId);
+    ctx->params.model = static_cast<wideangle::Model>(static_cast<int32_t>(model));
+    ctx->params.focalLength = focal;
+    ctx->params.cropFactor = crop;
+    ctx->params.scale = scale;
+    if (argc >= 6 && argv[5] != nullptr) {
+        bool isArr = false;
+        if (napi_is_array(env, argv[5], &isArr) == napi_ok && isArr) {
+            uint32_t n = 0;
+            napi_get_array_length(env, argv[5], &n);
+            for (uint32_t k = 0; k < n; ++k) {
+                napi_value obj = nullptr;
+                if (napi_get_element(env, argv[5], k, &obj) != napi_ok) {
+                    continue;
+                }
+                wideangle::Constraint c;
+                auto fld = [&](const char* key, double& v) -> bool {
+                    napi_value f = nullptr;
+                    return napi_get_named_property(env, obj, key, &f) == napi_ok && f != nullptr &&
+                           napi_get_value_double(env, f, &v) == napi_ok;
+                };
+                double ax = 0, ay = 0, bx = 0, by = 0, orient = 0;
+                if (!fld("ax", ax) || !fld("ay", ay) || !fld("bx", bx) || !fld("by", by)) {
+                    continue;
+                }
+                fld("orientation", orient);
+                c.a = {ax, ay};
+                c.b = {bx, by};
+                c.orientation = static_cast<wideangle::Orientation>(static_cast<int32_t>(orient));
+                ctx->params.constraints.push_back(c);
+            }
+        }
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0) {
+            delete ctx;
+            return makeError(env, kErrNoDoc, "applyWideAngle: no document");
+        }
+        if (e.textEditOpen || e.filterPreview.active) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "applyWideAngle: edit/preview session open");
+        }
+        ctx->docSnap = e.doc;
+        ctx->epoch = e.docEpoch;
+        ctx->revision = e.docRevision;
+    }
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value workName = nullptr;
+    napi_create_string_utf8(env, "montageWideAngle", NAPI_AUTO_LENGTH, &workName);
+    napi_status st = napi_create_async_work(
+        env, nullptr, workName,
+        [](napi_env /*env*/, void* data) {
+            auto* c = static_cast<WideAngleCtx*>(data);
+            Document work = c->docSnap;
+            Layer* layer = nullptr;
+            for (Layer& l : work.layers) {
+                if (l.id == c->layerId) {
+                    layer = &l;
+                    break;
+                }
+            }
+            if (layer == nullptr || layer->pixels == nullptr) {
+                c->err = "no raster layer";
+                return;
+            }
+            uint32_t bx = 0, by = 0, bw = 0, bh = 0;
+            if (!layerContentBBox(*layer->pixels, bx, by, bw, bh)) {
+                c->err = "empty layer";
+                return;
+            }
+            // 约束 doc → 层局部（帧=内容 bbox）
+            const RectI frame{static_cast<int>(bx), static_cast<int>(by),
+                              static_cast<int>(bx + bw), static_cast<int>(by + bh)};
+            for (wideangle::Constraint& cst : c->params.constraints) {
+                cst.a[0] -= bx;
+                cst.a[1] -= by;
+                cst.b[0] -= bx;
+                cst.b[1] -= by;
+            }
+            // 读内容区
+            warp::Img src;
+            src.w = frame.width();
+            src.h = frame.height();
+            src.px.resize(static_cast<size_t>(src.w) * src.h * 4u);
+            std::vector<uint8_t> row(static_cast<size_t>(src.w) * 4u);
+            for (int y = 0; y < src.h; ++y) {
+                const uint32_t gy = frame.y0 + y;
+                const uint32_t ty = gy / kTileSize;
+                const uint32_t inY = gy % kTileSize;
+                std::memset(row.data(), 0, static_cast<size_t>(src.w) * 4u);
+                for (uint32_t tx = static_cast<uint32_t>(frame.x0) / kTileSize;
+                     tx <= static_cast<uint32_t>(frame.x1 - 1) / kTileSize; ++tx) {
+                    auto it = layer->pixels->tiles.find(ty * layer->pixels->cols + tx);
+                    if (it == layer->pixels->tiles.end() || it->second == nullptr ||
+                        it->second->pixels == nullptr) {
+                        continue;
+                    }
+                    const uint8_t* sp = it->second->pixels->mapCpu();
+                    if (sp == nullptr) {
+                        continue;
+                    }
+                    const int x0 = std::max(frame.x0, static_cast<int>(tx * kTileSize));
+                    const int x1 = std::min(frame.x1, static_cast<int>((tx + 1) * kTileSize));
+                    std::memcpy(row.data() + static_cast<size_t>(x0 - frame.x0) * 4u,
+                                sp + static_cast<size_t>(inY) * it->second->pixels->rowBytes() +
+                                    static_cast<size_t>(x0 - static_cast<int>(tx * kTileSize)) * 4u,
+                                static_cast<size_t>(x1 - x0) * 4u);
+                }
+                std::memcpy(&src.px[static_cast<size_t>(y) * src.w * 4u], row.data(),
+                            static_cast<size_t>(src.w) * 4u);
+            }
+            // 求解 + 渲染（(out, src) 顶点对直接给 warpTrianglesImg）
+            const wideangle::Mesh mesh = wideangle::solve(c->params, frame);
+            if (mesh.verts.empty()) {
+                c->err = "solve failed";
+                return;
+            }
+            bool identity = true;
+            for (const auto& v : mesh.verts) {
+                if (std::fabs(v.first[0] - v.second[0]) > 1e-9 ||
+                    std::fabs(v.first[1] - v.second[1]) > 1e-9) {
+                    identity = false;
+                    break;
+                }
+            }
+            if (identity) {
+                return;  // 无约束/无缩放 = 恒等
+            }
+            const auto tris = mesh.triangles();
+            const double originX = frame.x0;
+            const double originY = frame.y0;
+            const warp::TriRender res = warp::warpTrianglesImg(
+                src, RectI{0, 0, src.w, src.h}, mesh.verts, tris, warp::Interp::Bicubic,
+                0.0, 0.0, frame.width(), frame.height());
+            if (res.out.w <= 0) {
+                c->err = "render failed";
+                return;
+            }
+            // 发布（帧原点不变：网格 (out,src) 都是 doc 域，输出=帧 bbox 同位）
+            const uint32_t cols = std::max(
+                1u, (static_cast<uint32_t>(res.out.w) + kTileSize - 1) / kTileSize);
+            const uint32_t rows = std::max(
+                1u, (static_cast<uint32_t>(res.out.h) + kTileSize - 1) / kTileSize);
+            TileGridBuilder builder(cols, rows);
+            for (int y = 0; y < res.out.h; ++y) {
+                std::vector<uint8_t> outRow(static_cast<size_t>(res.out.w) * 4u);
+                bool any = false;
+                for (int x = 0; x < res.out.w; ++x) {
+                    const float* sp = &res.out.px[(static_cast<size_t>(y) * res.out.w + x) * 4u];
+                    uint8_t* d = &outRow[static_cast<size_t>(x) * 4u];
+                    for (int c2 = 0; c2 < 4; ++c2) {
+                        d[c2] = static_cast<uint8_t>(std::lround(std::clamp(sp[c2], 0.0f, 1.0f) * 255.0f));
+                    }
+                    if (d[3] != 0) {
+                        any = true;
+                    }
+                }
+                if (!any) {
+                    continue;
+                }
+                for (uint32_t tx = 0; tx < cols; ++tx) {
+                    bool tileAny = false;
+                    for (uint32_t k = 0; k < kTileSize; ++k) {
+                        const uint32_t x = tx * kTileSize + k;
+                        if (x < static_cast<uint32_t>(res.out.w) &&
+                            outRow[static_cast<size_t>(x) * 4u + 3u] != 0) {
+                            tileAny = true;
+                            break;
+                        }
+                    }
+                    if (!tileAny) {
+                        continue;
+                    }
+                    uint8_t* dst = builder.ensureTile(tx, static_cast<uint32_t>(y) / kTileSize)
+                                       .mapCpuWrite() +
+                                   (y % kTileSize) * kTileSize * 4u;
+                    const uint32_t span = std::min<uint32_t>(kTileSize, static_cast<uint32_t>(res.out.w) - tx * kTileSize);
+                    std::memcpy(dst, &outRow[static_cast<size_t>(tx) * kTileSize * 4u],
+                                static_cast<size_t>(span) * 4u);
+                }
+            }
+            layer->pixels = builder.publish(layer->pixels->revision + 1);
+            if (layer->mask != nullptr && layer->mask->enabled) {
+                layer->render = composeMasked(layer->pixels, *layer->mask);
+            }
+            c->changed = true;
+            restyleDocument(work);
+            auto& eg = Engine::get();
+            std::lock_guard<std::mutex> lk(eg.docMutex);
+            if (eg.docEpoch == c->epoch && eg.docRevision == c->revision) {
+                eg.history.beginEdit(eg.doc, "\xe8\x87\xaa\xe9\x80\x82\xe5\xba\x94\xe5\xb9\xbf\xe8\xa7\x92",
+                                     static_cast<uint64_t>(eg.docRevision));  // 自适应广角
+                eg.doc = std::move(work);
+                eg.history.endEdit(eg.doc, static_cast<uint64_t>(eg.docRevision));
+                eg.bumpRevisionLocked();
+                eg.requestRender();
+            } else {
+                c->changed = false;
+                c->err = "doc changed during wide angle";
+            }
+        },
+        [](napi_env env, napi_status status, void* data) {
+            auto* c = static_cast<WideAngleCtx*>(data);
             auto& eg = Engine::get();
             if (status == napi_ok && c->changed) {
                 eg.historyVersion.fetch_add(1);
