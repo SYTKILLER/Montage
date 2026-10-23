@@ -1865,6 +1865,15 @@ export class CompositorEngine {
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
+  /** M20d 消失点透视克隆：平面四角+克隆源+dab 点列一步异步事务（全 doc 坐标）。 */
+  async applyVpClone(layerId: number, quad8: number[], sx: number, sy: number,
+    points: number[][], size: number, hardness: number, opacity: number): Promise<boolean> {
+    const value: Object = await (native.applyVpClone(layerId, quad8, sx, sy, points, size,
+      hardness, opacity) as Promise<Object>);
+    const r = narrowResult(value);
+    return r.ok && r.data !== null && boolOf(r.data, 'changed');
+  }
+
   /** 变换 overlay bbox（M8.1；进入 overlay 态）。 */
   beginTransformOverlay(): TransformOverlayBox | null {
     const r = narrowResult(native.beginTransformOverlay() as Object);

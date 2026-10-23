@@ -36,6 +36,7 @@
 #include "engine/liquify_ops.h"
 #include "engine/perspective_ops.h"
 #include "engine/wideangle_ops.h"
+#include "engine/vanishing_ops.h"
 #include "engine/puppet_ops.h"
 #include "engine/warp_ops.h"
 #include "tiles/magic_wand.h"
@@ -3494,6 +3495,302 @@ napi_value ApplyWideAngle(napi_env env, napi_callback_info info) {
         },
         [](napi_env env, napi_status status, void* data) {
             auto* c = static_cast<WideAngleCtx*>(data);
+            auto& eg = Engine::get();
+            if (status == napi_ok && c->changed) {
+                eg.historyVersion.fetch_add(1);
+            }
+            napi_value dataObj = nullptr;
+            napi_create_object(env, &dataObj);
+            napi_set_named_property(env, dataObj, "changed",
+                                    makeBool(env, status == napi_ok && c->changed));
+            napi_resolve_deferred(env, c->deferred, makeOk(env, dataObj));
+            napi_delete_async_work(env, c->work);
+            delete c;
+        },
+        ctx, &ctx->work);
+    if (st != napi_ok) {
+        delete ctx;
+        return makeError(env, kErrInternal, "create async work failed");
+    }
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+// ---------- M20d 消失点透视克隆命令面：平面四角+克隆源+一笔 dab 一步异步事务
+//（CaOp 同范式）。内核 vanishing::Scene（单平面，焦距自动推）+ cloneStroke
+//（度量偏移固定 dab，纹理随距离缩小）。 ----------
+struct VpCloneCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    Document docSnap;
+    uint64_t epoch = 0;
+    int64_t revision = 0;
+    LayerId layerId = 0;
+    vanishing::VpPlane plane;
+    std::array<double, 2> source = {0.0, 0.0};
+    std::vector<std::array<double, 2>> points;
+    double size = 40.0;
+    double hardness = 0.8;
+    float opacity = 1.0f;
+    bool changed = false;
+    std::string err;
+};
+
+napi_value ApplyVpClone(napi_env env, napi_callback_info info) {
+    size_t argc = 7;
+    napi_value argv[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 5) {
+        return makeError(env, kErrBadParam,
+                         "applyVpClone(layerId, quad8, sx, sy, points, size?, hardness?, opacity?) requires 5+ args");
+    }
+    auto* ctx = new VpCloneCtx();
+    auto numOf = [&](napi_value v, double& out) -> bool {
+        return napi_get_value_double(env, v, &out) == napi_ok;
+    };
+    double layerId = 0;
+    if (!numOf(argv[0], layerId) || layerId < 1) {
+        delete ctx;
+        return makeError(env, kErrBadParam, "applyVpClone: invalid layerId");
+    }
+    ctx->layerId = static_cast<LayerId>(layerId);
+    bool isArr = false;
+    if (napi_is_array(env, argv[1], &isArr) != napi_ok || !isArr) {
+        delete ctx;
+        return makeError(env, kErrBadParam, "applyVpClone: quad must be array");
+    }
+    uint32_t qn = 0;
+    napi_get_array_length(env, argv[1], &qn);
+    if (qn != 8) {
+        delete ctx;
+        return makeError(env, kErrBadParam, "applyVpClone: quad8 required");
+    }
+    for (uint32_t i = 0; i < 8; ++i) {
+        napi_value v = nullptr;
+        double d = 0;
+        if (napi_get_element(env, argv[1], i, &v) != napi_ok ||
+            napi_get_value_double(env, v, &d) != napi_ok) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "applyVpClone: bad quad");
+        }
+        ctx->plane.corners[i / 2][i % 2] = d;
+    }
+    double sx = 0, sy = 0;
+    if (!numOf(argv[2], sx) || !numOf(argv[3], sy)) {
+        delete ctx;
+        return makeError(env, kErrBadParam, "applyVpClone: bad source");
+    }
+    ctx->source = {sx, sy};
+    if (napi_is_array(env, argv[4], &isArr) != napi_ok || !isArr) {
+        delete ctx;
+        return makeError(env, kErrBadParam, "applyVpClone: points must be array");
+    }
+    uint32_t pn = 0;
+    napi_get_array_length(env, argv[4], &pn);
+    for (uint32_t i = 0; i < pn; ++i) {
+        napi_value pt = nullptr;
+        if (napi_get_element(env, argv[4], i, &pt) != napi_ok) {
+            continue;
+        }
+        bool ptArr = false;
+        if (napi_is_array(env, pt, &ptArr) != napi_ok || !ptArr) {
+            continue;
+        }
+        uint32_t dn = 0;
+        napi_get_array_length(env, pt, &dn);
+        if (dn < 2) {
+            continue;
+        }
+        napi_value xv = nullptr, yv = nullptr;
+        double x = 0, y = 0;
+        if (napi_get_element(env, pt, 0, &xv) == napi_ok &&
+            napi_get_element(env, pt, 1, &yv) == napi_ok &&
+            napi_get_value_double(env, xv, &x) == napi_ok &&
+            napi_get_value_double(env, yv, &y) == napi_ok) {
+            ctx->points.push_back({x, y});
+        }
+    }
+    if (ctx->points.empty()) {
+        delete ctx;
+        return makeError(env, kErrBadParam, "applyVpClone: empty points");
+    }
+    if (argc >= 6) {
+        double size = 40;
+        if (numOf(argv[5], size) && size >= 1.0) {
+            ctx->size = size;
+        }
+    }
+    if (argc >= 7) {
+        double hard = 0.8;
+        if (numOf(argv[6], hard)) {
+            ctx->hardness = std::clamp(hard, 0.0, 0.99);
+        }
+    }
+    if (argc >= 8) {
+        double op = 1.0;
+        if (numOf(argv[7], op)) {
+            ctx->opacity = static_cast<float>(std::clamp(op, 0.0, 1.0));
+        }
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0) {
+            delete ctx;
+            return makeError(env, kErrNoDoc, "applyVpClone: no document");
+        }
+        if (e.textEditOpen || e.filterPreview.active) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "applyVpClone: edit/preview session open");
+        }
+        ctx->docSnap = e.doc;
+        ctx->epoch = e.docEpoch;
+        ctx->revision = e.docRevision;
+    }
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value workName = nullptr;
+    napi_create_string_utf8(env, "montageVpClone", NAPI_AUTO_LENGTH, &workName);
+    napi_status st = napi_create_async_work(
+        env, nullptr, workName,
+        [](napi_env /*env*/, void* data) {
+            auto* c = static_cast<VpCloneCtx*>(data);
+            Document work = c->docSnap;
+            Layer* layer = nullptr;
+            for (Layer& l : work.layers) {
+                if (l.id == c->layerId) {
+                    layer = &l;
+                    break;
+                }
+            }
+            if (layer == nullptr || layer->pixels == nullptr) {
+                c->err = "no raster layer";
+                return;
+            }
+            const uint32_t gw = layer->pixels->cols * kTileSize;
+            const uint32_t gh = layer->pixels->rows * kTileSize;
+            // 网格 → f32
+            warp::Img img;
+            img.w = static_cast<int>(gw);
+            img.h = static_cast<int>(gh);
+            img.px.assign(static_cast<size_t>(gw) * gh * 4u, 0.0f);
+            std::vector<uint8_t> row(static_cast<size_t>(gw) * 4u);
+            for (uint32_t y = 0; y < gh; ++y) {
+                const uint32_t ty = y / kTileSize;
+                const uint32_t inY = y % kTileSize;
+                std::memset(row.data(), 0, static_cast<size_t>(gw) * 4u);
+                for (uint32_t tx = 0; tx < layer->pixels->cols; ++tx) {
+                    auto it = layer->pixels->tiles.find(ty * layer->pixels->cols + tx);
+                    if (it == layer->pixels->tiles.end() || it->second == nullptr ||
+                        it->second->pixels == nullptr) {
+                        continue;
+                    }
+                    const uint8_t* sp = it->second->pixels->mapCpu();
+                    if (sp == nullptr) {
+                        continue;
+                    }
+                    std::memcpy(row.data() + static_cast<size_t>(tx) * kTileSize * 4u,
+                                sp + static_cast<size_t>(inY) * it->second->pixels->rowBytes(),
+                                static_cast<size_t>(kTileSize) * 4u);
+                }
+                for (uint32_t x = 0; x < gw; ++x) {
+                    float* d = &img.px[(static_cast<size_t>(y) * gw + x) * 4u];
+                    d[0] = static_cast<float>(row[static_cast<size_t>(x) * 4u]) / 255.0f;
+                    d[1] = static_cast<float>(row[static_cast<size_t>(x) * 4u + 1u]) / 255.0f;
+                    d[2] = static_cast<float>(row[static_cast<size_t>(x) * 4u + 2u]) / 255.0f;
+                    d[3] = static_cast<float>(row[static_cast<size_t>(x) * 4u + 3u]) / 255.0f;
+                }
+            }
+            // 焦距：平面自动推，失败回退 800px（对角量级由内核 fallback 语义）
+            const std::array<double, 2> center = {static_cast<double>(work.width) / 2.0,
+                                                  static_cast<double>(work.height) / 2.0};
+            vanishing::Scene scene(c->plane, center, 0.0, 800.0);
+            const int dabs = vanishing::cloneStroke(scene, img, c->source, c->points, c->size,
+                                                    c->hardness, c->opacity);
+            if (dabs == 0) {
+                c->err = "no dabs (plane/source off canvas?)";
+                return;
+            }
+            // 写回（触区限定：dab bbox 外扩笔刷直径；瓦片 COW 与 liquify 区域路径同构）
+            double bbx0 = 1e308, bby0 = 1e308, bbx1 = -1e308, bby1 = -1e308;
+            for (const auto& pt : c->points) {
+                bbx0 = std::min(bbx0, pt[0]);
+                bby0 = std::min(bby0, pt[1]);
+                bbx1 = std::max(bbx1, pt[0]);
+                bby1 = std::max(bby1, pt[1]);
+            }
+            const double pad = c->size * 2.0 + 4.0;
+            const int wy0 = std::max(0, static_cast<int>(std::floor(bby0 - pad)));
+            const int wy1 = std::min(static_cast<int>(gh), static_cast<int>(std::ceil(bby1 + pad)));
+            const int wx0 = std::max(0, static_cast<int>(std::floor(bbx0 - pad)));
+            const int wx1 = std::min(static_cast<int>(gw), static_cast<int>(std::ceil(bbx1 + pad)));
+            auto cloned = std::make_shared<TileGrid>(*layer->pixels);
+            std::vector<uint8_t> outRow(static_cast<size_t>(std::max(1, wx1 - wx0)) * 4u);
+            for (int y = wy0; y < wy1; ++y) {
+                bool any = false;
+                for (int x = wx0; x < wx1; ++x) {
+                    const float* sp = &img.px[(static_cast<size_t>(y) * gw + x) * 4u];
+                    uint8_t* d = &outRow[static_cast<size_t>(x - wx0) * 4u];
+                    for (int ch = 0; ch < 4; ++ch) {
+                        d[ch] = static_cast<uint8_t>(std::lround(std::clamp(sp[ch], 0.0f, 1.0f) * 255.0f));
+                    }
+                    if (d[3] != 0) {
+                        any = true;
+                    }
+                }
+                if (!any) {
+                    continue;
+                }
+                const uint32_t ty = static_cast<uint32_t>(y) / kTileSize;
+                for (int txI = wx0 / static_cast<int>(kTileSize);
+                     txI <= (wx1 - 1) / static_cast<int>(kTileSize); ++txI) {
+                    const uint32_t tx = static_cast<uint32_t>(txI);
+                    // COW：新建瓦片整片拷贝
+                    auto tile = std::make_shared<Tile>();
+                    tile->pixels.reset(new EngineBuffer(kTileSize, kTileSize));
+                    auto it = cloned->tiles.find(ty * layer->pixels->cols + tx);
+                    if (it != cloned->tiles.end() && it->second != nullptr &&
+                        it->second->pixels != nullptr) {
+                        const uint8_t* oldPx = it->second->pixels->mapCpu();
+                        if (oldPx != nullptr) {
+                            std::memcpy(tile->pixels->mapCpuWrite(), oldPx,
+                                        static_cast<size_t>(it->second->pixels->rowBytes()) * kTileSize);
+                        }
+                    }
+                    const int x0 = std::max(wx0, static_cast<int>(tx * kTileSize));
+                    const int x1 = std::min(wx1, static_cast<int>((tx + 1) * kTileSize));
+                    uint8_t* base = tile->pixels->mapCpuWrite() + (y % kTileSize) * kTileSize * 4u;
+                    for (int x = x0; x < x1; ++x) {
+                        std::memcpy(base + static_cast<size_t>(x % kTileSize) * 4u,
+                                    &outRow[static_cast<size_t>(x - wx0) * 4u], 4u);
+                    }
+                    cloned->tiles[ty * layer->pixels->cols + tx] = std::move(tile);
+                }
+            }
+            cloned->revision = layer->pixels->revision + 1;
+            std::shared_ptr<const TileGrid> published = cloned;
+            layer->pixels = published;
+            if (layer->mask != nullptr && layer->mask->enabled) {
+                layer->render = composeMasked(layer->pixels, *layer->mask);
+            }
+            c->changed = true;
+            restyleDocument(work);
+            auto& eg = Engine::get();
+            std::lock_guard<std::mutex> lk(eg.docMutex);
+            if (eg.docEpoch == c->epoch && eg.docRevision == c->revision) {
+                eg.history.beginEdit(eg.doc, "\xe6\xb6\x88\xe5\xa4\xb1\xe7\x82\xb9\xe9\x80\x8f\xe8\xa7\x86\xe5\x85\x8b\xe9\x9a\x86",
+                                     static_cast<uint64_t>(eg.docRevision));  // 消失点透视克隆
+                eg.doc = std::move(work);
+                eg.history.endEdit(eg.doc, static_cast<uint64_t>(eg.docRevision));
+                eg.bumpRevisionLocked();
+                eg.requestRender();
+            } else {
+                c->changed = false;
+                c->err = "doc changed during vp clone";
+            }
+        },
+        [](napi_env env, napi_status status, void* data) {
+            auto* c = static_cast<VpCloneCtx*>(data);
             auto& eg = Engine::get();
             if (status == napi_ok && c->changed) {
                 eg.historyVersion.fetch_add(1);

@@ -101,6 +101,11 @@ export struct OptionsBar {
   @Prop puppetPinCount: number = 0;
   onPuppetApply: () => void = () => {};
   onPuppetCancel: () => void = () => {};
+  // M20d 消失点
+  @Prop vpSourceSet: boolean = false;
+  onVpPickSource: () => void = () => {};
+  onVpReset: () => void = () => {};
+  @Link vpSize: number;
   // M20d 透视变形
   onPerspectiveStraighten: () => void = () => {};
   onPerspectiveReset: () => void = () => {};
@@ -464,6 +469,30 @@ export struct OptionsBar {
         'Alt+点击或取源模式选点 → 涂抹修复')
         .fontSize(11)
         .fontColor(this.cloneSourceSet ? $r('app.color.text_secondary') : $r('app.color.danger'))
+    }
+    .height(36)
+  }
+
+  // M20d 消失点选项：取源/重置 + 直径
+  @Builder
+  vanishingOptions() {
+    Row({ space: 10 }) {
+      Button(this.vpSourceSet ? '已取源' : '取源')
+        .fontSize(12).height(28).width(this.vpSourceSet ? 68 : 56)
+        .backgroundColor(this.vpSourceSet ? $r('app.color.surface') : $r('app.color.accent'))
+        .fontColor(this.vpSourceSet ? $r('app.color.text_primary') : $r('app.color.on_accent'))
+        .border({ width: 1, color: $r('app.color.border') })
+        .onClick((): void => this.onVpPickSource())
+      Button('重置平面').fontSize(12).height(28).width(80)
+        .backgroundColor($r('app.color.surface'))
+        .fontColor($r('app.color.text_primary'))
+        .border({ width: 1, color: $r('app.color.border') })
+        .onClick((): void => this.onVpReset())
+      OptionSlider({ label: '直径', value: $vpSize, min: 10, max: 300, step: 2,
+        suffix: 'px', onCommitted: (_v: number): void => {} })
+      Text('点 4 下定平面 → 取源 → 点按克隆')
+        .fontSize(11)
+        .fontColor($r('app.color.text_secondary'))
     }
     .height(36)
   }
@@ -836,6 +865,8 @@ export struct OptionsBar {
         this.puppetOptions()
       } else if (this.tool === 'perspective') {
         this.perspectiveOptions()
+      } else if (this.tool === 'vanishing') {
+        this.vanishingOptions()
       } else if (this.tool === 'heal') {
         this.healOptions()
       } else if (this.tool === 'spotHeal') {

@@ -372,6 +372,12 @@ struct Index {
   @State perspectiveDragIdx: number = -1;
   private readonly perspectiveSrcBackup: number[] = [];
   // M20d 自适应广角（v1 对话框：模型/焦距/裁切/缩放；约束线 overlay 登记）
+  // M20d 消失点透视克隆（4 击定平面 → 取源 → 点按克隆一笔一事务）
+  @State vpQuad: number[] = [];
+  @State vpSource: number[] = [];
+  @State vpSourceSet: boolean = false;
+  @State vpSize: number = 60;
+  private vpPickingSource: boolean = false;
   @State showWideAngle: boolean = false;
   @State waModel: number = 2;   // 0 自动/1 鱼眼/2 透视/3 全球形
   @State waFocal: number = 15;
@@ -1092,6 +1098,9 @@ struct Index {
       case 'perspective':
         this.perspectiveTouch(e, docX, docY);  // M20d 透视：拖四角
         break;
+      case 'vanishing':
+        this.vanishingTouch(e, docX, docY);
+        break;
       case 'gradient':
         this.gradientTouch(e, docX, docY);
         break;
@@ -1296,13 +1305,17 @@ struct Index {
 
   // M20d：透视四角 doc → 视口闭合折线点列
   private perspectiveViewportPts(): number[] {
+    return this.perspectiveViewportPtsOf(this.perspectiveQuad.slice(8));
+  }
+
+  private perspectiveViewportPtsOf(quad: number[]): number[] {
     const pts: number[] = [];
     for (let i = 0; i < 4; ++i) {
-      pts.push(this.pinVpX(this.perspectiveQuad[8 + i * 2]));
-      pts.push(this.pinVpY(this.perspectiveQuad[8 + i * 2 + 1]));
+      pts.push(this.pinVpX(quad[i * 2]));
+      pts.push(this.pinVpY(quad[i * 2 + 1]));
     }
-    pts.push(this.pinVpX(this.perspectiveQuad[8]));
-    pts.push(this.pinVpY(this.perspectiveQuad[9]));
+    pts.push(this.pinVpX(quad[0]));
+    pts.push(this.pinVpY(quad[1]));
     return pts;
   }
 
@@ -3547,6 +3560,14 @@ struct Index {
     if (this.editingTextId !== 0) {
       this.commitTextEditing();  // 文本编辑会话独占 history pending 槽：任何命令先提交
     }
+    // M20d 消失点：进透视克隆工具
+    if (id === 'vanishing.enter') {
+      if (this.docOpen) {
+        this.pickTool('vanishing');
+        this.log('消失点：点 4 下定平面 → 取源 → 点按克隆（选项条重置）');
+      }
+      return;
+    }
     // M20d 自适应广角：对话框（模型/焦距/裁切/缩放）
     if (id === 'wideangle.enter') {
       if (this.docOpen) {
@@ -4449,6 +4470,66 @@ struct Index {
       });
   }
 
+  // M20d 消失点手势
+  private vanishingTouch(e: TouchEvent, docX: number, docY: number): void {
+    if (e.type !== TouchType.Down) {
+      return;
+    }
+    if (this.vpQuad.length < 8) {
+      this.vpQuad.push(docX, docY);
+      if (this.vpQuad.length === 8) {
+        this.log('消失点：平面已定形 → 取源 → 点按克隆');
+      }
+      return;
+    }
+    if (this.altHeld || this.vpPickingSource) {
+      this.vpSource = [docX, docY];
+      this.vpSourceSet = true;
+      this.vpPickingSource = false;
+      this.log(`消失点克隆源已设 (${docX.toFixed(0)},${docY.toFixed(0)})`);
+      return;
+    }
+    if (!this.vpSourceSet) {
+      this.toast('先设克隆源');
+      return;
+    }
+    const a = this.activeLayer();
+    if (a === undefined || a.isText) {
+      return;
+    }
+    const layerId = a.id;
+    const quad = this.vpQuad.slice();
+    const sx = this.vpSource[0];
+    const sy = this.vpSource[1];
+    const pts: number[][] = [[docX, docY]];
+    this.engine.applyVpClone(layerId, quad, sx, sy, pts, this.vpSize, 0.8, 1.0)
+      .then((ok: boolean): void => {
+        if (!ok) {
+          this.toast('克隆未生效（平面/源出界）');
+        }
+      })
+      .catch((_e: BusinessError): void => {
+        this.toast('透视克隆失败');
+      });
+  }
+
+  // M20d：平面采集中已落角点序号
+  private vpPendingIdx(): number[] {
+    const idx: number[] = [];
+    for (let i = 0; i < this.vpQuad.length / 2; ++i) {
+      idx.push(i);
+    }
+    return idx;
+  }
+
+  private vanishingReset(): void {
+    this.vpQuad = [];
+    this.vpSource = [];
+    this.vpSourceSet = false;
+    this.vpPickingSource = false;
+    this.log('消失点：平面与源已重置');
+  }
+
   // M20d 自适应广角应用（v1 无约束线；scale≠100 或模型弧形时非恒等）
   private wideAngleApply(): void {
     const a = this.activeLayer();
@@ -4997,7 +5078,7 @@ struct Index {
     filterMenus.push(leafItem('puppet.enter', '操控变形…', '', d));
     filterMenus.push(leafItem('perspective.enter', '透视变形…', '', d));
     filterMenus.push(leafItem('wideangle.enter', '自适应广角…', '', d));
-    filterMenus.push(leafItem('vanishing.enter', '消失点…', '', d, false));
+    filterMenus.push(leafItem('vanishing.enter', '消失点（透视克隆）…', '', d));
     filterMenus.push(menuOf('blur', '模糊'));
     filterMenus.push(menuOf('sharpen', '锐化'));
     filterMenus.push(menuOf('noise', '杂色'));
@@ -5786,6 +5867,15 @@ struct Index {
           onPuppetDensity: (d2: number): void => {
             this.puppetDensity = d2;
           },
+          vpSourceSet: this.vpSourceSet,
+          onVpPickSource: (): void => {
+            this.vpPickingSource = !this.vpPickingSource;
+            this.log(`取源模式: ${this.vpPickingSource ? '开' : '关'}`);
+          },
+          onVpReset: (): void => {
+            this.vanishingReset();
+          },
+          vpSize: $vpSize,
           puppetPinCount: this.puppetPins.length,
           onPerspectiveStraighten: (): void => {
             this.perspectiveStraighten();
@@ -6038,6 +6128,30 @@ struct Index {
                   })
                   .hitTestBehavior(HitTestMode.None)
               }, (i: number): string => `pq|${i}|${this.perspectiveQuad[8 + i * 2]}|${this.perspectiveQuad[8 + i * 2 + 1]}`)
+            }
+            // M20d 消失点预览：定形平面黄折线 / 采集中青点
+            if (this.tool === 'vanishing') {
+              if (this.vpQuad.length === 8) {
+                Polyline()
+                  .width('100%').height('100%')
+                  .points(this.perspectiveViewportPtsOf(this.vpQuad))
+                  .stroke('#FFD54F').strokeWidth(1)
+                  .fillOpacity(0)
+                  .hitTestBehavior(HitTestMode.None)
+                if (this.vpSourceSet) {
+                  Circle()
+                    .width(10).height(10).fill('#00E5FF')
+                    .position({ x: this.pinVpX(this.vpSource[0]) - 5, y: this.pinVpY(this.vpSource[1]) - 5 })
+                    .hitTestBehavior(HitTestMode.None)
+                }
+              } else if (this.vpQuad.length >= 2) {
+                ForEach(this.vpPendingIdx(), (i: number): void => {
+                    Circle()
+                      .width(8).height(8).fill('#00E5FF')
+                      .position({ x: this.pinVpX(this.vpQuad[i * 2]) - 4, y: this.pinVpY(this.vpQuad[i * 2 + 1]) - 4 })
+                      .hitTestBehavior(HitTestMode.None)
+                  }, (i: number): string => `vq|${i}|${this.vpQuad[i * 2]}|${this.vpQuad[i * 2 + 1]}`)
+              }
             }
             // M18c 钢笔路径预览：白折线 + 青锚点 + 首锚点大圈（闭合热点）
             if (this.penPoints.length >= 4) {

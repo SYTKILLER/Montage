@@ -9,6 +9,7 @@
 
 #include "engine/inpaint_ops.h"  // RectI
 #include "engine/perspective_ops.h"  // Homography
+#include "engine/warp_ops.h"  // Img（稠密 f32 RGBA，与 warp 共用）
 
 #include <array>
 #include <cstdint>
@@ -20,11 +21,7 @@ namespace vanishing {
 
 using inpaint::RectI;
 
-struct Img {
-    std::vector<float> px;  // w*h*4 RGBA
-    int w = 0;
-    int h = 0;
-};
+using Img = warp::Img;
 
 using V3 = std::array<double, 3>;
 
