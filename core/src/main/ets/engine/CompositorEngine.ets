@@ -1,7 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
-import { EngineStats, ExportPngData, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, } from '../model/EngineTypes';
+import { EngineStats, ExportPngData, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, SmartFilterDTO, SmartInfoDTO, } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -162,6 +162,10 @@ function narrowLayer(r: Record<string, Object>): LayerDTO {
     styleOn: boolOf(r, 'styleOn'),
     isFill: boolOf(r, 'isFill'),
     isShape: boolOf(r, 'isShape'),
+    isSmart: boolOf(r, 'isSmart'),
+    smartFilters: num(r, 'smartFilters'),
+    smartFiltersOn: boolOf(r, 'smartFiltersOn'),
+    smartHasMask: boolOf(r, 'smartHasMask'),
     shapeLiveKind: num(r, 'shapeLiveKind'),
     shapeRect: numArr(r, 'shapeRect'),
     shapeRadii: numArr(r, 'shapeRadii'),
@@ -2184,6 +2188,153 @@ export class CompositorEngine {
     }
     const d = r.data;
     return { ok: boolOf(d, 'ok'), x: num(d, 'x'), y: num(d, 'y'), w: num(d, 'w'), h: num(d, 'h') };
+  }
+
+  // ---------- M21 智能对象与智能滤镜 ----------
+
+  /** 转换为智能对象（多选根层/单层一步异步事务；返回新 SO 层 id，0 = 失败）。 */
+  async convertToSmartObject(layerIds: number[]): Promise<number> {
+    const value: Object = await (native.convertToSmartObject(layerIds) as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok || r.data === null) {
+      return 0;
+    }
+    return num(r.data, 'layer');
+  }
+
+  /** 置入嵌入的智能对象（源字节 ArrayBuffer + 文件名；适配居中放置）。 */
+  async placeEmbedded(fileName: string, bytes: Object): Promise<number> {
+    const value: Object = await (native.placeEmbedded(fileName, bytes) as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok || r.data === null) {
+      return 0;
+    }
+    return num(r.data, 'layer');
+  }
+
+  /** 替换内容（全共享实例换源重渲）。 */
+  async replaceSmartContents(layerId: number, fileName: string, bytes: Object): Promise<boolean> {
+    const value: Object =
+      await (native.replaceSmartContents(layerId, fileName, bytes) as Promise<Object>);
+    const r = narrowResult(value);
+    return r.ok && r.data !== null && boolOf(r.data, 'changed');
+  }
+
+  /** 智能对象放置仿射（行主序 6 参一步事务）。 */
+  async setSmartTransform(layerId: number, m: number[]): Promise<boolean> {
+    const value: Object = await (native.setSmartTransform(layerId, m) as Promise<Object>);
+    const r = narrowResult(value);
+    return r.ok && r.data !== null && boolOf(r.data, 'changed');
+  }
+
+  /** 追加智能滤镜（kind+参数槽；有选区且无蒙版时选区自动成滤镜蒙版——PS 语义）。 */
+  async addSmartFilter(layerId: number, kind: number, p: number[], seed: number,
+    blend: number, opacity: number, name: string): Promise<boolean> {
+    const value: Object = await (native.addSmartFilter(layerId, kind, p[0], p[1], p[2], p[3],
+      p[4], p[5], seed, blend, opacity, name) as Promise<Object>);
+    const r = narrowResult(value);
+    return r.ok && r.data !== null && boolOf(r.data, 'changed');
+  }
+
+  /** 编辑智能滤镜参数（index 定位；visible/blend/opacity/参数槽全量提交）。 */
+  async setSmartFilter(layerId: number, index: number, p: number[], seed: number,
+    blend: number, opacity: number, visible: boolean, name: string): Promise<boolean> {
+    const value: Object =
+      await (native.setSmartFilter(layerId, index, p[0], p[1], p[2], p[3], p[4], p[5], seed,
+        blend, opacity, visible ? 1 : 0, name) as Promise<Object>);
+    const r = narrowResult(value);
+    return r.ok && r.data !== null && boolOf(r.data, 'changed');
+  }
+
+  async removeSmartFilter(layerId: number, index: number): Promise<boolean> {
+    const value: Object = await (native.removeSmartFilter(layerId, index) as Promise<Object>);
+    const r = narrowResult(value);
+    return r.ok && r.data !== null && boolOf(r.data, 'changed');
+  }
+
+  async moveSmartFilter(layerId: number, from: number, to: number): Promise<boolean> {
+    const value: Object = await (native.moveSmartFilter(layerId, from, to) as Promise<Object>);
+    const r = narrowResult(value);
+    return r.ok && r.data !== null && boolOf(r.data, 'changed');
+  }
+
+  async setSmartFiltersEnabled(layerId: number, enabled: boolean): Promise<boolean> {
+    const value: Object =
+      await (native.setSmartFiltersEnabled(layerId, enabled ? 1 : 0) as Promise<Object>);
+    const r = narrowResult(value);
+    return r.ok && r.data !== null && boolOf(r.data, 'changed');
+  }
+
+  /** 滤镜蒙版（mode：0=清除 1=从当前选区建/更新 2=启停 flag）。 */
+  async setSmartFilterMask(layerId: number, mode: number, flag: boolean): Promise<boolean> {
+    const value: Object =
+      await (native.setSmartFilterMask(layerId, mode, flag ? 1 : 0) as Promise<Object>);
+    const r = narrowResult(value);
+    return r.ok && r.data !== null && boolOf(r.data, 'changed');
+  }
+
+  /** 栅格化智能对象（像素 = effective 外观，清 smart/蒙版/样式）。 */
+  rasterizeSmartObject(layerId: number): boolean {
+    const r = narrowResult(native.rasterizeSmartObject(layerId) as Object);
+    return r.ok;
+  }
+
+  /** 通过拷贝新建智能对象（共享源字节、独立内容；返回新层 id）。 */
+  newSmartObjectViaCopy(layerId: number): number {
+    const r = narrowResult(native.newSmartObjectViaCopy(layerId) as Object);
+    if (!r.ok || r.data === null) {
+      return 0;
+    }
+    return num(r.data, 'layer');
+  }
+
+  getSmartInfo(layerId: number): SmartInfoDTO {
+    const empty: SmartFilterDTO[] = [];
+    const emptyInfo: SmartInfoDTO = {
+      isSmart: false, contentsId: 0, embedded: true, fileName: '', linkedPath: '',
+      filtersEnabled: true, hasFilterMask: false, filterMaskEnabled: false,
+      sourceAvailable: false, filters: empty
+    };
+    const r = narrowResult(native.getSmartInfo(layerId) as Object);
+    if (!r.ok || r.data === null) {
+      return emptyInfo;
+    }
+    const d = r.data;
+    const filtersArr: SmartFilterDTO[] = [];
+    const rawFilters: Object = d['filters'];
+    if (Array.isArray(rawFilters)) {
+      for (const fo of rawFilters as Object[]) {
+        const f = fo as Record<string, Object>;
+        const pArr: number[] = [];
+        const rawP: Object = f['p'];
+        if (Array.isArray(rawP)) {
+          for (const pv of rawP as Object[]) {
+            pArr.push(typeof pv === 'number' ? pv : 0);
+          }
+        }
+        filtersArr.push({
+          kind: num(f, 'kind'), name: str(f, 'name'), psdClass: str(f, 'psdClass'),
+          blend: num(f, 'blend'), opacity: num(f, 'opacity'), visible: boolOf(f, 'visible'),
+          unsupported: boolOf(f, 'unsupported'), p: pArr, seed: num(f, 'seed')
+        });
+      }
+    }
+    return {
+      isSmart: boolOf(d, 'isSmart'), contentsId: num(d, 'contentsId'),
+      embedded: boolOf(d, 'embedded'), fileName: str(d, 'fileName'),
+      linkedPath: str(d, 'linkedPath'), filtersEnabled: boolOf(d, 'filtersEnabled'),
+      hasFilterMask: boolOf(d, 'hasFilterMask'), filterMaskEnabled: boolOf(d, 'filterMaskEnabled'),
+      sourceAvailable: boolOf(d, 'sourceAvailable'), filters: filtersArr
+    };
+  }
+
+  /** 导出内容（源字节写 fd；返回字节数，-1 = 失败）。 */
+  exportSmartContents(layerId: number, fd: number): number {
+    const r = narrowResult(native.exportSmartContents(layerId, fd) as Object);
+    if (!r.ok || r.data === null) {
+      return -1;
+    }
+    return num(r.data, 'bytes');
   }
 
   dispose(): void {

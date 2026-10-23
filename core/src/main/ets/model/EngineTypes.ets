@@ -163,6 +163,10 @@ export interface LayerDTO {
   textH: number;
   // M18 形状层字段（非形状层为常量缺省）
   isShape: boolean;
+  isSmart: boolean;   // M21 智能对象层
+  smartFilters: number;   // M21 智能滤镜数（0 = 无）
+  smartFiltersOn: boolean; // M21 整栈开关（非 SO 层恒 true）
+  smartHasMask: boolean;   // M21 滤镜蒙版存在
   shapeLiveKind: number;  // 0=None 1=Rect 2=Ellipse 3=Polygon 4=Line
   shapeRect: number[];    // [x,y,w,h]
   shapeRadii: number[];   // [tl,tr,br,bl]
@@ -282,4 +286,31 @@ export interface TransformOverlayBox {
   top: number;
   width: number;
   height: number;
+}
+
+/** 智能滤镜条目（getSmartInfo 的 filters 元素，M21；kind<0 = PSD 未实现滤镜直通）。 */
+export interface SmartFilterDTO {
+  kind: number;
+  name: string;
+  psdClass: string;
+  blend: number;
+  opacity: number;
+  visible: boolean;
+  unsupported: boolean;
+  p: number[];
+  seed: number;
+}
+
+/** 智能对象状态读回（getSmartInfo 的 data，M21）。 */
+export interface SmartInfoDTO {
+  isSmart: boolean;
+  contentsId: number;
+  embedded: boolean;
+  fileName: string;
+  linkedPath: string;
+  filtersEnabled: boolean;
+  hasFilterMask: boolean;
+  filterMaskEnabled: boolean;
+  sourceAvailable: boolean;
+  filters: SmartFilterDTO[];
 }

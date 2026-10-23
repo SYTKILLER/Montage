@@ -49,6 +49,9 @@ bool layersToSmart(const std::string& name, LayerId newId, std::vector<Layer>& m
 // 便捷单层版（name 取层名；外观态——可见/不透明/混合/剪贴——保留到 SO wrapper）
 bool layerToSmart(const Layer& l, LayerId newId, Layer& out, std::string& err);
 
+// 源预解码入缓存（置入/替换命令用：取源尺寸算放置，后续 renderLayer 缓存命中不二次解码）
+bool ensureSourceCached(const SmartLayerState& sm, uint32_t& w, uint32_t& h, std::string& err);
+
 // 会话缓存清理（Engine::resetDocument 挂载点：源解码/placed 缓存随文档替换清空）
 void clearSessionCaches();
 

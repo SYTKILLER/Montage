@@ -44,6 +44,7 @@ export struct LayersPanel {
   onDuplicate: () => void = () => {};
   onLinkToggle: () => void = () => {};
   onStyle: () => void = () => {};
+  onSmartFilters: (l: LayerDTO) => void = (_l: LayerDTO) => {};
   onMoveToParent: (id: number, newParent: number, flatIndex: number) => void =
     (_id: number, _newParent: number, _flatIndex: number) => {};
   onOpacityChange: (v: number) => void = (_v: number) => {};
@@ -353,6 +354,15 @@ export struct LayersPanel {
                       .fontColor($r('app.color.on_accent'))
                       .backgroundColor($r('app.color.icon_muted'))
                   }
+                  if (l.isSmart) {
+                    Text(`智${l.smartFilters > 0 ? l.smartFilters : ''}`)
+                      .fontSize(9)
+                      .width(20).height(16).borderRadius(3)
+                      .textAlign(TextAlign.Center)
+                      .fontColor($r('app.color.on_accent'))
+                      .backgroundColor($r('app.color.accent'))
+                      .onClick((): void => this.onSmartFilters(l))
+                  }
                   Text(l.name)
                     .fontSize(12)
                     .fontColor($r('app.color.text_primary'))
@@ -395,7 +405,7 @@ export struct LayersPanel {
           `${l.thumbToken}|${l.hasMask}|${l.maskEnabled}|${l.clipping}|${l.name}|` +
           `${this.getThumb(l.id) !== null ? 'p' : 'n'}|${this.thumbVersion}|` +
           `${l.isGroup ? 'g' : 'n'}|${l.collapsed ? 'c' : 'o'}|${l.parentId}|${this.panelVersion}|` +
-          `${this.isSelected(l) ? 's' : 'n'}|${l.linkId}|${l.hasStyle ? 'f' : 'n'}|${l.isFill ? 'i' : 'n'}`)
+          `${this.isSelected(l) ? 's' : 'n'}|${l.linkId}|${l.hasStyle ? 'f' : 'n'}|${l.isFill ? 'i' : 'n'}|${l.isSmart ? 'S' : 'n'}${l.smartFilters}|${l.smartFiltersOn ? 'o' : 'x'}${l.smartHasMask ? 'm' : 'n'}`)
       }
       .layoutWeight(1)
       .scrollBar(BarState.Auto)

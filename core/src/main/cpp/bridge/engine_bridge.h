@@ -263,6 +263,22 @@ napi_value DeleteCustomShape(napi_env env, napi_callback_info info);
 napi_value PlaceCustomShape(napi_env env, napi_callback_info info);
 napi_value SetLayerVectorMask(napi_env env, napi_callback_info info);
 napi_value SetVectorMaskEnabled(napi_env env, napi_callback_info info);
+
+// ---------- M21 智能对象与智能滤镜 ----------
+napi_value ConvertToSmartObject(napi_env env, napi_callback_info info);
+napi_value PlaceEmbedded(napi_env env, napi_callback_info info);
+napi_value ReplaceSmartContents(napi_env env, napi_callback_info info);
+napi_value SetSmartTransform(napi_env env, napi_callback_info info);
+napi_value AddSmartFilter(napi_env env, napi_callback_info info);
+napi_value SetSmartFilter(napi_env env, napi_callback_info info);
+napi_value RemoveSmartFilter(napi_env env, napi_callback_info info);
+napi_value MoveSmartFilter(napi_env env, napi_callback_info info);
+napi_value SetSmartFiltersEnabled(napi_env env, napi_callback_info info);
+napi_value SetSmartFilterMask(napi_env env, napi_callback_info info);
+napi_value RasterizeSmartObject(napi_env env, napi_callback_info info);
+napi_value NewSmartObjectViaCopy(napi_env env, napi_callback_info info);
+napi_value GetSmartInfo(napi_env env, napi_callback_info info);
+napi_value ExportSmartContents(napi_env env, napi_callback_info info);
 // 页面销毁时释放回调与渲染线程
 napi_value Dispose(napi_env env, napi_callback_info info);
 

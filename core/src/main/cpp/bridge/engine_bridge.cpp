@@ -6,6 +6,8 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
+#include <cstdio>
 #include <string>
 #include <vector>
 #include <unistd.h>
@@ -38,6 +40,7 @@
 #include "engine/wideangle_ops.h"
 #include "engine/vanishing_ops.h"
 #include "engine/puppet_ops.h"
+#include "engine/smart_ops.h"
 #include "engine/warp_ops.h"
 #include "tiles/magic_wand.h"
 #include "tiles/quick_mask.h"
@@ -852,6 +855,15 @@ napi_value makeLayerDto(napi_env env, const Layer& l, bool isActive) {
     napi_set_named_property(env, obj, "isFill", makeBool(env, l.fill != nullptr));
     // M18 形状层字段（非形状层给常量缺省，DTO 形状稳定）
     napi_set_named_property(env, obj, "isShape", makeBool(env, l.shape != nullptr));
+    napi_set_named_property(env, obj, "isSmart", makeBool(env, l.smart != nullptr));
+    napi_set_named_property(env, obj, "smartFilters",
+                            makeDouble(env, static_cast<double>(l.smart != nullptr
+                                                                  ? l.smart->filters.size()
+                                                                  : 0)));
+    napi_set_named_property(env, obj, "smartFiltersOn",
+                            makeBool(env, l.smart == nullptr || l.smart->filtersEnabled));
+    napi_set_named_property(env, obj, "smartHasMask",
+                            makeBool(env, l.smart != nullptr && l.smart->filterMask != nullptr));
     if (l.shape != nullptr) {
         const ShapeLayerState& sh = *l.shape;
         napi_set_named_property(env, obj, "shapeLiveKind", makeInt32(env, static_cast<int32_t>(sh.live.kind)));
@@ -8877,6 +8889,905 @@ napi_value SetVectorMaskEnabled(napi_env env, napi_callback_info info) {
         e.requestRender();
     }
     return makeOk(env, nullptr);
+}
+
+// ---------- M21 智能对象与智能滤镜（photocraft smart_cmds.rs 命令面；重渲一律异步
+// CaOp 范式：锁内快照 → 锁外渲染 → 发布段 epoch/revision 复核） ----------
+
+// 共享内容实例收集（contentsId 相同 = 同源实例，含组内；替换内容全实例联动）
+void smartCollectInstances(Document& doc, uint64_t contentsId, std::vector<Layer*>& out) {
+    for (Layer& l : doc.layers) {
+        if (l.smart != nullptr && l.smart->contentsId == contentsId) {
+            out.push_back(&l);
+        }
+    }
+}
+
+// 当前选区 → 滤镜蒙版（ink bbox 裁剪 patch；offset 相对 SO 层 origin——放置域局部）
+std::shared_ptr<LayerMask> smartFilterMaskFromSelection(Document& doc, const Layer& so) {
+    if (doc.selection == nullptr) {
+        return nullptr;
+    }
+    uint32_t ix = 0, iy = 0, iw = 0, ih = 0;
+    if (!gridInkBBox(*doc.selection, ix, iy, iw, ih)) {
+        return nullptr;
+    }
+    const uint32_t cols = (iw + kTileSize - 1u) / kTileSize;
+    const uint32_t rows = (ih + kTileSize - 1u) / kTileSize;
+    TileGridBuilder builder(cols, rows);
+    for (uint32_t ty = 0; ty < rows; ++ty) {
+        for (uint32_t tx = 0; tx < cols; ++tx) {
+            EngineBuffer& buf = builder.ensureTile(tx, ty);
+            uint8_t* dst = buf.mapCpuWrite();
+            const uint32_t y0 = ty * kTileSize;
+            const uint32_t x0 = tx * kTileSize;
+            const uint32_t copyH = std::min(kTileSize, ih - y0);
+            const uint32_t copyW = std::min(kTileSize, iw - x0);
+            for (uint32_t r = 0; r < copyH; ++r) {
+                uint8_t* row = dst + static_cast<size_t>(r) * buf.rowBytes();
+                const uint32_t sy = iy + y0 + r;
+                const uint32_t stx = ix / kTileSize;
+                const uint32_t sty = sy / kTileSize;
+                const uint32_t inCol = sy % kTileSize;
+                auto it = doc.selection->tiles.find(sty * doc.selection->cols + stx + tx);
+                if (it != doc.selection->tiles.end()) {
+                    const uint8_t* sbase = it->second->pixels->mapCpu();
+                    const uint32_t sstride = it->second->pixels->rowBytes();
+                    const uint32_t inRow = ix % kTileSize;
+                    const uint32_t avail = kTileSize - inRow;
+                    const uint32_t span = std::min(copyW, avail);
+                    for (uint32_t c = 0; c < span; ++c) {
+                        const uint8_t g = sbase[static_cast<size_t>(inCol) * sstride +
+                                                (inRow + c) * 4u];
+                        row[(x0 + c) * 4u + 0] = g;
+                        row[(x0 + c) * 4u + 1] = g;
+                        row[(x0 + c) * 4u + 2] = g;
+                        row[(x0 + c) * 4u + 3] = 255;
+                    }
+                    it->second->pixels->unmap();
+                }
+            }
+        }
+    }
+    auto m = std::make_shared<LayerMask>();
+    m->pixels = builder.publish(1);
+    m->width = iw;
+    m->height = ih;
+    m->offsetX = static_cast<int>(ix) - static_cast<int>(std::lround(so.transform.originX));
+    m->offsetY = static_cast<int>(iy) - static_cast<int>(std::lround(so.transform.originY));
+    m->outside = 255;
+    m->enabled = true;
+    m->linked = true;
+    return m;
+}
+
+std::string smartOpLabel(int op, const std::string& name);
+
+struct SmartOpCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    Document docSnap;
+    uint64_t epoch = 0;
+    int64_t revision = 0;
+    int op = 0;
+    std::vector<LayerId> ids;
+    LayerId layerId = 0;
+    std::vector<uint8_t> bytes;
+    std::string fileName;
+    double m[6] = {1, 0, 0, 0, 1, 0};
+    filters::FilterParams fp;
+    BlendMode blend = BlendMode::Normal;
+    double opacity = 1.0;
+    bool flag = false;
+    int index = 0;
+    int index2 = 0;
+    int maskMode = 0;
+    std::string name;
+    LayerId newLayerId = 0;
+    bool changed = false;
+    std::string err;
+};
+
+// op 表：0 convert 1 placeEmbedded 2 replaceContents 3 setTransform 4 addFilter
+//        5 setFilter 6 removeFilter 7 moveFilter 8 filtersEnabled 9 filterMask
+napi_value SmartOpAsync(napi_env env, napi_callback_info info, int op) {
+    auto& e = Engine::get();
+    auto* ctx = new SmartOpCtx();
+    ctx->op = op;
+    size_t argc = 16;
+    napi_value argv[16] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    const char* needMsg = op == 0 ? "convertToSmartObject(layerIds) requires 1 arg"
+                          : op == 1 ? "placeEmbedded(name, bytes) requires 2 args"
+                          : op == 2 ? "replaceSmartContents(id, name, bytes) requires 3 args"
+                                    : "smart op requires args";
+    const size_t needN = op == 0 ? 1 : op == 1 ? 2 : op == 2 ? 3 : 1;
+    if (argc < needN) {
+        delete ctx;
+        return makeError(env, kErrBadParam, needMsg);
+    }
+    auto num = [&](size_t i, double* out) -> bool {
+        return napi_get_value_double(env, argv[i], out) == napi_ok;
+    };
+    if (op == 0) {
+        bool isArr = false;
+        if (napi_is_array(env, argv[0], &isArr) != napi_ok || !isArr) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "convertToSmartObject: layerIds must be array");
+        }
+        uint32_t n = 0;
+        napi_get_array_length(env, argv[0], &n);
+        for (uint32_t i = 0; i < n; ++i) {
+            napi_value el = nullptr;
+            double v = 0;
+            if (napi_get_element(env, argv[0], i, &el) != napi_ok ||
+                napi_get_value_double(env, el, &v) != napi_ok) {
+                delete ctx;
+                return makeError(env, kErrBadParam, "convertToSmartObject: bad id");
+            }
+            ctx->ids.push_back(static_cast<LayerId>(v));
+        }
+    } else if (op == 1 || op == 2) {
+        const size_t base = op == 1 ? 0 : 1;
+        if (op == 2) {
+            double id = 0;
+            if (!num(0, &id)) {
+                delete ctx;
+                return makeError(env, kErrBadParam, "replaceSmartContents: bad id");
+            }
+            ctx->layerId = static_cast<LayerId>(id);
+        }
+        char buf[512];
+        size_t len = 0;
+        if (napi_get_value_string_utf8(env, argv[base], buf, sizeof(buf), &len) != napi_ok) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "smart source name must be string");
+        }
+        ctx->fileName.assign(buf, len);
+        void* data = nullptr;
+        size_t blen = 0;
+        if (napi_get_arraybuffer_info(env, argv[base + 1], &data, &blen) != napi_ok ||
+            data == nullptr || blen == 0) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "smart source bytes must be non-empty ArrayBuffer");
+        }
+        ctx->bytes.assign(static_cast<const uint8_t*>(data),
+                          static_cast<const uint8_t*>(data) + blen);
+    } else {
+        double id = 0;
+        if (!num(0, &id)) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "smart op: bad layer id");
+        }
+        ctx->layerId = static_cast<LayerId>(id);
+    }
+    // op 专属参数
+    if (op == 3) {
+        if (argc < 7) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "setSmartTransform(id, m[6]) requires 7 args");
+        }
+        for (int i = 0; i < 6; ++i) {
+            if (!num(static_cast<size_t>(i) + 1, &ctx->m[i]) || !std::isfinite(ctx->m[i])) {
+                delete ctx;
+                return makeError(env, kErrBadParam, "setSmartTransform: bad matrix");
+            }
+        }
+    } else if (op == 4 || op == 5) {
+        // addSmartFilter(id, kind, p0..p5, seed, blend, opacity, name)
+        // setSmartFilter(id, index, p0..p5, seed, blend, opacity, visible, name)
+        const size_t base = op == 4 ? 1 : 2;
+        if (argc < base + 10) {
+            delete ctx;
+            return makeError(env, kErrBadParam,
+                             op == 4 ? "addSmartFilter requires 12 args"
+                                     : "setSmartFilter requires 12 args");
+        }
+        size_t ci = base;
+        if (op == 5) {
+            double idx = 0;
+            if (!num(ci++, &idx)) {
+                delete ctx;
+                return makeError(env, kErrBadParam, "setSmartFilter: bad index");
+            }
+            ctx->index = static_cast<int>(idx);
+        } else {
+            double kind = 0;
+            if (!num(ci++, &kind)) {
+                delete ctx;
+                return makeError(env, kErrBadParam, "addSmartFilter: bad kind");
+            }
+            ctx->fp.kind = static_cast<int32_t>(kind);
+        }
+        float* slots[6] = {&ctx->fp.p0, &ctx->fp.p1, &ctx->fp.p2, &ctx->fp.p3, &ctx->fp.p4,
+                           &ctx->fp.p5};
+        for (int i = 0; i < 6; ++i) {
+            double v = 0;
+            if (!num(ci++, &v) || !std::isfinite(v)) {
+                delete ctx;
+                return makeError(env, kErrBadParam, "smart filter param invalid");
+            }
+            *slots[i] = static_cast<float>(v);
+        }
+        double seed = 0;
+        double blendv = 0;
+        double opac = 1;
+        double vis = 1;
+        if (!num(ci++, &seed) || !num(ci++, &blendv) || !num(ci++, &opac)) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "smart filter flags invalid");
+        }
+        if (op == 5 && !num(ci++, &vis)) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "smart filter visible invalid");
+        }
+        ctx->fp.seed = static_cast<uint32_t>(seed);
+        ctx->blend = blendv >= 0 && blendv < kBlendModeCount
+                         ? static_cast<BlendMode>(static_cast<int32_t>(blendv))
+                         : BlendMode::Normal;
+        ctx->opacity = std::min(1.0, std::max(0.0, opac));
+        ctx->flag = vis != 0;
+        char nbuf[128];
+        size_t nlen = 0;
+        if (ci < argc &&
+            napi_get_value_string_utf8(env, argv[ci], nbuf, sizeof(nbuf), &nlen) == napi_ok) {
+            ctx->name.assign(nbuf, nlen);
+        }
+    } else if (op == 6 || op == 7) {
+        double a = 0;
+        double b = 0;
+        if (!num(1, &a) || (op == 7 && !num(2, &b))) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "smart filter index invalid");
+        }
+        ctx->index = static_cast<int>(a);
+        ctx->index2 = static_cast<int>(b);
+    } else if (op == 8 || op == 9) {
+        double a = 0;
+        double b = 0;
+        if (!num(1, &a)) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "smart op flag invalid");
+        }
+        if (op == 8) {
+            ctx->flag = a != 0;
+        } else {
+            ctx->maskMode = static_cast<int>(a);
+            if (argc >= 3 && num(2, &b)) {
+                ctx->flag = b != 0;
+            }
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0) {
+            delete ctx;
+            return makeError(env, kErrNoDoc, "smart op: no document");
+        }
+        ctx->docSnap = e.doc;
+        ctx->epoch = e.docEpoch;
+        ctx->revision = e.docRevision;
+    }
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value workName = nullptr;
+    napi_create_string_utf8(env, "montageSmartOp", NAPI_AUTO_LENGTH, &workName);
+    napi_status st = napi_create_async_work(
+        env, nullptr, workName,
+        [](napi_env /*env*/, void* data) {
+            auto* c = static_cast<SmartOpCtx*>(data);
+            Document& work = c->docSnap;
+            switch (c->op) {
+                case 0: {
+                    // 转换：成员段（组带子树段）收集 → 移出 → layersToSmart → 原位插入
+                    std::unordered_set<LayerId> kill(c->ids.begin(), c->ids.end());
+                    for (LayerId id : c->ids) {
+                        for (size_t i = 0; i < work.layers.size(); ++i) {
+                            if (work.layers[i].id == id && work.layers[i].isGroup) {
+                                const int ce = groupChildEnd(work.layers, static_cast<int>(i));
+                                for (int k = i + 1; k < ce; ++k) {
+                                    kill.insert(work.layers[static_cast<size_t>(k)].id);
+                                }
+                            }
+                        }
+                    }
+                    std::vector<Layer> members;
+                    std::vector<Layer> kept;
+                    kept.reserve(work.layers.size());
+                    size_t insertAt = work.layers.size();
+                    std::string topName;
+                    for (size_t i = 0; i < work.layers.size(); ++i) {
+                        if (kill.count(work.layers[i].id) != 0) {
+                            if (insertAt == kept.size() + (work.layers.size() - i)) {
+                                // 首个成员位置 = 当前 kept 长度
+                            }
+                            if (members.empty()) {
+                                insertAt = kept.size();
+                            }
+                            if (members.empty()) {
+                                topName = work.layers[i].name;
+                            }
+                            members.push_back(std::move(work.layers[i]));
+                        } else {
+                            kept.push_back(std::move(work.layers[i]));
+                        }
+                    }
+                    if (members.empty()) {
+                        c->err = "convertToSmartObject: no layers found";
+                        break;
+                    }
+                    Layer out;
+                    const LayerId newId = Engine::get().nextLayerId();
+                    if (!smart::layersToSmart(topName, newId, members, out, c->err)) {
+                        // 失败回滚：成员放回原位（kept 顺序不变，插回 insertAt）
+                        std::vector<Layer> restored;
+                        restored.reserve(kept.size() + members.size());
+                        for (size_t i = 0, mi = 0, ki = 0; i < work.layers.size(); ++i) {
+                            if (mi < members.size() && i >= insertAt &&
+                                i < insertAt + members.size()) {
+                                restored.push_back(std::move(members[mi++]));
+                            } else if (ki < kept.size()) {
+                                restored.push_back(std::move(kept[ki++]));
+                            }
+                        }
+                        work.layers = std::move(restored);
+                        break;
+                    }
+                    c->newLayerId = out.id;
+                    kept.insert(kept.begin() + static_cast<long>(std::min(insertAt, kept.size())),
+                                std::move(out));
+                    work.layers = std::move(kept);
+                    work.activeId = c->newLayerId;
+                    c->changed = true;
+                    break;
+                }
+                case 1: {
+                    // 置入嵌入：源解码取尺寸 → 适配居中放置 → 顶层插入
+                    auto sm = std::make_shared<SmartLayerState>();
+                    sm->contentsId = smart::nextContentsId();
+                    sm->embedded = true;
+                    sm->fileName = c->fileName;
+                    sm->sourceBytes = c->bytes;
+                    uint32_t sw = 0;
+                    uint32_t sh = 0;
+                    if (!smart::ensureSourceCached(*sm, sw, sh, c->err)) {
+                        break;
+                    }
+                    double scale = 1.0;
+                    if (sw > 0 && sh > 0) {
+                        scale = std::min(1.0, std::min(static_cast<double>(work.width) / sw,
+                                                       static_cast<double>(work.height) / sh));
+                    }
+                    const double w = static_cast<double>(sw) * scale;
+                    const double h = static_cast<double>(sh) * scale;
+                    sm->m[0] = scale;
+                    sm->m[1] = 0.0;
+                    sm->m[2] = (static_cast<double>(work.width) - w) / 2.0;
+                    sm->m[3] = 0.0;
+                    sm->m[4] = scale;
+                    sm->m[5] = (static_cast<double>(work.height) - h) / 2.0;
+                    Layer out;
+                    out.id = Engine::get().nextLayerId();
+                    std::string base = c->fileName;
+                    const size_t dot = base.rfind('.');
+                    if (dot != std::string::npos) {
+                        base = base.substr(0, dot);
+                    }
+                    if (base.empty()) {
+                        base = "智能对象";
+                    }
+                    out.name = base;
+                    out.smart = std::move(sm);
+                    c->newLayerId = out.id;
+                    if (!smart::renderLayer(out, c->err)) {
+                        break;
+                    }
+                    work.layers.push_back(std::move(out));
+                    work.activeId = c->newLayerId;
+                    c->changed = true;
+                    break;
+                }
+                case 2: {
+                    // 替换内容：全共享实例换源重渲（psdRaw 失效清除——内容已变）
+                    Layer* first = findLayerLocked(work, c->layerId);
+                    if (first == nullptr || first->smart == nullptr) {
+                        c->err = "replaceSmartContents: layer is not a smart object";
+                        break;
+                    }
+                    const uint64_t cid = first->smart->contentsId;
+                    std::vector<Layer*> inst;
+                    smartCollectInstances(work, cid, inst);
+                    for (Layer* l : inst) {
+                        auto sm = std::make_shared<SmartLayerState>(*l->smart);
+                        sm->embedded = true;
+                        sm->fileName = c->fileName;
+                        sm->sourceBytes = c->bytes;
+                        sm->sourceHash = 0;
+                        sm->psdRaw.clear();
+                        sm->uuid.clear();
+                        l->smart = std::move(sm);
+                        l->smartCacheHash = 0;
+                        if (!smart::renderLayer(*l, c->err)) {
+                            break;
+                        }
+                    }
+                    c->changed = !inst.empty();
+                    break;
+                }
+                case 3: {
+                    Layer* l = findLayerLocked(work, c->layerId);
+                    if (l == nullptr || l->smart == nullptr) {
+                        c->err = "setSmartTransform: layer is not a smart object";
+                        break;
+                    }
+                    auto sm = std::make_shared<SmartLayerState>(*l->smart);
+                    for (int i = 0; i < 6; ++i) {
+                        sm->m[i] = c->m[i];
+                    }
+                    l->smart = std::move(sm);
+                    l->smartCacheHash = 0;
+                    c->changed = smart::renderLayer(*l, c->err) || true;
+                    break;
+                }
+                case 4: {
+                    Layer* l = findLayerLocked(work, c->layerId);
+                    if (l == nullptr || l->smart == nullptr) {
+                        c->err = "addSmartFilter: layer is not a smart object";
+                        break;
+                    }
+                    auto sm = std::make_shared<SmartLayerState>(*l->smart);
+                    // PS 语义：无滤镜蒙版且当前有选区 → 选区即滤镜蒙版
+                    if (sm->filterMask == nullptr && work.selection != nullptr) {
+                        auto fm = smartFilterMaskFromSelection(work, *l);
+                        if (fm != nullptr) {
+                            sm->filterMask = std::move(fm);
+                        }
+                    }
+                    SmartFilter sf;
+                    sf.kind = c->fp.kind;
+                    sf.params = c->fp;
+                    sf.name = c->name.empty() ? "智能滤镜" : c->name;
+                    sf.blend = c->blend;
+                    sf.opacity = c->opacity;
+                    sf.visible = true;
+                    sm->filters.push_back(std::move(sf));
+                    l->smart = std::move(sm);
+                    l->smartCacheHash = 0;
+                    c->changed = smart::renderLayer(*l, c->err) || true;
+                    break;
+                }
+                case 5: {
+                    Layer* l = findLayerLocked(work, c->layerId);
+                    if (l == nullptr || l->smart == nullptr ||
+                        c->index < 0 ||
+                        c->index >= static_cast<int>(l->smart->filters.size())) {
+                        c->err = "setSmartFilter: bad layer or filter index";
+                        break;
+                    }
+                    auto sm = std::make_shared<SmartLayerState>(*l->smart);
+                    SmartFilter& sf = sm->filters[static_cast<size_t>(c->index)];
+                    sf.params = c->fp;
+                    sf.blend = c->blend;
+                    sf.opacity = c->opacity;
+                    sf.visible = c->flag;
+                    if (!c->name.empty()) {
+                        sf.name = c->name;
+                    }
+                    l->smart = std::move(sm);
+                    l->smartCacheHash = 0;
+                    c->changed = smart::renderLayer(*l, c->err) || true;
+                    break;
+                }
+                case 6: {
+                    Layer* l = findLayerLocked(work, c->layerId);
+                    if (l == nullptr || l->smart == nullptr ||
+                        c->index < 0 ||
+                        c->index >= static_cast<int>(l->smart->filters.size())) {
+                        c->err = "removeSmartFilter: bad layer or filter index";
+                        break;
+                    }
+                    auto sm = std::make_shared<SmartLayerState>(*l->smart);
+                    sm->filters.erase(sm->filters.begin() + static_cast<long>(c->index));
+                    l->smart = std::move(sm);
+                    l->smartCacheHash = 0;
+                    c->changed = smart::renderLayer(*l, c->err) || true;
+                    break;
+                }
+                case 7: {
+                    Layer* l = findLayerLocked(work, c->layerId);
+                    if (l == nullptr || l->smart == nullptr || c->index < 0 || c->index2 < 0 ||
+                        c->index >= static_cast<int>(l->smart->filters.size()) ||
+                        c->index2 > static_cast<int>(l->smart->filters.size())) {
+                        c->err = "moveSmartFilter: bad layer or index";
+                        break;
+                    }
+                    auto sm = std::make_shared<SmartLayerState>(*l->smart);
+                    SmartFilter sf = sm->filters[static_cast<size_t>(c->index)];
+                    sm->filters.erase(sm->filters.begin() + static_cast<long>(c->index));
+                    sm->filters.insert(sm->filters.begin() + static_cast<long>(c->index2),
+                                       std::move(sf));
+                    l->smart = std::move(sm);
+                    l->smartCacheHash = 0;
+                    c->changed = smart::renderLayer(*l, c->err) || true;
+                    break;
+                }
+                case 8: {
+                    Layer* l = findLayerLocked(work, c->layerId);
+                    if (l == nullptr || l->smart == nullptr) {
+                        c->err = "setSmartFiltersEnabled: layer is not a smart object";
+                        break;
+                    }
+                    auto sm = std::make_shared<SmartLayerState>(*l->smart);
+                    sm->filtersEnabled = c->flag;
+                    l->smart = std::move(sm);
+                    l->smartCacheHash = 0;
+                    c->changed = smart::renderLayer(*l, c->err) || true;
+                    break;
+                }
+                case 9: {
+                    Layer* l = findLayerLocked(work, c->layerId);
+                    if (l == nullptr || l->smart == nullptr) {
+                        c->err = "setSmartFilterMask: layer is not a smart object";
+                        break;
+                    }
+                    auto sm = std::make_shared<SmartLayerState>(*l->smart);
+                    if (c->maskMode == 0) {
+                        sm->filterMask = nullptr;
+                    } else if (c->maskMode == 1) {
+                        auto fm = smartFilterMaskFromSelection(work, *l);
+                        if (fm == nullptr) {
+                            c->err = "setSmartFilterMask: no selection";
+                            break;
+                        }
+                        sm->filterMask = std::move(fm);
+                    } else {
+                        if (sm->filterMask == nullptr) {
+                            c->err = "setSmartFilterMask: no filter mask";
+                            break;
+                        }
+                        auto fm = std::make_shared<LayerMask>(*sm->filterMask);
+                        fm->enabled = c->flag;
+                        sm->filterMask = std::move(fm);
+                    }
+                    l->smart = std::move(sm);
+                    l->smartCacheHash = 0;
+                    c->changed = smart::renderLayer(*l, c->err) || true;
+                    break;
+                }
+                default:
+                    c->err = "smart op: unsupported";
+                    break;
+            }
+            if (c->changed) {
+                restyleDocument(work);
+            }
+            auto& eg = Engine::get();
+            std::lock_guard<std::mutex> lk(eg.docMutex);
+            if (c->changed && eg.docEpoch == c->epoch && eg.docRevision == c->revision) {
+                eg.history.beginEdit(eg.doc, smartOpLabel(c->op, c->name),
+                                     static_cast<uint64_t>(eg.docRevision));
+                eg.doc = std::move(work);
+                eg.history.endEdit(eg.doc, static_cast<uint64_t>(eg.docRevision));
+                eg.bumpRevisionLocked();
+                eg.requestRender();
+            } else if (c->changed) {
+                c->changed = false;
+                c->err = "smart op: document changed during render";
+            }
+        },
+        [](napi_env env, napi_status status, void* data) {
+            auto* c = static_cast<SmartOpCtx*>(data);
+            auto& eg = Engine::get();
+            if (status == napi_ok && c->changed) {
+                eg.historyVersion.fetch_add(1);
+            }
+            napi_value dataObj = nullptr;
+            napi_create_object(env, &dataObj);
+            napi_set_named_property(env, dataObj, "changed",
+                                    makeBool(env, status == napi_ok && c->changed));
+            if (c->changed && c->newLayerId != 0) {
+                napi_set_named_property(env, dataObj, "layer",
+                                        makeDouble(env, static_cast<double>(c->newLayerId)));
+            }
+            napi_resolve_deferred(env, c->deferred, makeOk(env, dataObj));
+            napi_delete_async_work(env, c->work);
+            delete c;
+        },
+        ctx, &ctx->work);
+    if (st != napi_ok) {
+        delete ctx;
+        return makeError(env, kErrInternal, "create async work failed");
+    }
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+std::string smartOpLabel(int op, const std::string& name) {
+    switch (op) {
+        case 0: return "转换为智能对象";
+        case 1: return "置入智能对象";
+        case 2: return "替换内容";
+        case 3: return "智能对象变换";
+        case 4: return "智能滤镜 " + (name.empty() ? std::string("滤镜") : name);
+        case 5: return "编辑智能滤镜";
+        case 6: return "删除智能滤镜";
+        case 7: return "调整智能滤镜顺序";
+        case 8: return "智能滤镜开关";
+        case 9: return "滤镜蒙版";
+        default: return "智能对象";
+    }
+}
+
+napi_value ConvertToSmartObject(napi_env env, napi_callback_info info) {
+    return SmartOpAsync(env, info, 0);
+}
+
+napi_value PlaceEmbedded(napi_env env, napi_callback_info info) {
+    return SmartOpAsync(env, info, 1);
+}
+
+napi_value ReplaceSmartContents(napi_env env, napi_callback_info info) {
+    return SmartOpAsync(env, info, 2);
+}
+
+napi_value SetSmartTransform(napi_env env, napi_callback_info info) {
+    return SmartOpAsync(env, info, 3);
+}
+
+napi_value AddSmartFilter(napi_env env, napi_callback_info info) {
+    return SmartOpAsync(env, info, 4);
+}
+
+napi_value SetSmartFilter(napi_env env, napi_callback_info info) {
+    return SmartOpAsync(env, info, 5);
+}
+
+napi_value RemoveSmartFilter(napi_env env, napi_callback_info info) {
+    return SmartOpAsync(env, info, 6);
+}
+
+napi_value MoveSmartFilter(napi_env env, napi_callback_info info) {
+    return SmartOpAsync(env, info, 7);
+}
+
+napi_value SetSmartFiltersEnabled(napi_env env, napi_callback_info info) {
+    return SmartOpAsync(env, info, 8);
+}
+
+napi_value SetSmartFilterMask(napi_env env, napi_callback_info info) {
+    return SmartOpAsync(env, info, 9);
+}
+
+// 栅格化智能对象（同步：像素 = effective 外观、清 smart/mask/style——全部烘焙）
+napi_value RasterizeSmartObject(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "rasterizeSmartObject(id) requires 1 arg");
+    }
+    double id = 0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "rasterizeSmartObject: invalid args");
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        if (l == nullptr || l->smart == nullptr) {
+            return makeError(env, kErrBadParam, "rasterizeSmartObject: layer is not a smart object");
+        }
+        if (l->effectivePixels() == nullptr) {
+            return makeError(env, kErrBadParam, "rasterizeSmartObject: no rendered pixels");
+        }
+        e.history.beginEdit(e.doc, "栅格化图层", static_cast<uint64_t>(e.docRevision));
+        l->pixels = l->effectivePixels();
+        l->transform.originX = l->effectiveOriginX();
+        l->transform.originY = l->effectiveOriginY();
+        l->smart = nullptr;
+        l->smartCache = nullptr;
+        l->smartCacheHash = 0;
+        l->mask = nullptr;
+        l->render = nullptr;
+        l->style = nullptr;
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// 通过拷贝新建智能对象（同步：共享源字节、独立 contentsId——photocraft via_copy 语义）
+napi_value NewSmartObjectViaCopy(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "newSmartObjectViaCopy(id) requires 1 arg");
+    }
+    double id = 0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "newSmartObjectViaCopy: invalid args");
+    }
+    auto& e = Engine::get();
+    napi_value result = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        if (l == nullptr || l->smart == nullptr) {
+            return makeError(env, kErrBadParam, "newSmartObjectViaCopy: layer is not a smart object");
+        }
+        e.history.beginEdit(e.doc, "通过拷贝新建智能对象", static_cast<uint64_t>(e.docRevision));
+        Layer copy = *l;
+        copy.id = e.nextLayerId();
+        copy.name = e.doc.name.empty() ? l->name : l->name;  // 命名 v1 = 同名（PS 副本后缀挂 UI）
+        auto sm = std::make_shared<SmartLayerState>(*l->smart);
+        sm->contentsId = smart::nextContentsId();  // 独立内容
+        sm->psdRaw.clear();
+        sm->uuid.clear();
+        copy.smart = std::move(sm);
+        copy.smartCacheHash = l->smartCacheHash;
+        const size_t at = static_cast<size_t>(
+            std::distance(e.doc.layers.data(), l));
+        e.doc.layers.insert(e.doc.layers.begin() + static_cast<long>(at) + 1, std::move(copy));
+        e.doc.activeId = e.doc.layers[static_cast<size_t>(at) + 1].id;
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+        napi_value obj = nullptr;
+        napi_create_object(env, &obj);
+        napi_value idv = makeDouble(env, static_cast<double>(e.doc.activeId));
+        napi_set_named_property(env, obj, "layer", idv);
+        result = obj;
+    }
+    return makeOk(env, result);
+}
+
+// 智能对象信息读回（同步 DTO：滤镜栈 + 源状态）
+napi_value GetSmartInfo(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "getSmartInfo(id) requires 1 arg");
+    }
+    double id = 0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam, "getSmartInfo: invalid args");
+    }
+    auto& e = Engine::get();
+    napi_value obj = nullptr;
+    napi_create_object(env, &obj);
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+    if (l == nullptr || l->smart == nullptr) {
+        napi_value isSmart = nullptr;
+        napi_get_boolean(env, false, &isSmart);
+        napi_set_named_property(env, obj, "isSmart", isSmart);
+        return makeOk(env, obj);
+    }
+    const SmartLayerState& sm = *l->smart;
+    napi_value t = nullptr;
+    napi_get_boolean(env, true, &t);
+    napi_set_named_property(env, obj, "isSmart", t);
+    napi_create_double(env, static_cast<double>(sm.contentsId), &t);
+    napi_set_named_property(env, obj, "contentsId", t);
+    napi_get_boolean(env, sm.embedded, &t);
+    napi_set_named_property(env, obj, "embedded", t);
+    napi_create_string_utf8(env, sm.fileName.c_str(), sm.fileName.size(), &t);
+    napi_set_named_property(env, obj, "fileName", t);
+    napi_create_string_utf8(env, sm.linkedPath.c_str(), sm.linkedPath.size(), &t);
+    napi_set_named_property(env, obj, "linkedPath", t);
+    napi_get_boolean(env, sm.filtersEnabled, &t);
+    napi_set_named_property(env, obj, "filtersEnabled", t);
+    napi_get_boolean(env, sm.filterMask != nullptr, &t);
+    napi_set_named_property(env, obj, "hasFilterMask", t);
+    napi_get_boolean(env, sm.filterMask != nullptr && sm.filterMask->enabled, &t);
+    napi_set_named_property(env, obj, "filterMaskEnabled", t);
+    napi_get_boolean(env, !sm.sourceBytes.empty() || !sm.embedded, &t);
+    napi_set_named_property(env, obj, "sourceAvailable", t);
+    napi_value arr = nullptr;
+    napi_create_array_with_length(env, sm.filters.size(), &arr);
+    for (size_t i = 0; i < sm.filters.size(); ++i) {
+        const SmartFilter& f = sm.filters[i];
+        napi_value fo = nullptr;
+        napi_create_object(env, &fo);
+        napi_create_double(env, static_cast<double>(f.kind), &t);
+        napi_set_named_property(env, fo, "kind", t);
+        napi_create_string_utf8(env, f.name.c_str(), f.name.size(), &t);
+        napi_set_named_property(env, fo, "name", t);
+        napi_create_string_utf8(env, f.psdClass.c_str(), f.psdClass.size(), &t);
+        napi_set_named_property(env, fo, "psdClass", t);
+        napi_create_double(env, static_cast<double>(f.blend), &t);
+        napi_set_named_property(env, fo, "blend", t);
+        napi_create_double(env, f.opacity, &t);
+        napi_set_named_property(env, fo, "opacity", t);
+        napi_get_boolean(env, f.visible, &t);
+        napi_set_named_property(env, fo, "visible", t);
+        napi_get_boolean(env, f.kind < 0, &t);
+        napi_set_named_property(env, fo, "unsupported", t);
+        const double pv[6] = {f.params.p0, f.params.p1, f.params.p2, f.params.p3, f.params.p4,
+                              f.params.p5};
+        napi_value pa = nullptr;
+        napi_create_array_with_length(env, 6, &pa);
+        for (int k = 0; k < 6; ++k) {
+            napi_value el = nullptr;
+            napi_create_double(env, pv[k], &el);
+            napi_set_element(env, pa, static_cast<uint32_t>(k), el);
+        }
+        napi_set_named_property(env, fo, "p", pa);
+        napi_create_double(env, static_cast<double>(f.params.seed), &t);
+        napi_set_named_property(env, fo, "seed", t);
+        napi_set_element(env, arr, static_cast<uint32_t>(i), fo);
+    }
+    napi_set_named_property(env, obj, "filters", arr);
+    return makeOk(env, obj);
+}
+
+// 导出智能对象内容（同步：源字节写 fd——「导出内容/编辑内容落盘」v1 通道）
+napi_value ExportSmartContents(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "exportSmartContents(id, fd) requires 2 args");
+    }
+    double id = 0;
+    int fd = -1;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok ||
+        napi_get_value_int32(env, argv[1], &fd) != napi_ok || fd < 0) {
+        return makeError(env, kErrBadParam, "exportSmartContents: invalid args");
+    }
+    auto& e = Engine::get();
+    std::vector<uint8_t> bytes;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        if (l == nullptr || l->smart == nullptr) {
+            close(fd);
+            return makeError(env, kErrBadParam, "exportSmartContents: layer is not a smart object");
+        }
+        if (l->smart->embedded) {
+            bytes = l->smart->sourceBytes;
+        } else {
+            // 链接源：读文件（沙箱可见路径）
+            FILE* f = std::fopen(l->smart->linkedPath.c_str(), "rb");
+            if (f == nullptr) {
+                close(fd);
+                return makeError(env, kErrBadParam, "exportSmartContents: linked file unavailable");
+            }
+            std::fseek(f, 0, SEEK_END);
+            const long sz = std::ftell(f);
+            std::fseek(f, 0, SEEK_SET);
+            if (sz > 0) {
+                bytes.resize(static_cast<size_t>(sz));
+                if (std::fread(bytes.data(), 1, bytes.size(), f) != bytes.size()) {
+                    bytes.clear();
+                }
+            }
+            std::fclose(f);
+        }
+    }
+    if (bytes.empty()) {
+        close(fd);
+        return makeError(env, kErrBadParam, "exportSmartContents: no source bytes");
+    }
+    size_t off = 0;
+    while (off < bytes.size()) {
+        const ssize_t w = ::write(fd, bytes.data() + off, bytes.size() - off);
+        if (w <= 0) {
+            close(fd);
+            return makeError(env, kErrInternal, "exportSmartContents: write failed");
+        }
+        off += static_cast<size_t>(w);
+    }
+    close(fd);
+    napi_value obj = nullptr;
+    napi_create_object(env, &obj);
+    napi_value bv = makeDouble(env, static_cast<double>(bytes.size()));
+    napi_set_named_property(env, obj, "bytes", bv);
+    return makeOk(env, obj);
 }
 
 }  // namespace bridge

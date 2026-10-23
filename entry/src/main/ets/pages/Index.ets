@@ -5,7 +5,7 @@ import { common } from '@kit.AbilityKit';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
 import { window } from '@kit.ArkUI';
-import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, RawDevelopData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO } from 'core';
+import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, RawDevelopData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, SmartInfoDTO, SmartFilterDTO } from 'core';
 import { AppPrefs, RecentProject, ThemeMode } from '../editor/AppPrefs';
 import { leafItem, MenuGroupVM, MenuItemVM, subItem, ToolVM } from '../editor/MenuModel';
 import { SWATCHES } from '../editor/components/OptionsBar';
@@ -246,6 +246,9 @@ struct Index {
   @State fillAngle: number = 90;
   @State showFilter: boolean = false;   // M13 滤镜对话框（proxy 预览）
   @State filterDef: FilterDef | null = null;
+  @State showSmartFilters: boolean = false;  // M21 智能滤镜管理对话框
+  @State smartInfo: SmartInfoDTO | null = null;
+  @State smartEditIndex: number = -1;        // >=0 = 滤镜对话框编辑模式（预填+setSmartFilter）
   @State filterP: number[] = [];        // 当前参数值（schema 序）
   @State filterSeed: number = 1;
   private filterDebounce: number = -1;
@@ -2273,6 +2276,23 @@ struct Index {
       this.toast('文字层请先栅格化再应用滤镜');
       return;
     }
+    if (a.isSmart) {
+      // M21：SO 层 = 智能滤镜化（无实时预览；编辑模式预填当前参数）
+      this.filterDef = def;
+      if (this.smartEditIndex >= 0 && this.smartInfo !== null &&
+          this.smartEditIndex < this.smartInfo.filters.length) {
+        const f: SmartFilterDTO = this.smartInfo.filters[this.smartEditIndex];
+        this.filterP = def.params.map((d: FilterParamDef, i: number): number =>
+          f.p[i] ?? d.def);
+        this.filterSeed = f.seed > 0 ? f.seed : 1;
+      } else {
+        this.filterP = def.params.map((d: FilterParamDef): number => d.def);
+        this.filterSeed = 1;
+      }
+      this.showFilter = true;
+      this.log(`智能滤镜对话框: ${def.label}${this.smartEditIndex >= 0 ? '（编辑）' : ''}`);
+      return;
+    }
     if (!this.engine.beginFilterPreview(a.id)) {
       this.toast('滤镜预览创建失败（空图层？）');
       return;
@@ -2322,6 +2342,26 @@ struct Index {
       this.filterDebounce = -1;
     }
     this.showFilter = false;
+    const a = this.activeLayer();
+    if (a !== undefined && a.isSmart) {
+      // M21：智能滤镜化——新滤镜走 addSmartFilter（选区自动成滤镜蒙版，PS 语义），
+      // 编辑模式走 setSmartFilter；无 1/4 代理预览管线（登记）
+      if (this.smartEditIndex >= 0) {
+        this.engine.setSmartFilter(a.id, this.smartEditIndex, vals, this.filterSeed, 0, 1.0,
+          true, def.label).then((ok: boolean): void => {
+            this.log(`智能滤镜已更新: ${def.label} (${ok})`);
+          });
+      } else {
+        this.engine.addSmartFilter(a.id, def.kind, vals, this.filterSeed, 0, 1.0, def.label)
+          .then((ok: boolean): void => {
+            this.log(`智能滤镜已应用: ${def.label} (${ok})`);
+            this.toast('已作为智能滤镜应用');
+          });
+      }
+      this.smartEditIndex = -1;
+      this.filterDef = null;
+      return;
+    }
     this.engine.endFilterPreview(true, def.kind, vals[0], vals[1], vals[2], vals[3], vals[4],
       vals[5], this.filterSeed, def.label);
     this.log(`滤镜已应用: ${def.label}`);
@@ -2338,14 +2378,124 @@ struct Index {
     }
     this.showFilter = false;
     const def = this.filterDef;
-    if (def !== null) {
+    const a = this.activeLayer();
+    if (def !== null && a !== undefined && !a.isSmart) {
       const p = this.filterP;
       const vals: number[] = [p[0] ?? 0, p[1] ?? 0, p[2] ?? 0, p[3] ?? 0, p[4] ?? 0, p[5] ?? 0];
       this.engine.endFilterPreview(false, def.kind, vals[0], vals[1], vals[2], vals[3], vals[4],
         vals[5], this.filterSeed);
     }
+    this.smartEditIndex = -1;
     this.filterDef = null;
     this.log('滤镜已取消');
+  }
+
+  // ---------- M21 智能滤镜管理对话框 ----------
+
+  private openSmartFiltersDialog(): void {
+    const a = this.activeLayer();
+    if (a === undefined) {
+      return;
+    }
+    const info = this.engine.getSmartInfo(a.id);
+    if (!info.isSmart) {
+      this.toast('活动图层不是智能对象');
+      return;
+    }
+    this.smartInfo = info;
+    this.showSmartFilters = true;
+    this.log(`智能滤镜对话框: ${info.filters.length} 个滤镜`);
+  }
+
+  private refreshSmartFiltersDialog(): void {
+    const a = this.activeLayer();
+    if (a === undefined) {
+      return;
+    }
+    this.smartInfo = this.engine.getSmartInfo(a.id);
+  }
+
+  private onSmartFilterVisible(idx: number, vis: boolean): void {
+    const a = this.activeLayer();
+    const info = this.smartInfo;
+    if (a === undefined || info === null || idx >= info.filters.length) {
+      return;
+    }
+    const f: SmartFilterDTO = info.filters[idx];
+    this.engine.setSmartFilter(a.id, idx, f.p, f.seed, f.blend, f.opacity, vis, f.name)
+      .then((ok: boolean): void => {
+        this.log(`智能滤镜显隐 #${idx}: ${ok}`);
+        this.refreshSmartFiltersDialog();
+      });
+  }
+
+  private onSmartFilterEdit(idx: number): void {
+    const info = this.smartInfo;
+    if (info === null || idx >= info.filters.length) {
+      return;
+    }
+    const f: SmartFilterDTO = info.filters[idx];
+    if (f.unsupported || f.kind < 0) {
+      this.toast('PSD 未实现滤镜不支持参数编辑（可显隐/删除）');
+      return;
+    }
+    const def = FILTER_CATALOG.find((d: FilterDef): boolean => d.kind === f.kind);
+    if (def === undefined) {
+      this.toast('滤镜目录未收录该核');
+      return;
+    }
+    this.smartEditIndex = idx;
+    this.showSmartFilters = false;
+    this.openFilterDialog(def);
+  }
+
+  private onSmartFilterRemove(idx: number): void {
+    const a = this.activeLayer();
+    if (a === undefined) {
+      return;
+    }
+    this.engine.removeSmartFilter(a.id, idx).then((ok: boolean): void => {
+      this.log(`智能滤镜已删除 #${idx}: ${ok}`);
+      this.refreshSmartFiltersDialog();
+    });
+  }
+
+  private onSmartFilterMove(idx: number, up: boolean): void {
+    const a = this.activeLayer();
+    const info = this.smartInfo;
+    if (a === undefined || info === null) {
+      return;
+    }
+    const to = up ? idx - 1 : idx + 1;
+    if (to < 0 || to >= info.filters.length) {
+      return;
+    }
+    this.engine.moveSmartFilter(a.id, idx, to).then((ok: boolean): void => {
+      this.log(`智能滤镜重排 #${idx}→${to}: ${ok}`);
+      this.refreshSmartFiltersDialog();
+    });
+  }
+
+  private onSmartFiltersEnabled(v: boolean): void {
+    const a = this.activeLayer();
+    if (a === undefined) {
+      return;
+    }
+    this.engine.setSmartFiltersEnabled(a.id, v).then((ok: boolean): void => {
+      this.log(`智能滤镜整栈开关: ${v} (${ok})`);
+      this.refreshSmartFiltersDialog();
+    });
+  }
+
+  private onSmartFilterMask(op: number, v: boolean): void {
+    const a = this.activeLayer();
+    if (a === undefined) {
+      return;
+    }
+    this.engine.setSmartFilterMask(a.id, op, v).then((ok: boolean): void => {
+      this.log(`滤镜蒙版操作 ${op}: ${ok}`);
+      this.refreshSmartFiltersDialog();
+    });
   }
 
   // ---------- M15e RAW 显影参数面板 ----------
@@ -2723,6 +2873,111 @@ struct Index {
       this.log(`JPEG 校准失败: ${msg}`);
       hilog.error(DOMAIN, TAG, 'jpeg calib failed: %{public}s', msg);
     }
+  }
+
+  // ---------- M21 置入/替换/导出智能对象内容 ----------
+
+  private pickSmartSource(replace: boolean): void {
+    const a = this.activeLayer();
+    if (replace && (a === undefined || !a.isSmart)) {
+      this.toast(replace ? '活动图层不是智能对象' : '无活动图层');
+      return;
+    }
+    if (!replace && !this.docOpen) {
+      this.toast('无文档（先新建或打开）');
+      return;
+    }
+    const opt = new picker.DocumentSelectOptions();
+    opt.maxSelectNumber = 1;
+    // M2.5 实证：后缀过滤非图片类为空 → 不过滤 + 应用侧分发
+    opt.defaultFilePathUri = 'file://docs/storage/Users/currentUser/Download';
+    const dp = new picker.DocumentViewPicker();
+    dp.select(opt).then((uris: string[]): void => {
+      if (uris.length < 1) {
+        return;
+      }
+      const uri = uris[0];
+      const seg = decodeURIComponent(uri.split('/').pop() ?? 'source.bin');
+      let f: fs.File;
+      try {
+        f = fs.openSync(uri, fs.OpenMode.READ_ONLY);
+      } catch (e) {
+        const be = e as BusinessError;
+        this.log(`置入打开失败: ${be.code} ${be.message}`);
+        this.toast('文件打开失败');
+        return;
+      }
+      try {
+        const st = fs.statSync(f.fd);
+        const buf = new ArrayBuffer(st.size);
+        fs.readSync(f.fd, buf);
+        fs.closeSync(f);
+        if (replace && a !== undefined) {
+          this.busyText = '替换内容中…';
+          this.engine.replaceSmartContents(a.id, seg, buf).then((ok: boolean): void => {
+            this.busyText = '';
+            this.toast(ok ? '内容已替换（共享实例同步重渲）' : '替换失败');
+            this.log(`替换内容 #${a.id} <- ${seg}: ${ok}`);
+          }).catch((e2: BusinessError): void => {
+            this.busyText = '';
+            this.log(`替换失败: ${e2.message}`);
+          });
+        } else {
+          this.busyText = '置入中…';
+          this.engine.placeEmbedded(seg, buf).then((newId: number): void => {
+            this.busyText = '';
+            if (newId !== 0) {
+              this.toast(`已置入 ${seg}`);
+              this.log(`置入智能对象 #${newId} <- ${seg}`);
+            } else {
+              this.toast('置入失败（源不可解码？）');
+            }
+          }).catch((e2: BusinessError): void => {
+            this.busyText = '';
+            this.log(`置入失败: ${e2.message}`);
+          });
+        }
+      } catch (e) {
+        fs.closeSync(f);
+        const be = e as BusinessError;
+        this.log(`置入读取失败: ${be.code} ${be.message}`);
+        this.toast('文件读取失败');
+      }
+    }).catch((e: BusinessError): void => {
+      this.log(`置入 picker 失败: ${e.message}`);
+    });
+  }
+
+  private exportSmartContents(): void {
+    const a = this.activeLayer();
+    if (a === undefined || !a.isSmart) {
+      this.toast('活动图层不是智能对象');
+      return;
+    }
+    const info = this.engine.getSmartInfo(a.id);
+    if (!info.embedded) {
+      this.toast('链接智能对象请直接使用源文件');
+      return;
+    }
+    const opt = new picker.DocumentSaveOptions();
+    opt.newFileNames = [info.fileName];
+    const dp = new picker.DocumentViewPicker();
+    dp.save(opt).then((uris: string[]): void => {
+      if (uris.length < 1) {
+        return;
+      }
+      const f = fs.openSync(uris[0], fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
+      const n = this.engine.exportSmartContents(a.id, f.fd);
+      fs.closeSync(f);
+      if (n >= 0) {
+        this.toast(`内容已导出（${n} 字节）`);
+        this.log(`导出内容 #${a.id} -> ${uris[0]}: ${n}B`);
+      } else {
+        this.toast('导出失败');
+      }
+    }).catch((e: BusinessError): void => {
+      this.log(`导出内容 picker 失败: ${e.message}`);
+    });
   }
 
   private onOpenImage(): void {
@@ -3930,6 +4185,80 @@ struct Index {
         this.onAlignPick(alignModes[id] ?? 0, id.startsWith('layer.align'));
         break;
       }
+      case 'layer.convertSmart': {
+        const a = this.activeLayer();
+        if (a === undefined || a.isGroup || a.isSmart) {
+          this.toast('选中一个非智能对象图层');
+          break;
+        }
+        this.busyText = '转换为智能对象…';
+        this.engine.convertToSmartObject([a.id]).then((newId: number): void => {
+          this.busyText = '';
+          if (newId !== 0) {
+            this.toast('已转换为智能对象');
+            this.log(`转换智能对象 #${a.id} → #${newId}`);
+          } else {
+            this.toast('转换失败（空图层？）');
+          }
+        }).catch((e: BusinessError): void => {
+          this.busyText = '';
+          this.log(`转换失败: ${e.message}`);
+        });
+        break;
+      }
+      case 'layer.smartViaCopy': {
+        const a = this.activeLayer();
+        if (a === undefined || !a.isSmart) {
+          this.toast('活动图层不是智能对象');
+          break;
+        }
+        const nid = this.engine.newSmartObjectViaCopy(a.id);
+        if (nid !== 0) {
+          this.toast('已新建智能对象副本（独立内容）');
+          this.log(`智能对象副本 #${nid}`);
+        } else {
+          this.toast('新建副本失败');
+        }
+        break;
+      }
+      case 'layer.smartRasterize': {
+        const a = this.activeLayer();
+        if (a === undefined || !a.isSmart) {
+          this.toast('活动图层不是智能对象');
+          break;
+        }
+        const ok = this.engine.rasterizeSmartObject(a.id);
+        this.toast(ok ? '已栅格化（不可再编辑内容/滤镜）' : '栅格化失败');
+        this.log(`栅格化智能对象 #${a.id}: ${ok}`);
+        break;
+      }
+      case 'layer.smartReplace':
+        this.pickSmartSource(true);
+        break;
+      case 'layer.smartExport':
+        this.exportSmartContents();
+        break;
+      case 'layer.smartFiltersDialog':
+        this.openSmartFiltersDialog();
+        break;
+      case 'layer.smartFiltersToggle': {
+        const a = this.activeLayer();
+        if (a !== undefined && a.isSmart) {
+          this.onSmartFiltersEnabled(!a.smartFiltersOn);
+        }
+        break;
+      }
+      case 'layer.smartMaskClear': {
+        const a = this.activeLayer();
+        if (a !== undefined && a.isSmart) {
+          this.onSmartFilterMask(0, false);
+          this.toast('滤镜蒙版已清除');
+        }
+        break;
+      }
+      case 'file.placeEmbedded':
+        this.pickSmartSource(false);
+        break;
       case 'layer.rasterizeText': {
         const a = this.activeLayer();
         if (a !== undefined && a.isText) {
@@ -4951,6 +5280,7 @@ struct Index {
       subItem('file.exportSub', '导出', d, [
         leafItem('file.export', '导出图像（PNG / JPEG）…', '', d),
       ]),
+      leafItem('file.placeEmbedded', '置入嵌入的智能对象…', '', d),
       leafItem('file.close', '关闭文档', '', d),
     ];
     const edit: MenuItemVM[] = [
@@ -5016,6 +5346,26 @@ struct Index {
         d && this.activeLayer()?.hasVectorMask === true),
       leafItem('layer.rasterizeShape', '栅格化形状', '',
         d && this.activeLayer()?.isShape === true),
+      // M21 智能对象组
+      leafItem('layer.convertSmart', '转换为智能对象', '',
+        d && this.activeLayer() !== undefined && this.activeLayer()?.isGroup === false &&
+          this.activeLayer()?.isSmart === false &&
+          this.activeLayer()?.isAdjustment === false),
+      leafItem('layer.smartFiltersDialog', '智能滤镜…', '',
+        d && this.activeLayer()?.isSmart === true &&
+          (this.activeLayer()?.smartFilters ?? 0) > 0),
+      leafItem('layer.smartViaCopy', '通过拷贝新建智能对象', '',
+        d && this.activeLayer()?.isSmart === true),
+      leafItem('layer.smartReplace', '替换内容…', '', d && this.activeLayer()?.isSmart === true),
+      leafItem('layer.smartExport', '导出内容…', '', d && this.activeLayer()?.isSmart === true),
+      leafItem('layer.smartFiltersToggle', '禁用/启用智能滤镜', '',
+        d && this.activeLayer()?.isSmart === true && (this.activeLayer()?.smartFilters ?? 0) > 0,
+        this.activeLayer()?.isSmart === true && this.activeLayer()?.smartFiltersOn === false),
+      leafItem('layer.smartMaskClear', '清除滤镜蒙版', '',
+        d && this.activeLayer()?.isSmart === true &&
+          this.activeLayer()?.smartHasMask === true),
+      leafItem('layer.smartRasterize', '栅格化智能对象', '',
+        d && this.activeLayer()?.isSmart === true),
       leafItem('layer.fillSolid', '新建纯色填充图层', '', d),
       leafItem('layer.fillGrad', '新建渐变填充图层', '', d),
       leafItem('layer.linkToggle', '链接图层 / 解除链接', '',
@@ -6482,6 +6832,9 @@ struct Index {
                 onDuplicate: (): void => this.runCommand('layer.duplicate'),
                 onLinkToggle: (): void => this.onLayerLinkToggle(),
                 onStyle: (): void => this.runCommand('layer.style'),
+                onSmartFilters: (l: LayerDTO): void => {
+                  this.runCommand('layer.smartFiltersDialog');
+                },
                 onMoveToParent: (id: number, newParent: number, flatIndex: number): void =>
                   this.onMoveToParent(id, newParent, flatIndex),
                 onOpacityChange: (v: number): void => {
@@ -6620,6 +6973,80 @@ struct Index {
         }
         .width('100%')
         .height('100%')
+      }
+      if (this.showSmartFilters && this.smartInfo !== null) {
+        Stack() {
+          Column().width('100%').height('100%').backgroundColor('#66000000')
+            .onClick((): void => { this.showSmartFilters = false; })
+          Column({ space: 12 }) {
+            Text('智能滤镜')
+              .fontSize(16).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+            Text('栈底 → 栈顶 · 混合/蒙版作用于下方全部滤镜结果')
+              .fontSize(11).fontColor($r('app.color.text_secondary'))
+            Row({ space: 10 }) {
+              Toggle({ type: ToggleType.Checkbox, isOn: this.smartInfo.filtersEnabled })
+                .onChange((v: boolean): void => { this.onSmartFiltersEnabled(v); })
+              Text('启用智能滤镜（整栈）').fontSize(13).fontColor($r('app.color.text_primary'))
+              Blank()
+              Toggle({ type: ToggleType.Checkbox, isOn: this.smartInfo.filterMaskEnabled })
+                .onChange((v: boolean): void => { this.onSmartFilterMask(2, v); })
+                .enabled(this.smartInfo.hasFilterMask)
+              Text('滤镜蒙版').fontSize(13).fontColor($r('app.color.text_primary'))
+            }.width('100%')
+            List({ space: 4 }) {
+              ForEach(this.smartInfo.filters, (f: SmartFilterDTO, idx: number): void => {
+                ListItem() {
+                Row({ space: 8 }) {
+                  Toggle({ type: ToggleType.Checkbox, isOn: f.visible })
+                    .onChange((v: boolean): void => { this.onSmartFilterVisible(idx, v); })
+                  Column({ space: 2 }).layoutWeight(1).alignItems(HorizontalAlign.Start) {
+                    Text(f.name + (f.unsupported ? '（PSD 未实现，直通）' : ''))
+                      .fontSize(13).fontColor($r('app.color.text_primary'))
+                      .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                    Text(`不透明度 ${Math.round(f.opacity * 100)}% · 混合 #${f.blend}`)
+                      .fontSize(10).fontColor($r('app.color.text_secondary'))
+                  }
+                  Button('上').fontSize(11).height(26).width(34)
+                    .backgroundColor($r('app.color.surface'))
+                    .fontColor($r('app.color.text_secondary'))
+                    .onClick((): void => this.onSmartFilterMove(idx, true))
+                  Button('下').fontSize(11).height(26).width(34)
+                    .backgroundColor($r('app.color.surface'))
+                    .fontColor($r('app.color.text_secondary'))
+                    .onClick((): void => this.onSmartFilterMove(idx, false))
+                  if (!f.unsupported) {
+                    Button('编辑').fontSize(11).height(26).width(48)
+                      .backgroundColor($r('app.color.surface'))
+                      .fontColor($r('app.color.accent'))
+                      .onClick((): void => this.onSmartFilterEdit(idx))
+                  }
+                  Button('删').fontSize(11).height(26).width(34)
+                    .backgroundColor($r('app.color.surface'))
+                    .fontColor($r('app.color.danger'))
+                    .onClick((): void => this.onSmartFilterRemove(idx))
+                }.width('100%').padding(6).borderRadius(8)
+                .backgroundColor($r('app.color.panel_background'))
+                }
+              }, (f: SmartFilterDTO, idx: number): string =>
+                `${idx}|${f.name}|${f.visible}|${this.smartInfo?.filters.length ?? 0}`)
+            }.layoutWeight(1).width('100%')
+            Row({ space: 12 }) {
+              if (this.smartInfo.hasFilterMask) {
+                Button('清除滤镜蒙版').fontSize(13).height(38)
+                  .backgroundColor($r('app.color.surface'))
+                  .fontColor($r('app.color.text_primary'))
+                  .onClick((): void => { this.onSmartFilterMask(0, false); })
+              }
+              Blank()
+              Button('关闭').fontSize(14).height(38).width(96)
+                .backgroundColor($r('app.color.accent'))
+                .fontColor($r('app.color.on_accent'))
+                .onClick((): void => { this.showSmartFilters = false; })
+            }.width('100%')
+          }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
+            .border({ width: 1, color: $r('app.color.border') }).width(420).height(480)
+        }.width('100%').height('100%')
       }
       if (this.showImageSize) {
         Stack() {

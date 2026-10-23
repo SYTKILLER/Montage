@@ -575,6 +575,12 @@ bool decodeSourceFlat(const std::string& fileName, const std::vector<uint8_t>& b
     return io::decodeRasterSource(fileName, bytes, w, h, rgba, err);
 }
 
+bool ensureSourceCached(const SmartLayerState& sm, uint32_t& w, uint32_t& h, std::string& err) {
+    uint64_t hash = 0;
+    std::vector<uint8_t> rgba;
+    return getSourceFlat(sm, hash, w, h, rgba, err);
+}
+
 bool renderLayer(Layer& l, std::string& err) {
     if (l.smart == nullptr) {
         return false;
