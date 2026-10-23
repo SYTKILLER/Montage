@@ -3,10 +3,14 @@
 
 // M4c 工程打开（04 §1.2）：.montage zip 包 → manifest 校验（04 §1.3 规则自持）→ 逐层 PNG
 // 解码切瓦 → 整档替换 + History 清空（撤销不跨文档）。fd 所有权移交 native（全路径关闭）。
+// M21：openProjectBytes 拆出（不触碰 Engine）——智能对象嵌套 .montage 源解码复用。
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
+
+#include "engine/document.h"
 
 namespace montage {
 namespace io {
@@ -18,6 +22,11 @@ struct ProjectOpenResult {
 };
 
 bool openProject(int fd, ProjectOpenResult* out, std::string& err);
+
+// 内存 .montage 包 → 完整 Document（含层像素/通道/图案/智能源装载；不触碰 Engine。
+// 失败返回 false + err；full 语义 = 成功时已组装完整）
+bool openProjectBytes(const std::vector<uint8_t>& data, Document& full, size_t* layerCount,
+                      std::string& err);
 
 }  // namespace io
 }  // namespace montage

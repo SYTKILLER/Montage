@@ -1,5 +1,7 @@
 #include "engine/style_ops.h"
 
+#include "engine/smart_ops.h"
+
 // M14c 渲染核。全部在连续 strip（直 alpha RGBA8888）上执行；发布走 filterStripToGrid。
 
 #include <algorithm>
@@ -1056,6 +1058,10 @@ void restyleDocument(Document& doc) {
     static std::atomic<uint64_t> rev{1};
     std::string err;
     for (Layer& l : doc.layers) {
+        if (l.smart != nullptr) {
+            // M21：智能对象派生（先于形状/样式——样式底片吃 effectivePixels 含 smartCache）
+            smart::renderLayer(l, err);
+        }
         if (l.shape != nullptr) {
             // M18：形状缓存先重派生（带样式的形状层其底片 = shapeCache）
             shapeRenderLayer(doc, l, err);

@@ -8,8 +8,11 @@
 // - 文本/矢量/智能对象/效果：按预合成像素导入 + 提示；调整层跳过 + 提示
 // - 混合键：引擎 4 模式精确映射，其余落 Normal + 提示（对齐上游落 Normal 并报告的策略）
 
+#include <functional>
 #include <string>
 #include <vector>
+
+#include "io/psd/psd_reader.h"
 
 namespace montage {
 namespace io {
@@ -18,6 +21,12 @@ namespace io {
 // 成功时引擎文档已被替换（多图层入栈），notes 返回降级提示清单。
 bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* notes,
                std::string& err);
+
+// 记录 → 引擎层组装（M21 抽出：智能对象 PSD 源解码复用；不触碰 Engine，层 id 由 nextId
+// 生成，progress 进度回调可为空）。notes 可为 nullptr。DFS 前序组装（组嵌套 + 深度护栏）。
+bool assemblePsdLayers(psd::PsdDocument& doc, const std::function<uint64_t()>& nextId,
+                       const std::function<void(double)>& progress, std::vector<Layer>& out,
+                       std::vector<std::string>* notes, std::string& err);
 
 }  // namespace io
 }  // namespace montage

@@ -31,6 +31,7 @@ add_library(compositor SHARED
         engine/vector_render.cpp
         engine/filter_ops.cpp
         engine/filters.cpp
+        engine/smart_ops.cpp
         engine/text_ops.cpp
         engine/text_raster_oh.cpp
         engine/transform_ops.cpp

@@ -97,46 +97,10 @@ std::shared_ptr<LayerMask> buildMask(const psd::Record& rec) {
 // 剪贴烘焙：clip 像素 × base alpha（文档坐标对齐，预乘域等比缩放）
 }  // namespace
 
-bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* notes,
-               std::string& err) {
-    // 全量读入（PSD 解析需随机访问；典型工程文件数十 MB）；512MB 上限（审查修复：
-    // 原先仅查空文件即按 sz 全量分配，对抗文件可打到 OOM）
-    constexpr off_t kMaxPsdBytes = 512ll * 1024 * 1024;
-    off_t sz = lseek(fd, 0, SEEK_END);
-    if (sz <= 0) {
-        close(fd);
-        err = "empty file";
-        return false;
-    }
-    if (sz > kMaxPsdBytes) {
-        close(fd);
-        err = "psd file too large";
-        return false;
-    }
-    lseek(fd, 0, SEEK_SET);
-    std::vector<uint8_t> data(static_cast<size_t>(sz));
-    size_t got = 0;
-    while (got < data.size()) {
-        ssize_t n = read(fd, data.data() + got, data.size() - got);
-        if (n <= 0) {
-            break;
-        }
-        got += static_cast<size_t>(n);
-    }
-    close(fd);
-    if (got != data.size()) {
-        err = "read failed";
-        return false;
-    }
-
-    auto& engine = Engine::get();
-    psd::PsdDocument doc;
-    if (!psd::readPsd(data.data(), data.size(), doc, err)) {
-        return false;
-    }
-
+bool assemblePsdLayers(psd::PsdDocument& doc, const std::function<uint64_t()>& nextId,
+                       const std::function<void(double)>& progress, std::vector<Layer>& layers,
+                       std::vector<std::string>* notes, std::string& err) {
     // 烘焙：蒙版 → 剪贴 → 直通 alpha；逐层切瓦片（M5b-2 起蒙版/剪贴均非破坏）
-    std::vector<Layer> layers;
     layers.reserve(doc.layers.size());
     // M14a 真编组 + 审查修复：reader 文件序中子层/内层组记录先于其父组记录出现（组头在
     // 收尾 divider 才产出），单趟解析时 groupIdMap 未填充 → parentId 恒 0（层级全扁平），
@@ -145,7 +109,7 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
     std::unordered_map<int, uint64_t> groupIdMap;  // M14a：组装期组号 → 引擎 LayerId
     for (const psd::Record& rec : doc.layers) {
         if (rec.isGroup && rec.groupId != 0) {
-            groupIdMap[rec.groupId] = engine.nextLayerId();
+            groupIdMap[rec.groupId] = nextId();
         }
     }
     std::unordered_map<int, std::vector<size_t>> childrenOf;  // 父组号 → 记录下标（记录序）
@@ -156,12 +120,14 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
     // 逐记录建层（parentId 由 DFS 父链给定）；返回是否产出引擎层（未映射调整类跳过）
     auto createRecord = [&](psd::Record& rec, uint64_t parent) -> bool {
         done++;
-        notifyProgress(0.15 + 0.8 * static_cast<double>(done) /
-                                   static_cast<double>(std::max<size_t>(doc.layers.size(), 1)));
+        if (progress != nullptr) {
+            progress(0.15 + 0.8 * static_cast<double>(done) /
+                               static_cast<double>(std::max<size_t>(doc.layers.size(), 1)));
+        }
         if (rec.isGroup) {
             Layer g;
             auto git = rec.groupId != 0 ? groupIdMap.find(rec.groupId) : groupIdMap.end();
-            g.id = git != groupIdMap.end() ? git->second : engine.nextLayerId();
+            g.id = git != groupIdMap.end() ? git->second : nextId();
             g.name = rec.name;
             g.visible = rec.visible;
             g.opacity = std::min(1.0, std::max(0.0, rec.opacity));
@@ -213,7 +179,7 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
             }
             if (mapped) {
                 Layer layer;
-                layer.id = engine.nextLayerId();
+                layer.id = nextId();
                 layer.name = rec.name;
                 layer.visible = rec.visible;
                 layer.opacity = std::min(1.0, std::max(0.0, rec.opacity));
@@ -228,7 +194,7 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
             return false;  // 其余调整类（hue2/blnc/...）仍跳过（note 已带）
         }
         Layer layer;
-        layer.id = engine.nextLayerId();
+        layer.id = nextId();
         layer.name = rec.name;
         layer.visible = rec.visible;
         layer.opacity = std::min(1.0, std::max(0.0, rec.opacity));
@@ -377,6 +343,52 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
         }
     };
     emitChildren(0, 0);
+    return true;
+}
+
+bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* notes,
+               std::string& err) {
+    // 全量读入（PSD 解析需随机访问；典型工程文件数十 MB）；512MB 上限（审查修复：
+    // 原先仅查空文件即按 sz 全量分配，对抗文件可打到 OOM）
+    constexpr off_t kMaxPsdBytes = 512ll * 1024 * 1024;
+    off_t sz = lseek(fd, 0, SEEK_END);
+    if (sz <= 0) {
+        close(fd);
+        err = "empty file";
+        return false;
+    }
+    if (sz > kMaxPsdBytes) {
+        close(fd);
+        err = "psd file too large";
+        return false;
+    }
+    lseek(fd, 0, SEEK_SET);
+    std::vector<uint8_t> data(static_cast<size_t>(sz));
+    size_t got = 0;
+    while (got < data.size()) {
+        ssize_t n = read(fd, data.data() + got, data.size() - got);
+        if (n <= 0) {
+            break;
+        }
+        got += static_cast<size_t>(n);
+    }
+    close(fd);
+    if (got != data.size()) {
+        err = "read failed";
+        return false;
+    }
+
+    auto& engine = Engine::get();
+    psd::PsdDocument doc;
+    if (!psd::readPsd(data.data(), data.size(), doc, err)) {
+        return false;
+    }
+
+    std::vector<Layer> layers;
+    if (!assemblePsdLayers(doc, [&engine]() { return engine.nextLayerId(); },
+                           [](double p) { notifyProgress(p); }, layers, notes, err)) {
+        return false;
+    }
 
     // 整档替换：统一走 resetDocument（清撤销/会话态，撤销不跨文档；未持锁调用）
     engine.resetDocument();

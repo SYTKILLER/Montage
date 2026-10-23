@@ -33,6 +33,11 @@ bool startImageImport(int fd, napi_threadsafe_function completionTsfn);
 // 请求取消（带边界生效）；不等待线程退出。
 void cancelImageImport();
 
+// M21：内存栅格源解码（智能对象源；系统解码器整图单趟 + mimeType 驱动 swapRB + 预乘还原）。
+// PNG 不走此路径（smart_ops 分发自研确定性解码）。
+bool decodeRasterSource(const std::string& fileName, const std::vector<uint8_t>& bytes,
+                        uint32_t& w, uint32_t& h, std::vector<uint8_t>& rgba, std::string& err);
+
 }  // namespace io
 }  // namespace montage
 

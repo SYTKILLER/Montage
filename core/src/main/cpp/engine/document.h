@@ -14,6 +14,7 @@
 
 #include <native_buffer/native_buffer.h>
 
+#include "engine/filters.h"
 #include "engine/vector_path.h"
 
 namespace montage {
@@ -358,6 +359,53 @@ inline bool operator==(const CustomShapeEntry& a, const CustomShapeEntry& b) {
 }
 
 
+// M21 智能滤镜（photocraft SmartFilter 对齐，参数即数据）：kind = filters::FilterKind
+// （29 值核）；-1 = 未实现滤镜（PSD filterFX 导入保 descriptor 原样 hex，可隐藏/重排/
+// 删除，导出原样回写——渲染按直通）。psdClass = PSD filter class id（四字节，"GsnB" 等；
+// Montage 内建滤镜置入时为空，PSD 双向映射用）。
+struct SmartFilter {
+    int32_t kind = -1;               // filters::FilterKind；-1 = 未实现（psdHex 非空）
+    std::string psdClass;            // "GsnB"/"MtnB"/…（内建置入 = 空）
+    std::string name;                // 显示名（「高斯模糊」/PS 原名）
+    filters::FilterParams params;    // 参数槽（kind >= 0 时有效）
+    BlendMode blend = BlendMode::Normal;
+    double opacity = 1.0;
+    bool visible = true;
+    std::string psdHex;              // kind<0：filterFX item descriptor 原样 hex
+
+    bool operator==(const SmartFilter& o) const {
+        return kind == o.kind && psdClass == o.psdClass && name == o.name &&
+               params.kind == o.params.kind && params.p0 == o.params.p0 && params.p1 == o.params.p1 &&
+               params.p2 == o.params.p2 && params.p3 == o.params.p3 && params.p4 == o.params.p4 &&
+               params.p5 == o.params.p5 && params.seed == o.params.seed &&
+               params.scale == o.params.scale && params.offset == o.params.offset &&
+               blend == o.blend && opacity == o.opacity && visible == o.visible &&
+               psdHex == o.psdHex;
+    }
+    bool operator!=(const SmartFilter& o) const { return !(*this == o); }
+};
+
+// M21 智能对象（photocraft SmartObject 子集，07 §3.12）：源（嵌入原样字节 / 链接路径）+
+// 放置仿射 + 智能滤镜栈 + 滤镜蒙版（每 SO 一个，PS 语义）。渲染 = smartCache 派生网格
+//（文字/形状层同架构）；源解码/放置/逐滤镜结果挂引擎级缓存（smart_ops，contentsId 键）。
+struct SmartLayerState {
+    uint64_t contentsId = 0;           // 共享内容实例 id（duplicate 共享、via copy 独立）
+    bool embedded = true;              // true = 嵌入源字节 / false = 链接路径
+    std::string fileName;              // 源文件名（扩展名驱动解码分发：.montage/.psd/.png/…）
+    std::vector<uint8_t> sourceBytes;  // 嵌入源原样字节（PSD lnk2 往返/编辑→替换 保真基础）
+    std::string linkedPath;            // embedded = false 时的链接路径
+    uint64_t sourceHash = 0;           // fnv1a(sourceBytes)（0 = 未算，渲染时现算）
+    double m[6] = {1, 0, 0, 0, 1, 0};  // 放置仿射（行主序：源 strip 坐标 → 文档 px）
+    std::vector<SmartFilter> filters;  // 应用序（栈底在前，PS filterFXList 同序）
+    bool filtersEnabled = true;        // 整栈开关（PS「禁用智能滤镜」，不动单滤镜 visible）
+    std::shared_ptr<LayerMask> filterMask = nullptr;  // 滤镜蒙版（图层局部坐标 = 放置域局部）
+    // PSD 透传：psdRaw = 导入的 SoLd/SoLE 块原始数据（内容未变时原样回写 = 字节级往返，
+    // photocraft psd_raw 同语义）；placedId/uuid = FEid 键与 lnk2 链接键（v1 仅透传）。
+    std::vector<uint8_t> psdRaw;
+    std::string placedId;
+    std::string uuid;
+};
+
 // 图层（值语义，对齐源 ImageLayer；M2 子集：蒙版/剪贴 M5、调整层 M6a、文本层 M12）。
 struct Layer {
     LayerId id = 0;
@@ -377,6 +425,12 @@ struct Layer {
     std::shared_ptr<FillLayerState> fill = nullptr;  // M14c：非空 = 填充层（渲染走 styledRender）
     std::shared_ptr<ShapeLayerState> shape = nullptr;  // M18：非空 = 形状层（pixels 恒 null，
                                                        // 渲染走 shapeCache 派生网格）
+    std::shared_ptr<SmartLayerState> smart = nullptr;  // M21：非空 = 智能对象层（pixels 恒
+                                                       // null，渲染走 smartCache 派生网格）
+    // M21 智能对象派生渲染（放置+滤镜链+滤镜蒙版；origin = transform.origin——渲染回填）。
+    // smartCacheHash = 渲染指纹（命中跳过重渲）；随 History 快照走（undo 即恢复）。
+    std::shared_ptr<const TileGrid> smartCache = nullptr;
+    uint64_t smartCacheHash = 0;
     std::shared_ptr<VectorMaskData> vectorMask = nullptr;  // M18d：非空 = 矢量蒙版
     // M18 形状派生渲染结果（文档域；origin 独立——域 = 形状包围盒 ∩ 画布）。
     std::shared_ptr<const TileGrid> shapeCache = nullptr;
@@ -399,8 +453,8 @@ struct Layer {
     // M14b 链接层：同一非零 linkId 的层随移动工具联动平移（对齐 PS 链接语义）。
     // 会话态 v1：.montage 不持久化（PSD 链接导出随 M15 评估），随 History 快照走。
     uint64_t linkId = 0;
-    // M14c/M18 渲染/缩略图取数优先级：样式/填充派生（含独立 origin，经 effectiveRenderOrigin）
-    // → 矢量蒙版派生（已含像素蒙版）→ 蒙版合成 → 形状派生 → 原像素
+    // M14c/M18/M21 渲染/缩略图取数优先级：样式/填充派生（含独立 origin，经 effectiveRenderOrigin）
+    // → 矢量蒙版派生（已含像素蒙版）→ 蒙版合成 → 智能对象派生 → 形状派生 → 原像素
     std::shared_ptr<const TileGrid> effectivePixels() const {
         if ((style != nullptr || fill != nullptr) && styledRender != nullptr &&
             (style == nullptr || style->enabled)) {
@@ -411,6 +465,9 @@ struct Layer {
         }
         if (mask != nullptr && mask->enabled && render != nullptr) {
             return render;
+        }
+        if (smart != nullptr && smartCache != nullptr) {
+            return smartCache;
         }
         if (shape != nullptr && shapeCache != nullptr) {
             return shapeCache;

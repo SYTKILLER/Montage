@@ -23,7 +23,7 @@ namespace {
 constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Save";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
-constexpr int kFormatVersion = 12;  // v12：+形状层/矢量蒙版/工作路径/保存路径/自定义形状（M18，可选字段读兼容 v1–v11）；v11：+等高线/Range/图案叠加/文档图案（M17d）；v10：+图层样式效果扩展（M17a 内阴影/外发光/内发光/渐变叠加，非默认才写）；v9：+参考线 guides 块（M15a，空则不写兼容 v8 包）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
+constexpr int kFormatVersion = 13;  // v13：+智能对象（smart 块 + 包内源文件/滤镜蒙版 PNG，M21，无 SO 层 = 字节兼容 v12）；v12：+形状层/矢量蒙版/工作路径/保存路径/自定义形状（M18）；v11：+等高线/Range/图案叠加/文档图案（M17d）；v10：+图层样式效果扩展（M17a 内阴影/外发光/内发光/渐变叠加，非默认才写）；v9：+参考线 guides 块（M15a，空则不写兼容 v8 包）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
 constexpr int kDeflateLevel = 6;
 // 04 §1.3 格式上限（沿用上游档位，与引擎运行预算分立）
 constexpr uint32_t kMaxSide = 30000;
@@ -75,13 +75,52 @@ void putU32BE(uint8_t* p, uint32_t v) {
     }
 }
 
-// ---------- zip 写出（流式单遍；条目先写占位本地头，收尾 pwrite 回填；不做 zip64） ----------
+// ---------- zip 写出（流式单遍；条目先写占位本地头，收尾回填；不做 zip64） ----------
+// M21：写出目标抽象化（fd 流式 / 内存包）——智能对象源 = 嵌套 .montage 内存编码复用同一条
+// 序列化路径（唯一来源，防 fd/内存双实现漂移）。
+
+class ZipSink {
+  public:
+    virtual ~ZipSink() = default;
+    virtual bool write(const uint8_t* p, size_t n) = 0;
+    virtual bool writeAt(uint64_t at, const uint8_t* p, size_t n) = 0;
+};
+
+class FdZipSink : public ZipSink {
+  public:
+    explicit FdZipSink(int fd) : fd_(fd) {}
+    bool write(const uint8_t* p, size_t n) override { return writeAll(fd_, p, n); }
+    bool writeAt(uint64_t at, const uint8_t* p, size_t n) override {
+        return pwriteAllAt(fd_, p, n, at);
+    }
+
+  private:
+    int fd_;
+};
+
+class MemZipSink : public ZipSink {
+  public:
+    explicit MemZipSink(std::vector<uint8_t>& out) : out_(out) {}
+    bool write(const uint8_t* p, size_t n) override {
+        out_.insert(out_.end(), p, p + n);
+        return true;
+    }
+    bool writeAt(uint64_t at, const uint8_t* p, size_t n) override {
+        if (out_.size() < at + n) {
+            out_.resize(static_cast<size_t>(at + n));
+        }
+        std::memcpy(out_.data() + at, p, n);
+        return true;
+    }
+
+  private:
+    std::vector<uint8_t>& out_;
+};
 
 class ZipWriter {
   public:
-    explicit ZipWriter(int fd) : fd_(fd) {}
+    explicit ZipWriter(ZipSink& sink) : sink_(sink) {}
 
-    int fd() const { return fd_; }
     uint64_t totalBytes() const { return tell_; }
 
     // 开一个条目（占位本地头，收尾回填）。PNG 等 deflate 已压缩载荷用 STORE(0)，manifest 也 STORE。
@@ -115,7 +154,7 @@ class ZipWriter {
         crc_ = crc32(crc_, p, static_cast<uInt>(n));
         usize_ += n;
         if (entryMethod_ == 0) {
-            if (!writeAll(fd_, p, n)) {
+            if (!sink_.write(p, n)) {
                 return false;
             }
             csize_ += n;
@@ -139,7 +178,7 @@ class ZipWriter {
         putU32(patch + 0, crc_);
         putU32(patch + 4, static_cast<uint32_t>(csize_));
         putU32(patch + 8, static_cast<uint32_t>(usize_));
-        if (!pwriteAllAt(fd_, patch, sizeof(patch), entryOffset_ + 14)) {
+        if (!sink_.writeAt(entryOffset_ + 14, patch, sizeof(patch))) {
             return false;
         }
         Entry e;
@@ -174,8 +213,8 @@ class ZipWriter {
             putU16(ch + 36, 0);
             putU32(ch + 38, 0);
             putU32(ch + 42, static_cast<uint32_t>(e.offset));
-            if (!writeAll(fd_, ch, sizeof(ch)) ||
-                !writeAll(fd_, reinterpret_cast<const uint8_t*>(e.name.data()), e.name.size())) {
+            if (!sink_.write(ch, sizeof(ch)) ||
+                !sink_.write(reinterpret_cast<const uint8_t*>(e.name.data()), e.name.size())) {
                 return false;
             }
             tell_ += sizeof(ch) + e.name.size();
@@ -190,7 +229,7 @@ class ZipWriter {
         putU32(eo + 12, static_cast<uint32_t>(cdSize));
         putU32(eo + 16, static_cast<uint32_t>(cdOffset));
         putU16(eo + 20, 0);
-        if (!writeAll(fd_, eo, sizeof(eo))) {
+        if (!sink_.write(eo, sizeof(eo))) {
             return false;
         }
         tell_ += sizeof(eo);
@@ -228,8 +267,8 @@ class ZipWriter {
         putU32(h + 22, static_cast<uint32_t>(usize));
         putU16(h + 26, static_cast<uint16_t>(name.size()));
         putU16(h + 28, 0);
-        if (!writeAll(fd_, h, sizeof(h)) ||
-            !writeAll(fd_, reinterpret_cast<const uint8_t*>(name.data()), name.size())) {
+        if (!sink_.write(h, sizeof(h)) ||
+            !sink_.write(reinterpret_cast<const uint8_t*>(name.data()), name.size())) {
             return false;
         }
         tell_ += sizeof(h) + name.size();
@@ -245,7 +284,7 @@ class ZipWriter {
             }
             const size_t produced = out_.size() - zs_.avail_out;
             if (produced > 0) {
-                if (!writeAll(fd_, out_.data(), produced)) {
+                if (!sink_.write(out_.data(), produced)) {
                     return false;
                 }
                 csize_ += produced;
@@ -268,7 +307,7 @@ class ZipWriter {
         }
     }
 
-    int fd_;
+    ZipSink& sink_;
     std::vector<Entry> entries_;
     uint64_t tell_ = 0;
     uint64_t entryOffset_ = 0;
@@ -451,6 +490,9 @@ struct LayerSnapshot {
     std::shared_ptr<ShapeLayerState> shape;
     std::shared_ptr<VectorMaskData> vectorMask;
     bool vectorMaskEnabled = true;
+    // M21 智能对象（null = 非 SO 层；pixels 已存 smartCache 派生结果、origin = transform）
+    // 状态指针共享（源字节不经拷贝；COW 快照同指针）
+    std::shared_ptr<const SmartLayerState> smart;
 };
 
 struct ChannelSnapshot {
@@ -1041,6 +1083,115 @@ std::string buildManifest(const DocSnapshot& doc) {
                              std::string(l.vectorMaskEnabled ? "true" : "false") +
                              ", \"path\": " + pathToJson(l.vectorMask->path, "           ") + "}");
         }
+        if (l.smart != nullptr) {
+            // v13 智能对象（M21）：源引用 + 放置仿射 + 智能滤镜栈 + 滤镜蒙版
+            const SmartLayerState& sm = *l.smart;
+            std::string so;
+            so += "      \"contentsId\": " + std::to_string(sm.contentsId);
+            so += std::string(",\n      \"embedded\": ") + (sm.embedded ? "true" : "false");
+            so += ",\n      \"fileName\": " + jsonEscape(sm.fileName);
+            if (sm.embedded) {
+                std::string ext = "bin";
+                const size_t dot = sm.fileName.rfind('.');
+                if (dot != std::string::npos && dot + 1 < sm.fileName.size()) {
+                    ext = sm.fileName.substr(dot + 1);
+                }
+                so += ",\n      \"sourceFile\": \"images/smart_" + std::to_string(sm.contentsId) +
+                      "." + ext + "\"";
+            } else {
+                so += ",\n      \"linkedPath\": " + jsonEscape(sm.linkedPath);
+            }
+            so += ",\n      \"m\": [";
+            for (int ci = 0; ci < 6; ++ci) {
+                so += jsonNumber(sm.m[ci]);
+                if (ci < 5) so += ", ";
+            }
+            so += "]";
+            if (!sm.filtersEnabled) {
+                so += ",\n      \"filtersEnabled\": false";
+            }
+            if (!sm.filters.empty()) {
+                so += ",\n      \"filters\": [\n";
+                for (size_t fi = 0; fi < sm.filters.size(); ++fi) {
+                    const SmartFilter& f = sm.filters[fi];
+                    std::string fs = "        {\"kind\": " + std::to_string(f.kind);
+                    if (!f.psdClass.empty()) {
+                        fs += ", \"psdClass\": " + jsonEscape(f.psdClass);
+                    }
+                    if (!f.name.empty()) {
+                        fs += ", \"name\": " + jsonEscape(f.name);
+                    }
+                    if (f.kind >= 0) {
+                        const float pv[6] = {f.params.p0, f.params.p1, f.params.p2,
+                                             f.params.p3, f.params.p4, f.params.p5};
+                        fs += ", \"p\": [";
+                        for (int ci = 0; ci < 6; ++ci) {
+                            fs += jsonNumber(pv[ci]);
+                            if (ci < 5) fs += ", ";
+                        }
+                        fs += "]";
+                        fs += ", \"seed\": " + std::to_string(f.params.seed);
+                        if (f.kind == filters::FCustom) {
+                            fs += ", \"scale\": " + jsonNumber(f.params.scale);
+                            fs += ", \"offset\": " + jsonNumber(f.params.offset);
+                            fs += ", \"kernel\": [";
+                            for (int ki = 0; ki < 25; ++ki) {
+                                fs += jsonNumber(f.params.kernel[ki]);
+                                if (ki < 24) fs += ", ";
+                            }
+                            fs += "]";
+                        }
+                        if (f.kind == filters::FClouds || f.kind == filters::FDifferenceClouds) {
+                            fs += ", \"colorFg\": [";
+                            for (int ci = 0; ci < 3; ++ci) {
+                                fs += jsonNumber(f.params.colorFg[ci]);
+                                if (ci < 2) fs += ", ";
+                            }
+                            fs += "], \"colorBg\": [";
+                            for (int ci = 0; ci < 3; ++ci) {
+                                fs += jsonNumber(f.params.colorBg[ci]);
+                                if (ci < 2) fs += ", ";
+                            }
+                            fs += "]";
+                        }
+                    }
+                    if (f.blend != BlendMode::Normal) {
+                        fs += ", \"blend\": " + std::to_string(static_cast<int32_t>(f.blend));
+                    }
+                    if (f.opacity != 1.0) {
+                        fs += ", \"opacity\": " + jsonNumber(f.opacity);
+                    }
+                    if (!f.visible) {
+                        fs += ", \"visible\": false";
+                    }
+                    if (!f.psdHex.empty()) {
+                        fs += ", \"psd\": " + jsonEscape(f.psdHex);
+                    }
+                    fs += "}";
+                    so += fs;
+                    so += (fi + 1 < sm.filters.size()) ? ",\n" : "\n";
+                }
+                so += "      ]";
+            }
+            if (sm.filterMask != nullptr) {
+                so += ",\n      \"filterMask\": \"images/smart_" + std::to_string(sm.contentsId) +
+                      ".fmask.png\"";
+                so += ",\n      \"filterMaskW\": " + std::to_string(sm.filterMask->width);
+                so += ",\n      \"filterMaskH\": " + std::to_string(sm.filterMask->height);
+                so += ",\n      \"filterMaskOffsetX\": " + std::to_string(sm.filterMask->offsetX);
+                so += ",\n      \"filterMaskOffsetY\": " + std::to_string(sm.filterMask->offsetY);
+                so += ",\n      \"filterMaskOutside\": " + std::to_string(sm.filterMask->outside);
+                so += std::string(",\n      \"filterMaskEnabled\": ") +
+                      (sm.filterMask->enabled ? "true" : "false");
+            }
+            if (!sm.placedId.empty()) {
+                so += ",\n      \"placedId\": " + jsonEscape(sm.placedId);
+            }
+            if (!sm.uuid.empty()) {
+                so += ",\n      \"uuid\": " + jsonEscape(sm.uuid);
+            }
+            fields.push_back("      \"smart\": {\n" + so + "\n      }");
+        }
         if (l.pixels != nullptr) {
             // 图像以内容包围盒存出；originX/Y = 包围盒左上角在文档坐标系的落点（load 据此重建 Transform）
             fields.push_back("      \"originX\": " + std::to_string(static_cast<int64_t>(l.originX)));
@@ -1180,102 +1331,100 @@ std::string buildManifest(const DocSnapshot& doc) {
     return j;
 }
 
-}  // namespace
-
-bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err) {
-    // 1) 锁内快照（元数据 + 不可变 TileGrid 引用），编解码全程锁外（02 §7 并发规则）
-    DocSnapshot snap;
-    {
-        auto& e = Engine::get();
-        std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
-            close(fd);
-            err = "no document";
-            return false;
-        }
-        snap.width = e.doc.width;
-        snap.height = e.doc.height;
-        snap.name = e.doc.name;
-        snap.activeId = e.doc.activeId;
-        snap.globalLightAngle = e.doc.globalLightAngle;
-        for (const DocumentPattern& p : e.doc.patterns) {
-            if (p.pixels != nullptr && p.w > 0 && p.h > 0) {
-                PatternSnapshot ps;
-                ps.id = p.id;
-                ps.name = p.name;
-                ps.w = p.w;
-                ps.h = p.h;
-                ps.pixels = p.pixels;
-                snap.patterns.push_back(std::move(ps));
-            }
-        }
-        for (const AlphaChannel& c : e.doc.channels) {
-            if (c.mask != nullptr) {
-                ChannelSnapshot cs;
-                cs.name = c.name;
-                cs.mask = c.mask;
-                snap.channels.push_back(std::move(cs));
-            }
-        }
-        snap.guidesH = e.doc.guidesH;
-        snap.guidesV = e.doc.guidesV;
-        snap.guidesLocked = e.doc.guidesLocked;
-        snap.guidesVisible = e.doc.guidesVisible;
-        snap.workPath = e.doc.workPath;
-        snap.paths = e.doc.paths;
-        snap.customShapes = e.doc.customShapes;
-        snap.customShapeSeq = e.doc.customShapeSeq;
-        snap.layers.reserve(e.doc.layers.size());
-        for (const Layer& l : e.doc.layers) {
-            LayerSnapshot s;
-            s.id = l.id;
-            s.name = l.name;
-            s.visible = l.visible;
-            s.opacity = l.opacity;
-            s.blendMode = l.blendMode;
-            s.pixels = l.pixels;
-            s.originX = l.transform.originX;
-            s.originY = l.transform.originY;
-            if (l.mask != nullptr) {
-                s.maskGrid = l.mask->pixels;
-                s.maskW = l.mask->width;
-                s.maskH = l.mask->height;
-                s.maskOffsetX = l.mask->offsetX;
-                s.maskOffsetY = l.mask->offsetY;
-                s.maskOutside = l.mask->outside;
-                s.maskEnabled = l.mask->enabled;
-            }
-            s.clipping = l.clipping;
-            s.adjustment = l.adjustment;
-            s.text = l.text;
-            s.isGroup = l.isGroup;
-            s.parentId = l.parentId;
-            s.collapsed = l.collapsed;
-            s.style = l.style;
-            s.fill = l.fill;
-            s.shape = l.shape;
-            if (l.shape != nullptr && s.pixels == nullptr) {
-                // M18：形状层像素 = shapeCache 派生结果、origin = shapeOrigin（PNG 编码复用）
-                s.pixels = l.shapeCache;
-                s.originX = l.shapeOriginX;
-                s.originY = l.shapeOriginY;
-            }
-            if (l.vectorMask != nullptr) {
-                s.vectorMask = l.vectorMask;
-                s.vectorMaskEnabled = l.vectorMask->enabled;
-            }
-            snap.layers.push_back(std::move(s));
+// 快照构建（M21 抽出：saveProject 传引擎文档；saveProjectBytes 传任意文档——智能对象
+// 嵌套 .montage 源编码共用同一条序列化路径）。只拷贝元数据与不可变网格引用。
+void buildDocSnapshot(const Document& doc, DocSnapshot& snap) {
+    snap.width = doc.width;
+    snap.height = doc.height;
+    snap.name = doc.name;
+    snap.activeId = doc.activeId;
+    snap.globalLightAngle = doc.globalLightAngle;
+    for (const DocumentPattern& p : doc.patterns) {
+        if (p.pixels != nullptr && p.w > 0 && p.h > 0) {
+            PatternSnapshot ps;
+            ps.id = p.id;
+            ps.name = p.name;
+            ps.w = p.w;
+            ps.h = p.h;
+            ps.pixels = p.pixels;
+            snap.patterns.push_back(std::move(ps));
         }
     }
+    for (const AlphaChannel& c : doc.channels) {
+        if (c.mask != nullptr) {
+            ChannelSnapshot cs;
+            cs.name = c.name;
+            cs.mask = c.mask;
+            snap.channels.push_back(std::move(cs));
+        }
+    }
+    snap.guidesH = doc.guidesH;
+    snap.guidesV = doc.guidesV;
+    snap.guidesLocked = doc.guidesLocked;
+    snap.guidesVisible = doc.guidesVisible;
+    snap.workPath = doc.workPath;
+    snap.paths = doc.paths;
+    snap.customShapes = doc.customShapes;
+    snap.customShapeSeq = doc.customShapeSeq;
+    snap.layers.reserve(doc.layers.size());
+    for (const Layer& l : doc.layers) {
+        LayerSnapshot s;
+        s.id = l.id;
+        s.name = l.name;
+        s.visible = l.visible;
+        s.opacity = l.opacity;
+        s.blendMode = l.blendMode;
+        s.pixels = l.pixels;
+        s.originX = l.transform.originX;
+        s.originY = l.transform.originY;
+        if (l.mask != nullptr) {
+            s.maskGrid = l.mask->pixels;
+            s.maskW = l.mask->width;
+            s.maskH = l.mask->height;
+            s.maskOffsetX = l.mask->offsetX;
+            s.maskOffsetY = l.mask->offsetY;
+            s.maskOutside = l.mask->outside;
+            s.maskEnabled = l.mask->enabled;
+        }
+        s.clipping = l.clipping;
+        s.adjustment = l.adjustment;
+        s.text = l.text;
+        s.isGroup = l.isGroup;
+        s.parentId = l.parentId;
+        s.collapsed = l.collapsed;
+        s.style = l.style;
+        s.fill = l.fill;
+        s.shape = l.shape;
+        if (l.shape != nullptr && s.pixels == nullptr) {
+            // M18：形状层像素 = shapeCache 派生结果、origin = shapeOrigin（PNG 编码复用）
+            s.pixels = l.shapeCache;
+            s.originX = l.shapeOriginX;
+            s.originY = l.shapeOriginY;
+        }
+        if (l.smart != nullptr) {
+            // M21：智能对象像素 = smartCache 派生结果、origin = transform.origin（渲染回填）
+            s.smart = l.smart;
+            if (l.smartCache != nullptr) {
+                s.pixels = l.smartCache;
+                s.originX = l.transform.originX;
+                s.originY = l.transform.originY;
+            }
+        }
+        if (l.vectorMask != nullptr) {
+            s.vectorMask = l.vectorMask;
+            s.vectorMaskEnabled = l.vectorMask->enabled;
+        }
+        snap.layers.push_back(std::move(s));
+    }
+}
 
-    // 2) 格式校验（04 §1.3：超限给明确错误）
+// 格式校验（04 §1.3：超限给明确错误；bbox/像素预算统计在校验中一并完成）
+bool validateSnapshot(DocSnapshot& snap, std::string& err) {
     if (snap.width > kMaxSide || snap.height > kMaxSide) {
-        close(fd);
         err = "document size exceeds format limit";
         return false;
     }
     if (snap.layers.size() > kMaxLayers) {
-        close(fd);
         err = "layer count exceeds format limit";
         return false;
     }
@@ -1291,13 +1440,17 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
         }
     }
     if (totalPixels > kMaxTotalPixels) {
-        close(fd);
         err = "total layer pixels exceed format budget";
         return false;
     }
+    return true;
+}
 
-    // 3) 包体：逐层 PNG（内容包围盒）+ 蒙版 PNG → manifest.json → central directory
-    ZipWriter zip(fd);
+// 包体编码（M21 抽出：逐层/蒙版/通道/图案 PNG + v13 智能对象源/滤镜蒙版 + manifest →
+// central directory；ZipSink 抽象 = fd 流式与内存包同路径）。失败返回 false + err。
+bool encodeProject(const DocSnapshot& snap, ZipSink& sink, size_t* outLayers, uint64_t* outBytes,
+                   std::string& err) {
+    ZipWriter zip(sink);
     // 网格 → 全幅 PNG 条目（蒙版 patch 用；图层走 bbox 拼装分支）
     auto encodeGridPng = [&](const TileGrid& grid, uint32_t w, uint32_t h,
                              const std::string& name) -> bool {
@@ -1347,7 +1500,6 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
         if (l.maskGrid != nullptr &&
             !encodeGridPng(*l.maskGrid, l.maskW, l.maskH,
                            "images/" + std::to_string(l.id) + ".mask.png")) {
-            close(fd);
             return false;
         }
         if (l.pixels == nullptr) {
@@ -1356,13 +1508,11 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
         const TileGrid& grid = *l.pixels;
         if (!zip.beginEntry("images/" + std::to_string(l.id) + ".png", 0)) {
             err = "zip init failed";
-            close(fd);
             return false;
         }
         PngRowEncoder png(zip, l.pw, l.ph);
         if (!png.begin()) {
             err = "png init failed";
-            close(fd);
             return false;
         }
         std::vector<uint8_t> row(static_cast<size_t>(l.pw) * 4u);
@@ -1388,13 +1538,11 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
             }
             if (!png.addRow(row.data())) {
                 err = "png encode failed";
-                close(fd);
                 return false;
             }
         }
         if (!png.finish() || !zip.endEntry()) {
             err = "png finalize failed";
-            close(fd);
             return false;
         }
         OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag,
@@ -1408,7 +1556,6 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
         const ChannelSnapshot& c = snap.channels[i];
         if (!encodeGridPng(*c.mask, snap.width, snap.height,
                            "channels/" + std::to_string(i) + ".png")) {
-            close(fd);
             return false;
         }
     }
@@ -1416,7 +1563,33 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
     // v11：文档图案 PNG（M17d，整幅 images/pattern_<id>.png）
     for (const PatternSnapshot& p : snap.patterns) {
         if (!encodeGridPng(*p.pixels, p.w, p.h, "images/pattern_" + p.id + ".png")) {
-            close(fd);
+            return false;
+        }
+    }
+
+    // v13：智能对象源文件（嵌入字节原样存储）+ 滤镜蒙版 patch PNG
+    for (const LayerSnapshot& l : snap.layers) {
+        if (l.smart == nullptr) {
+            continue;
+        }
+        if (l.smart->filterMask != nullptr && l.smart->filterMask->pixels != nullptr &&
+            !encodeGridPng(*l.smart->filterMask->pixels, l.smart->filterMask->width,
+                           l.smart->filterMask->height,
+                           "images/smart_" + std::to_string(l.smart->contentsId) + ".fmask.png")) {
+            return false;
+        }
+        if (!l.smart->embedded || l.smart->sourceBytes.empty()) {
+            continue;
+        }
+        std::string ext = "bin";
+        const size_t dot = l.smart->fileName.rfind('.');
+        if (dot != std::string::npos && dot + 1 < l.smart->fileName.size()) {
+            ext = l.smart->fileName.substr(dot + 1);
+        }
+        if (!zip.beginEntry("images/smart_" + std::to_string(l.smart->contentsId) + "." + ext, 0) ||
+            !zip.writeEntryBytes(l.smart->sourceBytes.data(), l.smart->sourceBytes.size()) ||
+            !zip.endEntry()) {
+            err = "smart source write failed";
             return false;
         }
     }
@@ -1424,15 +1597,53 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
     const std::string manifest = buildManifest(snap);
     if (manifest.size() > kMaxManifestBytes) {
         err = "manifest too large";
-        close(fd);
         return false;
     }
     if (!zip.beginEntry("manifest.json", 0) ||
         !zip.writeEntryBytes(reinterpret_cast<const uint8_t*>(manifest.data()), manifest.size()) ||
         !zip.endEntry() || !zip.finish()) {
         err = "zip finalize failed";
+        return false;
+    }
+    if (outLayers != nullptr) {
+        *outLayers = snap.layers.size();
+    }
+    if (outBytes != nullptr) {
+        *outBytes = zip.totalBytes();
+    }
+    return true;
+}
+
+}  // namespace
+
+bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err) {
+    // 1) 锁内快照（元数据 + 不可变 TileGrid 引用），编解码全程锁外（02 §7 并发规则）
+    DocSnapshot snap;
+    {
+        auto& e = Engine::get();
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            close(fd);
+            err = "no document";
+            return false;
+        }
+        buildDocSnapshot(e.doc, snap);
+    }
+
+    // 2) 格式校验（04 §1.3：超限给明确错误）
+    if (!validateSnapshot(snap, err)) {
         close(fd);
         return false;
+    }
+
+    // 3) 包体编码（fd 流式 sink；M21 起与内存编码共用 encodeProject）
+    uint64_t bytes = 0;
+    {
+        FdZipSink sink(fd);
+        if (!encodeProject(snap, sink, outLayers, &bytes, err)) {
+            close(fd);
+            return false;
+        }
     }
     if (fsync(fd) != 0) {
         err = "fsync failed";
@@ -1440,15 +1651,27 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
         return false;
     }
     close(fd);
-    if (outLayers != nullptr) {
-        *outLayers = snap.layers.size();
-    }
     if (outBytes != nullptr) {
-        *outBytes = zip.totalBytes();
+        *outBytes = bytes;
     }
     OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "project saved: %{public}zu layers, %{public}lu bytes",
-                 snap.layers.size(), static_cast<unsigned long>(zip.totalBytes()));
+                 snap.layers.size(), static_cast<unsigned long>(bytes));
     return true;
+}
+
+// M21：任意文档 → .montage 内存包（智能对象嵌套源编码；不触碰 Engine/History）
+bool saveProjectBytes(const Document& doc, std::vector<uint8_t>& out, std::string& err) {
+    DocSnapshot snap;
+    buildDocSnapshot(doc, snap);
+    if (snap.width == 0 || snap.height == 0) {
+        err = "no document";
+        return false;
+    }
+    if (!validateSnapshot(snap, err)) {
+        return false;
+    }
+    MemZipSink sink(out);
+    return encodeProject(snap, sink, nullptr, nullptr, err);
 }
 
 }  // namespace io

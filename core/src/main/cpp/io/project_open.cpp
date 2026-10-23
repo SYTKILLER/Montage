@@ -19,6 +19,7 @@
 #include "engine/document.h"
 #include "engine/vector_render.h"
 #include "engine/style_ops.h"
+#include "engine/smart_ops.h"
 #include "engine/engine.h"
 #include "io/png_decode.h"
 
@@ -30,7 +31,7 @@ constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Open";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
 constexpr int kMinVersion = 1;
-constexpr int kMaxVersion = 12;  // v11：+等高线/Range/图案叠加/文档图案（M17d，可选字段读兼容 v1–v10）；v10：+图层样式效果扩展（M17a，可选字段读兼容 v1–v9）；v9：+参考线 guides 块（M15a）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
+constexpr int kMaxVersion = 13;  // v13：+智能对象（smart 块 + 包内源文件/滤镜蒙版 PNG，M21，可选字段读兼容 v1–v12）；v12：+形状层/矢量蒙版/工作路径/保存路径/自定义形状（M18）；v11：+等高线/Range/图案叠加/文档图案（M17d）；v10：+图层样式效果扩展（M17a）；v9：+参考线 guides 块（M15a）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
 constexpr uint32_t kMaxSide = 30000;
 constexpr uint64_t kMaxTotalPixels = 100ull * 1000 * 1000;
 constexpr size_t kMaxLayers = 10000;
@@ -518,6 +519,10 @@ struct LayerRecord {
     std::shared_ptr<FillLayerState> fill;  // v8（M14c）
     std::shared_ptr<ShapeLayerState> shape;  // v12（M18）
     std::shared_ptr<VectorMaskData> vectorMask;  // v12（M18d）
+    // v13 智能对象（M21）：状态 + 包内源文件/滤镜蒙版 PNG 路径（层组装循环装载）
+    std::shared_ptr<SmartLayerState> smart;
+    std::string smartSourceFile;
+    std::string smartFilterMaskFile;
     // v7（M14a）
     bool isGroup = false;
     uint64_t parentId = 0;
@@ -1215,6 +1220,206 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
             }
             l.vectorMask = std::move(vm);
         }
+        // v13 智能对象（M21；可选字段）
+        const JValue* jsm = item.find("smart");
+        if (jsm != nullptr && jsm->type == JValue::Obj) {
+            auto sm = std::make_shared<SmartLayerState>();
+            const JValue* jv = jsm->find("contentsId");
+            if (jv == nullptr || !getU64(*jv, sm->contentsId) || sm->contentsId == 0) {
+                err = "bad smart contentsId";
+                return false;
+            }
+            jv = jsm->find("embedded");
+            if (jv != nullptr && jv->type == JValue::Bool) {
+                sm->embedded = jv->b;
+            }
+            jv = jsm->find("fileName");
+            if (jv != nullptr && jv->type == JValue::Str) {
+                sm->fileName = jv->str;
+            }
+            jv = jsm->find("sourceFile");
+            if (jv != nullptr && jv->type == JValue::Str) {
+                l.smartSourceFile = jv->str;
+            }
+            jv = jsm->find("linkedPath");
+            if (jv != nullptr && jv->type == JValue::Str) {
+                sm->linkedPath = jv->str;
+            }
+            jv = jsm->find("m");
+            if (jv == nullptr || jv->type != JValue::Arr || jv->arr.size() != 6) {
+                err = "bad smart transform";
+                return false;
+            }
+            for (int ci = 0; ci < 6; ++ci) {
+                double mv = 0;
+                if (!getDouble(jv->arr[ci], mv) || !std::isfinite(mv)) {
+                    err = "bad smart transform value";
+                    return false;
+                }
+                sm->m[ci] = mv;
+            }
+            jv = jsm->find("filtersEnabled");
+            if (jv != nullptr && jv->type == JValue::Bool) {
+                sm->filtersEnabled = jv->b;
+            }
+            jv = jsm->find("filters");
+            if (jv != nullptr && jv->type == JValue::Arr) {
+                for (const JValue& fj : jv->arr) {
+                    if (fj.type != JValue::Obj) {
+                        err = "bad smart filter";
+                        return false;
+                    }
+                    SmartFilter sf;
+                    const JValue* kv = fj.find("kind");
+                    int64_t kind = -1;
+                    if (kv != nullptr && kv->type == JValue::Num) {
+                        kind = static_cast<int64_t>(kv->num);
+                    }
+                    if (kind < -1 || kind > 0x7fffffff) {
+                        err = "bad smart filter kind";
+                        return false;
+                    }
+                    sf.kind = static_cast<int32_t>(kind);
+                    kv = fj.find("psdClass");
+                    if (kv != nullptr && kv->type == JValue::Str) {
+                        sf.psdClass = kv->str;
+                    }
+                    kv = fj.find("name");
+                    if (kv != nullptr && kv->type == JValue::Str) {
+                        sf.name = kv->str;
+                    }
+                    if (sf.kind >= 0) {
+                        kv = fj.find("p");
+                        if (kv != nullptr && kv->type == JValue::Arr && kv->arr.size() == 6) {
+                            float* slots[6] = {&sf.params.p0, &sf.params.p1, &sf.params.p2,
+                                                     &sf.params.p3, &sf.params.p4, &sf.params.p5};
+                            for (int ci = 0; ci < 6; ++ci) {
+                                double pv = 0;
+                                if (!getDouble(kv->arr[ci], pv) || !std::isfinite(pv)) {
+                                    err = "bad smart filter param";
+                                    return false;
+                                }
+                                *slots[ci] = static_cast<float>(pv);
+                            }
+                        }
+                        kv = fj.find("seed");
+                        if (kv != nullptr && kv->type == JValue::Num && kv->num >= 0) {
+                            sf.params.seed = static_cast<uint32_t>(kv->num);
+                        }
+                        if (sf.kind == filters::FCustom) {
+                            kv = fj.find("scale");
+                            if (kv != nullptr && kv->type == JValue::Num) {
+                                sf.params.scale = static_cast<float>(kv->num);
+                            }
+                            kv = fj.find("offset");
+                            if (kv != nullptr && kv->type == JValue::Num) {
+                                sf.params.offset = static_cast<float>(kv->num);
+                            }
+                            kv = fj.find("kernel");
+                            if (kv != nullptr && kv->type == JValue::Arr &&
+                                kv->arr.size() == 25) {
+                                for (int ki = 0; ki < 25; ++ki) {
+                                    double kvv = 0;
+                                    if (!getDouble(kv->arr[ki], kvv) || !std::isfinite(kvv)) {
+                                        err = "bad smart filter kernel";
+                                        return false;
+                                    }
+                                    sf.params.kernel[ki] = static_cast<float>(kvv);
+                                }
+                            }
+                        }
+                        if (sf.kind == filters::FClouds || sf.kind == filters::FDifferenceClouds) {
+                            kv = fj.find("colorFg");
+                            if (kv != nullptr && kv->type == JValue::Arr && kv->arr.size() == 3) {
+                                for (int ci = 0; ci < 3; ++ci) {
+                                    double cv = 0;
+                                    if (!getDouble(kv->arr[ci], cv)) {
+                                        err = "bad smart filter color";
+                                        return false;
+                                    }
+                                    sf.params.colorFg[ci] = static_cast<float>(cv);
+                                }
+                            }
+                            kv = fj.find("colorBg");
+                            if (kv != nullptr && kv->type == JValue::Arr && kv->arr.size() == 3) {
+                                for (int ci = 0; ci < 3; ++ci) {
+                                    double cv = 0;
+                                    if (!getDouble(kv->arr[ci], cv)) {
+                                        err = "bad smart filter color";
+                                        return false;
+                                    }
+                                    sf.params.colorBg[ci] = static_cast<float>(cv);
+                                }
+                            }
+                        }
+                    }
+                    kv = fj.find("blend");
+                    if (kv != nullptr && kv->type == JValue::Num && kv->num >= 0 &&
+                        kv->num < kBlendModeCount) {
+                        sf.blend = static_cast<BlendMode>(static_cast<int32_t>(kv->num));
+                    }
+                    kv = fj.find("opacity");
+                    if (kv != nullptr && kv->type == JValue::Num && std::isfinite(kv->num)) {
+                        sf.opacity = std::min(1.0, std::max(0.0, kv->num));
+                    }
+                    kv = fj.find("visible");
+                    if (kv != nullptr && kv->type == JValue::Bool) {
+                        sf.visible = kv->b;
+                    }
+                    kv = fj.find("psd");
+                    if (kv != nullptr && kv->type == JValue::Str) {
+                        sf.psdHex = kv->str;
+                    }
+                    sm->filters.push_back(std::move(sf));
+                }
+            }
+            jv = jsm->find("filterMask");
+            if (jv != nullptr && jv->type == JValue::Str) {
+                l.smartFilterMaskFile = jv->str;
+                auto fm = std::make_shared<LayerMask>();
+                fm->width = 0;
+                fm->height = 0;
+                fm->offsetX = 0;
+                fm->offsetY = 0;
+                fm->outside = 255;
+                fm->enabled = true;
+                fm->linked = true;
+                jv = jsm->find("filterMaskW");
+                if (jv != nullptr && jv->type == JValue::Num) {
+                    fm->width = static_cast<uint32_t>(jv->num);
+                }
+                jv = jsm->find("filterMaskH");
+                if (jv != nullptr && jv->type == JValue::Num) {
+                    fm->height = static_cast<uint32_t>(jv->num);
+                }
+                jv = jsm->find("filterMaskOffsetX");
+                if (jv != nullptr && jv->type == JValue::Num) {
+                    fm->offsetX = static_cast<int>(jv->num);
+                }
+                jv = jsm->find("filterMaskOffsetY");
+                if (jv != nullptr && jv->type == JValue::Num) {
+                    fm->offsetY = static_cast<int>(jv->num);
+                }
+                jv = jsm->find("filterMaskOutside");
+                if (jv != nullptr && jv->type == JValue::Num) {
+                    fm->outside = static_cast<uint8_t>(jv->num);
+                }
+                jv = jsm->find("filterMaskEnabled");
+                if (jv != nullptr && jv->type == JValue::Bool) {
+                    fm->enabled = jv->b;
+                }
+                sm->filterMask = std::move(fm);
+            }
+            jv = jsm->find("placedId");
+            if (jv != nullptr && jv->type == JValue::Str) {
+                sm->placedId = jv->str;
+            }
+            jv = jsm->find("uuid");
+            if (jv != nullptr && jv->type == JValue::Str) {
+                sm->uuid = jv->str;
+            }
+            l.smart = std::move(sm);
+        }
         const JValue* jst = item.find("style");
         if (jst != nullptr) {
             if (jst->type != JValue::Obj) {
@@ -1728,40 +1933,10 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
 
 }  // namespace
 
-bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
-    // 整包读入（与 PSD 导入同策略：包体几十 MB 量级）；512MB 上限（审查修复：
-    // 原先仅查空文件即按 sz 全量分配，对抗文件可打到 OOM——DNG 路径已有同款上限）
-    constexpr off_t kMaxProjectBytes = 512ll * 1024 * 1024;
-    std::vector<uint8_t> data;
-    {
-        off_t sz = lseek(fd, 0, SEEK_END);
-        if (sz <= 0) {
-            close(fd);
-            err = "empty file";
-            return false;
-        }
-        if (sz > kMaxProjectBytes) {
-            close(fd);
-            err = "project file too large";
-            return false;
-        }
-        lseek(fd, 0, SEEK_SET);
-        data.resize(static_cast<size_t>(sz));
-        size_t got = 0;
-        while (got < data.size()) {
-            ssize_t n = read(fd, data.data() + got, data.size() - got);
-            if (n <= 0) {
-                break;
-            }
-            got += static_cast<size_t>(n);
-        }
-        close(fd);
-        if (got != data.size()) {
-            err = "read failed";
-            return false;
-        }
-    }
-
+// 内存 .montage 包 → 完整 Document（M21 拆出：不触碰 Engine——智能对象嵌套源解码复用；
+// openProject(fd) = 读包 + 本函数 + 整档替换）。含逐层/通道/图案/智能源装载。
+bool openProjectBytes(const std::vector<uint8_t>& data, Document& full, size_t* layerCount,
+                      std::string& err) {
     ZipReader zip;
     if (!zip.open(data)) {
         err = "not a valid montage package";
@@ -1806,6 +1981,51 @@ bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
         l.vectorMask = rec.vectorMask;
         l.transform.originX = rec.originX;
         l.transform.originY = rec.originY;
+        if (rec.smart != nullptr) {
+            // v13：智能对象状态 + 包内源/滤镜蒙版装载（smartCache 不入库，open 后重渲）
+            l.smart = rec.smart;
+            if (!rec.smartSourceFile.empty()) {
+                const ZipReader::CdEntry* se = zip.find(rec.smartSourceFile);
+                if (se == nullptr) {
+                    err = "smart source missing: " + rec.smartSourceFile;
+                    return false;
+                }
+                std::vector<uint8_t> sbytes;
+                if (!zip.extract(*se, sbytes, err)) {
+                    return false;
+                }
+                l.smart->sourceBytes = std::move(sbytes);
+            }
+            if (!rec.smartFilterMaskFile.empty()) {
+                if (l.smart->filterMask == nullptr) {
+                    err = "smart filter mask record inconsistent";
+                    return false;
+                }
+                const ZipReader::CdEntry* fe = zip.find(rec.smartFilterMaskFile);
+                if (fe == nullptr) {
+                    err = "smart filter mask missing: " + rec.smartFilterMaskFile;
+                    return false;
+                }
+                std::vector<uint8_t> fbytes;
+                if (!zip.extract(*fe, fbytes, err)) {
+                    return false;
+                }
+                std::shared_ptr<const TileGrid> fgrid =
+                    decodePngToGrid(fbytes.data(), fbytes.size(), err);
+                if (fgrid == nullptr) {
+                    return false;
+                }
+                const uint32_t eCols =
+                    (l.smart->filterMask->width + kTileSize - 1u) / kTileSize;
+                const uint32_t eRows =
+                    (l.smart->filterMask->height + kTileSize - 1u) / kTileSize;
+                if (fgrid->cols != eCols || fgrid->rows != eRows) {
+                    err = "smart filter mask size mismatch";
+                    return false;
+                }
+                l.smart->filterMask->pixels = std::move(fgrid);
+            }
+        }
         if (rec.hasImage) {
             const ZipReader::CdEntry* png = zip.find("images/" + std::to_string(rec.id) + ".png");
             if (png == nullptr) {
@@ -1926,41 +2146,92 @@ bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
         }
         doc.patterns.push_back(std::move(p));
     }
+
+    // 完整文档组装（M18 教训：字段逐项拷贝清单是漏项温床——整结构一次赋值）
+    full = std::move(doc);
+    full.layers = std::move(layers);
+    if (layerCount != nullptr) {
+        *layerCount = records.size();
+    }
+    return true;
+}
+
+bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
+    // 整包读入（与 PSD 导入同策略：包体几十 MB 量级）；512MB 上限（审查修复：
+    // 原先仅查空文件即按 sz 全量分配，对抗文件可打到 OOM——DNG 路径已有同款上限）
+    constexpr off_t kMaxProjectBytes = 512ll * 1024 * 1024;
+    std::vector<uint8_t> data;
+    {
+        off_t sz = lseek(fd, 0, SEEK_END);
+        if (sz <= 0) {
+            close(fd);
+            err = "empty file";
+            return false;
+        }
+        if (sz > kMaxProjectBytes) {
+            close(fd);
+            err = "project file too large";
+            return false;
+        }
+        lseek(fd, 0, SEEK_SET);
+        data.resize(static_cast<size_t>(sz));
+        size_t got = 0;
+        while (got < data.size()) {
+            ssize_t n = read(fd, data.data() + got, data.size() - got);
+            if (n <= 0) {
+                break;
+            }
+            got += static_cast<size_t>(n);
+        }
+        close(fd);
+        if (got != data.size()) {
+            err = "read failed";
+            return false;
+        }
+    }
+
+    Document full;
+    size_t layerCount = 0;
+    if (!openProjectBytes(data, full, &layerCount, err)) {
+        return false;
+    }
+
+    // 序号回填（patternSeq v11 / 智能对象 contentsId v13——打开后新建不撞号）
+    uint64_t maxPatternSeq = 0;
+    for (const DocumentPattern& p : full.patterns) {
+        if (p.id.rfind("pat_", 0) == 0) {
+            maxPatternSeq = std::max(maxPatternSeq,
+                                     static_cast<uint64_t>(std::strtoull(p.id.c_str() + 4,
+                                                                         nullptr, 10)));
+        }
+    }
     Engine::get().patternSeq = std::max(Engine::get().patternSeq, maxPatternSeq);
+    uint64_t maxContentsId = 0;
+    for (const Layer& l : full.layers) {
+        if (l.smart != nullptr) {
+            maxContentsId = std::max(maxContentsId, l.smart->contentsId);
+        }
+    }
+    smart::bumpContentsSeqAbove(maxContentsId);
 
     // 整档替换（02 §5 语义）：统一走 resetDocument（清撤销/会话态，撤销不跨文档）
     auto& engine = Engine::get();
     engine.resetDocument();
     {
         std::lock_guard<std::mutex> lk(engine.docMutex);
-        engine.doc.width = doc.width;
-        engine.doc.height = doc.height;
-        engine.doc.name = doc.name;
-        engine.doc.layers = std::move(layers);
-        engine.doc.activeId = doc.activeId;
-        engine.doc.channels = std::move(doc.channels);
-        // M15a：参考线随工程恢复（会话态持久化）
-        engine.doc.guidesH = std::move(doc.guidesH);
-        engine.doc.guidesV = std::move(doc.guidesV);
-        engine.doc.guidesLocked = doc.guidesLocked;
-        engine.doc.guidesVisible = doc.guidesVisible;
-        engine.doc.patterns = std::move(doc.patterns);  // M17d：图案资源随工程恢复
-        engine.doc.workPath = std::move(doc.workPath);  // M18：路径面板/自定义形状随工程恢复
-        engine.doc.paths = std::move(doc.paths);
-        engine.doc.customShapes = std::move(doc.customShapes);
-        engine.doc.customShapeSeq = doc.customShapeSeq;
-        // M14c：样式/填充派生渲染重建（styledRender 不入库，读入后按参数重生成）
+        engine.doc = std::move(full);
+        // M14c/M21：样式/填充/智能对象派生渲染重建（不入库，读入后按参数重生成）
         restyleDocument(engine.doc);
         engine.bumpRevisionLocked();
         engine.requestRender();
     }
     if (out != nullptr) {
-        out->width = doc.width;
-        out->height = doc.height;
-        out->layers = records.size();
+        out->width = engine.doc.width;
+        out->height = engine.doc.height;
+        out->layers = layerCount;
     }
     OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "project opened: %{public}ux%{public}u, %{public}zu layers",
-                 doc.width, doc.height, records.size());
+                 engine.doc.width, engine.doc.height, layerCount);
     return true;
 }
 

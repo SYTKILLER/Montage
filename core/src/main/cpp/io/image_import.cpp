@@ -523,5 +523,128 @@ void cancelImageImport() {
     engine.import.cancel = true;
 }
 
+// M21：内存栅格源解码（智能对象源；系统解码器整图单趟 + mimeType 驱动 swapRB
+//（M16a 校准纪律：JPEG 报告诚实强制换序）+ 预乘还原（M4b 实证）。PNG 不走此路径
+//（自研确定性解码在 smart_ops decodeSourceFlat 分发）。
+bool decodeRasterSource(const std::string& fileName, const std::vector<uint8_t>& bytes,
+                        uint32_t& w, uint32_t& h, std::vector<uint8_t>& rgba, std::string& err) {
+    (void)fileName;
+    OH_ImageSourceNative* rawSource = nullptr;
+    if (OH_ImageSourceNative_CreateFromData(const_cast<uint8_t*>(bytes.data()), bytes.size(),
+                                            &rawSource) != IMAGE_SUCCESS ||
+        rawSource == nullptr) {
+        err = "smart source: CreateFromData failed";
+        return false;
+    }
+    SourceGuard source(rawSource);
+
+    uint32_t imgW = 0;
+    uint32_t imgH = 0;
+    std::string mimeType;
+    {
+        OH_ImageSource_Info* info = nullptr;
+        OH_ImageSourceInfo_Create(&info);
+        if (info == nullptr) {
+            err = "smart source: ImageSourceInfo create failed";
+            return false;
+        }
+        const Image_ErrorCode rc = OH_ImageSourceNative_GetImageInfo(source.get(), 0, info);
+        if (rc == IMAGE_SUCCESS) {
+            OH_ImageSourceInfo_GetWidth(info, &imgW);
+            OH_ImageSourceInfo_GetHeight(info, &imgH);
+            Image_MimeType mt{nullptr, 0};
+            if (OH_ImageSourceInfo_GetMimeType(info, &mt) == IMAGE_SUCCESS && mt.data != nullptr) {
+                mimeType.assign(mt.data, mt.size);
+            }
+        }
+        OH_ImageSourceInfo_Release(info);
+        if (rc != IMAGE_SUCCESS) {
+            err = "smart source: GetImageInfo rc=" + std::to_string(rc);
+            return false;
+        }
+    }
+    if (imgW == 0 || imgH == 0) {
+        err = "smart source: empty image";
+        return false;
+    }
+
+    // 整图单趟解码（BGRA 请求，M1 实证 native 解码器实出与请求同序语义按格式分治）
+    OH_DecodingOptions* opts = nullptr;
+    if (OH_DecodingOptions_Create(&opts) != IMAGE_SUCCESS || opts == nullptr) {
+        err = "smart source: DecodingOptions create failed";
+        return false;
+    }
+    OH_DecodingOptions_SetPixelFormat(opts, 4 /*BGRA_8888*/);
+    OH_PixelmapNative* rawPm = nullptr;
+    const Image_ErrorCode rc = OH_ImageSourceNative_CreatePixelmap(source.get(), opts, &rawPm);
+    OH_DecodingOptions_Release(opts);
+    if (rc != IMAGE_SUCCESS || rawPm == nullptr) {
+        err = "smart source: pixelmap decode rc=" + std::to_string(rc);
+        return false;
+    }
+    PixelMapGuard pm(rawPm);
+
+    OH_Pixelmap_ImageInfo* pinfo = nullptr;
+    OH_PixelmapImageInfo_Create(&pinfo);
+    if (pinfo == nullptr) {
+        err = "smart source: ImageInfo create failed";
+        return false;
+    }
+    OH_PixelmapNative_GetImageInfo(pm.get(), pinfo);
+    uint32_t pmW = 0;
+    uint32_t pmH = 0;
+    uint32_t rowStride = 0;
+    int32_t pixelFormat = 0;
+    int32_t alphaType = 0;
+    OH_PixelmapImageInfo_GetWidth(pinfo, &pmW);
+    OH_PixelmapImageInfo_GetHeight(pinfo, &pmH);
+    OH_PixelmapImageInfo_GetRowStride(pinfo, &rowStride);
+    OH_PixelmapImageInfo_GetPixelFormat(pinfo, &pixelFormat);
+    OH_PixelmapImageInfo_GetAlphaType(pinfo, &alphaType);
+    OH_PixelmapImageInfo_Release(pinfo);
+    if (pmW == 0 || pmH == 0 || pmW != imgW || pmH != imgH) {
+        err = "smart source: decode size mismatch";
+        return false;
+    }
+    if (rowStride == 0) {
+        rowStride = pmW * 4u;
+    }
+    // swapRB：mimeType 驱动（M16a：JPEG 诚实报告强制换序）；其余维持 fmt 启发式
+    const bool swapRB = mimeType == "image/jpeg" || pixelFormat == 3;
+    // unpremultiply：报告 UNPREMULTIPLIED(3) 才跳过（M4b 实证）
+    const bool unpremult = alphaType != 3;
+
+    void* addr = nullptr;
+    if (OH_PixelmapNative_AccessPixels(pm.get(), &addr) != IMAGE_SUCCESS || addr == nullptr) {
+        err = "smart source: pixel access failed";
+        return false;
+    }
+    const uint8_t* src = static_cast<const uint8_t*>(addr);
+    rgba.assign(static_cast<size_t>(pmW) * pmH * 4u, 0);
+    for (uint32_t y = 0; y < pmH; ++y) {
+        const uint8_t* srow = src + static_cast<size_t>(y) * rowStride;
+        uint8_t* drow = rgba.data() + static_cast<size_t>(y) * pmW * 4u;
+        for (uint32_t x = 0; x < pmW; ++x) {
+            uint8_t px[4];
+            std::memcpy(px, srow + static_cast<size_t>(x) * 4u, 4);
+            if (swapRB) {
+                std::swap(px[0], px[2]);
+            }
+            if (unpremult && px[3] != 255 && px[3] != 0) {
+                const unsigned a = px[3];
+                for (int c = 0; c < 3; ++c) {
+                    const unsigned v = (static_cast<unsigned>(px[c]) * 255u + a / 2u) / a;
+                    px[c] = static_cast<uint8_t>(v > 255u ? 255u : v);
+                }
+            }
+            std::memcpy(drow + static_cast<size_t>(x) * 4u, px, 4);
+        }
+    }
+    OH_PixelmapNative_UnaccessPixels(pm.get());
+    w = pmW;
+    h = pmH;
+    return true;
+}
+
 }  // namespace io
 }  // namespace montage
