@@ -37,6 +37,7 @@ add_library(compositor SHARED
         engine/resample.cpp
         engine/resample_hq.cpp
         engine/lens_ops.cpp
+        engine/warp_ops.cpp
         engine/liquify_ops.cpp
         engine/puppet_ops.cpp
         engine/perspective_ops.cpp
