@@ -23,6 +23,12 @@ namespace io {
 // 内容探测：相机 raw（DNG/CR2/NEF/ARW/RW2/ORF/RAF…，廉价头与 IFD 检查）。
 bool looksLikeCameraRaw(const std::vector<uint8_t>& bytes);
 
+// M23c：内嵌预览 JPEG → 交错 RGB8 的解码钩子（由 image_import 初始化时注入
+// 系统解码器实现；宿主测试不注入 = fit_look 参考不可得，保持中性回退）。
+using PreviewDecodeFn = bool (*)(const uint8_t* jpeg, size_t len, uint32_t& w, uint32_t& h,
+                                 std::vector<uint8_t>& rgb);
+void setPreviewDecodeHook(PreviewDecodeFn fn);
+
 // M15e 显影参数（相对默认显影的偏移；显影参数面板）
 struct DevelopParams {
     float temp = 0.0f;   // -100..100 色温偏移（正=暖/偏黄，负=冷/偏蓝；调制 R/B 增益 ±30%）

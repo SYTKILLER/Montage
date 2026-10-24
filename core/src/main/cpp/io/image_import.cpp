@@ -15,6 +15,7 @@
 #include "engine/engine.h"
 #include "io/png_decode.h"
 #include "io/dng_decode.h"
+#include "io/raw/raw_preview.h"
 #include "io/codecs/codec_import.h"
 #include "io/codecs/codec_table.h"
 #include "io/codecs/tiff_codec.h"
@@ -322,6 +323,45 @@ ImportCompletion* runImport(int fd, const std::string& fileName) {
                 }
                 OH_LOG_Print(LOG_APP, LOG_WARN, 0x4D30, "Montage.Dng",
                              "raw develop failed: %{public}s", derr.c_str());
+                // M23c 嵌入预览回退：不可解码 raw（CR3/PEF/压缩变体）导入相机
+                // 渲染 JPEG 当普通像素层（无 RAW 会话，不可重显影）。
+                auto prev = raw::embeddedPreview(bytes);
+                if (prev.has_value()) {
+                    std::vector<uint8_t> jpeg(bytes.begin() + static_cast<long>(prev->offset),
+                                              bytes.begin() + static_cast<long>(prev->offset + prev->len));
+                    uint32_t pw = 0;
+                    uint32_t ph = 0;
+                    std::vector<uint8_t> rgba;
+                    std::string jerr;
+                    if (decodeRasterSource("preview.jpg", jpeg, pw, ph, rgba, jerr) &&
+                        pw > 0 && ph > 0) {
+                        auto grid = gridFromRgba(pw, ph, rgba);
+                        if (grid != nullptr) {
+                            Layer layer;
+                            layer.id = engine.nextLayerId();
+                            layer.name = "RAW 预览";
+                            layer.transform.width = pw;
+                            layer.transform.height = ph;
+                            layer.pixels = grid;
+                            LayerId nid = layer.id;
+                            {
+                                std::lock_guard<std::mutex> lk(engine.docMutex);
+                                if (engine.doc.width == 0) {
+                                    engine.doc.width = pw;
+                                    engine.doc.height = ph;
+                                }
+                                engine.doc.layers.push_back(std::move(layer));
+                                engine.doc.activeId = nid;
+                                engine.bumpRevisionLocked();
+                            }
+                            engine.requestRender();
+                            OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Dng",
+                                         "imported embedded preview %ux%u", pw, ph);
+                            return makePayload(true, pw, ph, nid,
+                                               "raw not decodable (" + derr + "); imported the camera's embedded JPEG preview");
+                        }
+                    }
+                }
                 return makePayload(false, 0, 0, 0, derr);
             }
         }
@@ -597,6 +637,32 @@ bool startImageImport(int fd, napi_threadsafe_function completionTsfn,
     std::thread(&importThread, fd, fileName, completionTsfn).detach();
     return true;
 }
+
+// M23c：内嵌预览 JPEG → RGB8（developDngToGrid 的 fit_look 参考解码钩子）。
+namespace {
+bool previewJpegToRgb(const uint8_t* jpeg, size_t len, uint32_t& w, uint32_t& h,
+                      std::vector<uint8_t>& rgb) {
+    std::vector<uint8_t> bytes(jpeg, jpeg + len);
+    std::vector<uint8_t> rgba;
+    std::string err;
+    if (!decodeRasterSource("preview.jpg", bytes, w, h, rgba, err)) {
+        return false;
+    }
+    rgb.resize(static_cast<size_t>(w) * h * 3);
+    for (size_t i = 0; i < rgb.size() / 3; ++i) {
+        rgb[i * 3] = rgba[i * 4];
+        rgb[i * 3 + 1] = rgba[i * 4 + 1];
+        rgb[i * 3 + 2] = rgba[i * 4 + 2];
+    }
+    return true;
+}
+
+// 模块加载即挂（bridge 与 image_import 同在 libcompositor；宿主测试不链接本文件）。
+const bool kPreviewHookInit = [] {
+    setPreviewDecodeHook(&previewJpegToRgb);
+    return true;
+}();
+}  // namespace
 
 void cancelImageImport() {
     auto& engine = Engine::get();

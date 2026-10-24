@@ -194,6 +194,31 @@ std::tuple<std::vector<uint16_t>, size_t, size_t> orientRgb(std::vector<uint16_t
     return {std::move(out), ow, oh};
 }
 
+// M23c：fit_look 复用——与 developSensor 同源的白平衡（含用户 temp/tint 调制）
+// 与样本线性化值。Multipliers 非法时返回 false。
+bool lookWhiteBalance(const Sensor& s, const DevelopOptions& opts, std::array<double, 3>& neutral,
+                      std::vector<std::string>& warnings) {
+    try {
+        std::array<double, 3> n = resolveNeutral(s, opts, Scale(s), warnings);
+        float temp = std::clamp(opts.temp, -100.0f, 100.0f);
+        float tint = std::clamp(opts.tint, -100.0f, 100.0f);
+        double rMod = 1.0 + temp * 0.003;
+        double bMod = 1.0 - temp * 0.003;
+        double gMod = 1.0 - tint * 0.003;
+        if (rMod > 0.1) n[0] /= rMod;
+        if (bMod > 0.1) n[2] /= bMod;
+        if (gMod > 0.1) n[1] /= gMod;
+        neutral = n;
+        return true;
+    } catch (const RawError&) {
+        return false;
+    }
+}
+
+float lookSampleValue(const Sensor& s, size_t x, size_t y, size_t sample) {
+    return Scale(s).value(x, y, sample);
+}
+
 Developed developSensor(const Sensor& s, const DevelopOptions& opts) {
     Rect c = s.crop;
     if (c.empty() || c.x + c.width > s.width || c.y + c.height > s.height || s.data.size() < s.width * s.height * s.samples) {
@@ -223,13 +248,21 @@ Developed developSensor(const Sensor& s, const DevelopOptions& opts) {
     std::array<float, 3> mult{};
     for (int i = 0; i < 3; ++i) mult[i] = static_cast<float>(1.0 / neutral[i]);
 
-    // 平衡相机 → XYZ D50：文件校准或中性回退。（fit_look 相机 look 本批不移植，登记。）
+    // 平衡相机 → XYZ D50：文件校准、per-file look（M23c）或中性回退。
     bool mono = s.isMonochrome();
     std::optional<Mat3> balanced = balancedToXyzD50(s.color, neutral);
     Mat3 toXyz;
+    const ToneCurve* lookTone = nullptr;
     if (balanced) {
         toXyz = *balanced;
+    } else if (opts.cameraLook && !mono && opts.cameraLook->isUsable()) {
+        toXyz = opts.cameraLook->toXyz;
+        lookTone = opts.cameraLook->tone ? &*opts.cameraLook->tone : nullptr;
+        warnings.push_back(opts.cameraLook->note());
     } else {
+        if (opts.cameraLook && !(opts.cameraLook->isUsable())) {
+            warnings.push_back("camera look not usable; ignored");
+        }
         if (s.format != RawFormat::Dng && !mono) {
             warnings.push_back("no colour calibration for this camera; camera colours are treated as sRGB primaries");
         }
@@ -344,7 +377,9 @@ Developed developSensor(const Sensor& s, const DevelopOptions& opts) {
 
     // 相机 → ProPhoto、曝光、gamma 1.8、16 位。
     std::vector<uint16_t> out(w * h * 3);
-    GammaLut lut(s.toneCurve);
+    // M23c：look 的色调曲线折叠进编码表（曲线作用于线性 ProPhoto，与矩阵+曝光
+    // 之后的编码前一步吻合；文件自带 toneCurve 仅在无 look 时使用）。
+    GammaLut lut(lookTone != nullptr ? lookTone->knots() : s.toneCurve);
     for (size_t p = 0; p < w * h; ++p) {
         const float* src = rgb.data() + p * 3;
         uint16_t* o = out.data() + p * 3;

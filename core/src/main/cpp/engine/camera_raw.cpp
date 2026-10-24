@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 
 namespace montage {
 namespace {
@@ -807,6 +808,26 @@ std::vector<float> cameraCurveLut(const std::vector<std::array<float, 2>>& pts, 
     return out;
 }
 
+// M23c 多线程显影：行带切分（photocraft par 语义——行与行独立；photocraft 测试
+// 已证输出与线程数无关）。小图（<256 行）直接串行，避免线程启停开销。
+template <typename Fn>
+static void parRows(size_t h, Fn&& fn) {
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw <= 1 || h < 256) {
+        fn(0, h);
+        return;
+    }
+    size_t n = std::min<size_t>(hw, 8);
+    std::vector<std::thread> threads;
+    threads.reserve(n);
+    for (size_t t = 0; t < n; ++t) {
+        size_t y0 = h * t / n;
+        size_t y1 = h * (t + 1) / n;
+        threads.emplace_back([&, y0, y1] { fn(y0, y1); });
+    }
+    for (auto& th : threads) th.join();
+}
+
 void cameraRawDevelop(float* px, size_t w, size_t h, const CameraRaw& p, bool floatDoc) {
     if (w == 0 || h == 0 || p.isIdentity()) return;
     float ps = std::clamp(p.pixelScale, 0.01f, 1.0f);
@@ -817,8 +838,16 @@ void cameraRawDevelop(float* px, size_t w, size_t h, const CameraRaw& p, bool fl
         float norm = luma3(g[0], g[1], g[2]);
         float gain = std::pow(2.0f, p.exposure);
         for (int c = 0; c < 3; ++c) g[c] = g[c] / norm * gain;
-        for (size_t i = 0; i < w * h; ++i)
-            for (int c = 0; c < 3; ++c) px[(i) * 4 + c] = linearToSrgb(std::max(srgbToLinear(px[(i) * 4 + c]) * g[c], 0.0f));
+        parRows(h, [&](size_t y0, size_t y1) {
+            for (size_t y = y0; y < y1; ++y) {
+                for (size_t x = 0; x < w; ++x) {
+                    size_t i = y * w + x;
+                    for (int c = 0; c < 3; ++c) {
+                        px[i * 4 + c] = linearToSrgb(std::max(srgbToLinear(px[i * 4 + c]) * g[c], 0.0f));
+                    }
+                }
+            }
+        });
     }
     // 2. 去雾。
     if (p.dehaze != 0.0f) dehaze(px, w, h, p.dehaze / 100.0f);
@@ -847,36 +876,39 @@ void cameraRawDevelop(float* px, size_t w, size_t h, const CameraRaw& p, bool fl
             hasTex = true;
         }
         float kCon = p.contrast / 100.0f * 0.6f;
-        for (size_t y = 0; y < h; ++y)
-            for (size_t x = 0; x < w; ++x) {
-                size_t i = y * w + x;
-                float l0 = l[i];
-                float lv = lc[i];
-                if (hasBase) {
-                    float bv = std::clamp(base[i], 0.0f, 1.0f);
-                    float hm = smoothstep(0.45f, 0.95f, bv);
-                    float sm = 1.0f - smoothstep(0.05f, 0.5f, bv);
-                    lv *= std::pow(2.0f, p.highlights / 100.0f * 1.2f * hm + p.shadows / 100.0f * 1.4f * sm);
-                }
-                if (hasClar) {
-                    float mw = 1.0f - std::pow(2.0f * std::clamp(lv, 0.0f, 1.0f) - 1.0f, 2.0f);
-                    lv += p.clarity / 100.0f * 0.8f * (lc[i] - clar[i]) * mw;
-                }
-                if (hasTex) {
-                    lv += p.texture / 100.0f * 0.9f * std::clamp(lc[i] - tex[i], -0.1f, 0.1f);
-                }
-                if (p.whites != 0.0f) lv += p.whites / 100.0f * 0.25f * smoothstep(0.4f, 1.0f, lv);
-                if (p.blacks != 0.0f) lv += p.blacks / 100.0f * 0.15f * (1.0f - smoothstep(0.0f, 0.45f, lv));
-                if (kCon != 0.0f) {
-                    float xx = std::clamp(lv, 0.0f, 1.0f);
-                    lv += -kCon * std::sin(kTau * xx) / kTau;
-                }
-                float lv2 = std::max(lv, 0.0f) + (l0 - lc[i]);
-                float ratio = l0 > 1e-5f ? lv2 / l0 : 1.0f;
-                for (int c = 0; c < 3; ++c) {
-                    px[(i) * 4 + c] = l0 > 1e-5f ? px[(i) * 4 + c] * ratio : px[(i) * 4 + c] + (lv2 - l0);
+        parRows(h, [&](size_t y0, size_t y1) {
+            for (size_t y = y0; y < y1; ++y) {
+                for (size_t x = 0; x < w; ++x) {
+                    size_t i = y * w + x;
+                    float l0 = l[i];
+                    float lv = lc[i];
+                    if (hasBase) {
+                        float bv = std::clamp(base[i], 0.0f, 1.0f);
+                        float hm = smoothstep(0.45f, 0.95f, bv);
+                        float sm = 1.0f - smoothstep(0.05f, 0.5f, bv);
+                        lv *= std::pow(2.0f, p.highlights / 100.0f * 1.2f * hm + p.shadows / 100.0f * 1.4f * sm);
+                    }
+                    if (hasClar) {
+                        float mw = 1.0f - std::pow(2.0f * std::clamp(lv, 0.0f, 1.0f) - 1.0f, 2.0f);
+                        lv += p.clarity / 100.0f * 0.8f * (lc[i] - clar[i]) * mw;
+                    }
+                    if (hasTex) {
+                        lv += p.texture / 100.0f * 0.9f * std::clamp(lc[i] - tex[i], -0.1f, 0.1f);
+                    }
+                    if (p.whites != 0.0f) lv += p.whites / 100.0f * 0.25f * smoothstep(0.4f, 1.0f, lv);
+                    if (p.blacks != 0.0f) lv += p.blacks / 100.0f * 0.15f * (1.0f - smoothstep(0.0f, 0.45f, lv));
+                    if (kCon != 0.0f) {
+                        float xx = std::clamp(lv, 0.0f, 1.0f);
+                        lv += -kCon * std::sin(kTau * xx) / kTau;
+                    }
+                    float lv2 = std::max(lv, 0.0f) + (l0 - lc[i]);
+                    float ratio = l0 > 1e-5f ? lv2 / l0 : 1.0f;
+                    for (int c = 0; c < 3; ++c) {
+                        px[(i) * 4 + c] = l0 > 1e-5f ? px[(i) * 4 + c] * ratio : px[(i) * 4 + c] + (lv2 - l0);
+                    }
                 }
             }
+        });
     }
     // 4–7：逐像素颜色级。
     bool needColor = p.vibrance != 0.0f || p.saturation != 0.0f || !p.curvesNeutral() || !p.hslNeutral() || !p.gradeNeutral();
@@ -901,7 +933,10 @@ void cameraRawDevelop(float* px, size_t w, size_t h, const CameraRaw& p, bool fl
                                                      wheelTint(p.gradeGlobal)};
         float blend = 0.15f + std::clamp(p.gradeBlending, 0.0f, 100.0f) / 100.0f * 0.35f;
         float bal = std::clamp(p.gradeBalance, -100.0f, 100.0f) / 100.0f * 0.25f;
-        for (size_t i = 0; i < w * h; ++i) {
+        parRows(h, [&](size_t ry0, size_t ry1) {
+          for (size_t y = ry0; y < ry1; ++y)
+            for (size_t x = 0; x < w; ++x) {
+            size_t i = y * w + x;
             std::array<float, 3> c = {px[(i) * 4 + 0], px[(i) * 4 + 1], px[(i) * 4 + 2]};
             if (p.vibrance != 0.0f || p.saturation != 0.0f) {
                 float l = luma3(c[0], c[1], c[2]);
@@ -963,7 +998,8 @@ void cameraRawDevelop(float* px, size_t w, size_t h, const CameraRaw& p, bool fl
             px[(i) * 4 + 0] = c[0];
             px[(i) * 4 + 1] = c[1];
             px[(i) * 4 + 2] = c[2];
-        }
+            }
+        });
     }
     // 8. 细节。
     if (p.noiseLuminance > 0.0f || p.noiseColor > 0.0f || p.sharpenAmount > 0.0f) detail(px, w, h, p, ps);
@@ -975,7 +1011,8 @@ void cameraRawDevelop(float* px, size_t w, size_t h, const CameraRaw& p, bool fl
         float amt = p.grainAmount / 100.0f * 0.12f;
         uint64_t seed = p.seed;
         float pscale = 1.0f / ps;
-        for (size_t y = 0; y < h; ++y)
+        parRows(h, [&](size_t gy0, size_t gy1) {
+          for (size_t y = gy0; y < gy1; ++y)
             for (size_t x = 0; x < w; ++x) {
                 // 全分辨率坐标采样，代理预览与结果一致。
                 float fx = static_cast<float>(x) * pscale / cell;
@@ -985,10 +1022,14 @@ void cameraRawDevelop(float* px, size_t w, size_t h, const CameraRaw& p, bool fl
                 float g = (nv - 0.5f) * 2.0f * amt * (0.4f + 2.4f * l * (1.0f - l));
                 for (int c = 0; c < 3; ++c) px[(y * w + x) * 4 + c] += g;
             }
+        });
     }
     if (!floatDoc) {
-        for (size_t i = 0; i < w * h; ++i)
-            for (int c = 0; c < 3; ++c) px[(i) * 4 + c] = std::clamp(px[(i) * 4 + c], 0.0f, 1.0f);
+        parRows(h, [&](size_t y0, size_t y1) {
+            for (size_t i = y0 * w; i < y1 * w; ++i) {
+                for (int c = 0; c < 3; ++c) px[i * 4 + c] = std::clamp(px[i * 4 + c], 0.0f, 1.0f);
+            }
+        });
     }
 }
 

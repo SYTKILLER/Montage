@@ -8,6 +8,9 @@
 
 #include "io/raw/raw_color.h"
 #include "io/raw/raw_decode.h"
+#include "io/raw/raw_internal.h"
+#include "io/raw/raw_look.h"
+#include "io/raw/raw_preview.h"
 #include "io/raw/raw_types.h"
 
 namespace montage {
@@ -33,6 +36,14 @@ inline float srgbEncode(float v) {
 
 bool looksLikeCameraRaw(const std::vector<uint8_t>& bytes) {
     return raw::isRaw(bytes);
+}
+
+namespace {
+PreviewDecodeFn g_previewDecode = nullptr;
+}  // namespace
+
+void setPreviewDecodeHook(PreviewDecodeFn fn) {
+    g_previewDecode = fn;
 }
 
 bool developDngToGrid(const std::vector<uint8_t>& bytes,
@@ -62,7 +73,45 @@ bool developDngToGrid(const std::vector<uint8_t>& bytes,
     }
     raw::Developed dev;
     try {
-        dev = raw::develop(bytes, opts);
+        raw::Sensor sensor = raw::decodeRaw(bytes, opts.limits);
+        // M23c fit_look：无文件颜色校准的非 DNG 彩色 raw，用内嵌预览 JPEG 拟合
+        // per-file 相机 look（矩阵+色调曲线）；拟合失败静默保持中性回退。
+        if (g_previewDecode != nullptr && !sensor.isMonochrome() &&
+            sensor.format != raw::RawFormat::Dng) {
+            std::array<double, 3> neutral{};
+            std::vector<std::string> wbWarn;
+            if (raw::lookWhiteBalance(sensor, opts, neutral, wbWarn) &&
+                !raw::balancedToXyzD50(sensor.color, neutral)) {
+                auto prev = raw::embeddedPreview(bytes);
+                if (prev.has_value()) {
+                    uint32_t rw = 0;
+                    uint32_t rh = 0;
+                    std::vector<uint8_t> rgb;
+                    if (g_previewDecode(bytes.data() + prev->offset, prev->len, rw, rh, rgb)) {
+                        OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag,
+                                     "fit_look reference decoded %{public}dx%{public}d",
+                                     static_cast<int>(rw), static_cast<int>(rh));
+                        raw::LookReference ref;
+                        ref.width = rw;
+                        ref.height = rh;
+                        ref.rgb = std::move(rgb);
+                        std::string why;
+                        auto look = raw::fitLook(sensor, opts, ref, why);
+                        if (look.has_value()) {
+                            opts.cameraLook = *look;
+                            OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag,
+                                         "fit_look accepted: %{public}dx%{public}d dE=%{public}.2f (fallback %{public}.2f)",
+                                         static_cast<int>(rw), static_cast<int>(rh),
+                                         look->deltaE, look->deltaEFallback);
+                        } else {
+                            OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag,
+                                         "fit_look rejected: %{public}s", why.c_str());
+                        }
+                    }
+                }
+            }
+        }
+        dev = raw::developSensor(sensor, opts);
     } catch (const raw::RawError& e) {
         err = std::string("raw: ") + e.name() + ": " + e.msg;
         return false;

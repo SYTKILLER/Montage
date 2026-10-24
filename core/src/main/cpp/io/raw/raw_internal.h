@@ -3,6 +3,10 @@
 
 // M23a 内部入口声明：各容器解码器（.cpp 单件实现，翻译自 photocraft 同名 .rs）。
 
+#include <array>
+#include <optional>
+#include <utility>
+
 #include "io/raw/raw_types.h"
 
 namespace montage {
@@ -31,8 +35,17 @@ Sensor decodeOrf(const Tiff& t, const Limits& limits);
 // raf.rs（入口收整个文件字节）
 Sensor decodeRaf(const uint8_t* data, size_t len, const Limits& limits);
 constexpr uint8_t kRafMagic[] = "FUJIFILMCCD-RAW";
+// raf.rs / orf.rs 的内嵌预览 JPEG 偏移+长度（raw_preview 复用）
+std::optional<std::pair<size_t, size_t>> rafPreviewRange(const uint8_t* bytes, size_t len);
+// orf.rs
+std::optional<std::pair<size_t, size_t>> orfPreviewRange(const Tiff& t);
 // cameras.rs
 void applyCameraProfile(Sensor& s);
+
+// develop.rs 的 look 复用导出（M23c fit_look：与显影同源的白平衡/样本值）
+bool lookWhiteBalance(const Sensor& s, const struct DevelopOptions& opts,
+                      std::array<double, 3>& neutral, std::vector<std::string>& warnings);
+float lookSampleValue(const Sensor& s, size_t x, size_t y, size_t sample);
 
 // tiffep.rs 辅助（orf 复用）
 std::optional<Cfa> tiffEpCfa(const Tiff& t, const Ifd& raw, const std::vector<Ifd>& ifds);

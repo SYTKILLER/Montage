@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "io/raw/raw_demosaic.h"
+#include "io/raw/raw_look.h"
 #include "io/raw/raw_types.h"
 
 namespace montage {
@@ -42,6 +43,9 @@ struct DevelopOptions {
     float tint = 0.0f;
     // 应用文件 orientation（旋转/翻转像素）。
     bool orient = true;
+    // M23c：per-file 相机 look（fit_look 产物）。文件无颜色校准时替代中性
+    // 回退（不可用时忽略并告警，语义对齐 photocraft develop）。
+    std::optional<CameraLook> cameraLook;
     Limits limits;
 };
 

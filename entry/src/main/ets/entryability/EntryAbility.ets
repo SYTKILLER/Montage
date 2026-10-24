@@ -13,10 +13,25 @@ export default class EntryAbility extends UIAbility {
     }
     // M23a：调试直通打开（模拟器嵌套菜单注入被吞的替代 E2E 通道）：
     // aa start --ps debugOpenB64 <文件字节 base64> → Index aboutToAppear 消费
+    // M23c：大素材分段通道 —— debugB64Part 追加进累积串，debugB64Flush=1 时
+    // 拼出完整 debugOpenB64 并清累积（Windows 命令行 32KB 上限的分段绕行）。
     try {
       const dbg = want.parameters?.debugOpenB64;
       if (typeof dbg === 'string' && dbg.length > 0) {
         AppStorage.setOrCreate('debugOpenB64', dbg);
+      }
+      const part = want.parameters?.debugB64Part;
+      if (typeof part === 'string' && part.length > 0) {
+        const prev = AppStorage.get<string>('debugB64Accum') ?? '';
+        AppStorage.setOrCreate('debugB64Accum', prev + part);
+      }
+      const flush = want.parameters?.debugB64Flush;
+      if (typeof flush === 'string' && flush === '1') {
+        const acc = AppStorage.get<string>('debugB64Accum') ?? '';
+        if (acc.length > 0) {
+          AppStorage.setOrCreate('debugOpenB64', acc);
+          AppStorage.setOrCreate('debugB64Accum', '');
+        }
       }
     } catch (err) {
       hilog.error(DOMAIN, 'testTag', 'debugOpenB64 param: %{public}s', JSON.stringify(err));
@@ -29,6 +44,19 @@ export default class EntryAbility extends UIAbility {
       const dbg = want.parameters?.debugOpenB64;
       if (typeof dbg === 'string' && dbg.length > 0) {
         AppStorage.setOrCreate('debugOpenB64', dbg);
+      }
+      const part = want.parameters?.debugB64Part;
+      if (typeof part === 'string' && part.length > 0) {
+        const prev = AppStorage.get<string>('debugB64Accum') ?? '';
+        AppStorage.setOrCreate('debugB64Accum', prev + part);
+      }
+      const flush = want.parameters?.debugB64Flush;
+      if (typeof flush === 'string' && flush === '1') {
+        const acc = AppStorage.get<string>('debugB64Accum') ?? '';
+        if (acc.length > 0) {
+          AppStorage.setOrCreate('debugOpenB64', acc);
+          AppStorage.setOrCreate('debugB64Accum', '');
+        }
       }
     } catch (err) {
       hilog.error(DOMAIN, 'testTag', 'debugOpenB64 param(new): %{public}s', JSON.stringify(err));

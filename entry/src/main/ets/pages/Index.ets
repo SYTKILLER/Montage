@@ -111,6 +111,8 @@ const KC_APOSTROPHE: number = 2063;    // KEYCODE_APOSTROPHE（SDK 核验，2026
 @Component
 struct Index {
   @StorageProp('docVersion') @Watch('onDocVersion') docVersion: number = 0;
+  // M23c：分段 want 通道的 flush 消费（flush 设 debugOpenB64 后本位被写触发）。
+  @StorageProp('debugOpenB64') @Watch('onDebugOpenB64') debugOpenB64Prop: string = '';
   @StorageProp('importProgress') importProgress: number = 0;
   @State docOpen: boolean = false;
   @State docW: number = 0;
@@ -577,6 +579,16 @@ struct Index {
     // M23a：want 参数调试直通打开（EntryAbility.onCreate/onNewWant 写入；
     // 模拟器嵌套菜单注入被吞的替代 E2E 通道）。debugOpenB64 = 文件字节 base64
     // （app 沙箱读不了 shell 的 /data/local/tmp，直接传字节），写 cacheDir 后打开。
+    this.consumeDebugOpenB64();
+  }
+
+  // M23c：debugOpenB64 消费抽方法（分段 flush 在 aboutToAppear 之后到达，
+  // 由 @StorageProp @Watch 驱动重入）。
+  private onDebugOpenB64(): void {
+    this.consumeDebugOpenB64();
+  }
+
+  private consumeDebugOpenB64(): void {
     const dbgB64 = AppStorage.get<string>('debugOpenB64');
     if (dbgB64 !== undefined && dbgB64.length > 0) {
       AppStorage.setOrCreate('debugOpenB64', '');

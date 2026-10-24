@@ -68,6 +68,8 @@ add_library(compositor SHARED
         io/raw/raw_raf.cpp
         io/raw/raw_cameras.cpp
         io/raw/raw_develop.cpp
+        io/raw/raw_look.cpp
+        io/raw/raw_preview.cpp
         io/raw/raw_decode.cpp
         io/project_open.cpp
         io/project_save.cpp
