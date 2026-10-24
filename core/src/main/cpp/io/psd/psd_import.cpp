@@ -12,6 +12,7 @@
 
 #include "engine/engine.h"
 #include "engine/style_ops.h"
+#include "engine/smart_ops.h"
 #include "io/psd/psd_reader.h"
 
 namespace montage {
@@ -137,6 +138,74 @@ bool assemblePsdLayers(psd::PsdDocument& doc, const std::function<uint64_t()>& n
             layers.push_back(std::move(g));
             done++;
             return true;
+        }
+        if (rec.kind == psd::LayerKind::SmartObject && !rec.placedRaw.empty()) {
+            // M21：SoLd/PlLd + lnk2 内嵌源 → 非破坏智能对象层（源不可得时落回栅格化）
+            psd::PlacedSmart placed;
+            if (psd::parsePlaced(rec.placedKey, rec.placedRaw.data(), rec.placedRaw.size(),
+                                 placed)) {
+                const psd::LinkedFile* lf = nullptr;
+                for (const psd::LinkedFile& f : doc.linkedFiles) {
+                    if (!placed.idnt.empty() && f.uuid == placed.idnt) {
+                        lf = &f;
+                        break;
+                    }
+                }
+                if (lf != nullptr && !lf->bytes.empty()) {
+                    auto sm = std::make_shared<SmartLayerState>();
+                    sm->contentsId = nextId();
+                    sm->embedded = true;
+                    sm->fileName = lf->fileName;
+                    sm->sourceBytes = lf->bytes;
+                    for (int i = 0; i < 6; ++i) {
+                        sm->m[i] = placed.m[i];
+                    }
+                    sm->srcW = placed.srcW;
+                    sm->srcH = placed.srcH;
+                    sm->filters = placed.filters;
+                    sm->filtersEnabled = placed.stackEnabled;
+                    sm->psdRaw = rec.placedRaw;
+                    sm->placedId = placed.placedId;
+                    sm->uuid = placed.idnt;
+                    sm->sourceHash = 0;
+                    sm->psdImportHash = smart::fingerprint(*sm);
+                    Layer layer;
+                    layer.id = nextId();
+                    layer.name = rec.name;
+                    layer.visible = rec.visible;
+                    layer.opacity = std::min(1.0, std::max(0.0, rec.opacity));
+                    layer.blendMode = rec.blendMode;
+                    layer.clipping = rec.clipping;
+                    layer.parentId = parent;
+                    layer.transform.width = placed.srcW;
+                    layer.transform.height = placed.srcH;
+                    layer.smart = std::move(sm);
+                    // 蒙版像素在 FEid 缓存（v1 不读）→ 无滤镜蒙版 = 滤镜全域生效（PS
+                    // filterMaskExtendWithWhite 语义）+ 提示
+                    if (!rec.notes.empty()) {
+                        std::vector<std::string> kept;
+                        for (const std::string& n : rec.notes) {
+                            if (n != "The smart object was rasterized.") {
+                                kept.push_back(n);
+                            }
+                        }
+                        rec.notes = std::move(kept);
+                    }
+                    if (placed.hasStack && placed.maskEnabled && !placed.filters.empty()) {
+                        rec.notes.push_back(
+                            "The smart filter mask was flattened to the filtered result "
+                            "(FEid cache is not imported).");
+                    }
+                    for (const std::string& n : rec.notes) {
+                        if (notes != nullptr) {
+                            notes->push_back(rec.name + ": " + n);
+                        }
+                    }
+                    layers.push_back(std::move(layer));
+                    done++;
+                    return true;
+                }
+            }
         }
         if (rec.kind == psd::LayerKind::Adjustment) {
             // M9d：levl/curv/nvrt → 非破坏调整层（无像素内容）；其余仍跳过

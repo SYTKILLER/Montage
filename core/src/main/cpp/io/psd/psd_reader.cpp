@@ -621,7 +621,11 @@ bool unpackRLE(const std::vector<uint8_t>& data, size_t& offset, int width, int 
         if (crop == nullptr) {
             std::memcpy(plane + static_cast<size_t>(row) * width, rowBuf.data(), static_cast<size_t>(width));
         } else {
-            std::memcpy(plane + static_cast<size_t>(row - crop->y) * cw + crop->x,
+            // H7 corpus 门禁实证修复（P0 堆越界 + 内容错位）：dst 只按裁剪后行距排布，
+            // crop->x 是源行内列偏移（对拍 raw 压缩路径无 x 偏移的既有语义）。原式
+            // `+ crop->x` 令每行右移 x 且末行越界写 cw·ch 平面 crop->x 字节——凡层越出
+            // 画布左/上缘（croppedToCanvas）即触发。
+            std::memcpy(plane + static_cast<size_t>(row - crop->y) * cw,
                         rowBuf.data() + crop->x, static_cast<size_t>(crop->w));
         }
     }
@@ -982,6 +986,66 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
             layer.image[i * 4 + 3] = a;
         }
     }
+    // M21：全局附加块（通道数据后：global layer mask info + additional layer info 序列；
+    // lnk2/lnk3/lnkD 内嵌文件 → linkedFiles，其余原样存 globalExtra 供导出透传）
+    if (c.offset < layerSectionEnd && c.offset + 4 <= c.size()) {
+        static const char* kGlobalLargeKeys[] = {
+            "LMsk", "Lr16", "Lr32", "Layr", "Mt16", "Mt32", "Mtrn",
+            "Alph", "FMsk", "lnk2", "lnk3", "lnkD", "FEid", "FXid", "PxSD",
+        };
+        uint32_t gmLen = 0;
+        if (c.u32(&gmLen) && c.offset + gmLen <= layerSectionEnd && c.skip(gmLen)) {
+            while (c.offset + 12 <= layerSectionEnd && c.offset + 12 <= c.size()) {
+                std::string sig;
+                std::string gkey;
+                if (!c.string4(&sig) || (sig != "8BIM" && sig != "8B64")) {
+                    break;
+                }
+                if (!c.string4(&gkey)) {
+                    break;
+                }
+                bool glarge = sig == "8B64";
+                if (!glarge) {
+                    for (const char* k : kGlobalLargeKeys) {
+                        if (gkey == k) {
+                            glarge = true;
+                            break;
+                        }
+                    }
+                }
+                int64_t glen = 0;
+                if (glarge) {
+                    uint64_t lv = 0;
+                    if (!c.u64(&lv)) {
+                        break;
+                    }
+                    glen = static_cast<int64_t>(lv);
+                } else {
+                    uint32_t lv = 0;
+                    if (!c.u32(&lv)) {
+                        break;
+                    }
+                    glen = static_cast<int64_t>(lv);
+                }
+                if (glen < 0 || c.offset + static_cast<uint64_t>(glen) > layerSectionEnd ||
+                    c.offset + static_cast<uint64_t>(glen) > c.size()) {
+                    break;
+                }
+                std::vector<uint8_t> payload(static_cast<size_t>(glen));
+                if (glen > 0 && !c.bytes(payload.data(), payload.size())) {
+                    break;
+                }
+                if (glen % 2 == 1 && !c.skip(1)) {
+                    break;
+                }
+                if (gkey == "lnk2" || gkey == "lnk3" || gkey == "lnkD") {
+                    auto lf = parseLinkedFiles(payload.data(), payload.size());
+                    out.linkedFiles.insert(out.linkedFiles.end(), lf.begin(), lf.end());
+                }
+                out.globalExtra[gkey] = std::move(payload);
+            }
+        }
+    }
     c.offset = layerSectionEnd;
 
     // 组装（对拍 assemble：组 divider 配对/组 pass 语义/不透明度/蒙版/kind 提示）。
@@ -1091,6 +1155,15 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
             } else if (rec.kind == LayerKind::Vector) {
                 rec.notes.push_back("Vector shape was rasterized to pixels.");
             } else if (rec.kind == LayerKind::SmartObject) {
+                // M21：placed 块原始数据（psd_import 建 SO 层；成功时移除本 note）
+                for (const char* pk : {"SoLd", "SoLE", "PlLd"}) {
+                    auto pit = layer.extra.find(pk);
+                    if (pit != layer.extra.end() && !pit->second.empty()) {
+                        rec.placedKey = pk;
+                        rec.placedRaw = pit->second;
+                        break;
+                    }
+                }
                 rec.notes.push_back("The smart object was rasterized.");
             } else if (rec.kind == LayerKind::Effects) {
                 rec.notes.push_back("Layer effects were discarded.");

@@ -404,6 +404,9 @@ struct SmartLayerState {
     std::vector<uint8_t> psdRaw;
     std::string placedId;
     std::string uuid;
+    double srcW = 0.0;   // 源像素尺寸（SoLd Sz/置入解码/转换裁剪回填；导出四角出参）
+    double srcH = 0.0;
+    uint64_t psdImportHash = 0;  // 导入时渲染指纹（导出比对判定「未编辑」→ psdRaw 原样回写）
 };
 
 // 图层（值语义，对齐源 ImageLayer；M2 子集：蒙版/剪贴 M5、调整层 M6a、文本层 M12）。

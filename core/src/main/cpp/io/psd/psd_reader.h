@@ -7,10 +7,12 @@
 // 按预合成像素导入 + 降级提示（PSDConversionSheet 语义）；调整层（levl/curv/hue 等）跳过+提示。
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
 #include "engine/document.h"
+#include "io/psd/smart_psd.h"
 
 namespace montage {
 namespace psd {
@@ -52,6 +54,9 @@ struct Record {
     // M9d：调整层数据（kind=Adjustment 时；levl/curv/nvrt 可映射非破坏，其余 payload 原样）
     std::string adjKey;
     std::vector<uint8_t> adjPayload;
+    // M21：placed 块原始数据（kind=SmartObject 时非空；psd_import 建 SO 层用）
+    std::string placedKey;             // "SoLd"/"SoLE"/"PlLd"
+    std::vector<uint8_t> placedRaw;
     // M17c：lrFX 图层效果（Photoshop 5 布局）。v1 映射五类：dsdw/isdw（投影/内阴影）、
     // oglw/iglw（外/内发光）、sofi（颜色叠加）；bevel/satin/stroke/gradient/pattern 走
     // lfx2 descriptor（photocraft 亦不解析其 lrFX）→ notes 降级。PS 写效果时同时含
@@ -78,6 +83,9 @@ struct PsdDocument {
     int height = 0;
     double resolution = 72.0;
     std::vector<Record> layers;      // bottom → top
+    // M21：全局附加块原样（lnk2/FEid/FXid 等；导出透传用）+ 解析出的内嵌链接文件
+    std::map<std::string, std::vector<uint8_t>> globalExtra;
+    std::vector<LinkedFile> linkedFiles;
     // M18d：保存路径（资源 2000–2997）与工作路径（资源 1025）→ 路径面板
     std::vector<NamedPathEntry> paths;
     VectorPath workPath;

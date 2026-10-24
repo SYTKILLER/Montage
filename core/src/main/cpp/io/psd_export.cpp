@@ -1,5 +1,8 @@
 #include "io/psd_export.h"
 
+#include "engine/smart_ops.h"
+#include "io/psd/smart_psd.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -237,6 +240,11 @@ class BeWriter {
         buf_.push_back(static_cast<uint8_t>(v & 0xFF));
     }
     void i16(int16_t v) { u16(static_cast<uint16_t>(v)); }
+    void u64(uint64_t v) {
+        for (int i = 7; i >= 0; --i) {
+            buf_.push_back(static_cast<uint8_t>((v >> (i * 8)) & 0xFF));
+        }
+    }
     void u32(uint32_t v) {
         buf_.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
         buf_.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
@@ -488,6 +496,7 @@ struct EncodedLayer {
     std::vector<uint8_t> adjPayload;
     std::vector<uint8_t> lrfx;      // M17c：图层效果（非空 = 附加信息写 lrFX 块）
     std::vector<uint8_t> vmsk;      // M18d：矢量蒙版（非空 = 附加信息写 vmsk 块）
+    std::vector<uint8_t> solld;     // M21：智能对象 SoLd 块（非空 = 附加信息写 SoLd + lnk2）
 };
 
 }  // namespace
@@ -746,7 +755,32 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
                 res.notes.push_back("图层 \"" + l.name +
                                     "\" 的样式效果已合成进像素导出（非破坏样式不保留）。");
             }
+            // M21：智能对象 → SoLd 块（未编辑 = psdRaw 原样回写字节级；已编辑 = 新 descriptor；
+            // 不可表示（.montage 源/不可映射滤镜）= 烘焙像素 + note）
+            std::vector<uint8_t> solld;
+            if (l.smart != nullptr) {
+                const SmartLayerState& sm = *l.smart;
+                const bool untouched =
+                    sm.psdImportHash != 0 && sm.psdImportHash == smart::fingerprint(sm);
+                bool live = false;
+                if (untouched && !sm.psdRaw.empty()) {
+                    solld = sm.psdRaw;
+                    live = true;
+                } else if (sm.embedded && !sm.uuid.empty() && !sm.placedId.empty() &&
+                           sm.srcW > 0.0 && sm.srcH > 0.0) {
+                    std::vector<uint8_t> sd;
+                    if (psd::soldBytes(sm, 72.0, sd)) {
+                        solld = std::move(sd);
+                        live = true;
+                    }
+                }
+                if (!live) {
+                    res.notes.push_back("智能对象 \"" + l.name +
+                                        "\" 已栅格化为像素导出（源或滤镜不可由 PSD 表示）。");
+                }
+            }
             EncodedLayer el;
+            el.solld = std::move(solld);
             // M17c：可 lrFX 表示的样式 → 原始像素 + lrFX 块（像素已由快照分流为原始）
             if (l.style != nullptr) {
                 el.lrfx = buildLrfx(*l.style);
@@ -1029,6 +1063,14 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
             w.raw(el.vmsk);
             w.pad2In(w.size() - el.vmsk.size());
         }
+        // M21：智能对象（SoLd；lnk2 内嵌源经全局块写出）
+        if (!el.solld.empty()) {
+            w.ascii("8BIM", 4);
+            w.ascii("SoLd", 4);
+            w.u32(static_cast<uint32_t>(el.solld.size()));
+            w.raw(el.solld);
+            w.pad2In(w.size() - el.solld.size());
+        }
         w.patchU32(extraAt, static_cast<uint32_t>(w.size() - extraAt - 4));
     }
 
@@ -1053,6 +1095,54 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
     w.patchU32(liLenAt, static_cast<uint32_t>(w.size() - liLenAt - 4));
     // global layer mask info（空段）
     w.u32(0);
+    // M21：全局附加块——lnk2（内嵌链接文件；u64 长度键）+ 原样透传块
+    {
+        // 全部 SO 未编辑且导入保留 lnk2 → 原样透传；否则按 uuid 去重建新
+        bool allUntouched = true;
+        bool anySmart = false;
+        for (const EncodedLayer& el : layers) {
+            (void)el;
+        }
+        for (const PsdLayerSnap& l : snap.layers) {
+            if (l.smart == nullptr) {
+                continue;
+            }
+            anySmart = true;
+            if (!(l.smart->psdImportHash != 0 &&
+                  l.smart->psdImportHash == smart::fingerprint(*l.smart))) {
+                allUntouched = false;
+            }
+        }
+        std::vector<uint8_t> lnk2;
+        auto it = snap.globalBlocks.find("lnk2");
+        if (anySmart && allUntouched && it != snap.globalBlocks.end()) {
+            lnk2 = it->second;
+        } else if (anySmart) {
+            std::unordered_map<std::string, const SmartLayerState*> seen;
+            for (const PsdLayerSnap& l : snap.layers) {
+                if (l.smart == nullptr || !l.smart->embedded || l.smart->uuid.empty() ||
+                    l.smart->sourceBytes.empty()) {
+                    continue;
+                }
+                seen[l.smart->uuid] = l.smart.get();
+            }
+            for (const auto& [uuid, sm] : seen) {
+                psd::LinkedFile f;
+                f.uuid = uuid;
+                f.fileName = sm->fileName;
+                f.bytes = sm->sourceBytes;
+                auto item = psd::encodeLinkedFile(f);
+                lnk2.insert(lnk2.end(), item.begin(), item.end());
+            }
+        }
+        if (!lnk2.empty()) {
+            w.ascii("8BIM", 4);
+            w.ascii("lnk2", 4);
+            w.u64(static_cast<uint64_t>(lnk2.size()));
+            w.raw(lnk2);
+            w.pad2In(w.size() - lnk2.size());
+        }
+    }
     w.pad2In(lmLenAt + 4);
     w.patchU32(lmLenAt, static_cast<uint32_t>(w.size() - lmLenAt - 4));
 

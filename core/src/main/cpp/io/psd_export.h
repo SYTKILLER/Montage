@@ -10,6 +10,7 @@
 // 空像素层跳过。
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -46,6 +47,8 @@ struct PsdLayerSnap {
     bool hasStyle = false;    // 降级 note（样式已合成进像素——不可 lrFX 表示的路径）
     std::shared_ptr<const LayerStyle> style;  // M17c 非空 = 效果全可 lrFX 表示（像素走原始+lrFX）
     std::shared_ptr<const VectorMaskData> vectorMask;  // M18d 非空 = 写 vmsk 块
+    std::shared_ptr<const SmartLayerState> smart;  // M21 非空 = 智能对象（SoLd/lnk2 live 导出
+                                                   // 或烘焙像素降级）
     // 调整层参数（isAdjustment 时；kind 对齐 AdjustmentKind 枚举）
     int32_t adjKind = 0;      // 0=Levels 1=Curves 3=Invert 可直写；其余跳过 + note
     float adjInBlack = 0.0f;
@@ -66,6 +69,9 @@ struct PsdDocSnap {
     // M18d：保存路径/工作路径 → 路径资源 2000+ / 1025
     std::vector<NamedPathEntry> paths;
     VectorPath workPath;
+
+    // M21：导入保留的全局附加块（键 → payload 原样；lnk2 全部 SO 未编辑时透传）
+    std::map<std::string, std::vector<uint8_t>> globalBlocks;
 };
 
 struct PsdExportResult {

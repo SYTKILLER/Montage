@@ -23,6 +23,7 @@
 #include "io/project_save.h"
 #include "io/psd/psd_import.h"
 #include "io/psd/psd_reader.h"
+#include "io/psd/smart_psd.h"
 
 namespace montage {
 namespace smart {
@@ -754,6 +755,10 @@ bool layersToSmart(const std::string& name, LayerId newId, std::vector<Layer>& m
     sm->m[4] = 1.0;
     sm->m[5] = oy;
     out.smart = std::move(sm);
+    out.smart->srcW = static_cast<double>(bw);
+    out.smart->srcH = static_cast<double>(bh);
+    out.smart->uuid = psd::uuidFromContents(out.smart->contentsId);
+    out.smart->placedId = out.smart->uuid;
     out.smartCache = filterStripToGrid(cropped, bw, bh, nextGridRevision());
     out.smartCacheHash = fingerprint(*out.smart);
     out.transform.originX = ox;

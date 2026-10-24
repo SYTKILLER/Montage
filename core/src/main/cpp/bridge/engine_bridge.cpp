@@ -305,15 +305,24 @@ napi_value CloseDocument(napi_env env, napi_callback_info /*info*/) {
 // ---------- 导入 ----------
 
 napi_value OpenFileFromFd(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value argv[1] = {nullptr};
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 1) {
-        return makeError(env, kErrBadParam, "openFileFromFd(fd) requires 1 arg");
+        return makeError(env, kErrBadParam, "openFileFromFd(fd[, name]) requires 1 arg");
     }
     int32_t fd = -1;
     if (napi_get_value_int32(env, argv[0], &fd) != napi_ok || fd < 0) {
         return makeError(env, kErrBadParam, "openFileFromFd: invalid fd");
+    }
+    // M25：可选文件名（扩展名兜底 TGA 无魔数嗅探；其余格式不依赖）
+    std::string fileName;
+    if (argc >= 2 && argv[1] != nullptr) {
+        size_t nlen = 0;
+        char nbuf[256] = {0};
+        if (napi_get_value_string_utf8(env, argv[1], nbuf, sizeof(nbuf), &nlen) == napi_ok) {
+            fileName.assign(nbuf, nlen);
+        }
     }
     napi_value promise = nullptr;
     napi_deferred deferred = nullptr;
@@ -333,7 +342,7 @@ napi_value OpenFileFromFd(napi_env env, napi_callback_info info) {
         napi_resolve_deferred(env, deferred, makeError(env, kErrInternal, "create tsfn failed"));
         return promise;
     }
-    if (!io::startImageImport(fd, ctx->tsfn)) {
+    if (!io::startImageImport(fd, ctx->tsfn, fileName)) {
         // fd 所有权已被 native 接管并关闭（忙路径）
         napi_resolve_deferred(env, deferred, makeError(env, kErrBusy, "another import is running"));
         napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);
@@ -5351,6 +5360,9 @@ napi_value ExportPsd(napi_env env, napi_callback_info info) {
             }
             pl.isAdjustment = l.adjustment != nullptr;
             pl.vectorMask = l.vectorMask;  // M18d：vmsk 导出
+            if (l.smart != nullptr) {
+                pl.smart = l.smart;  // M21：智能对象导出（SoLd/lnk2 或烘焙降级）
+            }
             // M15c（PSD-2）：组树 + 降级标记 + 调整层参数
             pl.id = l.id;
             pl.parentId = l.parentId;
@@ -9279,6 +9291,8 @@ napi_value SmartOpAsync(napi_env env, napi_callback_info info, int op) {
                     }
                     out.name = base;
                     out.smart = std::move(sm);
+                    out.smart->uuid = psd::uuidFromContents(out.smart->contentsId);
+                    out.smart->placedId = out.smart->uuid;
                     c->newLayerId = out.id;
                     if (!smart::renderLayer(out, c->err)) {
                         break;
@@ -9625,7 +9639,8 @@ napi_value NewSmartObjectViaCopy(napi_env env, napi_callback_info info) {
         auto sm = std::make_shared<SmartLayerState>(*l->smart);
         sm->contentsId = smart::nextContentsId();  // 独立内容
         sm->psdRaw.clear();
-        sm->uuid.clear();
+        sm->uuid = psd::uuidFromContents(sm->contentsId);  // 新 uuid（PSD 侧独立源）
+        sm->placedId = sm->uuid;
         copy.smart = std::move(sm);
         copy.smartCacheHash = l->smartCacheHash;
         const size_t at = static_cast<size_t>(
