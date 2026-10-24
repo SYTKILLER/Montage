@@ -2995,6 +2995,8 @@ struct Index {
         this.openPsdByUri(uris[0]);
       } else if (uri.endsWith('.montage')) {
         this.openProjectByUri(uris[0]);
+      } else if (uri.endsWith('.tif') || uri.endsWith('.tiff')) {
+        this.openTiffByUri(uris[0]);
       } else {
         this.openByUri(uris[0]);
       }
@@ -3022,6 +3024,27 @@ struct Index {
       this.importing = false;
       this.busyText = '';
       this.log(`PSD 打开失败: ${e.message}`);
+    });
+  }
+
+  private openTiffByUri(uri: string): void {
+    const f = fs.openSync(uri, fs.OpenMode.READ_ONLY);
+    this.importing = true;
+    this.busyText = 'TIFF 解析中…';
+    this.engine.openTiffFile(f.fd).then((d: PsdOpenData): void => {
+      this.importing = false;
+      this.busyText = '';
+      this.docW = d.width;
+      this.docH = d.height;
+      this.afterDocChanged();
+      this.log(`TIFF 打开完成 ${d.width}x${d.height}，${d.notes.length} 条提示`);
+      for (let i = 0; i < d.notes.length && i < 8; i++) {
+        this.log(`提示: ${d.notes[i]}`);
+      }
+    }).catch((e: BusinessError): void => {
+      this.importing = false;
+      this.busyText = '';
+      this.log(`TIFF 打开失败: ${e.message}`);
     });
   }
 

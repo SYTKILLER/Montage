@@ -15,6 +15,7 @@ napi_value CloseDocument(napi_env env, napi_callback_info info);
 napi_value OpenFileFromFd(napi_env env, napi_callback_info info);
 // PSD 导入（04 §1.1 PSD-1）：解析→烘焙→整档替换文档，notes 返回降级提示
 napi_value OpenPsdFile(napi_env env, napi_callback_info info);
+napi_value OpenTiffFile(napi_env env, napi_callback_info info);
 // 工程保存（04 §1.2 M4b）：.montage zip 包流式写出；fd 所有权移交 native（含失败路径）
 napi_value SaveProject(napi_env env, napi_callback_info info);
 // 工程打开（04 §1.2 M4c）：zip 解析→manifest 校验→逐层解码→整档替换；fd 所有权移交 native

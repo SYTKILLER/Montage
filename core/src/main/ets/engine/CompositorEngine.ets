@@ -2190,6 +2190,28 @@ export class CompositorEngine {
     return { ok: boolOf(d, 'ok'), x: num(d, 'x'), y: num(d, 'y'), w: num(d, 'w'), h: num(d, 'h') };
   }
 
+  /** 打开 TIFF/BigTIFF 文档（分层→图层树整档替换；扁平→合成图单层，M25）。 */
+  async openTiffFile(fd: number): Promise<PsdOpenData> {
+    const value: Object = await (native.openTiffFile(fd) as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok || r.data === null) {
+      const errObj = r.error;
+      throw new Error(errObj !== null ? errObj.message : 'tiff open failed');
+    }
+    const d = r.data;
+    const notes: string[] = [];
+    const rawNotes: Object = d['notes'];
+    if (Array.isArray(rawNotes)) {
+      for (const n of rawNotes as Object[]) {
+        if (typeof n === 'string') {
+          notes.push(n);
+        }
+      }
+    }
+    const outData: PsdOpenData = { width: num(d, 'width'), height: num(d, 'height'), notes: notes };
+    return outData;
+  }
+
   // ---------- M21 智能对象与智能滤镜 ----------
 
   /** 转换为智能对象（多选根层/单层一步异步事务；返回新 SO 层 id，0 = 失败）。 */
