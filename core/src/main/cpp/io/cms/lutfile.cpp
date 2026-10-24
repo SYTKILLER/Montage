@@ -568,5 +568,42 @@ std::optional<LutFile> builtinLook(const std::string& id) {
     return LutFile::fromFn(label, 33, fn);
 }
 
+// ---- M22 收口：进程级用户 LUT 槽 ----
+
+namespace {
+
+struct LookupSlots {
+    static constexpr unsigned kSlots = 16;
+    std::optional<LutFile> slots[kSlots];
+    unsigned next = 0;
+    unsigned used = 0;
+};
+
+LookupSlots& lookupSlots() {
+    static LookupSlots s;
+    return s;
+}
+
+}  // namespace
+
+std::optional<LutFile> importedLookup(unsigned slot) {
+    LookupSlots& s = lookupSlots();
+    if (slot >= LookupSlots::kSlots) return std::nullopt;
+    return s.slots[slot];
+}
+
+unsigned storeImportedLookup(const LutFile& l) {
+    LookupSlots& s = lookupSlots();
+    const unsigned slot = s.next;
+    s.slots[slot] = l;
+    s.next = (s.next + 1u) % LookupSlots::kSlots;
+    if (s.used < LookupSlots::kSlots) ++s.used;
+    return slot;
+}
+
+unsigned importedLookupCount() {
+    return lookupSlots().used;
+}
+
 }  // namespace cms
 }  // namespace montage

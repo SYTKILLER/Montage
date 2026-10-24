@@ -144,6 +144,73 @@ bool TileRenderer::ensureFbos(int32_t vw, int32_t vh) {
     return true;
 }
 
+// M22：显示变换 3D LUT 上传（GLES 3.0 sampler3D；GL_TEXTURE_8 为合法纹理单元——
+// 在 drawFrame 中绑 GL_TEXTURE2/3 单元避免与瓦片/lut 冲突）。
+void TileRenderer::setViewLut(const uint8_t* rgba, size_t len, uint32_t size) {
+    if (size == 0 || rgba == nullptr || len < size * size * size * 4u) {
+        if (viewLutTex_ != 0) {
+            glDeleteTextures(1, &viewLutTex_);
+            viewLutTex_ = 0;
+        }
+        viewLutSize_ = 0;
+        return;
+    }
+    if (viewLutTex_ == 0) {
+        glGenTextures(1, &viewLutTex_);
+    }
+    glBindTexture(GL_TEXTURE_3D, viewLutTex_);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, size, size, size, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    viewLutSize_ = size;
+}
+
+void TileRenderer::setGamutLut(const uint8_t* r, size_t len, uint32_t size) {
+    if (size == 0 || r == nullptr || len < size * size * size) {
+        if (gamutTex_ != 0) {
+            glDeleteTextures(1, &gamutTex_);
+            gamutTex_ = 0;
+        }
+        gamutSize_ = 0;
+        return;
+    }
+    // 单通道判定表 → RGBA8（R=域外 1/0）
+    std::vector<uint8_t> rgba(static_cast<size_t>(size) * size * size * 4u, 0);
+    for (size_t i = 0; i < static_cast<size_t>(size) * size * size; ++i) {
+        rgba[i * 4u] = r[i] ? 255 : 0;
+        rgba[i * 4u + 3u] = 255;
+    }
+    if (gamutTex_ == 0) {
+        glGenTextures(1, &gamutTex_);
+    }
+    glBindTexture(GL_TEXTURE_3D, gamutTex_);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, size, size, size, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    gamutSize_ = size;
+}
+
+void TileRenderer::clearViewTransform() {
+    if (viewLutTex_ != 0) {
+        glDeleteTextures(1, &viewLutTex_);
+        viewLutTex_ = 0;
+    }
+    if (gamutTex_ != 0) {
+        glDeleteTextures(1, &gamutTex_);
+        gamutTex_ = 0;
+    }
+    viewLutSize_ = 0;
+    gamutSize_ = 0;
+}
+
 void TileRenderer::destroyFbos() {
     for (int i = 0; i < 2; ++i) {
         if (accFbo_[i] != 0) glDeleteFramebuffers(1, &accFbo_[i]);
@@ -165,6 +232,12 @@ void TileRenderer::destroyFbos() {
     baseTex_ = 0;
     if (lutTex_ != 0) glDeleteTextures(1, &lutTex_);
     lutTex_ = 0;
+    if (viewLutTex_ != 0) glDeleteTextures(1, &viewLutTex_);
+    viewLutTex_ = 0;
+    if (gamutTex_ != 0) glDeleteTextures(1, &gamutTex_);
+    gamutTex_ = 0;
+    viewLutSize_ = 0;
+    gamutSize_ = 0;
     fboW_ = fboH_ = 0;
 }
 
@@ -175,6 +248,7 @@ void TileRenderer::ensureInit() {
     checkerProg_ = buildProgram(shaders::kQuadVert, shaders::kCheckerFrag);
     tileProg_ = buildProgram(shaders::kQuadVert, shaders::kTileFrag);
     plainProg_ = buildProgram(shaders::kQuadVert, shaders::kPlainFrag);
+    viewProg_ = buildProgram(shaders::kQuadVert, shaders::kViewFrag);
     clipProg_ = buildProgram(shaders::kQuadVert, shaders::kClipFrag);
     adjustProg_ = buildProgram(shaders::kQuadVert, shaders::kAdjustFrag);
     antsProg_ = buildProgram(shaders::kAntsVert, shaders::kAntsFrag);
@@ -922,8 +996,30 @@ void TileRenderer::drawFrame(const Document& doc, const Viewport& vp, int32_t vw
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, accTex_[accIdx]);
-    drawQuad(plainProg_, 0.0f, 0.0f, static_cast<float>(doc.width), static_cast<float>(doc.height),
-             zoom, panX, panY, vwF, vhF);
+    if (viewLutSize_ > 0 || gamutSize_ > 0) {
+        // M22 显示变换末趟（视图级：软打样/查找表/色域警告共用）
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_3D, viewLutSize_ > 0 ? viewLutTex_ : 0);
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_3D, gamutSize_ > 0 ? gamutTex_ : 0);
+        glUseProgram(viewProg_);
+        glUniform1i(glGetUniformLocation(viewProg_, "uTex"), 0);
+        glUniform1i(glGetUniformLocation(viewProg_, "uLut3d"), 2);
+        glUniform1i(glGetUniformLocation(viewProg_, "uGamut3d"), 3);
+        glUniform1f(glGetUniformLocation(viewProg_, "uLutOn"), viewLutSize_ > 0 ? 1.0f : 0.0f);
+        glUniform1f(glGetUniformLocation(viewProg_, "uGamutOn"), gamutSize_ > 0 ? 1.0f : 0.0f);
+        glUniform1f(glGetUniformLocation(viewProg_, "uGamutSize"),
+                    gamutSize_ > 0 ? static_cast<float>(gamutSize_) : 33.0f);
+        drawQuad(viewProg_, 0.0f, 0.0f, static_cast<float>(doc.width),
+                 static_cast<float>(doc.height), zoom, panX, panY, vwF, vhF);
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_3D, 0);
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_3D, 0);
+    } else {
+        drawQuad(plainProg_, 0.0f, 0.0f, static_cast<float>(doc.width), static_cast<float>(doc.height),
+                 zoom, panX, panY, vwF, vhF);
+    }
 
     // M10d 快速蒙版红 overlay：图层合成之上、蚂蚁线之下（QM 模式 selection=null，ants 不画）
     if (doc.quickMask != nullptr) {

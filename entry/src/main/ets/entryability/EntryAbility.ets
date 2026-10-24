@@ -33,6 +33,11 @@ export default class EntryAbility extends UIAbility {
           AppStorage.setOrCreate('debugB64Accum', '');
         }
       }
+      // M22：调试命令直通（runCommand；uitest 注入退化时的 E2E 旁路）
+      const dbgCmd = want.parameters?.debugCmd;
+      if (typeof dbgCmd === 'string' && dbgCmd.length > 0) {
+        AppStorage.setOrCreate('debugCmd', dbgCmd);
+      }
     } catch (err) {
       hilog.error(DOMAIN, 'testTag', 'debugOpenB64 param: %{public}s', JSON.stringify(err));
     }
@@ -71,6 +76,10 @@ export default class EntryAbility extends UIAbility {
           AppStorage.setOrCreate('debugOpenB64', acc);
           AppStorage.setOrCreate('debugB64Accum', '');
         }
+      }
+      const dbgCmd = want.parameters?.debugCmd;
+      if (typeof dbgCmd === 'string' && dbgCmd.length > 0) {
+        AppStorage.setOrCreate('debugCmd', dbgCmd);
       }
     } catch (err) {
       hilog.error(DOMAIN, 'testTag', 'debugOpenB64 param(new): %{public}s', JSON.stringify(err));

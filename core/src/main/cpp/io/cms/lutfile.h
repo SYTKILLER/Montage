@@ -85,6 +85,14 @@ const std::pair<const char*, const char*>* builtinLookTable(size_t& count);
 // 按 id 取内置外观（33³），无则空。
 std::optional<LutFile> builtinLook(const std::string& id);
 
+// M22 收口：进程级用户 LUT 槽（导入的 .cube/.3dl/.look；Color Lookup 滤镜
+// p0 ≥ 100 经此取表）。槽 0..15，返回空 = 未加载。
+std::optional<LutFile> importedLookup(unsigned slot);
+// 存入槽（覆盖），返回实际槽号（0..15；满则挤最老——LRU 简化为循环）。
+unsigned storeImportedLookup(const LutFile& l);
+// 槽占用数（UI 透出）。
+unsigned importedLookupCount();
+
 }  // namespace cms
 }  // namespace montage
 

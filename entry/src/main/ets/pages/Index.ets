@@ -5,7 +5,7 @@ import { common } from '@kit.AbilityKit';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
 import { window } from '@kit.ArkUI';
-import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, RawDevelopData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, SmartInfoDTO, SmartFilterDTO } from 'core';
+import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, RawDevelopData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, SmartInfoDTO, SmartFilterDTO, LookupPresetDTO, LookupImportData } from 'core';
 import { AppPrefs, RecentProject, ThemeMode } from '../editor/AppPrefs';
 import { leafItem, MenuGroupVM, MenuItemVM, subItem, ToolVM } from '../editor/MenuModel';
 import { SWATCHES } from '../editor/components/OptionsBar';
@@ -118,6 +118,8 @@ struct Index {
   @StorageProp('docVersion') @Watch('onDocVersion') docVersion: number = 0;
   // M23c：分段 want 通道的 flush 消费（flush 设 debugOpenB64 后本位被写触发）。
   @StorageProp('debugOpenB64') @Watch('onDebugOpenB64') debugOpenB64Prop: string = '';
+  // M22：调试命令直通（want debugCmd → runCommand；uitest 注入退化的 E2E 旁路）
+  @StorageProp('debugCmd') @Watch('onDebugCmd') debugCmdProp: string = '';
   @StorageProp('importProgress') importProgress: number = 0;
   @State docOpen: boolean = false;
   @State docW: number = 0;
@@ -266,6 +268,10 @@ struct Index {
   @State fillColor: string = '#D93025';
   @State fillAngle: number = 90;
   @State showFilter: boolean = false;   // M13 滤镜对话框（proxy 预览）
+  @State lookupPresets: LookupPresetDTO[] = [];  // M22 颜色查找预设（内置 + 会话导入）
+  @State viewXformLut: boolean = false;   // M22 显示变换镜像
+  @State viewXformGamut: boolean = false;
+  @State viewXformDesc: string = '';
   @State filterDef: FilterDef | null = null;
   @State showSmartFilters: boolean = false;  // M21 智能滤镜管理对话框
   @State smartInfo: SmartInfoDTO | null = null;
@@ -610,13 +616,30 @@ struct Index {
     // M23a：want 参数调试直通打开（EntryAbility.onCreate/onNewWant 写入；
     // 模拟器嵌套菜单注入被吞的替代 E2E 通道）。debugOpenB64 = 文件字节 base64
     // （app 沙箱读不了 shell 的 /data/local/tmp，直接传字节），写 cacheDir 后打开。
+    this.lookupPresets = this.engine.getLookupPresets();
     this.consumeDebugOpenB64();
   }
 
   // M23c：debugOpenB64 消费抽方法（分段 flush 在 aboutToAppear 之后到达，
   // 由 @StorageProp @Watch 驱动重入）。
+  private refreshViewXformMirror(): void {
+    const vt = this.engine.getViewTransform();
+    this.viewXformLut = vt.lutOn;
+    this.viewXformGamut = vt.gamutOn;
+    this.viewXformDesc = vt.desc;
+  }
+
   private onDebugOpenB64(): void {
     this.consumeDebugOpenB64();
+  }
+
+  private onDebugCmd(): void {
+    const cmd = AppStorage.get<string>('debugCmd');
+    if (cmd !== undefined && cmd.length > 0) {
+      AppStorage.setOrCreate('debugCmd', '');
+      this.log(`debugCmd: ${cmd}`);
+      this.runCommand(cmd);
+    }
   }
 
   /** M24c：want debugControl=1 → 启动控制通道（debug-only；hilog 透出 token）。 */
@@ -2409,6 +2432,51 @@ struct Index {
       });
     }).catch((e: BusinessError): void => {
       this.log(`字体 picker 失败: ${e.message}`);
+    });
+  }
+
+  // M22：载入查找表（picker 选 .cube/.3dl/.look → importLookupTable 进程槽 →
+  // 颜色查找滤镜 chips 可选；util.Base64Helper 编码跨桥）
+  private doImportLookupTable(): void {
+    const opt = new picker.DocumentSelectOptions();
+    opt.maxSelectNumber = 1;
+    opt.defaultFilePathUri = 'file://docs/storage/Users/currentUser/Download';
+    const dp = new picker.DocumentViewPicker();
+    dp.select(opt).then((uris: string[]): void => {
+      if (uris.length < 1) {
+        return;
+      }
+      const uri = uris[0];
+      const lower = uri.toLowerCase();
+      if (!lower.endsWith('.cube') && !lower.endsWith('.3dl') && !lower.endsWith('.look')) {
+        this.toast('请选择 .cube / .3dl / .look 查找表文件');
+        return;
+      }
+      const seg = decodeURIComponent(uri.split('/').pop() ?? 'lookup.cube');
+      try {
+        const f = fs.openSync(uri, fs.OpenMode.READ_ONLY);
+        const stat = fs.statSync(f.fd);
+        const buf = new ArrayBuffer(stat.size);
+        fs.readSync(f.fd, buf);
+        fs.closeSync(f);
+        const b64 = new util.Base64Helper().encodeToStringSync(new Uint8Array(buf));
+        this.engine.importLookupTable(seg, b64).then((d: LookupImportData): void => {
+          this.lookupPresets = this.lookupPresets.concat([{
+            id: `user${d.slot}`, label: d.title.length > 0 ? d.title : seg, param: d.slot,
+          }]);
+          this.toast(`查找表已载入：${d.title.length > 0 ? d.title : seg}`);
+          this.log(`查找表导入: ${seg} -> p0=${d.slot}`);
+        }).catch((e: BusinessError): void => {
+          this.log(`查找表解析失败: ${e.message}`);
+          this.toast(`查找表解析失败: ${e.message}`);
+        });
+      } catch (e) {
+        const be = e as BusinessError;
+        this.log(`查找表读取失败: ${be.message}`);
+        this.toast('查找表文件读取失败');
+      }
+    }).catch((e: BusinessError): void => {
+      this.log(`查找表 picker 失败: ${e.message}`);
     });
   }
 
@@ -4467,6 +4535,51 @@ struct Index {
       }
       return;
     }
+    // M22 显示变换命令
+    if (id === 'view.proofOff' || id === 'view.lookupOff') {
+      this.engine.setViewProof('', 1, false).then((): void => { this.refreshViewXformMirror(); });
+      if (id === 'view.lookupOff') {
+        this.engine.setViewLookup(-1).then((): void => { this.refreshViewXformMirror(); });
+      }
+      this.log('显示变换已清除');
+      return;
+    }
+    if (id === 'view.proofCoated') {
+      this.engine.setViewProof('coated-cmyk', 1, true).then((ok: boolean): void => {
+        this.toast(ok ? '软打样：合成涂布纸 CMYK' : '软打样构建失败');
+        this.refreshViewXformMirror();
+      });
+      return;
+    }
+    if (id === 'view.proofP3') {
+      this.engine.setViewProof('display-p3', 1, true).then((ok: boolean): void => {
+        this.toast(ok ? '软打样：Display P3' : '软打样构建失败');
+        this.refreshViewXformMirror();
+      });
+      return;
+    }
+    if (id === 'view.gamutWarning') {
+      const on = !this.viewXformGamut;
+      this.engine.setGamutWarning('coatedCmyk', 2.0, on).then((ok: boolean): void => {
+        if (ok) {
+          this.viewXformGamut = on;
+          this.toast(on ? '色域警告开（CMYK 涂布）' : '色域警告关');
+        } else {
+          this.toast('色域警告构建失败');
+        }
+      });
+      return;
+    }
+    if (id === 'view.lookup0' || id === 'view.lookupMono') {
+      const param = id === 'view.lookup0' ? 0 : 2;
+      this.engine.setViewProof('', 1, false).then((): void => {
+        this.engine.setViewLookup(param).then((ok: boolean): void => {
+          this.toast(ok ? '校样颜色已应用' : '查找表应用失败');
+          this.refreshViewXformMirror();
+        });
+      });
+      return;
+    }
     // M23c：Camera Raw 滤镜（独立对话框，cameraJson 参数面超出目录 schema）
     if (id === 'filter.cameraRaw') {
       this.openCameraRawFilterDialog();
@@ -5077,6 +5190,10 @@ struct Index {
           this.toast('需要先建立选区');
         }
         break;
+      case 'edit.importLookup': {
+        this.doImportLookupTable();
+        break;
+      }
       case 'edit.definePattern': {
         const p = this.engine.definePattern();
         if (p !== null) {
@@ -5967,6 +6084,8 @@ struct Index {
       leafItem('edit.contentAwareFill', '内容识别填充', '', d && this.hasSelectionFlag),
       leafItem('edit.stroke', '描边…', '', d && this.hasSelectionFlag),
       leafItem('edit.definePattern', '定义图案', '', d && this.hasSelectionFlag),
+      // M22 颜色查找表导入（.cube/.3dl/.look；模拟器 picker 不可注入留真机）
+      leafItem('edit.importLookup', '载入查找表…', '', d),
       leafItem('edit.defineCustomShape', '定义自定形状', '',
         d && this.workPathNonEmpty === 1),
       subItem('edit.placeCustomSub', '放置自定形状', d && this.hasCustomShapes,
@@ -6107,6 +6226,7 @@ struct Index {
     filterMenus.push(leafItem('perspective.enter', '透视变形…', '', d));
     filterMenus.push(leafItem('wideangle.enter', '自适应广角…', '', d));
     filterMenus.push(leafItem('vanishing.enter', '消失点（透视克隆）…', '', d));
+    filterMenus.push(menuOf('adjust', '调整'));
     filterMenus.push(menuOf('blur', '模糊'));
     filterMenus.push(menuOf('sharpen', '锐化'));
     filterMenus.push(menuOf('noise', '杂色'));
@@ -6114,6 +6234,7 @@ struct Index {
     filterMenus.push(menuOf('stylize', '风格化'));
     filterMenus.push(menuOf('render', '渲染'));
     filterMenus.push(menuOf('other', '其他'));
+
     const view: MenuItemVM[] = [
       leafItem('view.zoomIn', '放大', 'Ctrl+=', d),
       leafItem('view.zoomOut', '缩小', 'Ctrl+-', d),
@@ -6135,6 +6256,18 @@ struct Index {
         leafItem('view.gridSpacing500', '500 px', '', true, this.gridSpacing === 500),
       ]),
       leafItem('view.snapGuides', '对齐参考线', '', true, this.snapGuidesOn),
+      // M22 显示变换（视图级；软打样/色域警告/查找表）
+      subItem('view.proofSub', '校样设置', d, [
+        leafItem('view.proofOff', '关闭校样', '', true, !this.viewXformLut),
+        leafItem('view.proofCoated', '合成涂布纸 CMYK', '', true, this.viewXformLut && this.viewXformDesc === 'proof: coated-cmyk'),
+        leafItem('view.proofP3', 'Display P3（广色域）', '', true, this.viewXformLut && this.viewXformDesc === 'proof: display-p3'),
+      ]),
+      leafItem('view.gamutWarning', '色域警告（CMYK）', 'Shift+Ctrl+Y', true, this.viewXformGamut),
+      subItem('view.lookupSub', '校样颜色（外观）', d, [
+        leafItem('view.lookupOff', '关闭', '', true, !this.viewXformLut || this.viewXformDesc.startsWith('proof')),
+        leafItem('view.lookup0', 'Teal & Orange', '', true, this.viewXformDesc === 'lookup: tealOrange'),
+        leafItem('view.lookupMono', 'Mono High Contrast', '', true, this.viewXformDesc === 'lookup: monoContrast'),
+      ]),
       leafItem('view.snapGrid', '对齐网格', "Shift+Ctrl+'", true, this.snapGridOn),
       subItem('view.screenModeSub', '屏幕模式', true, [
         leafItem('view.screenStd', '标准屏幕模式', 'F', true, this.screenMode === 0),
@@ -7981,6 +8114,25 @@ struct Index {
               .fontColor($r('app.color.text_primary'))
             Text('1/4 代理实时预览；选区约束自动生效')
               .fontSize(11).fontColor($r('app.color.text_secondary'))
+            if (this.filterDef.kind === 30) {
+              // M22 颜色查找：预设 chips（内置外观 + 已导入用户表槽）
+              Flex({ wrap: FlexWrap.Wrap }) {
+                ForEach(this.lookupPresets, (pr: LookupPresetDTO) => {
+                  Text(pr.label)
+                    .fontSize(11)
+                    .fontColor((this.filterP[0] ?? 0) === pr.param
+                      ? $r('app.color.on_accent') : $r('app.color.text_primary'))
+                    .backgroundColor((this.filterP[0] ?? 0) === pr.param
+                      ? $r('app.color.accent') : $r('app.color.surface'))
+                    .borderRadius(6)
+                    .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+                    .margin(2)
+                    .onClick((): void => { this.onFilterParamChange(0, pr.param); })
+                }, (pr: LookupPresetDTO): string => `${pr.id}|${pr.param}`)
+              }.width('100%')
+              Text('更多外观：编辑菜单「载入查找表…」导入 .cube/.3dl/.look')
+                .fontSize(10).fontColor($r('app.color.text_secondary'))
+            } else {
             ForEach(this.filterDef.params, (d: FilterParamDef, idx: number) => {
               Row({ space: 10 }) {
                 Text(d.label).fontSize(13).fontColor($r('app.color.text_secondary')).width(84)
@@ -7992,6 +8144,7 @@ struct Index {
                   .textAlign(TextAlign.End)
               }.width('100%')
             }, (d: FilterParamDef, idx: number): string => `${idx}|${d.label}`)
+            }
             if (this.filterDef.hasSeed) {
               Row({ space: 10 }) {
                 Text('随机种子').fontSize(13).fontColor($r('app.color.text_secondary')).width(84)

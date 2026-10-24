@@ -951,7 +951,12 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
         err = "only 8-bit RGB PSD can be imported";
         return false;
     }
-    if (mode == 7 || mode > 9) { err = "only 8-bit RGB PSD can be imported"; return false; }
+    if (mode == 7) {
+        // M22 登记：多通道模式拒绝（photocraft 同；无 RGB 合成语义）。
+        err = "multichannel PSD is not supported";
+        return false;
+    }
+    if (mode > 9) { err = "unsupported color mode " + std::to_string(mode); return false; }
     out.srcDepth = depth;
     out.srcMode = mode;
     out.srcChannels = channels;

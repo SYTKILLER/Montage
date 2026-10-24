@@ -182,9 +182,15 @@ export const FILTER_CATALOG: FilterDef[] = [
       { label: '暗角数量', min: -100, max: 100, step: 1, def: 0, unit: '' },
     ],
   },
+  {
+    // M22 颜色查找：参数 = 表选择（0..内置数-1 / 100+用户槽）；
+    // 对话框按 kind===30 渲染预设 chips（内置外观 + 已导入用户表）。
+    id: 'colorLookup', label: '颜色查找', kind: 30, menu: 'adjust', hasSeed: false,
+    params: [{ label: '预设', min: 0, max: 115, step: 1, def: 0, unit: '' }],
+  },
 ];
 
-export const FILTER_MENU_GROUPS: string[] = ['blur', 'sharpen', 'noise', 'pixelate', 'stylize', 'render', 'other'];
+export const FILTER_MENU_GROUPS: string[] = ['blur', 'sharpen', 'noise', 'pixelate', 'stylize', 'render', 'other', 'adjust'];
 export const FILTER_MENU_LABELS: Record<string, string> = {
   'blur': '模糊',
   'sharpen': '锐化',
@@ -193,4 +199,5 @@ export const FILTER_MENU_LABELS: Record<string, string> = {
   'stylize': '风格化',
   'render': '渲染',
   'other': '其他',
+  'adjust': '调整',
 };

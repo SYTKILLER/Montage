@@ -64,6 +64,35 @@ void main() {
 }
 )";
 
+// M22 显示变换末趟：acc 终合成时采样 3D LUT（软打样/视图查找表共用通道）；
+// uGamut3d 非 0 时叠加色域警告灰罩（PS 视图 › 色域警告）。
+// 3D 纹理线性过滤下采样坐标 = (c·(size−1)+0.5)/size（lut3d.h 内存序约定）。
+inline const char* kViewFrag = R"(#version 300 es
+precision mediump float;
+uniform sampler2D uTex;
+uniform sampler3D uLut3d;
+uniform sampler3D uGamut3d;
+uniform float uLutOn;
+uniform float uGamutOn;
+uniform float uGamutSize;
+uniform vec2 uViewport;
+out vec4 o;
+void main() {
+  vec2 uv = gl_FragCoord.xy / uViewport;
+  vec4 d = texture(uTex, uv);
+  vec3 c = d.rgb;
+  if (uLutOn > 0.5) {
+    c = texture(uLut3d, c).rgb;
+  }
+  vec4 g = vec4(c, d.a);
+  if (uGamutOn > 0.5) {
+    float bad = texture(uGamut3d, d.rgb).r;
+    g.rgb = mix(c, vec3(0.5), bad * 0.55);
+  }
+  o = g;
+}
+)";
+
 // 剪贴蒙版（M5b-2）：剪贴层 assemble 纹理 × 基底层 alpha（两者均在视口空间，straight alpha）
 inline const char* kClipFrag = R"(#version 300 es
 precision mediump float;

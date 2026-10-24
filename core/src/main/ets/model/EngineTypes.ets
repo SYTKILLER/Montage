@@ -313,6 +313,26 @@ export interface TransformOverlayBox {
 }
 
 /** 智能滤镜条目（getSmartInfo 的 filters 元素，M21；kind<0 = PSD 未实现滤镜直通）。 */
+/** 颜色查找预设（M22：内置外观；param = 滤镜 p0）。 */
+export interface LookupPresetDTO {
+  id: string;
+  label: string;
+  param: number;
+}
+
+export interface LookupImportData {
+  ok: boolean;
+  slot: number;
+  title: string;
+}
+
+/** 显示变换镜像（M22：软打样/色域警告/视图查找表状态）。 */
+export interface ViewTransformData {
+  lutOn: boolean;
+  gamutOn: boolean;
+  desc: string;
+}
+
 export interface SmartFilterDTO {
   kind: number;
   name: string;

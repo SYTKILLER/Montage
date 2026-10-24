@@ -314,12 +314,19 @@ void RenderLoop::doFrame() {
     Viewport vp;
     Engine::StrokeSnapshot strokeSnap;
     Engine::TransformPreview transformPreview;
+    bool viewXformDirtyLocal = false;  // M22
+    Engine::ViewTransform vtLocal;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
         docSnap = e.doc;  // shared_ptr 拷贝（02 §7 帧快照）
         vp = e.viewport;
         strokeSnap = e.copyStrokeSnapshotLocked();
         transformPreview = e.transformPreview;
+        if (e.viewXformDirty) {  // M22：显示变换字节随帧快照锁内拷贝（防撕裂）
+            e.viewXformDirty = false;
+            viewXformDirtyLocal = true;
+            vtLocal = e.viewXform;
+        }
         // M12：文本编辑会话中隐藏该层（RichEditor overlay 承担编辑态视觉，防 GL+overlay 双影）
         if (e.textEditOpen && e.textEditLayerId != 0) {
             for (Layer& l : docSnap.layers) {
@@ -383,6 +390,21 @@ void RenderLoop::doFrame() {
         xformPreview.active = true;
         for (int i = 0; i < 6; ++i) {
             xformPreview.m[i] = transformPreview.m[i];
+        }
+    }
+    // M22：显示变换字节上渲染器（dirty 才传；字节在 docSnap 锁内已拷贝到本地）
+    if (viewXformDirtyLocal) {
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.View", "upload: lutOn=%{public}d gamutOn=%{public}d",
+                     vtLocal.lutOn ? 1 : 0, vtLocal.gamutOn ? 1 : 0);
+        if (vtLocal.lutOn) {
+            renderer_.setViewLut(vtLocal.lut.data(), vtLocal.lut.size(), vtLocal.lutSize);
+        } else {
+            renderer_.setViewLut(nullptr, 0, 0);
+        }
+        if (vtLocal.gamutOn) {
+            renderer_.setGamutLut(vtLocal.gamut.data(), vtLocal.gamut.size(), vtLocal.gamutSize);
+        } else {
+            renderer_.setGamutLut(nullptr, 0, 0);
         }
     }
     renderer_.drawFrame(docSnap, vp, w, h, strokeSnap.active ? &overlay : nullptr,

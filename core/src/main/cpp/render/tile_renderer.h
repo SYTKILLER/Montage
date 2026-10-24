@@ -45,6 +45,13 @@ class TileRenderer {
     // 上下文销毁/丢失时清空全部 GL 资源（03 R3.9：派生缓存语义）
     void invalidate();
 
+    // ---- M22 显示变换（视图级：软打样/色域警告/查找表共用 3D LUT 末趟） ----
+    // 字节 = Lut3d::toRgba8()（size³×RGBA8，红最快内存序 = sampler3D 红轴）；
+    // size=0 关闭对应通道。GamutWarning 用 33³ 单通道判定表打包进 RGBA8（R=域外）。
+    void setViewLut(const uint8_t* rgba, size_t len, uint32_t size);
+    void setGamutLut(const uint8_t* r, size_t len, uint32_t size);
+    void clearViewTransform();
+
   private:
     struct CacheEntry {
         uint32_t tex = 0;
@@ -77,6 +84,12 @@ class TileRenderer {
     GLuint antsProg_ = 0;    // M7b：蚂蚁线
     GLuint qmProg_ = 0;      // M10d：快速蒙版红 overlay
     GLuint qmZeroTex_ = 0;   // 1×1 零纹理（缺瓦片 = 未选中 = 满红采样源）
+    // M22 显示变换
+    GLuint viewProg_ = 0;    // kViewFrag（kPlainFrag 的 3D LUT 增强版）
+    GLuint viewLutTex_ = 0;  // sampler3D 显示 LUT
+    GLuint gamutTex_ = 0;    // sampler3D 色域判定
+    uint32_t viewLutSize_ = 0;
+    uint32_t gamutSize_ = 0;
     // 快速蒙版通道瓦片纹理缓存：键 = Tile* 身份（未触碰瓦片跨提交共享指针 → 不重传）；
     // lastFrame 老化逐出（陈旧 Tile* 键只作身份比较不解引用）
     struct QmCacheEntry {

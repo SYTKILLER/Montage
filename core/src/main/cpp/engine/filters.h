@@ -45,8 +45,10 @@ enum FilterKind : int32_t {
     FCustom,
     FLensCorrection,  // M20d：镜头校正（lens_ops correct；p0..p5 见下）
     FCameraRaw,       // M23c：Camera Raw 9 级链（cameraJson 承载全部参数）
+    FColorLookup,     // M22：颜色查找（LutFile 采样；p0 = 表选择：0..N-1 内置外观，
+                      //       100+ = 进程级已导入的用户表）
 };
-constexpr int32_t kFilterKindCount = 30;
+constexpr int32_t kFilterKindCount = 31;
 
 // 参数槽（语义随 kind；与 06 §4 M13 对话框 schema 对齐）：
 //   GaussianBlur   p0=σ(0.1..500)

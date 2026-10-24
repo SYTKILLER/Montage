@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <map>
 #include <unordered_set>
 #include <cstdio>
 #include <string>
@@ -21,6 +22,11 @@
 #include "engine/vector_edit.h"
 #include "engine/vector_shapes.h"
 #include "engine/camera_raw.h"
+#include "io/cms/builtin.h"
+#include "io/cms/lutfile.h"
+#include "io/cms/lut3d.h"
+#include "io/cms/gamut.h"
+#include "io/cms/transform.h"
 #include "engine/engine.h"
 #include "engine/heal_ops.h"
 #include "engine/filter_ops.h"
@@ -5972,6 +5978,312 @@ bool readFilterArgs(napi_env env, napi_value* argv, size_t argc, filters::Filter
     return p.kind >= 0 && p.kind < filters::kFilterKindCount;
 }
 }  // namespace
+
+// M22 收口：导入查找表（fileName 决定解析格式 .cube/.3dl/.look，b64 = 文件字节）。
+// 存进程级槽（0..15，Color Lookup 滤镜 p0 = 100+槽号）；不入 .montage/History。
+napi_value ImportLookupTable(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    size_t nameLen = 0;
+    if (argc < 2 || napi_get_value_string_utf8(env, argv[0], nullptr, 0, &nameLen) != napi_ok ||
+        nameLen == 0 || nameLen > 256) {
+        return makeError(env, kErrBadParam, "importLookupTable(fileName, base64) invalid");
+    }
+    std::string fileName(nameLen, '\0');
+    napi_get_value_string_utf8(env, argv[0], fileName.data(), nameLen + 1, &nameLen);
+    size_t b64Len = 0;
+    if (napi_get_value_string_utf8(env, argv[1], nullptr, 0, &b64Len) != napi_ok ||
+        b64Len == 0 || b64Len > (8u << 20)) {
+        return makeError(env, kErrBadParam, "importLookupTable: bad base64");
+    }
+    std::string b64(b64Len, '\0');
+    napi_get_value_string_utf8(env, argv[1], b64.data(), b64Len + 1, &b64Len);
+    // base64 解码（M25 codec 同款手写表）
+    static const std::string tab = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    auto idx = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    std::vector<uint8_t> bytes;
+    bytes.reserve(b64.size() / 4 * 3);
+    uint32_t acc = 0;
+    int bits = 0;
+    for (char c : b64) {
+        if (c == '=' || c == '\n' || c == '\r') continue;
+        const int v = idx(c);
+        if (v < 0) {
+            return makeError(env, kErrBadParam, "importLookupTable: bad base64 char");
+        }
+        acc = (acc << 6) | static_cast<uint32_t>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            bytes.push_back(static_cast<uint8_t>((acc >> bits) & 0xFF));
+        }
+    }
+    if (bytes.empty()) {
+        return makeError(env, kErrBadParam, "importLookupTable: empty file");
+    }
+    std::string err;
+    auto lut = cms::parseLutFileName(fileName, bytes.data(), bytes.size(), err);
+    if (!lut) {
+        return makeError(env, kErrBadParam, "importLookupTable: " + err);
+    }
+    const unsigned slot = cms::storeImportedLookup(*lut);
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "slot", makeDouble(env, static_cast<double>(100 + slot)));
+    napi_set_named_property(env, data, "title", makeString(env, lut->title));
+    return makeOk(env, data);
+}
+
+// M22 收口：颜色查找预设透出（内置外观 id/标签 + 用户槽占用）。
+napi_value GetLookupPresets(napi_env env, napi_callback_info /*info*/) {
+    size_t count = 0;
+    const auto* table = cms::builtinLookTable(count);
+    napi_value arr = nullptr;
+    napi_create_array_with_length(env, count, &arr);
+    for (size_t i = 0; i < count; ++i) {
+        napi_value o = nullptr;
+        napi_create_object(env, &o);
+        napi_set_named_property(env, o, "id", makeString(env, table[i].first));
+        napi_set_named_property(env, o, "label", makeString(env, table[i].second));
+        napi_set_named_property(env, o, "param", makeDouble(env, static_cast<double>(i)));
+        napi_set_element(env, arr, static_cast<uint32_t>(i), o);
+    }
+    return makeOk(env, arr);
+}
+
+// ---- M22 显示变换（视图级：软打样/色域警告/查找表共用 3D LUT 末趟） ----
+
+// LutFile（红最快 (b·s+g)·s+r）→ Lut3d 字节（r+g·s+b·s² RGBA8，sampler3D 红轴）。
+static std::vector<uint8_t> lutFileToRgba8(const cms::LutFile& l) {
+    const size_t sz = l.size;
+    std::vector<uint8_t> out(sz * sz * sz * 4u, 255);
+    for (size_t b = 0; b < sz; ++b) {
+        for (size_t g = 0; g < sz; ++g) {
+            for (size_t r = 0; r < sz; ++r) {
+                const size_t src = ((b * sz + g) * sz + r) * 3;
+                const size_t dst = (r + g * sz + b * sz * sz) * 4;
+                for (int k = 0; k < 3; ++k) {
+                    out[dst + k] = static_cast<uint8_t>(
+                        std::clamp(l.data[src + k], 0.0f, 1.0f) * 255.0f + 0.5f);
+                }
+            }
+        }
+    }
+    return out;
+}
+
+// proofId → 内置 profile（命令面用稳定 id；无校验通过时错误返回）。
+static bool builtinProfileById(const std::string& id, const cms::Profile** out) {
+    auto b = cms::builtinFromId(id);
+    if (!b) return false;
+    *out = &cms::builtinProfile(*b);
+    return true;
+}
+
+// Transform 进程缓存（M22 登记「Transform 进程缓存」的显示变换侧收口：软打样
+// 开关/切换不重复构建；key = proofId|intent|bpc|paper。内置 profile 本身进程单例）。
+namespace {
+struct ProofCacheEntry {
+    bool ok = false;
+    cms::Transform tf;
+    std::string err;
+};
+std::map<std::string, ProofCacheEntry>& proofCache() {
+    static std::map<std::string, ProofCacheEntry> c;
+    return c;
+}
+}  // namespace
+
+// setViewProof(proofId, intent, bpc, simulatePaper?)：软打样（文档 sRGB → 打样设备 → sRGB）
+// 构建为 33³ 3D LUT 上渲染器末趟。proofId 空串 = 清除打样（保留其他通道不动）。
+napi_value SetViewProof(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    size_t idLen = 0;
+    if (argc < 3 || napi_get_value_string_utf8(env, argv[0], nullptr, 0, &idLen) != napi_ok ||
+        idLen > 64) {
+        return makeError(env, kErrBadParam, "setViewProof(proofId, intent, bpc, simulatePaper?) invalid");
+    }
+    std::string proofId(idLen, '\0');
+    napi_get_value_string_utf8(env, argv[0], proofId.data(), idLen + 1, &idLen);
+    double intent = 1, bpc = 1, paper = 0;
+    napi_get_value_double(env, argv[1], &intent);
+    napi_get_value_double(env, argv[2], &bpc);
+    if (argc >= 4) napi_get_value_double(env, argv[3], &paper);
+    auto& e = Engine::get();
+    if (proofId.empty()) {
+        OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.View", "setViewProof: clearing lut");
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        e.viewXform.lutOn = false;
+        e.viewXform.lut.clear();
+        e.viewXform.lutSize = 0;
+        e.viewXform.desc = e.viewXform.gamutOn ? "gamut warning" : "";
+        e.viewXformDirty = true;
+        e.requestRender();
+        return makeOk(env, nullptr);
+    }
+    const cms::Profile* proof = nullptr;
+    if (!builtinProfileById(proofId, &proof)) {
+        return makeError(env, kErrBadParam, "setViewProof: unknown profile id");
+    }
+    const cms::Intent in = static_cast<cms::Intent>(
+        static_cast<int>(std::min(3.0, std::max(0.0, intent))));
+    const std::string key = proofId + '|' + std::to_string(static_cast<int>(in)) + '|' +
+                            (bpc > 0.5 ? '1' : '0') + (paper > 0.5 ? '1' : '0');
+    auto& cache = proofCache();
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+        ProofCacheEntry entry;
+        auto tf = cms::Transform::proof(cms::builtinSrgb(), *proof, cms::builtinSrgb(), in,
+                                        bpc > 0.5, paper > 0.5, entry.err);
+        entry.ok = tf.has_value();
+        if (entry.ok) {
+            entry.tf = std::move(*tf);
+        }
+        it = cache.emplace(key, std::move(entry)).first;
+    }
+    if (!it->second.ok) {
+        return makeError(env, kErrInternal, "setViewProof: " + it->second.err);
+    }
+    cms::Lut3d lut = cms::Lut3d::fromTransform(it->second.tf, 33);
+    std::vector<uint8_t> bytes = lut.toRgba8();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    e.viewXform.lutOn = true;
+    e.viewXform.lut = std::move(bytes);
+    e.viewXform.lutSize = 33;
+    e.viewXform.desc = std::string("proof: ") + proofId;
+    e.viewXformDirty = true;
+    e.requestRender();
+    return makeOk(env, nullptr);
+}
+
+// setGamutWarning(proofId, threshold?, on?)：色域警告（sRGB 域 33³ 判定表）。
+napi_value SetGamutWarning(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    size_t idLen = 0;
+    if (argc < 1 || napi_get_value_string_utf8(env, argv[0], nullptr, 0, &idLen) != napi_ok ||
+        idLen > 64) {
+        return makeError(env, kErrBadParam, "setGamutWarning(proofId, threshold?, on?) invalid");
+    }
+    std::string proofId(idLen, '\0');
+    napi_get_value_string_utf8(env, argv[0], proofId.data(), idLen + 1, &idLen);
+    double threshold = 2.0, on = 1;
+    if (argc >= 2) napi_get_value_double(env, argv[1], &threshold);
+    if (argc >= 3) napi_get_value_double(env, argv[2], &on);
+    auto& e = Engine::get();
+    if (on < 0.5) {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        e.viewXform.gamutOn = false;
+        e.viewXform.gamut.clear();
+        e.viewXform.gamutSize = 0;
+        e.viewXform.desc = e.viewXform.lutOn ? e.viewXform.desc : "";
+        e.viewXformDirty = true;
+        e.requestRender();
+        return makeOk(env, nullptr);
+    }
+    const cms::Profile* proof = nullptr;
+    if (!builtinProfileById(proofId, &proof)) {
+        return makeError(env, kErrBadParam, "setGamutWarning: unknown profile id");
+    }
+    std::string err;
+    auto gc = cms::GamutCheck::make(cms::builtinSrgb(), *proof,
+                                    static_cast<float>(std::max(0.1, threshold)), err);
+    if (!gc) {
+        return makeError(env, kErrInternal, "setGamutWarning: " + err);
+    }
+    const size_t sz = 33;
+    std::vector<uint8_t> grid(sz * sz * sz, 0);
+    for (size_t b = 0; b < sz; ++b) {
+        for (size_t g = 0; g < sz; ++g) {
+            for (size_t r = 0; r < sz; ++r) {
+                const float px[3] = {static_cast<float>(r) / (sz - 1),
+                                     static_cast<float>(g) / (sz - 1),
+                                     static_cast<float>(b) / (sz - 1)};
+                grid[r + g * sz + b * sz * sz] = gc->outOfGamut(px) ? 1 : 0;
+            }
+        }
+    }
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    e.viewXform.gamutOn = true;
+    e.viewXform.gamut = std::move(grid);
+    e.viewXform.gamutSize = sz;
+    e.viewXformDirty = true;
+    e.requestRender();
+    return makeOk(env, nullptr);
+}
+
+// setViewLookup(param)：颜色查找视图级 LUT（param = 内置外观序号或 100+用户槽；
+// param < 0 清除）。与滤镜互不影响——这是「显示」外观（PS「视图 › 校样颜色」家族）。
+napi_value SetViewLookup(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double param = -1;
+    if (argc >= 1 && argv[0] != nullptr) {
+        napi_get_value_double(env, argv[0], &param);
+    }
+    auto& e = Engine::get();
+    if (param < 0) {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        e.viewXform.lutOn = false;
+        e.viewXform.lut.clear();
+        e.viewXform.lutSize = 0;
+        e.viewXform.desc = e.viewXform.gamutOn ? "gamut warning" : "";
+        e.viewXformDirty = true;
+        e.requestRender();
+        return makeOk(env, nullptr);
+    }
+    std::optional<cms::LutFile> lut;
+    std::string label;
+    if (param >= 100.0) {
+        lut = cms::importedLookup(static_cast<unsigned>(param) - 100u);
+        label = "lookup(imported)";
+    } else {
+        size_t count = 0;
+        const auto* table = cms::builtinLookTable(count);
+        const unsigned sel = static_cast<unsigned>(param);
+        if (sel >= count) {
+            return makeError(env, kErrBadParam, "setViewLookup: preset out of range");
+        }
+        lut = cms::builtinLook(table[sel].first);
+        label = std::string("lookup: ") + table[sel].first;
+    }
+    if (!lut) {
+        return makeError(env, kErrBadParam, "setViewLookup: table not loaded");
+    }
+    std::vector<uint8_t> bytes = lutFileToRgba8(*lut);
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    e.viewXform.lutOn = true;
+    e.viewXform.lut = std::move(bytes);
+    e.viewXform.lutSize = static_cast<uint32_t>(lut->size);
+    e.viewXform.desc = label;
+    e.viewXformDirty = true;
+    e.requestRender();
+    return makeOk(env, nullptr);
+}
+
+// getViewTransform()：显示变换镜像（菜单勾选态）。
+napi_value GetViewTransform(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    napi_value data = nullptr;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "lutOn", makeBool(env, e.viewXform.lutOn));
+    napi_set_named_property(env, data, "gamutOn", makeBool(env, e.viewXform.gamutOn));
+    napi_set_named_property(env, data, "desc", makeString(env, e.viewXform.desc));
+    return makeOk(env, data);
+}
 
 // M13：应用滤镜（layerId, kind, p0..p5, seed；一步 History 事务；选区约束自动）
 napi_value ApplyFilter(napi_env env, napi_callback_info info) {

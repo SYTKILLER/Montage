@@ -1,6 +1,8 @@
 #include "engine/filters.h"
 
 #include "engine/camera_raw.h"
+
+#include "io/cms/lutfile.h"
 #include "engine/lens_ops.h"
 
 // M13 滤镜核实现。算法对拍 photocraft algo crate（MIT，07 §3.4 注入，公式语义逐条照抄）：
@@ -946,6 +948,77 @@ bool applyFilter(const uint8_t* src, uint8_t* dst, uint32_t w, uint32_t h,
                     dst[i * 4u + c] = static_cast<uint8_t>(
                         std::clamp(fpx[i * 4u + c], 0.0f, 1.0f) * 255.0f + 0.5f);
                 }
+            }
+            break;
+        }
+        case FColorLookup: {
+            // M22：颜色查找（图像 › 调整 › 颜色查找）。表来源：内置外观（lutfile
+            // builtinLook，33³ 程序生成 CC0）或进程级导入表（lutImportSlot ≥100）。
+            std::optional<cms::LutFile> lut;
+            if (p.p0 >= 100.0f) {
+                lut = cms::importedLookup(static_cast<unsigned>(p.p0) - 100u);
+                if (!lut) {
+                    err = "lookup table not loaded";
+                    return false;
+                }
+            } else {
+                size_t count = 0;
+                const auto* table = cms::builtinLookTable(count);
+                unsigned sel = static_cast<unsigned>(p.p0);
+                if (sel >= count) {
+                    err = "lookup preset out of range";
+                    return false;
+                }
+                lut = cms::builtinLook(table[sel].first);
+                if (!lut) {
+                    err = "builtin look unavailable";
+                    return false;
+                }
+            }
+            const size_t sz = lut->size;
+            const float m = static_cast<float>(sz - 1);
+            auto sample = [&](float c, int ch) {
+                float t = std::clamp(c, 0.0f, 1.0f);
+                if (!lut->domainIsDefault()) {
+                    t = std::clamp((t - lut->domainMin[ch]) /
+                                       std::max(1e-6f, lut->domainMax[ch] - lut->domainMin[ch]),
+                                   0.0f, 1.0f);
+                }
+                return t;
+            };
+            for (size_t i = 0; i < n; ++i) {
+                const float r = sample(src[i * 4u] / 255.0f, 0);
+                const float g = sample(src[i * 4u + 1u] / 255.0f, 1);
+                const float b = sample(src[i * 4u + 2u] / 255.0f, 2);
+                // 红最快索引 = ((b·size + g)·size + r)·3；三线性（PS 颜色查找默认）。
+                const float fx = r * m;
+                const float fy = g * m;
+                const float fz = b * m;
+                const size_t x0 = std::min(static_cast<size_t>(fx), sz - 2);
+                const size_t y0 = std::min(static_cast<size_t>(fy), sz - 2);
+                const size_t z0 = std::min(static_cast<size_t>(fz), sz - 2);
+                const float tx = std::clamp(fx - static_cast<float>(x0), 0.0f, 1.0f);
+                const float ty = std::clamp(fy - static_cast<float>(y0), 0.0f, 1.0f);
+                const float tz = std::clamp(fz - static_cast<float>(z0), 0.0f, 1.0f);
+                float out[3] = {0.0f, 0.0f, 0.0f};
+                for (int corner = 0; corner < 8; ++corner) {
+                    const size_t cx = x0 + (corner & 1u);
+                    const size_t cy = y0 + ((corner >> 1) & 1u);
+                    const size_t cz = z0 + ((corner >> 2) & 1u);
+                    const float wx = (corner & 1u) ? tx : 1.0f - tx;
+                    const float wy = ((corner >> 1) & 1u) ? ty : 1.0f - ty;
+                    const float wz = ((corner >> 2) & 1u) ? tz : 1.0f - tz;
+                    const float w = wx * wy * wz;
+                    const size_t idx = ((cz * sz + cy) * sz + cx) * 3;
+                    for (int ch = 0; ch < 3; ++ch) {
+                        out[ch] += w * lut->data[idx + ch];
+                    }
+                }
+                for (int ch = 0; ch < 3; ++ch) {
+                    dst[i * 4u + ch] = static_cast<uint8_t>(
+                        std::clamp(out[ch], 0.0f, 1.0f) * 255.0f + 0.5f);
+                }
+                dst[i * 4u + 3] = src[i * 4u + 3];
             }
             break;
         }

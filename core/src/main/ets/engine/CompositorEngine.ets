@@ -2,7 +2,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
 import { automation } from './Automation';
-import { EngineStats, ExportPngData, ExportImageData, CodecCapabilities, CodecCap, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, SmartFilterDTO, SmartInfoDTO, } from '../model/EngineTypes';
+import { EngineStats, ExportPngData, ExportImageData, CodecCapabilities, CodecCap, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, SmartFilterDTO, SmartInfoDTO, LookupPresetDTO, LookupImportData, ViewTransformData, } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -885,6 +885,86 @@ export class CompositorEngine {
     }
     automation.note('filter.direct', { 'layerId': layerId, 'kind': kind, 'p0': p0, 'p1': p1, 'p2': p2, 'p3': p3, 'p4': p4, 'p5': p5, 'seed': seed });
     return true;
+  }
+
+  /** M22：导入查找表文件（.cube/.3dl/.look；返回滤镜 p0 = 100+槽号）。 */
+  async importLookupTable(fileName: string, base64: string): Promise<LookupImportData> {
+    const value: Object = await (native.importLookupTable(fileName, base64) as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok || r.data === null) {
+      throw new Error(r.error !== null ? r.error.message : 'importLookupTable failed');
+    }
+    return {
+      ok: boolOf(r.data, 'ok'),
+      slot: num(r.data, 'slot'),
+      title: str(r.data, 'title'),
+    };
+  }
+
+  /** M22：软打样（proofId 空串=清除；视图级 3D LUT 末趟）。 */
+  async setViewProof(proofId: string, intent: number, bpc: boolean, simulatePaper?: boolean): Promise<boolean> {
+    const value: Object = await (native.setViewProof(proofId, intent, bpc ? 1 : 0,
+      simulatePaper ?? false ? 1 : 0) as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setViewProof failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  /** M22：色域警告（proofId + ΔE 阈值；on=false 关闭）。 */
+  async setGamutWarning(proofId: string, threshold: number, on: boolean): Promise<boolean> {
+    const value: Object = await (native.setGamutWarning(proofId, threshold, on ? 1 : 0) as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setGamutWarning failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  /** M22：视图级查找表（param<0 清除；与滤镜互不影响）。 */
+  async setViewLookup(param: number): Promise<boolean> {
+    const value: Object = await (native.setViewLookup(param) as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setViewLookup failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  /** M22：显示变换镜像（lutOn/gamutOn/desc）。 */
+  getViewTransform(): ViewTransformData {
+    const r = narrowResult(native.getViewTransform() as Object);
+    if (!r.ok || r.data === null) {
+      return { lutOn: false, gamutOn: false, desc: '' };
+    }
+    return {
+      lutOn: boolOf(r.data, 'lutOn'),
+      gamutOn: boolOf(r.data, 'gamutOn'),
+      desc: str(r.data, 'desc'),
+    };
+  }
+
+  /** M22：内置颜色查找外观列表（param = 滤镜 p0）。 */
+  getLookupPresets(): LookupPresetDTO[] {
+    const r = narrowResult(native.getLookupPresets() as Object);
+    if (!r.ok || r.data === null) {
+      return [];
+    }
+    const out: LookupPresetDTO[] = [];
+    if (Array.isArray(r.data)) {
+      for (const it of r.data as Object[]) {
+        const o = it as Record<string, Object>;
+        out.push({ id: str(o, 'id'), label: str(o, 'label'), param: num(o, 'param') });
+      }
+    }
+    return out;
   }
 
   beginFilterPreview(layerId: number): boolean {

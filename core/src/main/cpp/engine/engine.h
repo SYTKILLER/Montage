@@ -146,6 +146,21 @@ class Engine {
     };
     CameraPreviewSession camPreview;
 
+    // M22 显示变换（视图级，PS「视图 › 校样设置/色域警告」语义：不随文档/撤销走，
+    // resetDocument 保留——跨文档视图偏好）。bytes = Lut3d::toRgba8（渲染器 3D 纹理），
+    // gamut = 单通道判定表（0/1）。会话只存最终字节；构建在 bridge（cms 内核）。
+    struct ViewTransform {
+        bool lutOn = false;
+        std::vector<uint8_t> lut;   // size³×RGBA8
+        uint32_t lutSize = 0;
+        bool gamutOn = false;
+        std::vector<uint8_t> gamut; // size³×1
+        uint32_t gamutSize = 0;
+        std::string desc;           // UI 镜像（状态栏/菜单勾选）
+    };
+    ViewTransform viewXform;
+    bool viewXformDirty = false;    // 渲染器重上传标记（invalidate 后也置位）
+
     // M10c 内部剪贴板（引擎内存；不随快照/持久化走，关闭文档保留——PS 同语义）
     ClipBuffer clipboard;
     // M17a 样式剪贴板（copyLayerStyle/pasteLayerStyle；跨文档保留，同 ClipBuffer 语义）
