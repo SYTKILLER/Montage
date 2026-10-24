@@ -7,7 +7,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(compositor SHARED
         bridge/napi_module.cpp
         bridge/engine_bridge.cpp
+        bridge/codec_bridge.cpp
         engine/brush.cpp
+        engine/camera_raw.cpp
         engine/clipboard_ops.cpp
         engine/document.cpp
         engine/engine.cpp
@@ -71,8 +73,22 @@ add_library(compositor SHARED
         io/project_save.cpp
         io/psd/psd_reader.cpp
         io/psd/psd_import.cpp
+        io/psd/psd_deep.cpp
         io/psd/descriptor.cpp
         io/psd/smart_psd.cpp
+        io/psdsrc_blob.cpp
+        io/cms/curve.cpp
+        io/cms/clut.cpp
+        io/cms/pipeline.cpp
+        io/cms/profile.cpp
+        io/cms/builtin.cpp
+        io/cms/synth.cpp
+        io/cms/transform.cpp
+        io/cms/gamut.cpp
+        io/cms/lut3d.cpp
+        io/cms/lutfile.cpp
+        io/cms/convert.cpp
+        io/cms/coated_cmyk_bytes.cpp
         io/codecs/codec_import.cpp
         io/codecs/codec_table.cpp
         io/codecs/codec_util.cpp

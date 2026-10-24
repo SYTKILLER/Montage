@@ -1,7 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
-import { EngineStats, ExportPngData, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, SmartFilterDTO, SmartInfoDTO, } from '../model/EngineTypes';
+import { EngineStats, ExportPngData, ExportImageData, CodecCapabilities, CodecCap, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, SmartFilterDTO, SmartInfoDTO, } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -38,6 +38,11 @@ function boolOf(r: Record<string, Object>, key: string): boolean {
 function str(r: Record<string, Object>, key: string): string {
   const v: Object = r[key];
   return typeof v === 'string' ? v : '';
+}
+
+function objOf(r: Record<string, Object>, key: string): Object {
+  const v: Object = r[key];
+  return v;
 }
 
 function narrowResult(value: Object): EngineResult {
@@ -271,10 +276,13 @@ export class CompositorEngine {
   /**
    * 导入图片。fd 所有权一律移交 native（含失败路径），调用方不得再 close。
    */
-  openFileFromFd(fd: number): Promise<OpenFileData> {
+  openFileFromFd(fd: number, name?: string): Promise<OpenFileData> {
     return new Promise<OpenFileData>((resolve: (d: OpenFileData) => void,
       reject: (e: Error) => void) => {
-      (native.openFileFromFd(fd) as Promise<Object>).then((value: Object): void => {
+      const call = name !== undefined && name !== ''
+        ? (native.openFileFromFd(fd, name) as Promise<Object>)
+        : (native.openFileFromFd(fd) as Promise<Object>);
+      call.then((value: Object): void => {
         const r = narrowResult(value);
         if (r.ok && r.data !== null) {
           resolve({
@@ -2029,8 +2037,8 @@ export class CompositorEngine {
   }
 
   /** M15e：RAW 重显影（色温/色调/曝光/γ，从会话 RAW 缓存出发；一步 history 事务）。 */
-  async developRaw(temp: number, tint: number, ev: number, gamma: number): Promise<RawDevelopData> {
-    const value: Object = await (native.developRaw(temp, tint, ev, gamma) as Promise<Object>);
+  async developRaw(temp: number, tint: number, ev: number, gamma: number, cameraJson?: string): Promise<RawDevelopData> {
+    const value: Object = await (native.developRaw(temp, tint, ev, gamma, cameraJson ?? '') as Promise<Object>);
     const r = narrowResult(value);
     if (!r.ok || r.data === null) {
       throw new Error(r.error !== null ? r.error.message : 'developRaw failed');
@@ -2210,6 +2218,63 @@ export class CompositorEngine {
     }
     const outData: PsdOpenData = { width: num(d, 'width'), height: num(d, 'height'), notes: notes };
     return outData;
+  }
+
+  /** M25 平面格式导出（tiff/gif/bmp/tga/qoi；flatten→encode→fd，异步）。 */
+  async exportImage(fd: number, format: string, quality?: number): Promise<ExportImageData> {
+    const call = quality !== undefined
+      ? (native.exportImage(fd, format, quality) as Promise<Object>)
+      : (native.exportImage(fd, format) as Promise<Object>);
+    const value: Object = await call;
+    const r = narrowResult(value);
+    if (!r.ok || r.data === null) {
+      const errObj = r.error;
+      throw new Error(errObj !== null ? errObj.message : 'exportImage failed');
+    }
+    const d = r.data;
+    const out: ExportImageData = { width: num(d, 'width'), height: num(d, 'height'), bytes: num(d, 'bytes') };
+    return out;
+  }
+
+  /** M25 编解码能力表（格式×读×写×深度单一事实来源；启动/对话框打开时取用）。 */
+  async getCodecCapabilities(): Promise<CodecCapabilities> {
+    const value: Object = await (native.getCodecCapabilities() as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok || r.data === null) {
+      const errObj = r.error;
+      throw new Error(errObj !== null ? errObj.message : 'getCodecCapabilities failed');
+    }
+    const d = r.data;
+    const formats: CodecCap[] = [];
+    const rawFormats: Object = objOf(d, 'formats');
+    if (Array.isArray(rawFormats)) {
+      for (const f0 of rawFormats as Object[]) {
+        const f = toRecord(f0);
+        const exts: string[] = [];
+        const rawExts: Object = objOf(f, 'exts');
+        if (Array.isArray(rawExts)) {
+          for (const x of rawExts as Object[]) {
+            if (typeof x === 'string') {
+              exts.push(x);
+            }
+          }
+        }
+        formats.push({
+          format: str(f, 'format'),
+          read: boolOf(f, 'read'),
+          write: boolOf(f, 'write'),
+          depths: str(f, 'depths'),
+          exts: exts,
+          note: str(f, 'note'),
+        });
+      }
+    }
+    const out: CodecCapabilities = {
+      formats: formats,
+      openExts: str(d, 'openExts'),
+      saveExts: str(d, 'saveExts'),
+    };
+    return out;
   }
 
   // ---------- M21 智能对象与智能滤镜 ----------

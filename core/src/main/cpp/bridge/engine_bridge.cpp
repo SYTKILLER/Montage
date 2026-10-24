@@ -5401,6 +5401,13 @@ napi_value ExportPsd(napi_env env, napi_callback_info info) {
         snap.width = e.doc.width;
         snap.height = e.doc.height;
         snap.name = e.doc.name;
+        // M22：深色/多模式往返元数据（原 header/ICC/色板/全局块）
+        snap.psdSrcDepth = e.doc.psdSrcDepth;
+        snap.psdSrcMode = e.doc.psdSrcMode;
+        snap.psdSrcChannels = e.doc.psdSrcChannels;
+        snap.psdIccProfile = e.doc.psdIccProfile;
+        snap.psdColorModeData = e.doc.psdColorModeData;
+        snap.globalBlocks = e.doc.psdGlobalExtra;
         for (const Layer& l : e.doc.layers) {
             io::PsdLayerSnap pl;
             pl.name = l.name;
@@ -5412,6 +5419,23 @@ napi_value ExportPsd(napi_env env, napi_callback_info info) {
             // M15c：样式派生域 origin 独立于 transform（投影/描边扩展），导出须对齐像素
             pl.originX = l.effectiveOriginX();
             pl.originY = l.effectiveOriginY();
+            // M22：深色 verbatim 元数据（源矩形由 reader 捕获存 transform 附字段；此处从
+            // Layer 的 psd* 直拷——指纹重算在 exportPsd 内做）
+            pl.psdSrcSection = l.psdSrcSection;
+            pl.psdChannelIds = l.psdChannelIds;
+            pl.psdChannelLens = l.psdChannelLens;
+            pl.psdImportHash = l.psdImportHash;
+            pl.psdSrcCropped = l.psdSrcCropped;
+            pl.psdRectW = static_cast<uint32_t>(l.transform.width);
+            pl.psdRectH = static_cast<uint32_t>(l.transform.height);
+            pl.srcLeft = l.psdSrcLeft;
+            pl.srcTop = l.psdSrcTop;
+            pl.srcRight = l.psdSrcRight;
+            pl.srcBottom = l.psdSrcBottom;
+            pl.srcMaskLeft = l.psdSrcMaskLeft;
+            pl.srcMaskTop = l.psdSrcMaskTop;
+            pl.srcMaskRight = l.psdSrcMaskRight;
+            pl.srcMaskBottom = l.psdSrcMaskBottom;
             if (l.mask != nullptr) {
                 pl.maskGrid = l.mask->pixels;
                 pl.maskW = l.mask->width;
@@ -6167,14 +6191,19 @@ struct DevelopRawCtx {
     std::shared_ptr<const TileGrid> grid;
 };
 
-// developRaw(temp, tint, ev, gamma)：从会话 RAW 缓存全分辨率重显影（恒从 RAW 出发，
-// 会话内非破坏），COW 换层像素 + 一步 history 事务。v1 无实时预览（登记后续）。
+// developRaw(temp, tint, ev, gamma, cameraJson?)：从会话 RAW 缓存全分辨率重显影（恒从
+// RAW 出发，会话内非破坏），COW 换层像素 + 一步 history 事务。v1 无实时预览（登记后续）。
+// M23b：第 5 参可选 CameraRaw JSON（camelCase；非空时 temp/tint/ev/gamma 忽略、
+// 由 Camera Raw 9 级链接管）。
 napi_value DevelopRaw(napi_env env, napi_callback_info info) {
-    size_t argc = 4;
-    napi_value argv[4] = {nullptr};
+    size_t argc = 5;
+    napi_value argv[5];
+    for (size_t i = 0; i < 5; ++i) {
+        argv[i] = nullptr;
+    }
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 4) {
-        return makeError(env, kErrBadParam, "developRaw(temp,tint,ev,gamma) requires 4 args");
+        return makeError(env, kErrBadParam, "developRaw(temp,tint,ev,gamma,cameraJson?) requires 4 args");
     }
     double temp = 0;
     double tint = 0;
@@ -6186,12 +6215,21 @@ napi_value DevelopRaw(napi_env env, napi_callback_info info) {
         napi_get_value_double(env, argv[3], &gamma) != napi_ok) {
         return makeError(env, kErrBadParam, "developRaw: invalid args");
     }
+    std::string cameraJson;
+    if (argc >= 5 && argv[4] != nullptr) {
+        size_t len = 0;
+        if (napi_get_value_string_utf8(env, argv[4], nullptr, 0, &len) == napi_ok && len > 0 && len < (1 << 20)) {
+            cameraJson.resize(len);
+            napi_get_value_string_utf8(env, argv[4], cameraJson.data(), len + 1, &len);
+        }
+    }
     auto& e = Engine::get();
     auto* ctx = new DevelopRawCtx();
     ctx->params.temp = static_cast<float>(std::min(100.0, std::max(-100.0, temp)));
     ctx->params.tint = static_cast<float>(std::min(100.0, std::max(-100.0, tint)));
     ctx->params.ev = static_cast<float>(std::min(2.0, std::max(-2.0, ev)));
     ctx->params.gamma = static_cast<float>(std::min(2.0, std::max(0.5, gamma)));
+    ctx->params.cameraJson = std::move(cameraJson);
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
         if (!e.rawDevelop.valid || e.rawDevelop.bytes.empty()) {

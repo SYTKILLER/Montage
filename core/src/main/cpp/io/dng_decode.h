@@ -11,8 +11,10 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
+#include "engine/camera_raw.h"
 #include "engine/document.h"
 
 namespace montage {
@@ -21,12 +23,15 @@ namespace io {
 // 内容探测：相机 raw（DNG/CR2/NEF/ARW/RW2/ORF/RAF…，廉价头与 IFD 检查）。
 bool looksLikeCameraRaw(const std::vector<uint8_t>& bytes);
 
-// M15e 显影参数（相对默认显影的偏移；显影参数面板 P1）
+// M15e 显影参数（相对默认显影的偏移；显影参数面板）
 struct DevelopParams {
     float temp = 0.0f;   // -100..100 色温偏移（正=暖/偏黄，负=冷/偏蓝；调制 R/B 增益 ±30%）
     float tint = 0.0f;   // -100..100 色调偏移（正=品红，负=绿；调制 G 增益）
     float ev = 0.0f;     // -2..+2 曝光（线性增益 2^ev，高光照常截断）
     float gamma = 1.0f;  // 0.5..2.0 伽马（sRGB 编码后再取 1/γ 次幂；>1 提亮中间调）
+    // M23b：Camera Raw 9 级链（settingsJson 非空时启用；photocraft camera_raw 语义，
+    // JSON = CameraRaw 字段 camelCase 串——basic/曲线/HSL/分级/细节/效果全量）。
+    std::string cameraJson;
 };
 
 // 显影 → 直 RGBA TileGrid（引擎瓦片约定）。失败给明确错误。

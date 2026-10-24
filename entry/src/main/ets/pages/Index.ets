@@ -262,6 +262,25 @@ struct Index {
   @State devTint: number = 0;           // -100..100（正=品红）
   @State devEv: number = 0;             // -2..+2 EV
   @State devGamma: number = 1;          // 0.5..2.0
+  // M23b：Camera Raw 链开关 + Basic/细节/效果滑杆（camera_raw.rs 语义；开着时
+  // v1 四参中 temp/tint/ev 由链接管、伽马保留）。曲线/HSL/分级留 M23c 编辑器。
+  @State devCameraOn: boolean = false;
+  @State devExposure: number = 0;       // -100..100（Camera Raw 单位，0.25/级）
+  @State devContrast: number = 0;       // -100..100
+  @State devHighlights: number = 0;     // -100..100
+  @State devShadows: number = 0;        // -100..100
+  @State devWhites: number = 0;         // -100..100
+  @State devBlacks: number = 0;         // -100..100
+  @State devTexture: number = 0;        // -100..100
+  @State devClarity: number = 0;        // -100..100
+  @State devDehaze: number = 0;         // -100..100
+  @State devVibrance: number = 0;       // -100..100
+  @State devSaturation: number = 0;     // -100..100
+  @State devSharpen: number = 0;        // 0..300（ACR 锐化量）
+  @State devNoiseLum: number = 0;       // 0..100
+  @State devNoiseColor: number = 0;     // 0..100
+  @State devVignette: number = 0;       // -100..100
+  @State devGrain: number = 0;          // 0..100
   // M11c 形状工具：种类/样式 + 拖拽预览（视口 [x,y,w,h]）
   @State shapeKind: number = 0;         // 0=矩形 1=圆角矩形 2=椭圆 3=直线
   @State shapeFill: boolean = true;
@@ -2548,6 +2567,40 @@ struct Index {
       return;
     }
     this.showDevelop = false;
+    if (this.devCameraOn) {
+      // M23b：Camera Raw 链（JSON camelCase；temp/tint/exposure 映射进链，其余 v1 参留默认）。
+      const cam: Record<string, number> = {
+        'temperature': this.devTemp,
+        'tint': this.devTint,
+        'exposure': this.devExposure / 100.0 * 2.0,  // -100..100 → ±2 EV
+        'contrast': this.devContrast,
+        'highlights': this.devHighlights,
+        'shadows': this.devShadows,
+        'whites': this.devWhites,
+        'blacks': this.devBlacks,
+        'texture': this.devTexture,
+        'clarity': this.devClarity,
+        'dehaze': this.devDehaze,
+        'vibrance': this.devVibrance,
+        'saturation': this.devSaturation,
+        'sharpenAmount': this.devSharpen,
+        'noiseLuminance': this.devNoiseLum,
+        'noiseColor': this.devNoiseColor,
+        'vignetteAmount': this.devVignette,
+        'grainAmount': this.devGrain,
+      };
+      const camJson = JSON.stringify(cam);
+      this.engine.developRaw(0, 0, 0, this.devGamma, camJson)
+        .then((d: RawDevelopData): void => {
+          this.log(`RAW 重显影(Camera Raw): ${d.width}x${d.height} 层${d.layerId}`);
+          this.toast('Camera Raw 显影已应用');
+        })
+        .catch((e: BusinessError): void => {
+          this.log(`RAW 重显影失败: ${e.message}`);
+          this.toast(`显影失败: ${e.message}`);
+        });
+      return;
+    }
     this.engine.developRaw(this.devTemp, this.devTint, this.devEv, this.devGamma)
       .then((d: RawDevelopData): void => {
         this.log(`RAW 重显影: ${d.width}x${d.height} 层${d.layerId}`);
@@ -3117,7 +3170,10 @@ struct Index {
   private openByUri(uri: string): void {
     const f = fs.openSync(uri, fs.OpenMode.READ_ONLY);
     this.importing = true;
-    this.engine.openFileFromFd(f.fd).then((d: OpenFileData): void => {
+    // M25：文件名透传（TGA 等无魔数格式的嗅探兜底；native 侧魔数优先）
+    const dot = uri.lastIndexOf('.');
+    const baseName = dot >= 0 ? uri.slice(dot) : '';
+    this.engine.openFileFromFd(f.fd, baseName).then((d: OpenFileData): void => {
       // fd 所有权已移交 native（含失败路径）
       this.importing = false;
       if (d.width > this.docW || d.height > this.docH) {
@@ -3197,9 +3253,19 @@ struct Index {
       this.toast('无文档可导出');
       return;
     }
-    const ext = format === 'png' ? 'png' : (format === 'psd' ? 'psd' : 'jpg');
+    const extMap = new Map<string, string>();
+    extMap.set('png', 'png');
+    extMap.set('jpeg', 'jpg');
+    extMap.set('psd', 'psd');
+    extMap.set('tiff', 'tif');
+    extMap.set('gif', 'gif');
+    extMap.set('bmp', 'bmp');
+    extMap.set('tga', 'tga');
+    extMap.set('qoi', 'qoi');
+    extMap.set('webp', 'webp');
+    const ext = extMap.get(format) ?? 'png';
     const opt = new picker.DocumentSaveOptions();
-    opt.newFileNames = [`${this.docName().replace(/\.(montage|png|jpg|jpeg)$/i, '') || '未命名'}.${ext}`];
+    opt.newFileNames = [`${this.docName().replace(/\.(montage|png|jpg|jpeg|tif|tiff|gif|bmp|tga|qoi|webp)$/i, '') || '未命名'}.${ext}`];
     const dp = new picker.DocumentViewPicker();
     dp.save(opt).then((uris: string[]): void => {
       if (uris.length < 1) {
@@ -3253,8 +3319,10 @@ struct Index {
         this.log(`PNG 导出失败: ${e.message}`);
         this.toast('PNG 导出失败');
       });
-    } else {
-      // JPEG：引擎扁平化 → PixelMap → ImagePacker（V-01）
+    } else if (format === 'jpeg' || format === 'webp') {
+      // JPEG/WebP：引擎扁平化 → PixelMap → ImagePacker（V-01；webp M25）
+      const mime = format === 'webp' ? 'image/webp' : 'image/jpeg';
+      const label = format === 'webp' ? 'WebP' : 'JPEG';
       this.engine.flattenToPixelMap().then((d): void => {
         if (d.pixelMap === null) {
           this.busyText = '';
@@ -3264,21 +3332,33 @@ struct Index {
         }
         const pm = d.pixelMap as image.PixelMap;
         const packer = image.createImagePacker();
-        packer.packToFile(pm, f.fd, { format: 'image/jpeg', quality: quality }).then((): void => {
+        packer.packToFile(pm, f.fd, { format: mime, quality: quality }).then((): void => {
           this.busyText = '';
           pm.release();
-          this.log(`JPEG 导出 q=${quality}（${Date.now() - t0}ms）→ ${uri}`);
-          this.toast('JPEG 已导出');
+          this.log(`${label} 导出 q=${quality}（${Date.now() - t0}ms）→ ${uri}`);
+          this.toast(`${label} 已导出`);
         }).catch((e: BusinessError): void => {
           this.busyText = '';
           pm.release();
-          this.log(`JPEG 编码失败: ${e.message}`);
-          this.toast('JPEG 导出失败');
+          this.log(`${label} 编码失败: ${e.message}`);
+          this.toast(`${label} 导出失败`);
         });
       }).catch((e: BusinessError): void => {
         this.busyText = '';
         this.log(`扁平化失败: ${e.message}`);
         this.toast('导出失败');
+      });
+    } else {
+      // M25 平面格式（TIFF/GIF/BMP/TGA/QOI）：引擎扁平化 → 编码器直写 fd
+      const label = format.toUpperCase();
+      this.engine.exportImage(f.fd, format, quality).then((d): void => {
+        this.busyText = '';
+        this.log(`${label} 导出 ${d.width}x${d.height} ${d.bytes} 字节（${Date.now() - t0}ms）→ ${uri}`);
+        this.toast(`${label} 已导出（${(d.bytes / 1048576).toFixed(1)}MB）`);
+      }).catch((e: BusinessError): void => {
+        this.busyText = '';
+        this.log(`${label} 导出失败: ${e.message}`);
+        this.toast(`${label} 导出失败`);
       });
     }
   }
@@ -7325,38 +7405,200 @@ struct Index {
               .fontColor($r('app.color.text_primary'))
             Text('恒从原始 RAW 重显影（会话内非破坏）；确定 = 一步撤销事务')
               .fontSize(11).fontColor($r('app.color.text_secondary'))
-            Row({ space: 10 }) {
-              Text('色温').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
-              Slider({ value: this.devTemp, min: -100, max: 100, step: 1 })
-                .layoutWeight(1)
-                .onChange((v: number): void => { this.devTemp = v; })
-              Text(`${Math.round(this.devTemp)}`).fontSize(12).width(44).textAlign(TextAlign.End)
-                .fontColor($r('app.color.text_primary'))
-            }
-            Row({ space: 10 }) {
-              Text('色调').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
-              Slider({ value: this.devTint, min: -100, max: 100, step: 1 })
-                .layoutWeight(1)
-                .onChange((v: number): void => { this.devTint = v; })
-              Text(`${Math.round(this.devTint)}`).fontSize(12).width(44).textAlign(TextAlign.End)
-                .fontColor($r('app.color.text_primary'))
-            }
-            Row({ space: 10 }) {
-              Text('曝光').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
-              Slider({ value: this.devEv, min: -2, max: 2, step: 0.05 })
-                .layoutWeight(1)
-                .onChange((v: number): void => { this.devEv = v; })
-              Text(`${this.devEv.toFixed(2)}`).fontSize(12).width(44).textAlign(TextAlign.End)
-                .fontColor($r('app.color.text_primary'))
-            }
-            Row({ space: 10 }) {
-              Text('伽马').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
-              Slider({ value: this.devGamma, min: 0.5, max: 2, step: 0.05 })
-                .layoutWeight(1)
-                .onChange((v: number): void => { this.devGamma = v; })
-              Text(`${this.devGamma.toFixed(2)}`).fontSize(12).width(44).textAlign(TextAlign.End)
-                .fontColor($r('app.color.text_primary'))
-            }
+            Scroll() {
+              Column({ space: 10 }) {
+                Row({ space: 8 }) {
+                  Toggle({ type: ToggleType.Switch, isOn: this.devCameraOn })
+                    .onChange((on: boolean): void => { this.devCameraOn = on; })
+                  Text('Camera Raw 显影链（M23b）').fontSize(13)
+                    .fontColor($r('app.color.text_primary'))
+                }.width('100%')
+                if (!this.devCameraOn) {
+                  Row({ space: 10 }) {
+                    Text('色温').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                    Slider({ value: this.devTemp, min: -100, max: 100, step: 1 })
+                      .layoutWeight(1)
+                      .onChange((v: number): void => { this.devTemp = v; })
+                    Text(`${Math.round(this.devTemp)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                      .fontColor($r('app.color.text_primary'))
+                  }
+                  Row({ space: 10 }) {
+                    Text('色调').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                    Slider({ value: this.devTint, min: -100, max: 100, step: 1 })
+                      .layoutWeight(1)
+                      .onChange((v: number): void => { this.devTint = v; })
+                    Text(`${Math.round(this.devTint)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                      .fontColor($r('app.color.text_primary'))
+                  }
+                  Row({ space: 10 }) {
+                    Text('曝光').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                    Slider({ value: this.devEv, min: -2, max: 2, step: 0.05 })
+                      .layoutWeight(1)
+                      .onChange((v: number): void => { this.devEv = v; })
+                    Text(`${this.devEv.toFixed(2)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                      .fontColor($r('app.color.text_primary'))
+                  }
+                }
+                Row({ space: 10 }) {
+                  Text('伽马').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                  Slider({ value: this.devGamma, min: 0.5, max: 2, step: 0.05 })
+                    .layoutWeight(1)
+                    .onChange((v: number): void => { this.devGamma = v; })
+                  Text(`${this.devGamma.toFixed(2)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                    .fontColor($r('app.color.text_primary'))
+                }
+                if (this.devCameraOn) {
+                  Text('Basic').fontSize(12).fontWeight(FontWeight.Bold)
+                    .fontColor($r('app.color.text_secondary')).width('100%')
+                  Row({ space: 10 }) {
+                    Text('色温').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                    Slider({ value: this.devTemp, min: -100, max: 100, step: 1 })
+                      .layoutWeight(1)
+                      .onChange((v: number): void => { this.devTemp = v; })
+                    Text(`${Math.round(this.devTemp)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                      .fontColor($r('app.color.text_primary'))
+                  }
+                  Row({ space: 10 }) {
+                    Text('色调').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                    Slider({ value: this.devTint, min: -100, max: 100, step: 1 })
+                      .layoutWeight(1)
+                      .onChange((v: number): void => { this.devTint = v; })
+                    Text(`${Math.round(this.devTint)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                      .fontColor($r('app.color.text_primary'))
+                  }
+                  Row({ space: 10 }) {
+                    Text('曝光').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                    Slider({ value: this.devExposure, min: -100, max: 100, step: 1 })
+                      .layoutWeight(1)
+                      .onChange((v: number): void => { this.devExposure = v; })
+                    Text(`${(this.devExposure / 50).toFixed(1)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                      .fontColor($r('app.color.text_primary'))
+                  }
+                  Row({ space: 10 }) {
+                    Text('对比度').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                    Slider({ value: this.devContrast, min: -100, max: 100, step: 1 })
+                      .layoutWeight(1)
+                      .onChange((v: number): void => { this.devContrast = v; })
+                    Text(`${Math.round(this.devContrast)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                      .fontColor($r('app.color.text_primary'))
+                  }
+                  Row({ space: 10 }) {
+                    Text('高光').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                    Slider({ value: this.devHighlights, min: -100, max: 100, step: 1 })
+                      .layoutWeight(1)
+                      .onChange((v: number): void => { this.devHighlights = v; })
+                    Text(`${Math.round(this.devHighlights)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                      .fontColor($r('app.color.text_primary'))
+                  }
+                  Row({ space: 10 }) {
+                    Text('阴影').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                    Slider({ value: this.devShadows, min: -100, max: 100, step: 1 })
+                      .layoutWeight(1)
+                      .onChange((v: number): void => { this.devShadows = v; })
+                    Text(`${Math.round(this.devShadows)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                      .fontColor($r('app.color.text_primary'))
+                  }
+                  Row({ space: 10 }) {
+                    Text('白色').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                    Slider({ value: this.devWhites, min: -100, max: 100, step: 1 })
+                      .layoutWeight(1)
+                      .onChange((v: number): void => { this.devWhites = v; })
+                    Text(`${Math.round(this.devWhites)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                      .fontColor($r('app.color.text_primary'))
+                  }
+                  Row({ space: 10 }) {
+                    Text('黑色').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                    Slider({ value: this.devBlacks, min: -100, max: 100, step: 1 })
+                      .layoutWeight(1)
+                      .onChange((v: number): void => { this.devBlacks = v; })
+                    Text(`${Math.round(this.devBlacks)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                      .fontColor($r('app.color.text_primary'))
+                  }
+                  Row({ space: 10 }) {
+                    Text('纹理').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                    Slider({ value: this.devTexture, min: -100, max: 100, step: 1 })
+                      .layoutWeight(1)
+                      .onChange((v: number): void => { this.devTexture = v; })
+                    Text(`${Math.round(this.devTexture)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                      .fontColor($r('app.color.text_primary'))
+                  }
+                  Row({ space: 10 }) {
+                    Text('清晰度').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                    Slider({ value: this.devClarity, min: -100, max: 100, step: 1 })
+                      .layoutWeight(1)
+                      .onChange((v: number): void => { this.devClarity = v; })
+                    Text(`${Math.round(this.devClarity)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                      .fontColor($r('app.color.text_primary'))
+                  }
+                  Row({ space: 10 }) {
+                    Text('去雾').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                    Slider({ value: this.devDehaze, min: -100, max: 100, step: 1 })
+                      .layoutWeight(1)
+                      .onChange((v: number): void => { this.devDehaze = v; })
+                    Text(`${Math.round(this.devDehaze)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                      .fontColor($r('app.color.text_primary'))
+                  }
+                  Row({ space: 10 }) {
+                    Text('自然饱和').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                    Slider({ value: this.devVibrance, min: -100, max: 100, step: 1 })
+                      .layoutWeight(1)
+                      .onChange((v: number): void => { this.devVibrance = v; })
+                    Text(`${Math.round(this.devVibrance)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                      .fontColor($r('app.color.text_primary'))
+                  }
+                  Row({ space: 10 }) {
+                    Text('饱和度').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                    Slider({ value: this.devSaturation, min: -100, max: 100, step: 1 })
+                      .layoutWeight(1)
+                      .onChange((v: number): void => { this.devSaturation = v; })
+                    Text(`${Math.round(this.devSaturation)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                      .fontColor($r('app.color.text_primary'))
+                  }
+                  Text('细节 / 效果').fontSize(12).fontWeight(FontWeight.Bold)
+                    .fontColor($r('app.color.text_secondary')).width('100%')
+                  Row({ space: 10 }) {
+                    Text('锐化').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                    Slider({ value: this.devSharpen, min: 0, max: 300, step: 1 })
+                      .layoutWeight(1)
+                      .onChange((v: number): void => { this.devSharpen = v; })
+                    Text(`${Math.round(this.devSharpen)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                      .fontColor($r('app.color.text_primary'))
+                  }
+                  Row({ space: 10 }) {
+                    Text('亮度降噪').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                    Slider({ value: this.devNoiseLum, min: 0, max: 100, step: 1 })
+                      .layoutWeight(1)
+                      .onChange((v: number): void => { this.devNoiseLum = v; })
+                    Text(`${Math.round(this.devNoiseLum)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                      .fontColor($r('app.color.text_primary'))
+                  }
+                  Row({ space: 10 }) {
+                    Text('彩色降噪').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                    Slider({ value: this.devNoiseColor, min: 0, max: 100, step: 1 })
+                      .layoutWeight(1)
+                      .onChange((v: number): void => { this.devNoiseColor = v; })
+                    Text(`${Math.round(this.devNoiseColor)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                      .fontColor($r('app.color.text_primary'))
+                  }
+                  Row({ space: 10 }) {
+                    Text('暗角').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                    Slider({ value: this.devVignette, min: -100, max: 100, step: 1 })
+                      .layoutWeight(1)
+                      .onChange((v: number): void => { this.devVignette = v; })
+                    Text(`${Math.round(this.devVignette)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                      .fontColor($r('app.color.text_primary'))
+                  }
+                  Row({ space: 10 }) {
+                    Text('颗粒').fontSize(13).fontColor($r('app.color.text_secondary')).width(52)
+                    Slider({ value: this.devGrain, min: 0, max: 100, step: 1 })
+                      .layoutWeight(1)
+                      .onChange((v: number): void => { this.devGrain = v; })
+                    Text(`${Math.round(this.devGrain)}`).fontSize(12).width(44).textAlign(TextAlign.End)
+                      .fontColor($r('app.color.text_primary'))
+                  }
+                }
+              }.width('100%').constraintSize({ maxHeight: 420 })
+            }.scrollable(ScrollDirection.Vertical).width('100%')
             Row({ space: 12 }) {
               Button('取消').fontSize(14).height(40).width(96)
                 .backgroundColor($r('app.color.surface'))
@@ -7369,7 +7611,7 @@ struct Index {
                 .onClick((): void => this.commitDevelop())
             }.justifyContent(FlexAlign.End).width('100%')
           }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
-            .border({ width: 1, color: $r('app.color.border') }).width(400)
+            .border({ width: 1, color: $r('app.color.border') }).width(440)
         }.width('100%').height('100%')
       }
       // M17b 全局光角度
