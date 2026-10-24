@@ -3,6 +3,10 @@
 #include "engine/smart_ops.h"
 #include "io/psd/smart_psd.h"
 
+#include "io/psd/psd_deep.h"
+
+#include <cstdio>
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -476,6 +480,20 @@ Plane encodePlaneFromMask(const TileGrid& patch, uint32_t mw, uint32_t mh) {
     return p;
 }
 
+// M22：任意深度字节平面 RLE（行字节 = deepRowBytes；PackBits 字节导向对 16/32 位大端行同样有效）。
+Plane encodePlaneFromBytes(const std::vector<uint8_t>& bytes, uint32_t w, uint32_t h, uint16_t depth) {
+    const size_t rb = psd::deepRowBytes(w, depth);
+    Plane p;
+    p.counts.resize(h);
+    for (uint32_t r = 0; r < h; ++r) {
+        const uint8_t* row = bytes.data() + static_cast<size_t>(r) * rb;
+        std::vector<uint8_t> packed = packBitsRow(row, rb);
+        p.counts[r] = static_cast<uint16_t>(packed.size());
+        p.payload.insert(p.payload.end(), packed.begin(), packed.end());
+    }
+    return p;
+}
+
 struct EncodedLayer {
     std::string name;
     int top = 0, left = 0, bottom = 0, right = 0;
@@ -484,6 +502,8 @@ struct EncodedLayer {
     uint8_t clipping = 0;
     uint8_t flags = 0;  // bit1 = hidden
     Plane red, green, blue, alpha;
+    // M22：深色模式平面（[色彩 cc 平面..., alpha]；非空 = 通道表/数据走 deepPlanes）
+    std::vector<Plane> deepPlanes;
     bool hasMask = false;
     int mTop = 0, mLeft = 0, mBottom = 0, mRight = 0;
     uint8_t mDefault = 255;
@@ -497,6 +517,11 @@ struct EncodedLayer {
     std::vector<uint8_t> lrfx;      // M17c：图层效果（非空 = 附加信息写 lrFX 块）
     std::vector<uint8_t> vmsk;      // M18d：矢量蒙版（非空 = 附加信息写 vmsk 块）
     std::vector<uint8_t> solld;     // M21：智能对象 SoLd 块（非空 = 附加信息写 SoLd + lnk2）
+    // M22：深色 verbatim（非空 = 通道信息表/数据段字节级回写）
+    bool verbatim = false;
+    std::vector<uint8_t> vSection;
+    std::vector<int16_t> vChannelIds;
+    std::vector<int64_t> vChannelLens;
 };
 
 }  // namespace
@@ -618,9 +643,125 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
             roots.push_back(i);
         }
     }
+    // M22：导入渲染指纹重算（reader 同式：预乘像素 + 蒙版 + 矩形）——比对匹配才 verbatim。
+    const auto deepFingerprint = [&](const PsdLayerSnap& l) -> uint64_t {
+        // 矩形缺省（.montage 打开后 transform 尺寸 = 0 = 用像素尺寸）时从源矩形推导
+        //（verbatim 前提 !cropped ⇒ 源矩形 = 导入矩形，reader 指纹语义一致）。
+        uint32_t rectW = rectW;
+        uint32_t rectH = rectH;
+        if ((rectW == 0 || rectH == 0) && !l.psdSrcCropped) {
+            rectW = static_cast<uint32_t>(l.srcRight - l.srcLeft);
+            rectH = static_cast<uint32_t>(l.srcBottom - l.srcTop);
+        }
+        if (l.pixels == nullptr || rectW == 0 || rectH == 0) {
+            return 0;
+        }
+        const double ox = l.originX, oy = l.originY;
+        if (ox != static_cast<double>(static_cast<int>(ox)) || oy != static_cast<double>(static_cast<int>(oy))) {
+            return 0;  // 非整数原点 = 已被移动/变换
+        }
+        uint64_t h = 1469598103934665603ull;
+        auto fnvMix = [&h](const uint8_t* p, size_t n) {
+            for (size_t i = 0; i < n; ++i) {
+                h ^= p[i];
+                h *= 1099511628211ull;
+            }
+        };
+        auto mixU64 = [&h](uint64_t v) {
+            for (int i = 0; i < 8; ++i) {
+                h ^= static_cast<uint8_t>(v >> (8 * i));
+                h *= 1099511628211ull;
+            }
+        };
+        mixU64(static_cast<uint64_t>(static_cast<int>(ox)));
+        mixU64(static_cast<uint64_t>(static_cast<int>(oy)));
+        mixU64(static_cast<uint64_t>(rectW));
+        mixU64(static_cast<uint64_t>(rectH));
+        // 预乘像素（reader 公式 (c*a+127)/255；网格直 alpha）。
+        const uint32_t gw = l.pixels->cols * kTile;
+        std::vector<uint8_t> fullRow(gw * 4);
+        std::vector<uint8_t> row4(static_cast<size_t>(rectW) * 4);
+        for (uint32_t y = 0; y < rectH; ++y) {
+            if (y >= l.pixels->rows * kTile) {
+                std::memset(row4.data(), 0, row4.size());
+            } else {
+                gridReadRow(*l.pixels, y, fullRow.data());
+                for (uint32_t x = 0; x < rectW; ++x) {
+                    const uint8_t* px4 = (x < gw ? fullRow.data() + static_cast<size_t>(x) * 4 : fullRow.data());
+                    const uint8_t a = px4[3];
+                    row4[static_cast<size_t>(x) * 4] =
+                        static_cast<uint8_t>((static_cast<uint16_t>(px4[0]) * a + 127) / 255);
+                    row4[static_cast<size_t>(x) * 4 + 1] =
+                        static_cast<uint8_t>((static_cast<uint16_t>(px4[1]) * a + 127) / 255);
+                    row4[static_cast<size_t>(x) * 4 + 2] =
+                        static_cast<uint8_t>((static_cast<uint16_t>(px4[2]) * a + 127) / 255);
+                    row4[static_cast<size_t>(x) * 4 + 3] = a;
+                }
+            }
+            fnvMix(row4.data(), row4.size());
+        }
+        if (l.maskGrid != nullptr && l.maskW > 0 && l.maskH > 0) {
+            mixU64(0xDEE9BA5Eull);
+            // reader 语义 = 8-bit 单通道平面（1 字节/像素 R）；网格行取 R 通道。
+            const uint32_t mgw = l.maskGrid->cols * kTile;
+            std::vector<uint8_t> mrow(mgw * 4);
+            std::vector<uint8_t> m1(l.maskW);
+            for (uint32_t y = 0; y < l.maskH; ++y) {
+                if (y < l.maskGrid->rows * kTile) {
+                    gridReadRow(*l.maskGrid, y, mrow.data());
+                } else {
+                    std::memset(mrow.data(), 0, static_cast<size_t>(l.maskW) * 4);
+                }
+                for (uint32_t x = 0; x < l.maskW; ++x) {
+                    m1[x] = mrow[static_cast<size_t>(x) * 4];
+                }
+                fnvMix(m1.data(), m1.size());
+            }
+            mixU64(static_cast<uint64_t>(static_cast<int>(l.originX) + l.maskOffsetX));
+            mixU64(static_cast<uint64_t>(static_cast<int>(l.originY) + l.maskOffsetY));
+        }
+        return h;
+    };
+    const bool deepActive = snap.psdSrcDepth != 8 || snap.psdSrcMode != 3;
     const auto encodePixel = [&](const PsdLayerSnap& l, EncodedLayer* el) -> bool {
         if (l.pixels == nullptr || l.pixels->tiles.empty()) {
             return false;
+        }
+        // M22 verbatim：深色未编辑层——通道段字节级回写（矩形写源矩形）。
+        if (deepActive && !l.psdSrcSection.empty() && !l.psdSrcCropped && l.psdImportHash != 0 &&
+            l.psdChannelIds.size() == l.psdChannelLens.size() && !l.psdChannelIds.empty()) {
+            const uint64_t fp = deepFingerprint(l);
+#ifdef M22_DBG
+            std::printf("[dbg] verbatim? stored=%016llx computed=%016llx\n",
+                        static_cast<unsigned long long>(l.psdImportHash), static_cast<unsigned long long>(fp));
+#endif
+            if (l.psdImportHash == fp) {
+            el->verbatim = true;
+            el->vSection = l.psdSrcSection;
+            el->vChannelIds = l.psdChannelIds;
+            el->vChannelLens = l.psdChannelLens;
+            el->name = l.name;
+            el->left = l.srcLeft;
+            el->top = l.srcTop;
+            el->right = l.srcRight;
+            el->bottom = l.srcBottom;
+            el->key = blendToKey(l.blendMode);
+            el->opacity =
+                static_cast<uint8_t>(std::lround(std::min(1.0, std::max(0.0, l.opacity)) * 255.0));
+            el->clipping = l.clipping ? 1 : 0;
+            el->flags = l.visible ? 0 : 2;
+            // 蒙版段同 verbatim 语义（源蒙版矩形）；蒙版数据在段内原样。
+            if (l.srcMaskRight > l.srcMaskLeft && l.srcMaskBottom > l.srcMaskTop) {
+                el->hasMask = true;
+                el->mLeft = l.srcMaskLeft;
+                el->mTop = l.srcMaskTop;
+                el->mRight = l.srcMaskRight;
+                el->mBottom = l.srcMaskBottom;
+                el->mDefault = static_cast<uint8_t>(l.maskOutside);
+                el->mFlags = l.maskEnabled ? 0 : 2;
+            }
+            return true;
+            }
         }
         uint32_t px = 0, py = 0, pw = 0, ph = 0;
         if (!gridBBox(*l.pixels, px, py, pw, ph)) {
@@ -636,10 +777,53 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
             std::lround(std::min(1.0, std::max(0.0, l.opacity)) * 255.0));
         el->clipping = l.clipping ? 1 : 0;
         el->flags = l.visible ? 0 : 2;
-        el->red = encodePlaneFromGrid(*l.pixels, px, py, pw, ph, 0);
-        el->green = encodePlaneFromGrid(*l.pixels, px, py, pw, ph, 1);
-        el->blue = encodePlaneFromGrid(*l.pixels, px, py, pw, ph, 2);
-        el->alpha = encodePlaneFromGrid(*l.pixels, px, py, pw, ph, 3);
+        if (deepActive) {
+            // M22 深色重编码：bbox 直 alpha RGBA → 模式色彩平面（受管）+ alpha → 深度样本。
+            const size_t n = static_cast<size_t>(pw) * ph;
+            std::vector<uint8_t> rgba(n * 4);
+            const uint32_t gw = l.pixels->cols * kTile;
+            std::vector<uint8_t> fullRow(gw * 4);
+            for (uint32_t r = 0; r < ph; ++r) {
+                if (py + r < l.pixels->rows * kTile) {
+                    gridReadRow(*l.pixels, py + r, fullRow.data());
+                } else {
+                    std::memset(fullRow.data(), 0, static_cast<size_t>(pw) * 4);
+                }
+                std::memcpy(rgba.data() + static_cast<size_t>(r) * pw * 4,
+                            fullRow.data() + static_cast<size_t>(px) * 4, static_cast<size_t>(pw) * 4);
+            }
+            const uint8_t* palette =
+                snap.psdColorModeData.size() >= 768 ? snap.psdColorModeData.data() : nullptr;
+            auto planes = psd::rgbaToModePlanes(snap.psdSrcMode, rgba.data(), n, palette);
+            if (planes) {
+                const size_t cc = planes->size();
+                std::vector<Plane>& out = el->deepPlanes;
+                out.resize(cc + 1);
+                for (size_t k = 0; k < cc; ++k) {
+                    out[k] = encodePlaneFromBytes(psd::planeToDepth((*planes)[k], snap.psdSrcDepth, pw, ph),
+                                                  pw, ph, snap.psdSrcDepth);
+                }
+                // alpha 平面（8-bit 网格 alpha → 深度）。
+                std::vector<uint8_t> a8(n);
+                for (size_t i = 0; i < n; ++i) {
+                    a8[i] = rgba[i * 4 + 3];
+                }
+                out[cc] = encodePlaneFromBytes(psd::planeToDepth(a8, snap.psdSrcDepth, pw, ph), pw, ph,
+                                               snap.psdSrcDepth);
+            } else {
+                // 模式不可逆（多通道/未知）→ 8-bit RGB 平面兜底 + note。
+                el->red = encodePlaneFromGrid(*l.pixels, px, py, pw, ph, 0);
+                el->green = encodePlaneFromGrid(*l.pixels, px, py, pw, ph, 1);
+                el->blue = encodePlaneFromGrid(*l.pixels, px, py, pw, ph, 2);
+                el->alpha = encodePlaneFromGrid(*l.pixels, px, py, pw, ph, 3);
+                res.notes.push_back("Layer \"" + l.name + "\" could not be re-encoded in the document's color mode; exported as 8-bit RGB.");
+            }
+        } else {
+            el->red = encodePlaneFromGrid(*l.pixels, px, py, pw, ph, 0);
+            el->green = encodePlaneFromGrid(*l.pixels, px, py, pw, ph, 1);
+            el->blue = encodePlaneFromGrid(*l.pixels, px, py, pw, ph, 2);
+            el->alpha = encodePlaneFromGrid(*l.pixels, px, py, pw, ph, 3);
+        }
         if (l.maskGrid != nullptr && l.maskW > 0 && l.maskH > 0) {
             el->hasMask = true;
             el->mLeft = static_cast<int>(l.originX) + l.maskOffsetX;
@@ -648,7 +832,27 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
             el->mBottom = el->mTop + static_cast<int>(l.maskH);
             el->mDefault = static_cast<uint8_t>(l.maskOutside);
             el->mFlags = l.maskEnabled ? 0 : 2;
-            el->maskPlane = encodePlaneFromMask(*l.maskGrid, l.maskW, l.maskH);
+            Plane m = encodePlaneFromMask(*l.maskGrid, l.maskW, l.maskH);
+            if (deepActive) {
+                // 蒙版亦随文档深度（8-bit 灰度 → 深度样本）。
+                std::vector<uint8_t> m8(static_cast<size_t>(l.maskW) * l.maskH);
+                const uint32_t mgw = l.maskGrid->cols * kTile;
+                std::vector<uint8_t> mrow(mgw * 4);
+                for (uint32_t r = 0; r < l.maskH; ++r) {
+                    if (r < l.maskGrid->rows * kTile) {
+                        gridReadRow(*l.maskGrid, r, mrow.data());
+                    } else {
+                        std::memset(mrow.data(), 0, static_cast<size_t>(l.maskW) * 4);
+                    }
+                    for (uint32_t x = 0; x < l.maskW; ++x) {
+                        m8[static_cast<size_t>(r) * l.maskW + x] = mrow[static_cast<size_t>(x) * 4];
+                    }
+                }
+                el->maskPlane = encodePlaneFromBytes(psd::planeToDepth(m8, snap.psdSrcDepth, l.maskW, l.maskH),
+                                                     l.maskW, l.maskH, snap.psdSrcDepth);
+            } else {
+                el->maskPlane = std::move(m);
+            }
         }
         return true;
     };
@@ -875,16 +1079,33 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
     w.ascii("8BPS", 4);
     w.u16(1);
     w.zeros(6);
-    w.u16(4);
+    // M22：深色文档还原原通道数/深度/模式（8-bit RGB 文档 = 4/8/3 不变）。
+    w.u16(snap.psdSrcChannels > 0 ? snap.psdSrcChannels : 4);
     w.u32(snap.height);
     w.u32(snap.width);
-    w.u16(8);
-    w.u16(3);
-    // Color Mode Data
-    w.u32(0);
-    // Image Resources（M18d：路径资源——工作路径 1025、保存路径 2000+）
+    w.u16(snap.psdSrcDepth != 0 ? snap.psdSrcDepth : 8);
+    w.u16(snap.psdSrcMode != 0 ? snap.psdSrcMode : 3);
+    // Color Mode Data（indexed 调色板原样回写）
+    w.u32(static_cast<uint32_t>(snap.psdColorModeData.size()));
+    if (!snap.psdColorModeData.empty()) {
+        w.raw(snap.psdColorModeData);
+    }
+    // Image Resources（M18d：路径资源——工作路径 1025、保存路径 2000+；M22：ICC 1039）
     {
         std::vector<uint8_t> res;
+        if (!snap.psdIccProfile.empty()) {
+            const std::vector<uint8_t>& icc = snap.psdIccProfile;
+            res.insert(res.end(), {'8', 'B', 'I', 'M'});
+            res.push_back(static_cast<uint8_t>(1039 >> 8));
+            res.push_back(static_cast<uint8_t>(1039 & 0xFF));
+            res.push_back(0);  // pascal name 空
+            res.push_back(0);  // pascal 偶数补齐（reader skip(nameLength)+pad 同构）
+            beU32(res, static_cast<uint32_t>(icc.size()));
+            res.insert(res.end(), icc.begin(), icc.end());
+            if (icc.size() % 2 == 1) {
+                res.push_back(0);
+            }
+        }
         auto addPathRes = [&](uint16_t id, const VectorPath& path) {
             const std::vector<uint8_t> data = pathToPsdRecords(path, snap.width, snap.height);
             res.insert(res.end(), {'8', 'B', 'I', 'M'});
@@ -933,6 +1154,25 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
             w.u32(0);
             w.i16(-1);
             w.u32(0);
+        } else if (el.verbatim) {
+            // M22：深色未编辑层——通道信息表原样回写。
+            w.u16(static_cast<uint16_t>(el.vChannelIds.size()));
+            for (size_t k = 0; k < el.vChannelIds.size(); ++k) {
+                w.i16(el.vChannelIds[k]);
+                w.u32(static_cast<uint32_t>(el.vChannelLens[k]));
+            }
+        } else if (!el.deepPlanes.empty()) {
+            // M22：深色重编码层——[色彩 cc 平面..., alpha]（+蒙版）。
+            const int chanCount = static_cast<int>(el.deepPlanes.size()) + (el.hasMask ? 1 : 0);
+            w.u16(static_cast<uint16_t>(chanCount));
+            for (size_t k = 0; k < el.deepPlanes.size(); ++k) {
+                w.i16(static_cast<int16_t>(k));
+                w.u32(el.deepPlanes[k].totalLen());
+            }
+            if (el.hasMask) {
+                w.i16(-2);
+                w.u32(el.maskPlane.totalLen());
+            }
         } else {
             // 通道表 = [nch u16][每通道 id i16 + len u32]（reader/PSD 规范同构）。
             // 396d006 起此处多写了一个 i16(0) 且 len/id 逆序——单层往返侥幸对齐、
@@ -1080,10 +1320,20 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
         if (el.recordType != 0) {
             continue;
         }
-        el.red.writeTo(w);
-        el.green.writeTo(w);
-        el.blue.writeTo(w);
-        el.alpha.writeTo(w);
+        if (el.verbatim) {
+            w.raw(el.vSection);
+            continue;
+        }
+        if (!el.deepPlanes.empty()) {
+            for (const Plane& p : el.deepPlanes) {
+                p.writeTo(w);
+            }
+        } else {
+            el.red.writeTo(w);
+            el.green.writeTo(w);
+            el.blue.writeTo(w);
+            el.alpha.writeTo(w);
+        }
         if (el.hasMask) {
             el.maskPlane.writeTo(w);
         }
@@ -1147,9 +1397,53 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
     w.patchU32(lmLenAt, static_cast<uint32_t>(w.size() - lmLenAt - 4));
 
     // ---- Image Data（合并图） ----
-    flatR.writeTo(w);
-    flatG.writeTo(w);
-    flatB.writeTo(w);
+    if (snap.psdSrcDepth != 8 || snap.psdSrcMode != 3) {
+        // M22 深色：合成图按文档模式/深度回写（扁平 RGBA → 模式色彩平面 + alpha/零补
+        // 平面至 srcChannels；bitmap 1 位阈值化）。
+        const size_t n = static_cast<size_t>(snap.width) * snap.height;
+        const size_t cc = psd::deepColorChannels(snap.psdSrcMode);
+        if (cc > 0) {
+            const uint8_t* palette =
+                snap.psdColorModeData.size() >= 768 ? snap.psdColorModeData.data() : nullptr;
+            auto planes = psd::rgbaToModePlanes(snap.psdSrcMode, flat.data(), n, palette);
+            if (planes) {
+                std::vector<Plane> out;
+                out.reserve(snap.psdSrcChannels);
+                for (size_t k = 0; k < planes->size(); ++k) {
+                    out.push_back(encodePlaneFromBytes(
+                        psd::planeToDepth((*planes)[k], snap.psdSrcDepth, snap.width, snap.height),
+                        snap.width, snap.height, snap.psdSrcDepth));
+                }
+                // alpha 平面（合成图无 alpha 语义混淆时补全不透明——PS 以 extra alpha 存）。
+                if (snap.psdSrcChannels > planes->size()) {
+                    std::vector<uint8_t> a8(n, 255);
+                    out.push_back(encodePlaneFromBytes(
+                        psd::planeToDepth(a8, snap.psdSrcDepth, snap.width, snap.height), snap.width,
+                        snap.height, snap.psdSrcDepth));
+                }
+                // 余下平面（专色通道等）零填充。
+                std::vector<uint8_t> zeros(psd::deepRowBytes(snap.width, snap.psdSrcDepth), 0);
+                while (out.size() < snap.psdSrcChannels) {
+                    out.push_back(encodePlaneFromBytes(zeros, snap.width, snap.height, snap.psdSrcDepth));
+                }
+                for (const Plane& p : out) {
+                    p.writeTo(w);
+                }
+            } else {
+                flatR.writeTo(w);
+                flatG.writeTo(w);
+                flatB.writeTo(w);
+            }
+        } else {
+            flatR.writeTo(w);
+            flatG.writeTo(w);
+            flatB.writeTo(w);
+        }
+    } else {
+        flatR.writeTo(w);
+        flatG.writeTo(w);
+        flatB.writeTo(w);
+    }
 
     if (!w.flushTo(fd, &res.error)) {
         close(fd);

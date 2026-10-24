@@ -76,6 +76,17 @@ struct Record {
     std::vector<PsdStyleEffect> style;
     // M18d：vmsk/vsms 图层矢量蒙版（vmsk3 路径记录；语义见 psd_reader.cpp 解析）
     std::shared_ptr<VectorMaskData> vectorMask;
+    // M22：深色/多模式原始通道段（整段 = 全部通道的 compression+payload 原样字节，文件序）。
+    // 深度/模式非 8-bit RGB 时填充；层未被编辑（importHash 匹配）且未被画布裁剪时
+    // 导出字节级回写（「存储与往返先行」）。
+    std::vector<uint8_t> srcSection;
+    uint64_t importHash = 0;
+    bool srcCropped = false;
+    // M22：层记录通道信息表原样（id + 字节长；导出回写通道段用）
+    std::vector<std::pair<int, int64_t>> srcChannels;
+    // M22：源矩形/蒙版矩形（裁剪前的记录值；verbatim 回写用）
+    int srcLeft = 0, srcTop = 0, srcRight = 0, srcBottom = 0;
+    int srcMaskLeft = 0, srcMaskTop = 0, srcMaskRight = 0, srcMaskBottom = 0;
 };
 
 struct PsdDocument {
@@ -90,6 +101,13 @@ struct PsdDocument {
     std::vector<NamedPathEntry> paths;
     VectorPath workPath;
     std::vector<std::string> notes;  // 全局提示
+    // M22 深色/多模式元数据（8-bit RGB PSD 之外填充；渲染转 8-bit，原始深/模式/通道表
+    // + 内嵌 ICC + 调色板保真往返）。
+    uint16_t srcDepth = 8;
+    uint16_t srcMode = 3;
+    uint16_t srcChannels = 3;
+    std::vector<uint8_t> iccProfile;     // 资源 1039
+    std::vector<uint8_t> colorModeData;  // 头部色板段（indexed 调色板）
 };
 
 // 混合键映射（对拍 PSDTypes.fromPSD 25 项；Dissolve/Darker/Lighter 上游即落 Normal）

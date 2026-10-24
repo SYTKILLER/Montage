@@ -7,6 +7,7 @@
 // opacity 默认 1、blendMode 默认 normal、空图层画笔开始才分配像素。
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -456,6 +457,20 @@ struct Layer {
     // M14b 链接层：同一非零 linkId 的层随移动工具联动平移（对齐 PS 链接语义）。
     // 会话态 v1：.montage 不持久化（PSD 链接导出随 M15 评估），随 History 快照走。
     uint64_t linkId = 0;
+    // M22 深色 PSD 往返（「存储与往返先行」——渲染仍 8-bit）：
+    // psdSrcSection = 导入层的原始通道数据段（全部通道，文件序）；psdImportHash = 导入时
+    // 渲染指纹（导出重算比对——未编辑且未越界裁剪 → 段字节级回写原深度/模式）。
+    // 通道 (id, length) 表平铺于 psdChannelIds/psdChannelLens（层记录通道信息段用）。
+    std::vector<uint8_t> psdSrcSection;
+    std::vector<int16_t> psdChannelIds;
+    std::vector<int64_t> psdChannelLens;
+    uint64_t psdImportHash = 0;
+    bool psdSrcCropped = false;
+    uint16_t psdSrcDepth = 8;      // 层所属文档的原始深度/模式（blob 自携带，防孤立解包）
+    uint16_t psdSrcMode = 3;
+    uint16_t psdSrcChannels = 3;
+    int psdSrcLeft = 0, psdSrcTop = 0, psdSrcRight = 0, psdSrcBottom = 0;  // 源矩形（verbatim 回写）
+    int psdSrcMaskLeft = 0, psdSrcMaskTop = 0, psdSrcMaskRight = 0, psdSrcMaskBottom = 0;
     // M14c/M18/M21 渲染/缩略图取数优先级：样式/填充派生（含独立 origin，经 effectiveRenderOrigin）
     // → 矢量蒙版派生（已含像素蒙版）→ 蒙版合成 → 智能对象派生 → 形状派生 → 原像素
     std::shared_ptr<const TileGrid> effectivePixels() const {
@@ -538,6 +553,16 @@ struct Document {
     std::vector<NamedPathEntry> paths;
     std::vector<CustomShapeEntry> customShapes;
     uint32_t customShapeSeq = 0;  // csh_N 单调号（openProject 回填防撞号）
+    // M21 全局附加块（lnk2/FEid 等；PSD 导出透传；不入 History，随文档替换清空）
+    std::map<std::string, std::vector<uint8_t>> psdGlobalExtra;
+    // M22 深色/多模式 PSD 往返元数据（8-bit RGB 文档 = 默认值；导入深色 PSD 填充，
+    // PSD 导出/保存还原原深/模式 header + 内嵌 ICC + 调色板。「存储与往返先行」：
+    // 渲染仍 8-bit sRGB，深色数据存层 psdSrcSection 字节级保真）。
+    uint16_t psdSrcDepth = 8;
+    uint16_t psdSrcMode = 3;
+    uint16_t psdSrcChannels = 3;
+    std::vector<uint8_t> psdIccProfile;     // 资源 1039 原样
+    std::vector<uint8_t> psdColorModeData;  // 头部色板段（indexed 调色板）
 };
 
 // 视口：pan = 视口左上角的文档坐标（doc px），screen = (doc - pan) * zoom。

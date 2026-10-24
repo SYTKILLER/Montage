@@ -275,6 +275,22 @@ bool assemblePsdLayers(psd::PsdDocument& doc, const std::function<uint64_t()>& n
         layer.transform.originY = rec.top;
         layer.transform.width = rec.width;
         layer.transform.height = rec.height;
+        // M22：深色往返元数据（原样通道段 + 指纹 + 通道表 + 源矩形）
+        layer.psdSrcSection = rec.srcSection;
+        layer.psdImportHash = rec.importHash;
+        layer.psdSrcCropped = rec.srcCropped;
+        layer.psdSrcLeft = rec.srcLeft;
+        layer.psdSrcTop = rec.srcTop;
+        layer.psdSrcRight = rec.srcRight;
+        layer.psdSrcBottom = rec.srcBottom;
+        layer.psdSrcMaskLeft = rec.srcMaskLeft;
+        layer.psdSrcMaskTop = rec.srcMaskTop;
+        layer.psdSrcMaskRight = rec.srcMaskRight;
+        layer.psdSrcMaskBottom = rec.srcMaskBottom;
+        for (const auto& ch : rec.srcChannels) {
+            layer.psdChannelIds.push_back(static_cast<int16_t>(ch.first));
+            layer.psdChannelLens.push_back(static_cast<int64_t>(ch.second));
+        }
 
         if (!rec.isGroup && rec.width > 0 && rec.height > 0 && !rec.rgba.empty()) {
             // M5b-2：剪贴非破坏——保留标志渲染期生效；栈底剪贴（无基）给提示
@@ -474,6 +490,13 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
         // M18d：PSD 路径资源 → 路径面板（保存路径 + 工作路径；不入 History）
         engine.doc.paths = doc.paths;
         engine.doc.workPath = doc.workPath;
+        // M22：深色/多模式往返元数据（渲染仍 8-bit；导出回写原深/模式）
+        engine.doc.psdSrcDepth = doc.srcDepth;
+        engine.doc.psdSrcMode = doc.srcMode;
+        engine.doc.psdSrcChannels = doc.srcChannels;
+        engine.doc.psdIccProfile = doc.iccProfile;
+        engine.doc.psdColorModeData = doc.colorModeData;
+        engine.doc.psdGlobalExtra = doc.globalExtra;
         restyleDocument(engine.doc);
         engine.bumpRevisionLocked();
         engine.requestRender();

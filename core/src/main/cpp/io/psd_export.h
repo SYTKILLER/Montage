@@ -56,6 +56,15 @@ struct PsdLayerSnap {
     float adjGamma = 1.0f;
     std::vector<float> adjCurveX;  // 0..1
     std::vector<float> adjCurveY;
+    // ---- M22 深色 verbatim（非空 = 未编辑深色层：通道段字节级回写原深度/模式） ----
+    std::vector<uint8_t> psdSrcSection;      // 全部通道 [compression u16 + payload] 原样
+    std::vector<int16_t> psdChannelIds;      // 层记录通道表原样
+    std::vector<int64_t> psdChannelLens;
+    uint64_t psdImportHash = 0;              // 导入渲染指纹（导出重算比对；匹配才回写）
+    bool psdSrcCropped = false;              // 导入时越画布裁剪 → 不回写（矩形语义已变）
+    uint32_t psdRectW = 0, psdRectH = 0;     // 导入矩形（指纹重算用；transform 同源）
+    int srcLeft = 0, srcTop = 0, srcRight = 0, srcBottom = 0;                    // 源矩形
+    int srcMaskLeft = 0, srcMaskTop = 0, srcMaskRight = 0, srcMaskBottom = 0;    // 源蒙版矩形
 };
 
 struct PsdDocSnap {
@@ -72,6 +81,13 @@ struct PsdDocSnap {
 
     // M21：导入保留的全局附加块（键 → payload 原样；lnk2 全部 SO 未编辑时透传）
     std::map<std::string, std::vector<uint8_t>> globalBlocks;
+
+    // M22 深色/多模式（8-bit RGB 文档 = 默认值；深色文档导出还原原 header/ICC/色板）
+    uint16_t psdSrcDepth = 8;
+    uint16_t psdSrcMode = 3;
+    uint16_t psdSrcChannels = 3;
+    std::vector<uint8_t> psdIccProfile;
+    std::vector<uint8_t> psdColorModeData;
 };
 
 struct PsdExportResult {

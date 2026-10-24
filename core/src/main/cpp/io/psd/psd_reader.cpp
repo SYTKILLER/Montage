@@ -7,6 +7,9 @@
 
 #include <hilog/log.h>
 
+#include "io/cms/convert.h"
+#include "io/psd/psd_deep.h"
+
 namespace montage {
 namespace psd {
 namespace {
@@ -156,6 +159,10 @@ struct RawLayer {
     std::vector<Record::PsdStyleEffect> style;
     bool hasStyle = false;
     std::vector<std::string> skippedFx;
+    // M22：深色原始通道段 + 导入指纹（组装期转 Record）
+    std::vector<uint8_t> srcSection;
+    uint64_t importHash = 0;
+    bool srcCropped = false;
 };
 
 // ---- M18d PSD 路径记录（photocraft psd/path.rs 对拍，MIT OR Apache-2.0） ----
@@ -632,6 +639,10 @@ bool unpackRLE(const std::vector<uint8_t>& data, size_t& offset, int width, int 
     return true;
 }
 
+// M22：扁平 PSD 的合成图（ImageData）段解码 → 单背景 Record（深度/模式全通道）。
+void decodeFlatComposite(const uint8_t* data, Cursor& c, bool isPSB, int width, int height,
+                         uint16_t depth, uint16_t mode, PsdDocument& out);
+
 bool decodeChannel(int compression, int width, int height, const std::vector<uint8_t>& payload,
                    bool largeDoc, const Crop* crop, std::vector<uint8_t>& out, std::string& err) {
     if (width <= 0 || height <= 0) {
@@ -669,6 +680,168 @@ bool decodeChannel(int compression, int width, int height, const std::vector<uin
     }
     err = "unsupported compression";
     return false;
+}
+
+// M22：扁平 PSD 的合成图（ImageData）段解码 → 单背景 Record（深度/模式全通道）。
+// 位置 = c 当前处（layer & mask 段末尾）：u16 compression + 全通道数据。
+// raw = 平面字节连续（srcChannels × rb × h）；RLE = 全通道行计数表
+//（srcChannels × h 项，PSB u32）后接全部压缩行。截断/不支持 = 静默空文档（旧行为）。
+void decodeFlatComposite(const uint8_t* data, Cursor& c, bool isPSB, int width, int height,
+                         uint16_t depth, uint16_t mode, PsdDocument& out) {
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+    const size_t cc = deepColorChannels(mode);
+    if (cc == 0 || out.srcChannels < cc || out.srcChannels > 56) {
+        return;
+    }
+    const size_t channels = out.srcChannels;
+    const size_t rb = deepRowBytes(static_cast<size_t>(width), depth);
+    if (rb * static_cast<size_t>(height) > 512ull * 1024 * 1024) {
+        return;  // 预算闸（与导入上限同族）
+    }
+    const size_t sectionStart = c.offset;
+    uint16_t compression = 0;
+    if (!c.u16(&compression)) {
+        return;
+    }
+    std::vector<std::vector<uint8_t>> planesRaw(channels);
+    if (compression == 0) {
+        const size_t total = rb * static_cast<size_t>(height) * channels;
+        std::vector<uint8_t> all;
+        all.resize(total);
+        if (!c.bytes(all.data(), all.size())) {
+            return;
+        }
+        const size_t planeSize = rb * static_cast<size_t>(height);
+        for (size_t k = 0; k < channels; ++k) {
+            planesRaw[k].assign(all.begin() + static_cast<std::ptrdiff_t>(k * planeSize),
+                                all.begin() + static_cast<std::ptrdiff_t>((k + 1) * planeSize));
+        }
+    } else if (compression == 1) {
+        // 全通道行计数表。
+        std::vector<size_t> counts(channels * static_cast<size_t>(height));
+        for (size_t i = 0; i < counts.size(); ++i) {
+            if (isPSB) {
+                uint32_t v = 0;
+                if (!c.u32(&v)) {
+                    return;
+                }
+                counts[i] = v;
+            } else {
+                uint16_t v = 0;
+                if (!c.u16(&v)) {
+                    return;
+                }
+                counts[i] = v;
+            }
+        }
+        // 每通道的行数据段（按表序连续）。
+        for (size_t k = 0; k < channels; ++k) {
+            std::vector<uint8_t> payload;
+            // 行计数表重建（rleToBytes 读 h 项）。
+            auto putCount = [&](size_t v) {
+                if (isPSB) {
+                    payload.push_back(static_cast<uint8_t>(v >> 24));
+                    payload.push_back(static_cast<uint8_t>(v >> 16));
+                    payload.push_back(static_cast<uint8_t>(v >> 8));
+                    payload.push_back(static_cast<uint8_t>(v));
+                } else {
+                    payload.push_back(static_cast<uint8_t>(v >> 8));
+                    payload.push_back(static_cast<uint8_t>(v));
+                }
+            };
+            for (size_t r = 0; r < static_cast<size_t>(height); ++r) {
+                putCount(counts[k * static_cast<size_t>(height) + r]);
+            }
+            for (size_t r = 0; r < static_cast<size_t>(height); ++r) {
+                const size_t n = counts[k * static_cast<size_t>(height) + r];
+                std::vector<uint8_t> row(n);
+                if (n > 0 && !c.bytes(row.data(), row.size())) {
+                    return;
+                }
+                payload.insert(payload.end(), row.begin(), row.end());
+            }
+            planesRaw[k] = std::move(payload);
+        }
+    } else {
+        return;
+    }
+    // 字节平面 → 8-bit → 模式交错 → 预乘背景层。
+    std::vector<std::vector<uint8_t>> color8(cc);
+    for (size_t k = 0; k < cc; ++k) {
+        std::string derr;
+        auto p8 = planeToU8(planesRaw[k].data(), planesRaw[k].size(), depth, static_cast<size_t>(width),
+                            static_cast<size_t>(height), derr);
+        if (!p8) {
+            return;
+        }
+        color8[k] = std::move(*p8);
+    }
+    std::vector<uint8_t> alpha8;
+    const std::vector<uint8_t>* alphaPtr = nullptr;
+    if (channels > cc) {
+        std::string derr;
+        auto p8 = planeToU8(planesRaw[cc].data(), planesRaw[cc].size(), depth, static_cast<size_t>(width),
+                            static_cast<size_t>(height), derr);
+        if (!p8) {
+            return;
+        }
+        alpha8 = std::move(*p8);
+        alphaPtr = &alpha8;
+    }
+    const size_t n = static_cast<size_t>(width) * static_cast<size_t>(height);
+    std::string ierr;
+    std::shared_ptr<const cms::CmykSpace> space =
+        out.iccProfile.empty() ? nullptr : cms::CmykSpace::forProfile(&out.iccProfile);
+    cms::CmykScope cmykScope(space);
+    auto rgba = interleaveToRgba(mode, color8, alphaPtr,
+                                 out.colorModeData.empty() ? nullptr : out.colorModeData.data(), n, ierr);
+    if (!rgba) {
+        return;
+    }
+    Record rec;
+    rec.name = "Background";
+    rec.left = 0;
+    rec.top = 0;
+    rec.width = width;
+    rec.height = height;
+    rec.rgba.resize(n * 4);
+    for (size_t i = 0; i < n; ++i) {
+        const uint8_t a = (*rgba)[i * 4 + 3];
+        rec.rgba[i * 4] = static_cast<uint8_t>((static_cast<uint16_t>((*rgba)[i * 4]) * a + 127) / 255);
+        rec.rgba[i * 4 + 1] =
+            static_cast<uint8_t>((static_cast<uint16_t>((*rgba)[i * 4 + 1]) * a + 127) / 255);
+        rec.rgba[i * 4 + 2] =
+            static_cast<uint8_t>((static_cast<uint16_t>((*rgba)[i * 4 + 2]) * a + 127) / 255);
+        rec.rgba[i * 4 + 3] = a;
+    }
+    // 往返元数据：整段（含 compression u16）原样 + 导入指纹。
+    rec.srcSection.assign(data + sectionStart, data + c.offset);
+    rec.srcCropped = false;
+    uint64_t hsh = 1469598103934665603ull;
+    auto fnvMix = [&hsh](const uint8_t* p, size_t cnt) {
+        for (size_t i = 0; i < cnt; ++i) {
+            hsh ^= p[i];
+            hsh *= 1099511628211ull;
+        }
+    };
+    auto mixU64 = [&hsh](uint64_t v) {
+        for (int i = 0; i < 8; ++i) {
+            hsh ^= static_cast<uint8_t>(v >> (8 * i));
+            hsh *= 1099511628211ull;
+        }
+    };
+    mixU64(0);
+    mixU64(0);
+    mixU64(static_cast<uint64_t>(width));
+    mixU64(static_cast<uint64_t>(height));
+    fnvMix(rec.rgba.data(), rec.rgba.size());
+    rec.importHash = hsh;
+    out.layers.push_back(std::move(rec));
+    OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag,
+                 "flat composite decoded %{public}dx%{public}d depth=%{public}u mode=%{public}u",
+                 width, height, depth, mode);
 }
 
 Crop cropRect(int left, int top, int right, int bottom, int canvasW, int canvasH) {
@@ -772,12 +945,28 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
         err = "image too large";
         return false;
     }
-    if (depth != 8) { err = "only 8-bit RGB PSD can be imported"; return false; }
-    if (mode != 3) { err = "only 8-bit RGB PSD can be imported"; return false; }
+    // M22：深度 1/8/16/32、模式 Bitmap/Gray/Indexed/RGB/CMYK/Duotone/Lab 全收
+    //（渲染仍 8-bit——读入转 8-bit RGB，原始深/模式/ICC 保真存储与往返）。
+    if (depth != 1 && depth != 8 && depth != 16 && depth != 32) {
+        err = "only 8-bit RGB PSD can be imported";
+        return false;
+    }
+    if (mode == 7 || mode > 9) { err = "only 8-bit RGB PSD can be imported"; return false; }
+    out.srcDepth = depth;
+    out.srcMode = mode;
+    out.srcChannels = channels;
 
     uint32_t colorModeLen = 0;
     if (!c.u32(&colorModeLen)) { err = "truncated"; return false; }
-    if (!c.skip(colorModeLen)) { err = "truncated"; return false; }
+    // indexed 调色板（768 字节，R/G/B 三平面表）保真捕获（其余模式跳过）。
+    if (mode == 2 && colorModeLen > 0 && colorModeLen <= 2048) {
+        std::vector<uint8_t> palette(static_cast<size_t>(colorModeLen));
+        if (!c.bytes(palette.data(), palette.size())) { err = "truncated"; return false; }
+        out.colorModeData = std::move(palette);
+    } else if (!c.skip(colorModeLen)) {
+        err = "truncated";
+        return false;
+    }
 
 
 
@@ -823,6 +1012,13 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
             }
             out.resolution = std::min(9600.0, std::max(1.0, res));
         }
+        // M22：内嵌 ICC profile（资源 1039）——文档 CMYK/Lab/RGB 空间的色彩受管转换用。
+        if (id == 1039 && len > 0 && len <= 32u * 1024 * 1024) {
+            std::vector<uint8_t> icc(static_cast<size_t>(len));
+            if (c.bytes(icc.data(), icc.size())) {
+                out.iccProfile = std::move(icc);
+            }
+        }
         c.offset = dataStart + len;
         if (len % 2 == 1 && !c.skip(1)) { err = "truncated"; return false; }
     }
@@ -841,7 +1037,10 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
     out.width = static_cast<int>(w);
     out.height = static_cast<int>(h);
     if (layerSection < 4) {
-        return true;  // 无图层段（扁平 PSD）
+        // 无图层段（扁平 PSD）：M22 起解码合成图（ImageData）段为单背景层——
+        // 16/32/CMYK/Lab/Gray 的扁平文件在互换场景常见；截断/失败保持空文档旧行为。
+        decodeFlatComposite(data, c, isPSB, static_cast<int>(w), static_cast<int>(h), depth, mode, out);
+        return true;
     }
     uint64_t layerInfoLength = 0;
     if (isPSB) {
@@ -857,6 +1056,12 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
     if (!c.i16(&rawCount)) { err = "truncated"; return false; }
     const int count = std::abs(static_cast<int>(rawCount));
     if (count > 10000) { err = "image too large"; return false; }
+    if (count == 0) {
+        // layerSection 存在但 0 层 = 扁平文件（PS 保存的合并 PSD 常见）：解码合成图为背景层。
+        decodeFlatComposite(data, c, isPSB, static_cast<int>(w), static_cast<int>(h), depth, mode, out);
+        c.offset = layerSectionEnd;
+        return true;
+    }
 
     std::vector<RawLayer> raw(static_cast<size_t>(count));
     for (int i = 0; i < count; ++i) {
@@ -901,8 +1106,17 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
         cropLayer(l);
     }
 
-    // 通道解码（对拍 decodeChannels；源尺寸解码 + 目标裁剪）
-    for (RawLayer& layer : raw) {
+    // 通道解码（对拍 decodeChannels；源尺寸解码 + 目标裁剪）。
+    // M22：深度 1/16/32 与模式 Gray/Indexed/Bitmap/Duotone/CMYK/Lab 走 psd_deep
+    // （CMYK/Lab 受管转换——文档内嵌 ICC 经 CmykScope 生效，否则内置涂布 CMYK）；
+    // 8-bit RGB 保持原路径不变（回归安全）。原始通道段整段捕获供未编辑回写。
+    {
+        std::shared_ptr<const cms::CmykSpace> space =
+            out.iccProfile.empty() ? nullptr : cms::CmykSpace::forProfile(&out.iccProfile);
+        cms::CmykScope cmykScope(space);
+        const bool deepActive = depth != 8 || mode != 3;
+        const size_t colorCount = deepActive ? deepColorChannels(mode) : 3;
+        for (RawLayer& layer : raw) {
         const int width = std::max(0, layer.right - layer.left);
         const int height = std::max(0, layer.bottom - layer.top);
         const int maskWidth = std::max(0, layer.maskRight - layer.maskLeft);
@@ -912,14 +1126,15 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
         const int sourceMaskW = std::max(0, layer.sourceMaskRight - layer.sourceMaskLeft);
         const int sourceMaskH = std::max(0, layer.sourceMaskBottom - layer.sourceMaskTop);
         std::map<int, std::vector<uint8_t>> planes;
+        const size_t sectionStart = c.offset;
         for (const auto& ch : layer.channels) {
             const size_t start = c.offset;
             if (c.offset + static_cast<uint64_t>(std::max<int64_t>(0, ch.second)) > c.size()) {
                 err = "truncated";
                 return false;
             }
-            const bool unpacked = ch.first == -1 || ch.first == 0 || ch.first == 1 || ch.first == 2 ||
-                                  ch.first == -2;
+            const bool unpacked = (ch.first >= 0 && static_cast<size_t>(ch.first) < colorCount) ||
+                                  ch.first == -1 || ch.first == -2;
             if (!unpacked || ch.second < 2) {
                 c.offset = start + static_cast<size_t>(std::max<int64_t>(0, ch.second));
                 continue;
@@ -943,7 +1158,30 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
             }
             std::vector<uint8_t> plane;
             std::string derr;
-            if (!decodeChannel(compression, isMask ? sourceMaskW : sourceW,
+            if (deepActive) {
+                // 深色路径：字节平面（大端样本）→ 8-bit 平面；裁剪按采样粒度换算。
+                const int srcW = isMask ? sourceMaskW : sourceW;
+                const int srcH = isMask ? sourceMaskH : sourceH;
+                int cropArr[4] = {crop.x, crop.y, crop.w, crop.h};
+                auto rawPlane = decodeDeepChannel(compression, static_cast<size_t>(std::max(srcW, 0)),
+                                                  static_cast<size_t>(std::max(srcH, 0)), depth, isPSB,
+                                                  payload.data(), payload.size(),
+                                                  cropValid ? cropArr : nullptr, derr);
+                if (!rawPlane) {
+                    err = derr.empty() ? "decode failed" : derr;
+                    return false;
+                }
+                const int dstW = cropValid ? crop.w : srcW;
+                const int dstH = cropValid ? crop.h : srcH;
+                auto p8 = planeToU8(rawPlane->data(), rawPlane->size(), depth,
+                                    static_cast<size_t>(std::max(dstW, 0)),
+                                    static_cast<size_t>(std::max(dstH, 0)), derr);
+                if (!p8) {
+                    err = derr.empty() ? "decode failed" : derr;
+                    return false;
+                }
+                plane = std::move(*p8);
+            } else if (!decodeChannel(compression, isMask ? sourceMaskW : sourceW,
                                isMask ? sourceMaskH : sourceH, payload, isPSB,
                                cropValid ? &crop : nullptr, plane, derr)) {
                 err = derr.empty() ? "decode failed" : derr;
@@ -953,6 +1191,12 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
                 planes[ch.first] = std::move(plane);
             }
             c.offset = start + static_cast<size_t>(std::max<int64_t>(0, ch.second));
+        }
+        if (deepActive) {
+            layer.srcSection.assign(data + sectionStart, data + c.offset);
+            layer.srcCropped = layer.cropped;
+            layer.srcSection.assign(data + sectionStart, data + c.offset);
+            layer.srcCropped = layer.cropped;
         }
         if (layer.hasMask && maskWidth > 0 && maskHeight > 0) {
             auto it = planes.find(-2);
@@ -967,17 +1211,54 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
         const size_t count2 = static_cast<size_t>(width) * height;
         std::vector<uint8_t> opaque(count2, 255);
         std::vector<uint8_t> black(count2, 0);
+        const std::vector<uint8_t>& alpha = planes.count(-1) ? planes[-1] : opaque;
+        // 预乘 RGBA（对拍 rgbaImage：(c*a+127)/255）
+        layer.image.assign(count2 * 4, 0);
+        if (deepActive) {
+            // 模式语义序的 8-bit 色彩平面；缺平面按模式语义填充
+            //（CMYK 255 = 无墨、Lab a/b 128 = 中性，photocraft 填充语义的 M22 扩展）。
+            std::vector<std::vector<uint8_t>> colorPlanes(colorCount);
+            for (size_t k = 0; k < colorCount; ++k) {
+                auto it = planes.find(static_cast<int>(k));
+                if (it != planes.end()) {
+                    colorPlanes[k] = it->second;
+                } else if (mode == 4) {
+                    colorPlanes[k].assign(count2, 255);
+                } else if (mode == 9 && k > 0) {
+                    colorPlanes[k].assign(count2, 128);
+                } else {
+                    colorPlanes[k] = black;
+                }
+                if (colorPlanes[k].size() < count2) {
+                    err = "truncated";
+                    return false;
+                }
+            }
+            std::string ierr;
+            auto rgba = interleaveToRgba(mode, colorPlanes,
+                                         planes.count(-1) ? &planes[-1] : nullptr,
+                                         out.colorModeData.empty() ? nullptr : out.colorModeData.data(),
+                                         count2, ierr);
+            if (!rgba) {
+                err = ierr.empty() ? "interleave failed" : ierr;
+                return false;
+            }
+            for (size_t i = 0; i < count2; ++i) {
+                const uint8_t a = (*rgba)[i * 4 + 3];
+                layer.image[i * 4] = static_cast<uint8_t>((static_cast<uint16_t>((*rgba)[i * 4]) * a + 127) / 255);
+                layer.image[i * 4 + 1] = static_cast<uint8_t>((static_cast<uint16_t>((*rgba)[i * 4 + 1]) * a + 127) / 255);
+                layer.image[i * 4 + 2] = static_cast<uint8_t>((static_cast<uint16_t>((*rgba)[i * 4 + 2]) * a + 127) / 255);
+                layer.image[i * 4 + 3] = a;
+            }
+        } else {
         const std::vector<uint8_t>& red = planes.count(0) ? planes[0] : black;
         const std::vector<uint8_t>& green = planes.count(1) ? planes[1] : black;
         const std::vector<uint8_t>& blue = planes.count(2) ? planes[2] : black;
-        const std::vector<uint8_t>& alpha = planes.count(-1) ? planes[-1] : opaque;
         if (red.size() < count2 || green.size() < count2 || blue.size() < count2 ||
             alpha.size() < count2) {
             err = "truncated";
             return false;
         }
-        // 预乘 RGBA（对拍 rgbaImage：(c*a+127)/255）
-        layer.image.assign(count2 * 4, 0);
         for (size_t i = 0; i < count2; ++i) {
             const uint8_t a = alpha[i];
             layer.image[i * 4] = static_cast<uint8_t>((static_cast<uint16_t>(red[i]) * a + 127) / 255);
@@ -985,7 +1266,37 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
             layer.image[i * 4 + 2] = static_cast<uint8_t>((static_cast<uint16_t>(blue[i]) * a + 127) / 255);
             layer.image[i * 4 + 3] = a;
         }
+        }
+        if (deepActive) {
+        // 导入渲染指纹：预乘像素 + 蒙版 + 几何（导出比对判定「未编辑」→ 段字节级回写）。
+        uint64_t hsh = 1469598103934665603ull;
+        auto fnvMix = [&hsh](const uint8_t* p, size_t n) {
+            for (size_t i = 0; i < n; ++i) {
+                hsh ^= p[i];
+                hsh *= 1099511628211ull;
+            }
+        };
+        auto mixU64 = [&hsh](uint64_t v) {
+            for (int i = 0; i < 8; ++i) {
+                hsh ^= static_cast<uint8_t>(v >> (8 * i));
+                hsh *= 1099511628211ull;
+            }
+        };
+        mixU64(static_cast<uint64_t>(layer.left));
+        mixU64(static_cast<uint64_t>(layer.top));
+        mixU64(static_cast<uint64_t>(width));
+        mixU64(static_cast<uint64_t>(height));
+        fnvMix(layer.image.data(), layer.image.size());
+        if (!layer.maskImage.empty()) {
+            mixU64(0xDEE9BA5Eull);
+            fnvMix(layer.maskImage.data(), layer.maskImage.size());
+            mixU64(static_cast<uint64_t>(layer.maskLeft));
+            mixU64(static_cast<uint64_t>(layer.maskTop));
+        }
+        layer.importHash = hsh;
+        }
     }
+    }  // M22 deepActive/CmykScope 作用域
     // M21：全局附加块（通道数据后：global layer mask info + additional layer info 序列；
     // lnk2/lnk3/lnkD 内嵌文件 → linkedFiles，其余原样存 globalExtra 供导出透传）
     if (c.offset < layerSectionEnd && c.offset + 4 <= c.size()) {
@@ -1063,6 +1374,18 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
         rec.name = layer.name;
         rec.hasStyle = layer.hasStyle;   // M17c：lrFX 效果
         rec.style = layer.style;
+        rec.srcSection = layer.srcSection;   // M22：深色往返元数据
+        rec.importHash = layer.importHash;
+        rec.srcCropped = layer.srcCropped;
+        rec.srcChannels = layer.channels;
+        rec.srcLeft = layer.sourceLeft;
+        rec.srcTop = layer.sourceTop;
+        rec.srcRight = layer.sourceRight;
+        rec.srcBottom = layer.sourceBottom;
+        rec.srcMaskLeft = layer.sourceMaskLeft;
+        rec.srcMaskTop = layer.sourceMaskTop;
+        rec.srcMaskRight = layer.sourceMaskRight;
+        rec.srcMaskBottom = layer.sourceMaskBottom;
         // M18d：vmsk/vsms 矢量蒙版（u32 version=3 + u32 flags(bit0 invert/1 not-linked/2
         // disabled) + 路径记录；vmsk 读法 = 首子路径 subtract → inverted + 补对偶）
         for (const char* vk : {"vmsk", "vsms"}) {

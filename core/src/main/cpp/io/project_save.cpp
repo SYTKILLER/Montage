@@ -13,6 +13,8 @@
 #include <hilog/log.h>
 
 #include "engine/document.h"
+
+#include "io/psdsrc_blob.h"
 #include "engine/vector_render.h"
 #include "engine/engine.h"
 
@@ -23,7 +25,7 @@ namespace {
 constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Save";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
-constexpr int kFormatVersion = 13;  // v13：+智能对象（smart 块 + 包内源文件/滤镜蒙版 PNG，M21，无 SO 层 = 字节兼容 v12）；v12：+形状层/矢量蒙版/工作路径/保存路径/自定义形状（M18）；v11：+等高线/Range/图案叠加/文档图案（M17d）；v10：+图层样式效果扩展（M17a 内阴影/外发光/内发光/渐变叠加，非默认才写）；v9：+参考线 guides 块（M15a，空则不写兼容 v8 包）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
+constexpr int kFormatVersion = 14;  // v14：+深色 PSD 往返（文档 psd 块 + 层 psdSrc blob，M22，无深色数据 = 字节兼容 v13）；v13：+智能对象（smart 块 + 包内源文件/滤镜蒙版 PNG，M21，无 SO 层 = 字节兼容 v12）；v12：+形状层/矢量蒙版/工作路径/保存路径/自定义形状（M18）；v11：+等高线/Range/图案叠加/文档图案（M17d）；v10：+图层样式效果扩展（M17a 内阴影/外发光/内发光/渐变叠加，非默认才写）；v9：+参考线 guides 块（M15a，空则不写兼容 v8 包）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
 constexpr int kDeflateLevel = 6;
 // 04 §1.3 格式上限（沿用上游档位，与引擎运行预算分立）
 constexpr uint32_t kMaxSide = 30000;
@@ -493,6 +495,8 @@ struct LayerSnapshot {
     // M21 智能对象（null = 非 SO 层；pixels 已存 smartCache 派生结果、origin = transform）
     // 状态指针共享（源字节不经拷贝；COW 快照同指针）
     std::shared_ptr<const SmartLayerState> smart;
+    // M22 v14：深色 PSD 层 verbatim blob（自包含，空 = 无；无深色数据层不写 = v13 包不变）
+    std::shared_ptr<std::vector<uint8_t>> psdSrcBlob;
 };
 
 struct ChannelSnapshot {
@@ -527,6 +531,13 @@ struct DocSnapshot {
     std::vector<NamedPathEntry> paths;
     std::vector<CustomShapeEntry> customShapes;
     uint32_t customShapeSeq = 0;
+    // v14（M22 深色 PSD 往返；全空不写 = v13 包字节不变）
+    uint16_t psdSrcDepth = 8;
+    uint16_t psdSrcMode = 3;
+    uint16_t psdSrcChannels = 3;
+    std::shared_ptr<std::vector<uint8_t>> psdIcc;        // images/psdicc.bin（资源 1039 原样）
+    std::shared_ptr<std::vector<uint8_t>> psdColorMode;  // images/psdcmode.bin（色板段原样）
+    std::vector<std::pair<std::string, std::shared_ptr<std::vector<uint8_t>>>> psdGlobalBlocks;
 };
 
 // M17d 等高线 JSON（非 custom 不写）：{"pts": [x0,y0,…], "corners": [0/1,…]}
@@ -1192,6 +1203,11 @@ std::string buildManifest(const DocSnapshot& doc) {
             }
             fields.push_back("      \"smart\": {\n" + so + "\n      }");
         }
+        if (l.psdSrcBlob != nullptr) {
+            // M22 v14：深色 verbatim blob（自包含：深度/模式/通道表/源矩形/指纹/段字节）
+            fields.push_back("      \"psdSrc\": \"images/psdsrc_" + std::to_string(l.id) +
+                             ".bin\"");
+        }
         if (l.pixels != nullptr) {
             // 图像以内容包围盒存出；originX/Y = 包围盒左上角在文档坐标系的落点（load 据此重建 Transform）
             fields.push_back("      \"originX\": " + std::to_string(static_cast<int64_t>(l.originX)));
@@ -1327,6 +1343,30 @@ std::string buildManifest(const DocSnapshot& doc) {
         }
         j += "  }\n";
     }
+    // v14：深色 PSD 元数据（M22；全空不写 = v13 包字节不变）
+    if (doc.psdIcc != nullptr || doc.psdColorMode != nullptr || !doc.psdGlobalBlocks.empty() ||
+        doc.psdSrcDepth != 8 || doc.psdSrcMode != 3) {
+        j += ",\n  \"psd\": {\n";
+        j += "    \"depth\": " + std::to_string(doc.psdSrcDepth) + ",\n";
+        j += "    \"mode\": " + std::to_string(doc.psdSrcMode) + ",\n";
+        j += "    \"channels\": " + std::to_string(doc.psdSrcChannels);
+        if (doc.psdIcc != nullptr) {
+            j += ",\n    \"icc\": \"images/psdicc.bin\"";
+        }
+        if (doc.psdColorMode != nullptr) {
+            j += ",\n    \"colorMode\": \"images/psdcmode.bin\"";
+        }
+        if (!doc.psdGlobalBlocks.empty()) {
+            j += ",\n    \"blocks\": [\n";
+            for (size_t i = 0; i < doc.psdGlobalBlocks.size(); ++i) {
+                j += "      {\"key\": " + jsonEscape(doc.psdGlobalBlocks[i].first) +
+                     ", \"file\": \"images/psdglb_" + std::to_string(i) + ".bin\"}";
+                j += (i + 1 < doc.psdGlobalBlocks.size()) ? ",\n" : "\n";
+            }
+            j += "    ]\n";
+        }
+        j += "  }\n";
+    }
     j += "}\n";
     return j;
 }
@@ -1414,7 +1454,46 @@ void buildDocSnapshot(const Document& doc, DocSnapshot& snap) {
             s.vectorMask = l.vectorMask;
             s.vectorMaskEnabled = l.vectorMask->enabled;
         }
+        if (!l.psdSrcSection.empty()) {
+            // M22 v14：深色 verbatim 元数据 → 自包含 blob
+            io::PsdSrcMeta m;
+            m.depth = l.psdSrcDepth;
+            m.mode = l.psdSrcMode;
+            m.channels = l.psdSrcChannels;
+            m.cropped = l.psdSrcCropped;
+            m.importHash = l.psdImportHash;
+            m.srcLeft = l.psdSrcLeft;
+            m.srcTop = l.psdSrcTop;
+            m.srcRight = l.psdSrcRight;
+            m.srcBottom = l.psdSrcBottom;
+            m.srcMaskLeft = l.psdSrcMaskLeft;
+            m.srcMaskTop = l.psdSrcMaskTop;
+            m.srcMaskRight = l.psdSrcMaskRight;
+            m.srcMaskBottom = l.psdSrcMaskBottom;
+            m.channelTable.reserve(l.psdChannelIds.size());
+            for (size_t ci = 0; ci < l.psdChannelIds.size(); ++ci) {
+                m.channelTable.emplace_back(l.psdChannelIds[ci], l.psdChannelLens[ci]);
+            }
+            m.section = l.psdSrcSection;
+            s.psdSrcBlob = std::make_shared<std::vector<uint8_t>>(encodePsdSrcBlob(m));
+        }
         snap.layers.push_back(std::move(s));
+    }
+    // v14：文档级深色元数据
+    snap.psdSrcDepth = doc.psdSrcDepth;
+    snap.psdSrcMode = doc.psdSrcMode;
+    snap.psdSrcChannels = doc.psdSrcChannels;
+    if (!doc.psdIccProfile.empty()) {
+        snap.psdIcc = std::make_shared<std::vector<uint8_t>>(doc.psdIccProfile);
+    }
+    if (!doc.psdColorModeData.empty()) {
+        snap.psdColorMode = std::make_shared<std::vector<uint8_t>>(doc.psdColorModeData);
+    }
+    for (const auto& [key, payload] : doc.psdGlobalExtra) {
+        if (!payload.empty()) {
+            snap.psdGlobalBlocks.emplace_back(key,
+                                              std::make_shared<std::vector<uint8_t>>(payload));
+        }
     }
 }
 
@@ -1563,6 +1642,33 @@ bool encodeProject(const DocSnapshot& snap, ZipSink& sink, size_t* outLayers, ui
     // v11：文档图案 PNG（M17d，整幅 images/pattern_<id>.png）
     for (const PatternSnapshot& p : snap.patterns) {
         if (!encodeGridPng(*p.pixels, p.w, p.h, "images/pattern_" + p.id + ".png")) {
+            return false;
+        }
+    }
+
+    // v14：深色 PSD blob/ICC/色板/全局块（原样字节 bin）
+    auto writeBin = [&](const std::string& name, const std::vector<uint8_t>& bytes) -> bool {
+        if (!zip.beginEntry(name, 0) ||
+            !zip.writeEntryBytes(bytes.data(), bytes.size()) || !zip.endEntry()) {
+            err = "psd bin write failed";
+            return false;
+        }
+        return true;
+    };
+    for (const LayerSnapshot& l : snap.layers) {
+        if (l.psdSrcBlob != nullptr &&
+            !writeBin("images/psdsrc_" + std::to_string(l.id) + ".bin", *l.psdSrcBlob)) {
+            return false;
+        }
+    }
+    if (snap.psdIcc != nullptr && !writeBin("images/psdicc.bin", *snap.psdIcc)) {
+        return false;
+    }
+    if (snap.psdColorMode != nullptr && !writeBin("images/psdcmode.bin", *snap.psdColorMode)) {
+        return false;
+    }
+    for (size_t i = 0; i < snap.psdGlobalBlocks.size(); ++i) {
+        if (!writeBin("images/psdglb_" + std::to_string(i) + ".bin", *snap.psdGlobalBlocks[i].second)) {
             return false;
         }
     }

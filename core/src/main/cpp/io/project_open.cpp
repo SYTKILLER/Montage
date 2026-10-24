@@ -20,6 +20,8 @@
 #include "engine/vector_render.h"
 #include "engine/style_ops.h"
 #include "engine/smart_ops.h"
+
+#include "io/psdsrc_blob.h"
 #include "engine/engine.h"
 #include "io/png_decode.h"
 
@@ -31,7 +33,7 @@ constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Open";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
 constexpr int kMinVersion = 1;
-constexpr int kMaxVersion = 13;  // v13：+智能对象（smart 块 + 包内源文件/滤镜蒙版 PNG，M21，可选字段读兼容 v1–v12）；v12：+形状层/矢量蒙版/工作路径/保存路径/自定义形状（M18）；v11：+等高线/Range/图案叠加/文档图案（M17d）；v10：+图层样式效果扩展（M17a）；v9：+参考线 guides 块（M15a）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
+constexpr int kMaxVersion = 14;  // v14：+深色 PSD 往返（文档 psd 块 + 层 psdSrc blob，M22，可选字段读兼容 v1–v13）；v13：+智能对象（smart 块 + 包内源文件/滤镜蒙版 PNG，M21，可选字段读兼容 v1–v12）；v12：+形状层/矢量蒙版/工作路径/保存路径/自定义形状（M18）；v11：+等高线/Range/图案叠加/文档图案（M17d）；v10：+图层样式效果扩展（M17a）；v9：+参考线 guides 块（M15a）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
 constexpr uint32_t kMaxSide = 30000;
 constexpr uint64_t kMaxTotalPixels = 100ull * 1000 * 1000;
 constexpr size_t kMaxLayers = 10000;
@@ -523,10 +525,18 @@ struct LayerRecord {
     std::shared_ptr<SmartLayerState> smart;
     std::string smartSourceFile;
     std::string smartFilterMaskFile;
+    std::string psdSrcFile;  // M22 v14：深色 verbatim blob（包内 images/psdsrc_<id>.bin）
     // v7（M14a）
     bool isGroup = false;
     uint64_t parentId = 0;
     bool collapsed = false;
+};
+
+// M22 v14：文档级深色元数据的包内文件引用（解析期收集中；应用期解包）。
+struct PsdDocRefs {
+    std::string iccFile;
+    std::string colorModeFile;
+    std::vector<std::pair<std::string, std::string>> blocks;  // (key, file)
 };
 
 bool getU64(const JValue& v, uint64_t& out) {
@@ -614,6 +624,7 @@ static bool parsePathFlat(const JValue& v, VectorPath& out) {
 bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector<LayerRecord>& layers,
                    std::vector<std::string>& channelFiles,
                    std::vector<DocumentPattern>& patterns,
+                   PsdDocRefs& psdRefs,
                    std::string& err) {
     if (bytes.size() > kMaxManifestBytes) {
         err = "manifest too large";
@@ -1420,6 +1431,13 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
             }
             l.smart = std::move(sm);
         }
+        // M22 v14：深色 verbatim blob 文件名（可选）
+        {
+            const JValue* jp = item.find("psdSrc");
+            if (jp != nullptr && jp->type == JValue::Str) {
+                l.psdSrcFile = jp->str;
+            }
+        }
         const JValue* jst = item.find("style");
         if (jst != nullptr) {
             if (jst->type != JValue::Obj) {
@@ -1921,6 +1939,53 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
             patterns.push_back(std::move(p));
         }
     }
+    // v14：深色 PSD 元数据（M22；可选块。depth/mode/channels 直填 doc；文件引用收集应用期解包）
+    const JValue* jpsd = root.find("psd");
+    if (jpsd != nullptr) {
+        if (jpsd->type != JValue::Obj) {
+            err = "bad psd record";
+            return false;
+        }
+        const JValue* jd = jpsd->find("depth");
+        const JValue* jm = jpsd->find("mode");
+        const JValue* jc = jpsd->find("channels");
+        double dv = 8, mv = 3, cv = 3;
+        if (jd != nullptr && getDouble(*jd, dv) && mv >= 0) {
+            doc.psdSrcDepth = static_cast<uint16_t>(dv);
+        }
+        if (jm != nullptr && getDouble(*jm, mv) && mv >= 0) {
+            doc.psdSrcMode = static_cast<uint16_t>(mv);
+        }
+        if (jc != nullptr && getDouble(*jc, cv) && cv >= 0) {
+            doc.psdSrcChannels = static_cast<uint16_t>(cv);
+        }
+        const JValue* jicc = jpsd->find("icc");
+        if (jicc != nullptr && jicc->type == JValue::Str && !jicc->str.empty()) {
+            psdRefs.iccFile = jicc->str;
+        }
+        const JValue* jcm = jpsd->find("colorMode");
+        if (jcm != nullptr && jcm->type == JValue::Str && !jcm->str.empty()) {
+            psdRefs.colorModeFile = jcm->str;
+        }
+        const JValue* jb = jpsd->find("blocks");
+        if (jb != nullptr && jb->type == JValue::Arr) {
+            for (const JValue& jbi : jb->arr) {
+                if (jbi.type != JValue::Obj) {
+                    err = "bad psd block record";
+                    return false;
+                }
+                const JValue* jk = jbi.find("key");
+                const JValue* jf = jbi.find("file");
+                if (jk == nullptr || jk->type != JValue::Str || jk->str.empty() ||
+                    jk->str.size() > 8 || jf == nullptr || jf->type != JValue::Str ||
+                    jf->str.empty()) {
+                    err = "bad psd block fields";
+                    return false;
+                }
+                psdRefs.blocks.emplace_back(jk->str, jf->str);
+            }
+        }
+    }
     // activeLayerId 必须在集合内（对齐上游 validate）
     const JValue* jactive = root.find("activeLayerId");
     if (jactive != nullptr && jactive->type == JValue::Num && jactive->num > 0) {
@@ -1955,7 +2020,8 @@ bool openProjectBytes(const std::vector<uint8_t>& data, Document& full, size_t* 
     std::vector<LayerRecord> records;
     std::vector<std::string> channelFiles;
     std::vector<DocumentPattern> patterns;
-    if (!parseManifest(manifestBytes, doc, records, channelFiles, patterns, err)) {
+    PsdDocRefs psdRefs;
+    if (!parseManifest(manifestBytes, doc, records, channelFiles, patterns, psdRefs, err)) {
         return false;
     }
 
@@ -2087,7 +2153,77 @@ bool openProjectBytes(const std::vector<uint8_t>& data, Document& full, size_t* 
                 l.render = composeMasked(l.pixels, *l.mask);
             }
         }
+        if (!rec.psdSrcFile.empty()) {
+            // M22 v14：深色 verbatim blob → 层往返元数据
+            const ZipReader::CdEntry* pe = zip.find(rec.psdSrcFile);
+            if (pe == nullptr) {
+                err = "psd src missing: " + rec.psdSrcFile;
+                return false;
+            }
+            std::vector<uint8_t> pb;
+            if (!zip.extract(*pe, pb, err)) {
+                return false;
+            }
+            PsdSrcMeta m;
+            std::string perr;
+            if (!decodePsdSrcBlob(pb.data(), pb.size(), m, perr)) {
+                err = perr;
+                return false;
+            }
+            l.psdSrcDepth = m.depth;
+            l.psdSrcMode = m.mode;
+            l.psdSrcChannels = m.channels;
+            l.psdSrcCropped = m.cropped;
+            l.psdImportHash = m.importHash;
+            l.psdSrcLeft = m.srcLeft;
+            l.psdSrcTop = m.srcTop;
+            l.psdSrcRight = m.srcRight;
+            l.psdSrcBottom = m.srcBottom;
+            l.psdSrcMaskLeft = m.srcMaskLeft;
+            l.psdSrcMaskTop = m.srcMaskTop;
+            l.psdSrcMaskRight = m.srcMaskRight;
+            l.psdSrcMaskBottom = m.srcMaskBottom;
+            for (const auto& ch : m.channelTable) {
+                l.psdChannelIds.push_back(ch.first);
+                l.psdChannelLens.push_back(ch.second);
+            }
+            l.psdSrcSection = std::move(m.section);
+        }
         layers.push_back(std::move(l));
+    }
+
+    // v14：文档级深色元数据解包（ICC/色板/全局块原样字节）
+    if (!psdRefs.iccFile.empty()) {
+        const ZipReader::CdEntry* ie = zip.find(psdRefs.iccFile);
+        if (ie == nullptr) {
+            err = "psd icc missing: " + psdRefs.iccFile;
+            return false;
+        }
+        if (!zip.extract(*ie, doc.psdIccProfile, err)) {
+            return false;
+        }
+    }
+    if (!psdRefs.colorModeFile.empty()) {
+        const ZipReader::CdEntry* ce = zip.find(psdRefs.colorModeFile);
+        if (ce == nullptr) {
+            err = "psd colorMode missing: " + psdRefs.colorModeFile;
+            return false;
+        }
+        if (!zip.extract(*ce, doc.psdColorModeData, err)) {
+            return false;
+        }
+    }
+    for (const auto& [key, file] : psdRefs.blocks) {
+        const ZipReader::CdEntry* be = zip.find(file);
+        if (be == nullptr) {
+            err = "psd block missing: " + file;
+            return false;
+        }
+        std::vector<uint8_t> bb;
+        if (!zip.extract(*be, bb, err)) {
+            return false;
+        }
+        doc.psdGlobalExtra[key] = std::move(bb);
     }
 
     // v5：Alpha 通道 PNG（文档域灰度网格；尺寸须与文档一致）
