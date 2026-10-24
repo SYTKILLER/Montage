@@ -27,8 +27,10 @@ struct ImportCompletion {
 
 // 异步启动导入（新建线程）。完成/失败经 completionTsfn 送 JS 线程 resolve Promise（payload=
 // ImportCompletion*，消费方 delete）；fd 所有权一律移交本函数（结束时 close，含失败路径）。
+// fileName 可选（M25：TGA 等无魔数格式的扩展名嗅探兜底；空 = 仅魔数探测）。
 // 返回 false = 未启动（已有导入在跑），此时 fd 同样被关闭。
-bool startImageImport(int fd, napi_threadsafe_function completionTsfn);
+bool startImageImport(int fd, napi_threadsafe_function completionTsfn,
+                      const std::string& fileName = std::string());
 
 // 请求取消（带边界生效）；不等待线程退出。
 void cancelImageImport();

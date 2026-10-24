@@ -54,6 +54,18 @@ add_library(compositor SHARED
         io/project_save.cpp
         io/psd/psd_reader.cpp
         io/psd/psd_import.cpp
+        io/psd/descriptor.cpp
+        io/psd/smart_psd.cpp
+        io/codecs/codec_import.cpp
+        io/codecs/codec_table.cpp
+        io/codecs/codec_util.cpp
+        io/codecs/bmp_codec.cpp
+        io/codecs/exr_codec.cpp
+        io/codecs/gif_codec.cpp
+        io/codecs/hdr_codec.cpp
+        io/codecs/qoi_codec.cpp
+        io/codecs/tga_codec.cpp
+        io/codecs/tiff_codec.cpp
         render/render_loop.cpp
         render/tile_renderer.cpp
         tiles/pixel_probe.cpp

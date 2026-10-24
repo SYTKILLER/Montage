@@ -15,6 +15,9 @@
 #include "engine/engine.h"
 #include "io/png_decode.h"
 #include "io/dng_decode.h"
+#include "io/codecs/codec_import.h"
+#include "io/codecs/codec_table.h"
+#include "io/codecs/tiff_codec.h"
 
 namespace montage {
 namespace io {
@@ -245,26 +248,38 @@ bool decodeBand(OH_ImageSourceNative* source, uint32_t imgW, uint32_t imgY, uint
 
 // 导入主体（fd 归属本函数）。导入 = 追加图层：无文档时以图片尺寸建文档；有文档时
 // 新图层居中放置、置于栈顶并激活。返回 payload（堆）。
-ImportCompletion* runImport(int fd) {
+ImportCompletion* runImport(int fd, const std::string& fileName) {
     FdGuard fdGuard(fd);
     auto& engine = Engine::get();
 
-    // M15d：DNG RAW 显影链（内容探测在系统解码器之前——ImageSource 不识别 RAW）
+    // 全量读入一次（DNG/M25 嗅探共用；512MB 上限）
+    std::vector<uint8_t> fileBytes;
     {
         lseek(fd, 0, SEEK_SET);
         const off_t sz = lseek(fd, 0, SEEK_END);
         lseek(fd, 0, SEEK_SET);
         if (sz > 0 && sz <= 512ll * 1024 * 1024) {
-            std::vector<uint8_t> bytes(static_cast<size_t>(sz));
+            fileBytes.resize(static_cast<size_t>(sz));
             size_t got = 0;
-            while (got < bytes.size()) {
-                const ssize_t n = read(fd, bytes.data() + got, bytes.size() - got);
+            while (got < fileBytes.size()) {
+                const ssize_t n = read(fd, fileBytes.data() + got, fileBytes.size() - got);
                 if (n <= 0) {
                     break;
                 }
                 got += static_cast<size_t>(n);
             }
-            if (got == bytes.size() && looksLikeDng(bytes)) {
+            if (got != fileBytes.size()) {
+                fileBytes.clear();
+            }
+        }
+        lseek(fd, 0, SEEK_SET);
+    }
+
+    // M15d：DNG RAW 显影链（内容探测在系统解码器之前——ImageSource 不识别 RAW）
+    if (!fileBytes.empty() && looksLikeDng(fileBytes)) {
+        {
+            const std::vector<uint8_t>& bytes = fileBytes;
+            {
                 std::shared_ptr<const TileGrid> grid;
                 uint32_t w = 0, h = 0;
                 std::string derr;
@@ -310,6 +325,81 @@ ImportCompletion* runImport(int fd) {
             }
         }
         lseek(fd, 0, SEEK_SET);
+    }
+
+    // M25：平面格式内容探测分发（TIFF/BigTIFF/EXR/HDR/GIF/QOI/BMP + TGA footer/扩展名）。
+    // 命中即整图解码为单层追加（分层 TIFF 的图层语义走 openTiffFile 文档命令；此路径
+    // 解过分层也只取合成图，保证「导入=追加图层」语义恒定）。
+    std::shared_ptr<const TileGrid> codecGrid;
+    if (!fileBytes.empty()) {
+        std::string fmt;
+        if (codecs::sniff(fileBytes.data(), fileBytes.size(), fileName, fmt)) {
+            std::vector<std::string> layerNotes;
+            if (fmt == "tiff") {
+                uint32_t lw = 0;
+                uint32_t lh = 0;
+                std::vector<codecs::CodecLayerRec> lr;
+                std::string lerr;
+                std::vector<psd::Record> pr;
+                if (codecs::tiffDecodeLayers(fileBytes.data(), fileBytes.size(), lw, lh, lr,
+                                             layerNotes, lerr)) {
+                    for (const std::string& n : layerNotes) {
+                        OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag,
+                                     "layered tiff (composite import): %{public}s", n.c_str());
+                    }
+                }
+            }
+            codecs::CodecImage img;
+            std::string cerr;
+            if (!codecs::decode(fileBytes.data(), fileBytes.size(), fmt, img, cerr)) {
+                return makePayload(false, 0, 0, 0, fmt + " decode failed: " + cerr);
+            }
+            if (img.w == 0 || img.h == 0 || img.w > kMaxSide || img.h > kMaxSide ||
+                static_cast<uint64_t>(img.w) * img.h > kMaxPixels) {
+                return makePayload(false, img.w, img.h, 0, "codec size out of limits");
+            }
+            codecGrid = gridFromRgba(img.w, img.h, img.rgba);
+            if (codecGrid == nullptr) {
+                return makePayload(false, img.w, img.h, 0, "codec grid build failed");
+            }
+            OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag,
+                         "codec native decode path %{public}s %{public}ux%{public}u", fmt.c_str(),
+                         img.w, img.h);
+            // 短路发布：不走 ImageSource；「导入=追加图层」语义与主路径一致
+            //（无文档建档、有文档居中置顶激活；分层 TIFF 只取合成图）
+            const LayerId codecLayerId = engine.nextLayerId();
+            Transform ct;
+            {
+                std::lock_guard<std::mutex> lk(engine.docMutex);
+                const bool createsDoc = (engine.doc.width == 0 || engine.doc.height == 0);
+                if (createsDoc) {
+                    engine.doc.width = img.w;
+                    engine.doc.height = img.h;
+                    engine.doc.name = "Untitled";
+                    ct.originX = 0.0;
+                    ct.originY = 0.0;
+                } else {
+                    ct.originX = std::max(0.0, (static_cast<double>(engine.doc.width) - img.w) / 2.0);
+                    ct.originY = std::max(0.0, (static_cast<double>(engine.doc.height) - img.h) / 2.0);
+                }
+                ct.width = img.w;
+                ct.height = img.h;
+                Layer layer;
+                layer.id = codecLayerId;
+                layer.name = "图片 " + std::to_string(codecLayerId);
+                layer.transform = ct;
+                layer.pixels = codecGrid;
+                engine.doc.layers.push_back(std::move(layer));
+                engine.doc.activeId = codecLayerId;
+                engine.bumpRevisionLocked();
+                engine.requestRender();
+            }
+            notifyProgress(1.0);
+            OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag,
+                         "codec import done %{public}ux%{public}u layer=%{public}llu",
+                         img.w, img.h, static_cast<unsigned long long>(codecLayerId));
+            return makePayload(true, img.w, img.h, codecLayerId, "");
+        }
     }
 
     OH_ImageSourceNative* rawSource = nullptr;
@@ -485,8 +575,8 @@ ImportCompletion* runImport(int fd) {
     return makePayload(true, imgW, imgH, layerId, "");
 }
 
-void importThread(int fd, napi_threadsafe_function completionTsfn) {
-    ImportCompletion* payload = runImport(fd);
+void importThread(int fd, std::string fileName, napi_threadsafe_function completionTsfn) {
+    ImportCompletion* payload = runImport(fd, std::move(fileName));
     auto& engine = Engine::get();
     {
         std::lock_guard<std::mutex> lk(engine.import.mtx);
@@ -501,7 +591,8 @@ void importThread(int fd, napi_threadsafe_function completionTsfn) {
 
 }  // namespace
 
-bool startImageImport(int fd, napi_threadsafe_function completionTsfn) {
+bool startImageImport(int fd, napi_threadsafe_function completionTsfn,
+                      const std::string& fileName) {
     auto& engine = Engine::get();
     {
         std::lock_guard<std::mutex> lk(engine.import.mtx);
@@ -513,7 +604,7 @@ bool startImageImport(int fd, napi_threadsafe_function completionTsfn) {
         engine.import.progress = 0.0;
         engine.import.running = true;
     }
-    std::thread(&importThread, fd, completionTsfn).detach();
+    std::thread(&importThread, fd, fileName, completionTsfn).detach();
     return true;
 }
 
