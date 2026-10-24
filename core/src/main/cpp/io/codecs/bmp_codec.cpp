@@ -76,9 +76,10 @@ bool bmpDecode(const uint8_t* data, size_t len, CodecImage& out, std::string& er
     uint32_t compression = 0;
     uint32_t colorsUsed = 0;
     size_t palettePos = 14 + dibSize;   // 调色板紧跟 DIB
-    size_t corePalEntry = 3;            // CORE 头调色板项 3 字节（BGR）
+    size_t corePalEntry = 4;            // 默认 BGRX 4 字节/项；CORE(12)/OS2-V2(52,64) 才是 3
 
     if (dibSize == 12) {  // BITMAPCOREHEADER
+        corePalEntry = 3;
         w = rdU16(dib + 4);
         h = rdU16(dib + 6);
         bpp = rdU16(dib + 10);
@@ -145,11 +146,11 @@ bool bmpDecode(const uint8_t* data, size_t len, CodecImage& out, std::string& er
     uint32_t rMask = 0, gMask = 0, bMask = 0, aMask = 0;
     size_t masksExtra = 0;  // V3+BITFIELDS 时数据前的 3-4 个 u32
     if (compression == 3) {
-        if (dibSize >= 108) {  // V4/V5：掩码在头内
-            rMask = rdU32(dib + 40 + 8);
-            gMask = rdU32(dib + 40 + 12);
-            bMask = rdU32(dib + 40 + 16);
-            aMask = rdU32(dib + 40 + 20);
+        if (dibSize >= 52) {  // V2+/V4/V5：掩码在头内（Red@40 Green@44 Blue@48 Alpha@52）
+            rMask = rdU32(dib + 40);
+            gMask = rdU32(dib + 44);
+            bMask = rdU32(dib + 48);
+            aMask = dibSize >= 56 ? rdU32(dib + 52) : 0;
         } else {
             if (palettePos + 12 > len) {
                 err = "bmp: bitfields truncated";
@@ -397,12 +398,8 @@ bool bmpEncode(const uint8_t* rgba, uint32_t w, uint32_t h, bool withAlpha,
     wrU32(out, 0x000000FF);  // B
     wrU32(out, withAlpha ? 0xFF000000u : 0x00000000u);  // A
     wrU32(out, 0x73524742);  // 'sRGB' (LCS_sRGB)
-    // V4 尾段（CIEXYZTRIPLE 36 + 3 gamma + 5 色彩意图/引用）——全零可接受
+    // V4 尾段 = CIEXYZTRIPLE 36 + gamma×3 12（intent 是 V5 字段不写——头恒 108）
     for (int i = 0; i < 12; ++i) {
-        wrU32(out, 0);
-    }
-    wrU32(out, 4);  // LCS_GM_IMAGES
-    for (int i = 0; i < 3; ++i) {
         wrU32(out, 0);
     }
     // 像素（bottom-up，BGRA）

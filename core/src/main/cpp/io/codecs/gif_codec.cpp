@@ -159,7 +159,10 @@ void lzwEncode(const std::vector<uint8_t>& pixels, int minCodeSize, std::vector<
         if (next < 4096) {
             dict.emplace(key, next);
             ++next;
-            if (next == (1 << width) && width < 12) {
+            // 宽度切换延迟一档（next > 2^width）：编码器字典比解码器超前一个条目
+            //（解码器首个数据码不建条目），== 切换会让码流超前解码器一位
+            //（PIL 裁决实证：引擎解码器语义与 PIL 一致，编码器对齐之）
+            if (next > (1 << width) && width < 12) {
                 ++width;
             }
         } else {

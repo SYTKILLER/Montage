@@ -563,6 +563,22 @@ struct Index {
         fs.writeSync(fw.fd, bin.buffer);
         fs.closeSync(fw);
         const f = fs.openSync(pd, fs.OpenMode.READ_ONLY);
+        // M22：8BPS 魔数 → PSD 命令（PSD 不在 openFileFromFd 通用链上，独立 openPsdFile）
+        const head = String.fromCharCode(bin[0], bin[1], bin[2], bin[3]);
+        if (head === '8BPS') {
+          this.engine.openPsdFile(f.fd).then((dd: PsdOpenData): void => {
+            this.docW = dd.width;
+            this.docH = dd.height;
+            this.docOpen = true;
+            this.log(`调试直通打开(PSD): ${dd.width}x${dd.height} notes=${dd.notes.length}`);
+            for (const nt of dd.notes) {
+              this.log(`  note: ${nt}`);
+            }
+          }).catch((e: BusinessError): void => {
+            this.log(`调试直通打开失败(PSD): ${e.message}`);
+          });
+          return;
+        }
         this.engine.openFileFromFd(f.fd).then((dd: OpenFileData): void => {
           this.docW = dd.width;
           this.docH = dd.height;

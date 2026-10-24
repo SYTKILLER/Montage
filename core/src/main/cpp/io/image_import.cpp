@@ -330,25 +330,14 @@ ImportCompletion* runImport(int fd, const std::string& fileName) {
 
     // M25：平面格式内容探测分发（TIFF/BigTIFF/EXR/HDR/GIF/QOI/BMP + TGA footer/扩展名）。
     // 命中即整图解码为单层追加（分层 TIFF 的图层语义走 openTiffFile 文档命令；此路径
-    // 解过分层也只取合成图，保证「导入=追加图层」语义恒定）。
+    // 只取合成图，保证「导入=追加图层」语义恒定）。
     std::shared_ptr<const TileGrid> codecGrid;
     if (!fileBytes.empty()) {
         std::string fmt;
         if (codecs::sniff(fileBytes.data(), fileBytes.size(), fileName, fmt)) {
-            std::vector<std::string> layerNotes;
-            if (fmt == "tiff") {
-                uint32_t lw = 0;
-                uint32_t lh = 0;
-                std::vector<codecs::CodecLayerRec> lr;
-                std::string lerr;
-                std::vector<psd::Record> pr;
-                if (codecs::tiffDecodeLayers(fileBytes.data(), fileBytes.size(), lw, lh, lr,
-                                             layerNotes, lerr)) {
-                    for (const std::string& n : layerNotes) {
-                        OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag,
-                                     "layered tiff (composite import): %{public}s", n.c_str());
-                    }
-                }
+            if (fmt == "tiff" && codecs::tiffHasLayerData(fileBytes.data(), fileBytes.size())) {
+                OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag,
+                             "layered tiff via append path: composite only (layers via openTiffFile)");
             }
             codecs::CodecImage img;
             std::string cerr;

@@ -1,15 +1,55 @@
 /**
  * 导出对话框（05 §5 模态范式：Stack 遮罩 + 居中卡片）。
- * PNG（引擎 PngRowEncoder 直写）/ JPEG（ImagePacker，质量可调）。
+ * PNG（引擎 PngRowEncoder 直写）/ JPEG·WebP（ImagePacker）/ PSD（保留图层）/
+ * TIFF·GIF·BMP·TGA·QOI（M25 引擎编码器直写）。
  */
 @Component
 export struct ExportDialog {
   @Prop docW: number = 0;
   @Prop docH: number = 0;
-  @State formatIdx: number = 0;   // 0=PNG 1=JPEG
+  // 格式槽位：0=PNG 1=JPEG 2=PSD 3=TIFF 4=GIF 5=BMP 6=TGA 7=QOI 8=WebP
+  @State formatIdx: number = 0;
   @State quality: number = 90;
   onConfirm: (format: string, quality: number) => void = (_f: string, _q: number) => {};
   onCancel: () => void = () => {};
+
+  private fmtName(i: number): string {
+    if (i === 0) return 'PNG（无损）';
+    if (i === 1) return 'JPEG';
+    if (i === 2) return 'PSD（保留图层）';
+    if (i === 3) return 'TIFF';
+    if (i === 4) return 'GIF（256 色抖动）';
+    if (i === 5) return 'BMP';
+    if (i === 6) return 'TGA';
+    if (i === 7) return 'QOI';
+    return 'WebP';
+  }
+
+  private fmtKey(i: number): string {
+    if (i === 0) return 'png';
+    if (i === 1) return 'jpeg';
+    if (i === 2) return 'psd';
+    if (i === 3) return 'tiff';
+    if (i === 4) return 'gif';
+    if (i === 5) return 'bmp';
+    if (i === 6) return 'tga';
+    if (i === 7) return 'qoi';
+    return 'webp';
+  }
+
+  @Builder
+  fmtRadio(i: number) {
+    Row({ space: 6 }) {
+      Radio({ value: this.fmtName(i), group: 'exportFmt' })
+        .checked(this.formatIdx === i)
+        .onChange((on: boolean): void => {
+          if (on) {
+            this.formatIdx = i;
+          }
+        })
+      Text(this.fmtName(i)).fontSize(13).fontColor($r('app.color.text_primary'))
+    }
+  }
 
   build() {
     Stack() {
@@ -28,40 +68,40 @@ export struct ExportDialog {
           .fontSize(12)
           .fontColor($r('app.color.text_secondary'))
 
-        Row({ space: 16 }) {
-          Row({ space: 6 }) {
-            Radio({ value: 'PNG', group: 'exportFmt' })
-              .checked(this.formatIdx === 0)
-              .onChange((on: boolean): void => {
-                if (on) {
-                  this.formatIdx = 0;
-                }
-              })
-            Text('PNG（无损）').fontSize(13).fontColor($r('app.color.text_primary'))
+        Grid() {
+          GridItem() {
+            this.fmtRadio(0)
           }
-          Row({ space: 6 }) {
-            Radio({ value: 'JPEG', group: 'exportFmt' })
-              .checked(this.formatIdx === 1)
-              .onChange((on: boolean): void => {
-                if (on) {
-                  this.formatIdx = 1;
-                }
-              })
-            Text('JPEG').fontSize(13).fontColor($r('app.color.text_primary'))
+          GridItem() {
+            this.fmtRadio(1)
           }
-          Row({ space: 6 }) {
-            Radio({ value: 'PSD', group: 'exportFmt' })
-              .checked(this.formatIdx === 2)
-              .onChange((on: boolean): void => {
-                if (on) {
-                  this.formatIdx = 2;
-                }
-              })
-            Text('PSD（保留图层）').fontSize(13).fontColor($r('app.color.text_primary'))
+          GridItem() {
+            this.fmtRadio(2)
+          }
+          GridItem() {
+            this.fmtRadio(3)
+          }
+          GridItem() {
+            this.fmtRadio(4)
+          }
+          GridItem() {
+            this.fmtRadio(5)
+          }
+          GridItem() {
+            this.fmtRadio(6)
+          }
+          GridItem() {
+            this.fmtRadio(7)
+          }
+          GridItem() {
+            this.fmtRadio(8)
           }
         }
+        .columnsTemplate('1fr 1fr 1fr')
+        .rowsGap(10)
+        .width('100%')
 
-        if (this.formatIdx === 1) {
+        if (this.formatIdx === 1 || this.formatIdx === 8) {
           Row({ space: 8 }) {
             Text('质量').fontSize(12).fontColor($r('app.color.text_secondary'))
             Slider({ value: this.quality, min: 10, max: 100, step: 1 })
@@ -91,7 +131,7 @@ export struct ExportDialog {
             .width(96)
             .backgroundColor($r('app.color.accent'))
             .fontColor($r('app.color.on_accent'))
-            .onClick((): void => this.onConfirm(this.formatIdx === 0 ? 'png' : (this.formatIdx === 1 ? 'jpeg' : 'psd'), this.quality))
+            .onClick((): void => this.onConfirm(this.fmtKey(this.formatIdx), this.quality))
         }
         .justifyContent(FlexAlign.End)
         .width('100%')

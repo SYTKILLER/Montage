@@ -166,8 +166,8 @@ bool exrDecode(const uint8_t* data, size_t len, CodecImage& out, std::string& er
                 ch.name.assign(reinterpret_cast<const char*>(val + cp), c0);
                 cp += c0 + 1;
                 ch.pixelType = rdI32(val + cp);
-                // pLinear uchar + 3 pad + xSampling + ySampling
-                cp += 1 + 3 + 4 + 4;
+                cp += 4;              // pixelType i32（此前漏跳：项宽 14≠18，多通道名错位）
+                cp += 1 + 3 + 4 + 4;  // pLinear u8 + 3 pad + xSampling + ySampling
                 channels.push_back(std::move(ch));
             }
         }
@@ -178,12 +178,13 @@ bool exrDecode(const uint8_t* data, size_t len, CodecImage& out, std::string& er
         err = "exr: missing channels";
         return false;
     }
-    if (dw[2] <= dw[0] || dw[3] <= dw[1]) {
+    if (dw[2] < dw[0] || dw[3] < dw[1]) {
         err = "exr: bad dataWindow";
         return false;
     }
-    const int w = dw[2] - dw[0];
-    const int h = dw[3] - dw[1];
+    // dataWindow 为闭区间（OpenEXR 规范）；单行/单列图（y1==y0）合法
+    const int w = dw[2] - dw[0] + 1;
+    const int h = dw[3] - dw[1] + 1;
     if (w > 16384 || h > 16384 || static_cast<int64_t>(w) * h > static_cast<int64_t>(kLimit)) {
         err = "exr: size out of limits";
         return false;

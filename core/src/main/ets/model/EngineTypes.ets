@@ -252,6 +252,30 @@ export interface ExportPngData {
   bytes: number;
 }
 
+/** M25 编解码能力条目（getCodecCapabilities；C++ capabilities() 单一事实来源镜像）。 */
+export interface CodecCap {
+  format: string;
+  read: boolean;
+  write: boolean;
+  depths: string;
+  exts: string[];
+  note: string;
+}
+
+/** M25 能力表（formats 顺序 = C++ 呈现顺序；openExts/saveExts 分号串）。 */
+export interface CodecCapabilities {
+  formats: CodecCap[];
+  openExts: string;
+  saveExts: string;
+}
+
+/** M25 平面格式导出结果（exportImage）。 */
+export interface ExportImageData {
+  width: number;
+  height: number;
+  bytes: number;
+}
+
 /** 扁平化结果（flattenToPixelMap 的 data，M7.5 JPEG 导出；RGBA_8888 PixelMap）。 */
 export interface FlattenData {
   width: number;

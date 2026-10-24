@@ -150,6 +150,10 @@ napi_value ExportPng(napi_env env, napi_callback_info info);
 // M8b：PSD 导出（8-bit RGB，层/蒙版/剪贴/混合键/luni 中文名）
 napi_value ExportPsd(napi_env env, napi_callback_info info);
 napi_value FlattenToPixelMap(napi_env env, napi_callback_info info);
+// M25 编解码批：平面格式导出（tiff/gif/bmp/tga/qoi；fd+format 异步，flatten→encode→写 fd）/
+// 能力表（格式×读×写×深度单一事实来源，getCodecCapabilities 同步）
+napi_value ExportImage(napi_env env, napi_callback_info info);
+napi_value GetCodecCapabilities(napi_env env, napi_callback_info info);
 // M8a 无损文档操作：画布重设（裁剪/画布大小）/ 裁切 / 显示全部 / 90°旋转 / 翻转 /
 // 移动图层（三段事务）/ 选区平移
 napi_value ResizeCanvas(napi_env env, napi_callback_info info);

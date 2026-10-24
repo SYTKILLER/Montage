@@ -46,9 +46,9 @@ struct Reader {
 // IFD 条目值读取：返回字节视图（内联或外置 offset）
 bool entryValue(const Reader& r, size_t ifdPos, size_t idx, size_t& dataOff, uint64_t& count,
                 uint16_t& type) {
-    const size_t ent = ifdPos + 2 + idx * (r.big ? 20 : 12);
-    type = r.u16(ent);
-    count = r.u64(ent + 2);
+    const size_t ent = ifdPos + (r.big ? 8 : 2) + idx * (r.big ? 20 : 12);
+    type = r.u16(ent + 2);        // 条目 = tag(2)+type(2)+count(4/8)+value(4/8)
+    count = r.u64(ent + 4);
     static const int kSize[] = {0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8, 4, 8, 8, 8, 0, 8, 8, 8};
     if (type == 0 || type >= 19) {
         return false;
@@ -83,9 +83,32 @@ std::vector<uint64_t> entryList(const Reader& r, size_t ifdPos, size_t idx) {
     return out;
 }
 
-uint64_t entryScalar(const Reader& r, size_t ifdPos, size_t idx, uint64_t def) {
-    const auto v = entryList(r, ifdPos, idx);
-    return v.empty() ? def : v[0];
+// tag →（首个条目）→ 值数组；不存在返回空。
+std::vector<uint64_t> entryListByTag(const Reader& r, size_t ifdPos, uint16_t tag) {
+    const uint64_t nEntries = r.big ? r.u64(ifdPos) : r.u16(ifdPos);
+    const size_t esize = r.big ? 20 : 12;
+    const size_t ebase = ifdPos + (r.big ? 8 : 2);  // BigTIFF nEntries 是 u64
+    for (uint64_t i = 0; i < nEntries; ++i) {
+        if (r.u16(ebase + static_cast<size_t>(i) * esize) == tag) {
+            return entryList(r, ifdPos, static_cast<size_t>(i));
+        }
+    }
+    return {};
+}
+
+// tag →（首个条目）→ 标量值；条目不存在返回 def。
+// 注意第三参是 tag 而非条目索引（调用方语义；与 entryList 的 idx 参数区分）
+uint64_t entryScalar(const Reader& r, size_t ifdPos, uint16_t tag, uint64_t def) {
+    const uint64_t nEntries = r.big ? r.u64(ifdPos) : r.u16(ifdPos);
+    const size_t esize = r.big ? 20 : 12;
+    const size_t ebase = ifdPos + (r.big ? 8 : 2);
+    for (uint64_t i = 0; i < nEntries; ++i) {
+        if (r.u16(ebase + static_cast<size_t>(i) * esize) == tag) {
+            const auto v = entryList(r, ifdPos, static_cast<size_t>(i));
+            return v.empty() ? def : v[0];
+        }
+    }
+    return def;
 }
 
 // ---------- 压缩解码 ----------
@@ -221,28 +244,33 @@ void undoPredictor(uint8_t* row, size_t rowBytes, uint32_t samples, int bps) {
 
 // 位流取样本（1/2/4 位 MSB 先行；8/16/32 按文件字节序）
 inline double unpackSample(const uint8_t* base, size_t bitIdx, uint64_t bps, bool le) {
+    // bitIdx 单位 = 位（bps<8 的打包样本与 8/16/32 的整字节统一）；整字节族先 >>3
     switch (bps) {
-        case 8:
-            return base[bitIdx];
+        case 8: {
+            const size_t byte = bitIdx >> 3;
+            return base[byte];
+        }
         case 16: {
-            const uint16_t v = le ? static_cast<uint16_t>(base[bitIdx]) |
-                                        static_cast<uint16_t>(base[bitIdx + 1] << 8)
-                                  : static_cast<uint16_t>((base[bitIdx] << 8) | base[bitIdx + 1]);
+            const size_t byte = bitIdx >> 3;
+            const uint16_t v = le ? static_cast<uint16_t>(base[byte]) |
+                                        static_cast<uint16_t>(base[byte + 1] << 8)
+                                  : static_cast<uint16_t>((base[byte] << 8) | base[byte + 1]);
             return v;
         }
         case 32: {
+            const size_t byte = bitIdx >> 3;
             float f;
             if (le) {
-                uint32_t bits = static_cast<uint32_t>(base[bitIdx]) |
-                                (static_cast<uint32_t>(base[bitIdx + 1]) << 8) |
-                                (static_cast<uint32_t>(base[bitIdx + 2]) << 16) |
-                                (static_cast<uint32_t>(base[bitIdx + 3]) << 24);
+                uint32_t bits = static_cast<uint32_t>(base[byte]) |
+                                (static_cast<uint32_t>(base[byte + 1]) << 8) |
+                                (static_cast<uint32_t>(base[byte + 2]) << 16) |
+                                (static_cast<uint32_t>(base[byte + 3]) << 24);
                 std::memcpy(&f, &bits, 4);
             } else {
-                uint32_t bits = (static_cast<uint32_t>(base[bitIdx]) << 24) |
-                                (static_cast<uint32_t>(base[bitIdx + 1]) << 16) |
-                                (static_cast<uint32_t>(base[bitIdx + 2]) << 8) |
-                                static_cast<uint32_t>(base[bitIdx + 3]);
+                uint32_t bits = (static_cast<uint32_t>(base[byte]) << 24) |
+                                (static_cast<uint32_t>(base[byte + 1]) << 16) |
+                                (static_cast<uint32_t>(base[byte + 2]) << 8) |
+                                static_cast<uint32_t>(base[byte + 3]);
                 std::memcpy(&f, &bits, 4);
             }
             return f;
@@ -310,23 +338,25 @@ bool tiffDecode(const uint8_t* data, size_t len, CodecImage& out, std::string& e
     }
 
     // IFD 定位：优先含图像数据的 IFD0；否则下沉 SubIFDs 取最大
-    size_t ifdPos = static_cast<size_t>(r.u64(4));
+    // BigTIFF 的 IFD 偏移在 @8（@4-5=offsetSize u16、@6-7=zero）；经典 TIFF 在 @4 u32
+    size_t ifdPos = static_cast<size_t>(r.big ? r.u64(8) : r.u32(4));
     std::vector<size_t> chain;
     for (int guard = 0; guard < 8 && ifdPos >= 8 && ifdPos + 2 <= len; ++guard) {
         chain.push_back(ifdPos);
         if (r.big) {
             const uint64_t nEntries = r.u64(ifdPos);
-            ifdPos = static_cast<size_t>(r.u64(ifdPos + 2 + nEntries * 20));
+            ifdPos = static_cast<size_t>(r.u64(ifdPos + 8 + nEntries * 20));
         } else {
-            const uint32_t nEntries = r.u32(ifdPos);
+            const uint16_t nEntries = r.u16(ifdPos);
             ifdPos = r.u32(ifdPos + 2 + nEntries * 12);
         }
     }
     auto findTag = [&](size_t pos, uint16_t tag) -> int {
-        const uint64_t nEntries = r.big ? r.u64(pos) : r.u32(pos);
+        const uint64_t nEntries = r.big ? r.u64(pos) : r.u16(pos);  // 经典=u16
         const size_t esize = r.big ? 20 : 12;
+        const size_t ebase = pos + (r.big ? 8 : 2);  // BigTIFF nEntries 是 u64
         for (uint64_t i = 0; i < nEntries; ++i) {
-            if (r.u16(pos + 2 + static_cast<size_t>(i) * esize) == tag) {
+            if (r.u16(ebase + static_cast<size_t>(i) * esize) == tag) {
                 return static_cast<int>(i);
             }
         }
@@ -374,7 +404,7 @@ bool tiffDecode(const uint8_t* data, size_t len, CodecImage& out, std::string& e
     const uint64_t predictor = entryScalar(r, imgIfd, 317, 1);
     const uint64_t rowsPerStrip = entryScalar(r, imgIfd, 278, 0xFFFFFFFFull);
     uint64_t bps = entryScalar(r, imgIfd, 258, 1);
-    const auto bpsList = entryList(r, imgIfd, 258);
+    const auto bpsList = entryListByTag(r, imgIfd, 258);
     if (!bpsList.empty()) {
         bps = bpsList[0];
         for (uint64_t b : bpsList) {
@@ -384,13 +414,13 @@ bool tiffDecode(const uint8_t* data, size_t len, CodecImage& out, std::string& e
             }
         }
     }
-    const auto sampleFormat = entryList(r, imgIfd, 339);
-    const auto extraSamples = entryList(r, imgIfd, 338);
+    const auto sampleFormat = entryListByTag(r, imgIfd, 339);
+    const auto extraSamples = entryListByTag(r, imgIfd, 338);
     const uint64_t tileW = entryScalar(r, imgIfd, 322, 0);
     const uint64_t tileH = entryScalar(r, imgIfd, 323, 0);
     const bool tiled = tileW != 0 && tileH != 0;
-    const auto offsets = entryList(r, imgIfd, tiled ? 324 : 273);
-    const auto byteCounts = entryList(r, imgIfd, tiled ? 325 : 279);
+    const auto offsets = entryListByTag(r, imgIfd, tiled ? 324 : 273);
+    const auto byteCounts = entryListByTag(r, imgIfd, tiled ? 325 : 279);
 
     if (width == 0 || height == 0 || width > 16384 || height > 16384 ||
         width * height > kLimit) {
@@ -433,8 +463,9 @@ bool tiffDecode(const uint8_t* data, size_t len, CodecImage& out, std::string& e
         return false;
     }
 
-    // 调色板（u16 × 3×2^bps；高位字节）
+    // 调色板（u16 × 3×2^bps；高位字节；palEntries = 2^bps 三段每段项数）
     std::vector<uint8_t> palette;
+    size_t palEntries = 0;
     if (photometric == 3) {
         const int palIdx = findTag(imgIfd, 320);
         if (palIdx < 0) {
@@ -451,6 +482,7 @@ bool tiffDecode(const uint8_t* data, size_t len, CodecImage& out, std::string& e
         }
         const size_t entries = 1u << bps;
         palette.resize(entries * 3);
+        palEntries = entries;
         for (size_t i = 0; i < entries * 3; ++i) {
             palette[i] = static_cast<uint8_t>(r.u16(poff + i * 2) >> 8);
         }
@@ -539,13 +571,12 @@ bool tiffDecode(const uint8_t* data, size_t len, CodecImage& out, std::string& e
                 if (hasAlpha && spp >= 4) {
                     v[3] = sampleAt(x, 3);
                 }
-            } else if (photometric == 3) {  // palette
-                const double idx = sampleAt(x, 0);
-                const size_t pe = static_cast<size_t>(idx) * 3;
-                if (pe + 2 < palette.size()) {
-                    v[0] = palette[pe];
-                    v[1] = palette[pe + 1];
-                    v[2] = palette[pe + 2];
+            } else if (photometric == 3) {  // palette（ColorMap = R|G|B 三段连续，各 2^bps 项）
+                const size_t idx = static_cast<size_t>(sampleAt(x, 0));
+                if (idx < palEntries) {
+                    v[0] = palette[idx];
+                    v[1] = palette[palEntries + idx];
+                    v[2] = palette[palEntries * 2 + idx];
                 }
             } else {  // gray
                 const double g = sampleAt(x, 0);
@@ -554,10 +585,12 @@ bool tiffDecode(const uint8_t* data, size_t len, CodecImage& out, std::string& e
                     v[3] = sampleAt(x, 1);
                 }
             }
-            drow[x * 4 + 0] = toChannel8(v[0], bps);
-            drow[x * 4 + 1] = toChannel8(v[1], bps);
-            drow[x * 4 + 2] = toChannel8(v[2], bps);
-            drow[x * 4 + 3] = toChannel8(v[3], bps);
+            // palette 值域 = 8bit（调色板已展宽），photometric 3 不再按 bps 缩放
+            const uint64_t outBps = (photometric == 3) ? 8u : bps;
+            drow[x * 4 + 0] = toChannel8(v[0], outBps);
+            drow[x * 4 + 1] = toChannel8(v[1], outBps);
+            drow[x * 4 + 2] = toChannel8(v[2], outBps);
+            drow[x * 4 + 3] = toChannel8(v[3], outBps);
         }
     };
 
@@ -641,11 +674,11 @@ bool tiffDecode(const uint8_t* data, size_t len, CodecImage& out, std::string& e
                                     v[3] = sampleAt(3);
                                 }
                             } else if (photometric == 3) {
-                                const size_t pe = static_cast<size_t>(sampleAt(0)) * 3;
-                                if (pe + 2 < palette.size()) {
-                                    v[0] = palette[pe];
-                                    v[1] = palette[pe + 1];
-                                    v[2] = palette[pe + 2];
+                                const size_t idx = static_cast<size_t>(sampleAt(0));
+                                if (idx < palEntries) {
+                                    v[0] = palette[idx];
+                                    v[1] = palette[palEntries + idx];
+                                    v[2] = palette[palEntries * 2 + idx];
                                 }
                             } else {
                                 const double g = sampleAt(0);
@@ -655,10 +688,11 @@ bool tiffDecode(const uint8_t* data, size_t len, CodecImage& out, std::string& e
                                 }
                             }
                             const uint32_t dx = static_cast<uint32_t>(tx * tileW + x);
-                            drow[dx * 4 + 0] = toChannel8(v[0], bps);
-                            drow[dx * 4 + 1] = toChannel8(v[1], bps);
-                            drow[dx * 4 + 2] = toChannel8(v[2], bps);
-                            drow[dx * 4 + 3] = toChannel8(v[3], bps);
+                            const uint64_t outBpsT = (photometric == 3) ? 8u : bps;
+                            drow[dx * 4 + 0] = toChannel8(v[0], outBpsT);
+                            drow[dx * 4 + 1] = toChannel8(v[1], outBpsT);
+                            drow[dx * 4 + 2] = toChannel8(v[2], outBpsT);
+                            drow[dx * 4 + 3] = toChannel8(v[3], outBpsT);
                         }
                     }
                 }
@@ -771,8 +805,8 @@ bool tiffEncode(const uint8_t* rgba, uint32_t w, uint32_t h, int bitDepth, bool 
     size_t stripTotal = 0;
     for (const auto& s : stripData) stripTotal += s.size();
     const size_t ifdPos = 8 + stripTotal;
-    // 条目数：基础 12 + alpha extraSamples
-    const int nEntries = doAlpha ? 14 : 13;
+    // 条目数：基础 12（含 296/339）+ alpha extraSamples（entry 调用数恒定，与 strips 无关）
+    const int nEntries = doAlpha ? 13 : 12;
     const size_t ifdBytes = 2 + static_cast<size_t>(nEntries) * 12 + 4;
     const size_t extPos = ifdPos + ifdBytes;
     // 外置值区：bps 数组(若 alpha 4×SHORT=8B>4) + stripOffsets(4×strips) + stripByteCounts
@@ -796,7 +830,7 @@ bool tiffEncode(const uint8_t* rgba, uint32_t w, uint32_t h, int bitDepth, bool 
     };
     w8(0, 'I'); w8(1, 'I'); w16(2, 42); w32(4, static_cast<uint32_t>(ifdPos));
 
-    // 像素数据
+    // 像素数据（单 strip 时 273/279 的 LONG count=1 内联 value 字段——写真值非外置地址）
     size_t po = 8;
     for (uint32_t s = 0; s < strips; ++s) {
         std::memcpy(out.data() + po, stripData[s].data(), stripData[s].size());
@@ -804,6 +838,8 @@ bool tiffEncode(const uint8_t* rgba, uint32_t w, uint32_t h, int bitDepth, bool 
         w32(bcOff + static_cast<size_t>(s) * 4, static_cast<uint32_t>(stripData[s].size()));
         po += stripData[s].size();
     }
+    const uint32_t strip0Off = 8;
+    const uint32_t strip0Cnt = static_cast<uint32_t>(stripData.empty() ? 0 : stripData[0].size());
 
     // IFD（tag 升序）
     w16(ifdPos, static_cast<uint16_t>(nEntries));
@@ -825,10 +861,17 @@ bool tiffEncode(const uint8_t* rgba, uint32_t w, uint32_t h, int bitDepth, bool 
     }
     entry(259, 3, 1, static_cast<uint32_t>(compTag));
     entry(262, 3, 1, 2);  // RGB
-    entry(273, 4, strips, static_cast<uint32_t>(soOff));
-    entry(277, 3, 1, static_cast<uint32_t>(spp));
-    entry(278, 4, 1, rps);
-    entry(279, 4, strips, static_cast<uint32_t>(bcOff));
+    if (strips == 1) {
+        entry(273, 4, 1, strip0Off);   // 单条：LONG 4B 内联真值
+        entry(277, 3, 1, static_cast<uint32_t>(spp));
+        entry(278, 4, 1, rps);
+        entry(279, 4, 1, strip0Cnt);
+    } else {
+        entry(273, 4, strips, static_cast<uint32_t>(soOff));
+        entry(277, 3, 1, static_cast<uint32_t>(spp));
+        entry(278, 4, 1, rps);
+        entry(279, 4, strips, static_cast<uint32_t>(bcOff));
+    }
     entry(284, 3, 1, 1);  // chunky
     entry(296, 3, 1, 2);  // inch
     if (doAlpha) {
@@ -920,9 +963,10 @@ bool tiffHasLayerData(const uint8_t* data, size_t len) {
     else if (std::memcmp(data, "MM", 2) == 0) r.le = false;
     else return false;
     r.big = r.u16(2) == 43;
-    size_t ifdPos = static_cast<size_t>(r.u64(4));
+    // BigTIFF 的 IFD 偏移在 @8（@4-5=offsetSize u16、@6-7=zero）；经典 TIFF 在 @4 u32
+    size_t ifdPos = static_cast<size_t>(r.big ? r.u64(8) : r.u32(4));
     for (int guard = 0; guard < 4 && ifdPos >= 8 && ifdPos + 2 <= len; ++guard) {
-        const uint64_t nEntries = r.big ? r.u64(ifdPos) : r.u32(ifdPos);
+        const uint64_t nEntries = r.big ? r.u64(ifdPos) : r.u16(ifdPos);  // 经典=u16
         const size_t esize = r.big ? 20 : 12;
         for (uint64_t i = 0; i < nEntries; ++i) {
             const size_t ent = ifdPos + 2 + static_cast<size_t>(i) * esize;
@@ -949,7 +993,7 @@ bool tiffHasLayerData(const uint8_t* data, size_t len) {
                 return false;
             }
         }
-        ifdPos = r.big ? static_cast<size_t>(r.u64(ifdPos + 2 + nEntries * esize))
+        ifdPos = r.big ? static_cast<size_t>(r.u64(ifdPos + 8 + nEntries * esize))
                        : r.u32(ifdPos + 2 + nEntries * esize);
     }
     return false;
@@ -965,10 +1009,11 @@ bool tiffDecodeLayers(const uint8_t* data, size_t len, uint32_t& w, uint32_t& h,
     r.n = len;
     r.le = std::memcmp(data, "II", 2) == 0;
     r.big = r.u16(2) == 43;
-    size_t ifdPos = static_cast<size_t>(r.u64(4));
+    // BigTIFF 的 IFD 偏移在 @8（@4-5=offsetSize u16、@6-7=zero）；经典 TIFF 在 @4 u32
+    size_t ifdPos = static_cast<size_t>(r.big ? r.u64(8) : r.u32(4));
     if (ifdPos < 8 || ifdPos + 2 > len) { err = "tiff: bad IFD"; return false; }
     auto scalar = [&](uint16_t tag, uint64_t def) -> uint64_t {
-        const uint64_t nEntries = r.big ? r.u64(ifdPos) : r.u32(ifdPos);
+        const uint64_t nEntries = r.big ? r.u64(ifdPos) : r.u16(ifdPos);  // 经典=u16
         const size_t esize = r.big ? 20 : 12;
         for (uint64_t i = 0; i < nEntries; ++i) {
             const size_t ent = ifdPos + 2 + static_cast<size_t>(i) * esize;
@@ -989,7 +1034,7 @@ bool tiffDecodeLayers(const uint8_t* data, size_t len, uint32_t& w, uint32_t& h,
     // 2) 取 ImageSourceData
     std::vector<uint8_t> isd;
     {
-        const uint64_t nEntries = r.big ? r.u64(ifdPos) : r.u32(ifdPos);
+        const uint64_t nEntries = r.big ? r.u64(ifdPos) : r.u16(ifdPos);  // 经典=u16
         const size_t esize = r.big ? 20 : 12;
         bool found = false;
         for (uint64_t i = 0; i < nEntries && !found; ++i) {
