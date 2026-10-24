@@ -502,6 +502,7 @@ void Engine::resetDocument() {
         lastSelection.reset();  // M10a：重新选择来源不跨文档
         transformPreview = TransformPreview{};
         rawDevelop = RawDevelopSession{};  // M15e：RAW 显影会话随文档清空
+        camPreview = CameraPreviewSession{};  // M23c：Camera Raw 预览会话随文档清空
         smart::clearSessionCaches();  // M21：智能对象源解码/placed 缓存随文档清空（独立互斥）
         historyVersion.fetch_add(1);  // 历史面板随清空刷新（M15b）
         ++docEpoch;  // 文档代次递增：在途异步发布（bake 等）凭旧代次作废，不复活已关档

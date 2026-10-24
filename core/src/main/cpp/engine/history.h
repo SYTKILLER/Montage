@@ -27,6 +27,10 @@ class History {
     // 整档替换（打开工程/PSD）时清空：撤销不许跨文档回退
     void clear();
 
+    // M23c：取回并弃置挂起的 pending 事务（Camera Raw 预览取消还原用）。
+    // 有 pending 时把 before 快照浅拷给 out 并清标志，返回 true。
+    bool takePending(Document& out);
+
     // M15b 历史面板：线性状态列表 + 当前指针。
     // 列表 = [初始态, undo_[0].label, ..., undo_[n-1].label, redo 倒序标签...]；
     // current = undo_.size()（0 = 初始态）。labels[0] 为空串，由 UI 渲染「打开/新建」。

@@ -44,8 +44,9 @@ enum FilterKind : int32_t {
     FOffset,
     FCustom,
     FLensCorrection,  // M20d：镜头校正（lens_ops correct；p0..p5 见下）
+    FCameraRaw,       // M23c：Camera Raw 9 级链（cameraJson 承载全部参数）
 };
-constexpr int32_t kFilterKindCount = 29;
+constexpr int32_t kFilterKindCount = 30;
 
 // 参数槽（语义随 kind；与 06 §4 M13 对话框 schema 对齐）：
 //   GaussianBlur   p0=σ(0.1..500)
@@ -91,6 +92,7 @@ struct FilterParams {
     float kernel[25] = {0.0f};
     float scale = 1.0f;
     float offset = 0.0f;
+    std::string cameraJson;  // M23c：FCameraRaw 专用（CameraRaw camelCase JSON）
 };
 
 // 核执行：src/dst 均 w×h RGBA8888 直 alpha（stride = w*4）。域外取样 = 透明。

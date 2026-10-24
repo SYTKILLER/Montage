@@ -20,6 +20,7 @@
 #include "engine/vector_flatten.h"
 #include "engine/vector_edit.h"
 #include "engine/vector_shapes.h"
+#include "engine/camera_raw.h"
 #include "engine/engine.h"
 #include "engine/heal_ops.h"
 #include "engine/filter_ops.h"
@@ -2787,7 +2788,7 @@ napi_value ApplyLiquify(napi_env env, napi_callback_info info) {
             delete ctx;
             return makeError(env, kErrNoDoc, "applyLiquify: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active) {
+        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
             delete ctx;
             return makeError(env, kErrBadParam, "applyLiquify: edit/preview session open");
         }
@@ -2992,7 +2993,7 @@ napi_value ApplyPuppet(napi_env env, napi_callback_info info) {
             delete ctx;
             return makeError(env, kErrNoDoc, "applyPuppet: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active) {
+        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
             delete ctx;
             return makeError(env, kErrBadParam, "applyPuppet: edit/preview session open");
         }
@@ -3150,7 +3151,7 @@ napi_value ApplyPerspective(napi_env env, napi_callback_info info) {
             delete ctx;
             return makeError(env, kErrNoDoc, "applyPerspective: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active) {
+        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
             delete ctx;
             return makeError(env, kErrBadParam, "applyPerspective: edit/preview session open");
         }
@@ -3413,7 +3414,7 @@ napi_value ApplyWideAngle(napi_env env, napi_callback_info info) {
             delete ctx;
             return makeError(env, kErrNoDoc, "applyWideAngle: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active) {
+        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
             delete ctx;
             return makeError(env, kErrBadParam, "applyWideAngle: edit/preview session open");
         }
@@ -3723,7 +3724,7 @@ napi_value ApplyVpClone(napi_env env, napi_callback_info info) {
             delete ctx;
             return makeError(env, kErrNoDoc, "applyVpClone: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active) {
+        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
             delete ctx;
             return makeError(env, kErrBadParam, "applyVpClone: edit/preview session open");
         }
@@ -5994,7 +5995,7 @@ napi_value ApplyFilter(napi_env env, napi_callback_info info) {
         if (e.doc.width == 0) {
             return makeError(env, kErrNoDoc, "applyFilter: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active) {
+        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
             return makeError(env, kErrBadParam, "applyFilter: edit/preview session open");
         }
         e.history.beginEdit(e.doc, "filter", static_cast<uint64_t>(e.docRevision));
@@ -6029,7 +6030,7 @@ napi_value BeginFilterPreview(napi_env env, napi_callback_info info) {
         if (layer == nullptr || layer->pixels == nullptr) {
             return makeError(env, kErrBadParam, "beginFilterPreview: empty layer");
         }
-        if (e.textEditOpen || e.filterPreview.active) {
+        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
             return makeError(env, kErrBadParam, "beginFilterPreview: session open");
         }
         uint32_t gx = 0, gy = 0, w = 0, h = 0;
@@ -6178,12 +6179,23 @@ napi_value EndFilterPreview(napi_env env, napi_callback_info info) {
 // ---------- M15e RAW 显影参数面板 ----------
 
 // RAW 重显影异步任务上下文（锁内快照 RAW 字节 → libuv 线程锁外显影 → JS 线程 COW 提交）
-struct DevelopRawCtx {
+// M23c：Camera Raw 异步任务上下文（RAW 重显影与层滤镜两路共用）。
+// RAW 路（fromRaw）：会话 RAW 字节 → developDngToGrid；层滤镜路：打开时像素快照的
+// 全帧 strip → cameraRawDevelop。mode：0=立即提交（单步事务）/ 1=预览（首预览挂
+// pending，后续无事务换像素）/ 2=终提交（endEdit 一步撤销）/ 3=取消（同步，不走异步）。
+struct CamOpCtx {
     napi_async_work work = nullptr;
     napi_deferred deferred = nullptr;
-    std::vector<uint8_t> bytes;
+    bool fromRaw = false;
+    std::vector<uint8_t> rawBytes;   // fromRaw
+    std::vector<uint8_t> srcStrip;   // 层滤镜：会话打开时全帧 strip（直 alpha）
+    uint32_t stripW = 0;
+    uint32_t stripH = 0;
     LayerId layerId = 0;
-    io::DevelopParams params;
+    io::DevelopParams params;        // fromRaw 参数
+    std::string cameraJson;          // 层滤镜参数
+    uint32_t seq = 0;                // 预览代次（发布段失配作废）
+    int mode = 0;
     bool ok = false;
     uint32_t w = 0;
     uint32_t h = 0;
@@ -6191,19 +6203,119 @@ struct DevelopRawCtx {
     std::shared_ptr<const TileGrid> grid;
 };
 
-// developRaw(temp, tint, ev, gamma, cameraJson?)：从会话 RAW 缓存全分辨率重显影（恒从
-// RAW 出发，会话内非破坏），COW 换层像素 + 一步 history 事务。v1 无实时预览（登记后续）。
-// M23b：第 5 参可选 CameraRaw JSON（camelCase；非空时 temp/tint/ev/gamma 忽略、
-// 由 Camera Raw 9 级链接管）。
+// 层滤镜路核：全帧 strip（u8 直 alpha）→ cameraRawDevelop → 新网格。
+// 身份参数返回空网格指针 = 调用方保留原像素。
+static std::shared_ptr<const TileGrid> cameraRawStripToGrid(const std::vector<uint8_t>& strip,
+                                                            uint32_t w, uint32_t h,
+                                                            const std::string& cameraJson) {
+    CameraRaw cam;
+    parseCameraJson(cameraJson, cam);
+    if (cam.isIdentity()) {
+        return std::shared_ptr<const TileGrid>();
+    }
+    std::vector<float> fpx(static_cast<size_t>(w) * h * 4u);
+    for (size_t i = 0; i < fpx.size(); ++i) {
+        fpx[i] = strip[i] / 255.0f;
+    }
+    cameraRawDevelop(fpx.data(), w, h, cam, false);
+    std::vector<uint8_t> out(fpx.size());
+    for (size_t i = 0; i < fpx.size(); ++i) {
+        out[i] = static_cast<uint8_t>(std::clamp(fpx[i], 0.0f, 1.0f) * 255.0f + 0.5f);
+    }
+    return filterStripToGrid(out, w, h, nextGridRevision());
+}
+
+// CamOpCtx 完成回调共用：发布段按 mode 分派（预览代次/会话失配即静默丢弃 resolve ok）。
+static void camOpComplete(napi_env env, napi_status status, void* data) {
+    auto* c = static_cast<CamOpCtx*>(data);
+    auto& e = Engine::get();
+    bool applied = false;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = nullptr;
+        for (Layer& cand : e.doc.layers) {
+            if (cand.id == c->layerId) { l = &cand; break; }
+        }
+        if (l != nullptr && status == napi_ok && c->ok) {
+            if (c->mode == 1) {
+                // 预览：会话仍开且代次最新才发布；无事务（pending 已在首预览挂上）。
+                if (e.camPreview.open && e.camPreview.layerId == c->layerId &&
+                    e.camPreview.seq == c->seq) {
+                    if (c->grid) l->pixels = c->grid;
+                    restyleAllLocked(e);
+                    e.bumpRevisionLocked();
+                    applied = true;
+                } else {
+                    applied = true;  // 陈旧任务：静默丢弃（不算失败）
+                }
+            } else if (c->mode == 0) {
+                e.history.beginEdit(e.doc, c->fromRaw ? "RAW 显影" : "Camera Raw 滤镜",
+                                    static_cast<uint64_t>(e.docRevision));
+                if (c->grid) l->pixels = c->grid;
+                restyleAllLocked(e);
+                e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+                e.bumpRevisionLocked();
+                if (c->fromRaw) e.rawDevelop.last = c->params;
+                applied = true;
+            } else if (c->mode == 2) {
+                // 终提交：会话仍开且代次最新才收口；否则退回单步事务路径。
+                if (e.camPreview.open && e.camPreview.layerId == c->layerId &&
+                    e.camPreview.seq == c->seq) {
+                    if (c->grid) l->pixels = c->grid;
+                    restyleAllLocked(e);
+                    e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+                    e.bumpRevisionLocked();
+                    if (c->fromRaw) e.rawDevelop.last = c->params;
+                    e.camPreview.open = false;
+                } else {
+                    e.history.beginEdit(e.doc, c->fromRaw ? "RAW 显影" : "Camera Raw 滤镜",
+                                        static_cast<uint64_t>(e.docRevision));
+                    if (c->grid) l->pixels = c->grid;
+                    restyleAllLocked(e);
+                    e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+                    e.bumpRevisionLocked();
+                    if (c->fromRaw) e.rawDevelop.last = c->params;
+                }
+                e.historyVersion.fetch_add(1);
+                applied = true;
+            }
+        } else if (l == nullptr) {
+            c->err = "layer no longer exists";
+        }
+    }
+    if (applied) {
+        e.requestRender();
+        napi_value dataObj = nullptr;
+        napi_create_object(env, &dataObj);
+        napi_set_named_property(env, dataObj, "width", makeUint32(env, c->w));
+        napi_set_named_property(env, dataObj, "height", makeUint32(env, c->h));
+        napi_set_named_property(env, dataObj, "layerId",
+                                makeDouble(env, static_cast<double>(c->layerId)));
+        napi_resolve_deferred(env, c->deferred, makeOk(env, dataObj));
+    } else {
+        napi_resolve_deferred(env, c->deferred,
+                              makeError(env, kErrInternal,
+                                        c->err.empty() ? "develop failed" : c->err));
+    }
+    napi_delete_async_work(env, c->work);
+    delete c;
+}
+
+// developRaw(temp, tint, ev, gamma, cameraJson?, mode?)：
+//   mode 0 = 立即提交（M15e 原语义，单步事务）；
+//   mode 1 = 实时预览（首预览挂 pending；从会话 RAW 字节恒重显影）；
+//   mode 2 = 终提交（endEdit 一步撤销 + 参数记忆）；
+//   mode 3 = 取消（同步还原会话打开时像素并弃 pending）。
 napi_value DevelopRaw(napi_env env, napi_callback_info info) {
-    size_t argc = 5;
-    napi_value argv[5];
-    for (size_t i = 0; i < 5; ++i) {
+    size_t argc = 6;
+    napi_value argv[6];
+    for (size_t i = 0; i < 6; ++i) {
         argv[i] = nullptr;
     }
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 4) {
-        return makeError(env, kErrBadParam, "developRaw(temp,tint,ev,gamma,cameraJson?) requires 4 args");
+        return makeError(env, kErrBadParam,
+                         "developRaw(temp,tint,ev,gamma,cameraJson?,mode?) requires 4 args");
     }
     double temp = 0;
     double tint = 0;
@@ -6218,13 +6330,43 @@ napi_value DevelopRaw(napi_env env, napi_callback_info info) {
     std::string cameraJson;
     if (argc >= 5 && argv[4] != nullptr) {
         size_t len = 0;
-        if (napi_get_value_string_utf8(env, argv[4], nullptr, 0, &len) == napi_ok && len > 0 && len < (1 << 20)) {
+        if (napi_get_value_string_utf8(env, argv[4], nullptr, 0, &len) == napi_ok &&
+            len > 0 && len < (1 << 20)) {
             cameraJson.resize(len);
             napi_get_value_string_utf8(env, argv[4], cameraJson.data(), len + 1, &len);
         }
     }
+    double modeD = 0;
+    if (argc >= 6 && argv[5] != nullptr) {
+        napi_get_value_double(env, argv[5], &modeD);
+    }
+    const int mode = static_cast<int>(modeD);
     auto& e = Engine::get();
-    auto* ctx = new DevelopRawCtx();
+    if (mode == 3) {
+        // 取消：同步还原（不排队异步）。
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (!e.camPreview.open || !e.camPreview.fromRaw) {
+            return makeError(env, kErrBadParam, "developRaw: no preview session");
+        }
+        const LayerId id = e.camPreview.layerId;
+        auto snap = e.camPreview.snap;
+        e.camPreview = Engine::CameraPreviewSession{};
+        Document before;
+        e.history.takePending(before);
+        for (Layer& l : e.doc.layers) {
+            if (l.id == id) {
+                l.pixels = snap;
+                restyleAllLocked(e);
+                e.bumpRevisionLocked();
+                e.requestRender();
+                break;
+            }
+        }
+        return makeOk(env, nullptr);
+    }
+    auto* ctx = new CamOpCtx();
+    ctx->fromRaw = true;
+    ctx->mode = mode;
     ctx->params.temp = static_cast<float>(std::min(100.0, std::max(-100.0, temp)));
     ctx->params.tint = static_cast<float>(std::min(100.0, std::max(-100.0, tint)));
     ctx->params.ev = static_cast<float>(std::min(2.0, std::max(-2.0, ev)));
@@ -6240,8 +6382,35 @@ napi_value DevelopRaw(napi_env env, napi_callback_info info) {
             delete ctx;
             return makeError(env, kErrBadParam, "developRaw: session open");
         }
-        ctx->bytes = e.rawDevelop.bytes;
+        if (e.camPreview.open && !e.camPreview.fromRaw) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "developRaw: camera raw filter session open");
+        }
         ctx->layerId = e.rawDevelop.layerId;
+        if (mode == 1 || mode == 2) {
+            if (!e.camPreview.open) {
+                Layer* l = nullptr;
+                for (Layer& cand : e.doc.layers) {
+                    if (cand.id == ctx->layerId) { l = &cand; break; }
+                }
+                if (l == nullptr) {
+                    delete ctx;
+                    return makeError(env, kErrBadParam, "developRaw: RAW layer no longer exists");
+                }
+                e.camPreview.open = true;
+                e.camPreview.fromRaw = true;
+                e.camPreview.layerId = ctx->layerId;
+                e.camPreview.snap = l->pixels;
+                e.history.beginEdit(e.doc, "Camera Raw 显影",
+                                    static_cast<uint64_t>(e.docRevision));
+            } else if (e.camPreview.layerId != ctx->layerId) {
+                delete ctx;
+                return makeError(env, kErrBadParam, "developRaw: preview session mismatch");
+            }
+            ++e.camPreview.seq;
+            ctx->seq = e.camPreview.seq;
+        }
+        ctx->rawBytes = e.rawDevelop.bytes;
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -6250,57 +6419,127 @@ napi_value DevelopRaw(napi_env env, napi_callback_info info) {
     napi_status st = napi_create_async_work(
         env, nullptr, workName,
         [](napi_env /*env*/, void* data) {
-            auto* c = static_cast<DevelopRawCtx*>(data);
-            c->ok = io::developDngToGrid(c->bytes, c->params, c->grid, c->w, c->h, c->err);
+            auto* c = static_cast<CamOpCtx*>(data);
+            c->ok = io::developDngToGrid(c->rawBytes, c->params, c->grid, c->w, c->h, c->err);
         },
-        [](napi_env env, napi_status status, void* data) {
-            auto* c = static_cast<DevelopRawCtx*>(data);
-            auto& e = Engine::get();
-            if (status == napi_ok && c->ok) {
-                bool applied = false;
-                {
-                    std::lock_guard<std::mutex> lk(e.docMutex);
-                    for (Layer& l : e.doc.layers) {
-                        if (l.id != c->layerId) {
-                            continue;
-                        }
-                        // 同一 RAW 同尺寸：transform 不动，仅 COW 换像素 + 一步事务
-                        e.history.beginEdit(e.doc, "RAW 显影",
-                                            static_cast<uint64_t>(e.docRevision));
-                        l.pixels = c->grid;
-                        restyleAllLocked(e);
-                        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
-                        e.bumpRevisionLocked();
-                        e.rawDevelop.last = c->params;
-                        applied = true;
-                        break;
-                    }
-                    if (!applied) {
-                        c->err = "developRaw: RAW layer no longer exists";
-                    }
-                }
-                if (applied) {
-                    e.requestRender();
-                    napi_value dataObj = nullptr;
-                    napi_create_object(env, &dataObj);
-                    napi_set_named_property(env, dataObj, "width", makeUint32(env, c->w));
-                    napi_set_named_property(env, dataObj, "height", makeUint32(env, c->h));
-                    napi_set_named_property(env, dataObj, "layerId",
-                                            makeDouble(env, static_cast<double>(c->layerId)));
-                    napi_resolve_deferred(env, c->deferred, makeOk(env, dataObj));
-                } else {
-                    napi_resolve_deferred(env, c->deferred,
-                                          makeError(env, kErrInternal, c->err));
-                }
-            } else {
-                napi_resolve_deferred(env, c->deferred,
-                                      makeError(env, kErrInternal,
-                                                c->err.empty() ? "developRaw failed" : c->err));
+        camOpComplete, ctx, &ctx->work);
+    if (st != napi_ok) {
+        delete ctx;
+        return makeError(env, kErrInternal, "create async work failed");
+    }
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+// cameraRawFilter(layerId, cameraJson, mode?)：Camera Raw 9 级链作层滤镜（M23c
+// FilterDef 评估落地；mode 语义同 developRaw：0 立即提交 / 1 预览 / 2 终提交 / 3 取消）。
+// 域 = 层像素网格全 extent（对齐 RAW 显影全帧语义）；恒从会话打开时的像素快照出发。
+napi_value CameraRawFilter(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double id = 0;
+    if (argc < 2 || napi_get_value_double(env, argv[0], &id) != napi_ok) {
+        return makeError(env, kErrBadParam,
+                         "cameraRawFilter(layerId,cameraJson,mode?) requires 2 args");
+    }
+    std::string cameraJson;
+    {
+        size_t len = 0;
+        if (napi_get_value_string_utf8(env, argv[1], nullptr, 0, &len) != napi_ok ||
+            len == 0 || len >= (1 << 20)) {
+            return makeError(env, kErrBadParam, "cameraRawFilter: invalid cameraJson");
+        }
+        cameraJson.resize(len);
+        napi_get_value_string_utf8(env, argv[1], cameraJson.data(), len + 1, &len);
+    }
+    double modeD = 0;
+    if (argc >= 3 && argv[2] != nullptr) {
+        napi_get_value_double(env, argv[2], &modeD);
+    }
+    const int mode = static_cast<int>(modeD);
+    auto& e = Engine::get();
+    if (mode == 3) {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (!e.camPreview.open || e.camPreview.fromRaw) {
+            return makeError(env, kErrBadParam, "cameraRawFilter: no preview session");
+        }
+        const LayerId lid = e.camPreview.layerId;
+        auto snap = e.camPreview.snap;
+        e.camPreview = Engine::CameraPreviewSession{};
+        Document before;
+        e.history.takePending(before);
+        for (Layer& l : e.doc.layers) {
+            if (l.id == lid) {
+                l.pixels = snap;
+                restyleAllLocked(e);
+                e.bumpRevisionLocked();
+                e.requestRender();
+                break;
             }
-            napi_delete_async_work(env, c->work);
-            delete c;
+        }
+        return makeOk(env, nullptr);
+    }
+    auto* ctx = new CamOpCtx();
+    ctx->fromRaw = false;
+    ctx->mode = mode;
+    ctx->cameraJson = std::move(cameraJson);
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = nullptr;
+        for (Layer& cand : e.doc.layers) {
+            if (cand.id == static_cast<LayerId>(id)) { l = &cand; break; }
+        }
+        if (l == nullptr || l->pixels == nullptr) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "cameraRawFilter: layer has no pixels");
+        }
+        if (e.textEditOpen || e.filterPreview.active) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "cameraRawFilter: session open");
+        }
+        if (e.camPreview.open && e.camPreview.fromRaw) {
+            delete ctx;
+            return makeError(env, kErrBadParam, "cameraRawFilter: RAW preview session open");
+        }
+        ctx->layerId = l->id;
+        const TileGrid* srcGrid = nullptr;
+        if (mode == 1 || mode == 2) {
+            if (!e.camPreview.open) {
+                e.camPreview.open = true;
+                e.camPreview.fromRaw = false;
+                e.camPreview.layerId = l->id;
+                e.camPreview.snap = l->pixels;
+                e.history.beginEdit(e.doc, "Camera Raw 滤镜",
+                                    static_cast<uint64_t>(e.docRevision));
+            } else if (e.camPreview.layerId != l->id) {
+                delete ctx;
+                return makeError(env, kErrBadParam, "cameraRawFilter: preview session mismatch");
+            }
+            ++e.camPreview.seq;
+            ctx->seq = e.camPreview.seq;
+            srcGrid = e.camPreview.snap.get();
+        } else {
+            srcGrid = l->pixels.get();
+        }
+        ctx->stripW = srcGrid->cols * kTileSize;
+        ctx->stripH = srcGrid->rows * kTileSize;
+        filterGridToStrip(*srcGrid, 0, 0, ctx->stripW, ctx->stripH, ctx->srcStrip);
+        ctx->w = ctx->stripW;
+        ctx->h = ctx->stripH;
+    }
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value workName = nullptr;
+    napi_create_string_utf8(env, "montageCameraRawFilter", NAPI_AUTO_LENGTH, &workName);
+    napi_status st = napi_create_async_work(
+        env, nullptr, workName,
+        [](napi_env /*env*/, void* data) {
+            auto* c = static_cast<CamOpCtx*>(data);
+            c->grid = cameraRawStripToGrid(c->srcStrip, c->stripW, c->stripH, c->cameraJson);
+            c->ok = true;
         },
-        ctx, &ctx->work);
+        camOpComplete, ctx, &ctx->work);
     if (st != napi_ok) {
         delete ctx;
         return makeError(env, kErrInternal, "create async work failed");
@@ -6319,7 +6558,7 @@ napi_value AddGroup(napi_env env, napi_callback_info info) {
         if (e.doc.width == 0) {
             return makeError(env, kErrNoDoc, "addGroup: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active) {
+        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
             return makeError(env, kErrBadParam, "addGroup: session open");
         }
         e.history.beginEdit(e.doc, "new group", static_cast<uint64_t>(e.docRevision));
@@ -6494,7 +6733,7 @@ napi_value runLayerMergeCommand(napi_env env, const char* what,
         if (e.doc.width == 0 || e.doc.height == 0) {
             return makeError(env, kErrNoDoc, std::string(what) + ": no document");
         }
-        if (e.textEditOpen || e.filterPreview.active) {
+        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
             return makeError(env, kErrBadParam, std::string(what) + ": session open");
         }
         e.history.beginEdit(e.doc, what, static_cast<uint64_t>(e.docRevision));
@@ -6525,7 +6764,7 @@ napi_value FlattenImage(napi_env env, napi_callback_info /*info*/) {
         if (e.doc.width == 0 || e.doc.height == 0) {
             return makeError(env, kErrNoDoc, "flattenImage: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active) {
+        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
             return makeError(env, kErrBadParam, "flattenImage: session open");
         }
         e.history.beginEdit(e.doc, "flatten image", static_cast<uint64_t>(e.docRevision));
@@ -6549,7 +6788,7 @@ napi_value StampVisible(napi_env env, napi_callback_info /*info*/) {
         if (e.doc.width == 0 || e.doc.height == 0) {
             return makeError(env, kErrNoDoc, "stampVisible: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active) {
+        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
             return makeError(env, kErrBadParam, "stampVisible: session open");
         }
         e.history.beginEdit(e.doc, "stamp visible", static_cast<uint64_t>(e.docRevision));
@@ -6587,7 +6826,7 @@ napi_value DuplicateLayer(napi_env env, napi_callback_info info) {
         if (e.doc.width == 0 || e.doc.height == 0) {
             return makeError(env, kErrNoDoc, "duplicateLayer: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active) {
+        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
             return makeError(env, kErrBadParam, "duplicateLayer: session open");
         }
         LayerId src = static_cast<LayerId>(id);
@@ -6718,7 +6957,7 @@ napi_value runStyleCommand(napi_env env, const char* what, LayerId id,
         if (e.doc.width == 0 || e.doc.height == 0) {
             return makeError(env, kErrNoDoc, std::string(what) + ": no document");
         }
-        if (e.textEditOpen || e.filterPreview.active) {
+        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
             return makeError(env, kErrBadParam, std::string(what) + ": session open");
         }
         Layer* l = id > 0 ? findLayerLocked(e.doc, id) : nullptr;
@@ -7265,7 +7504,7 @@ napi_value AddFillLayer(napi_env env, napi_callback_info info) {
         if (e.doc.width == 0 || e.doc.height == 0) {
             return makeError(env, kErrNoDoc, "addFillLayer: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active) {
+        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
             return makeError(env, kErrBadParam, "addFillLayer: session open");
         }
         e.history.beginEdit(e.doc, "new fill layer", static_cast<uint64_t>(e.docRevision));

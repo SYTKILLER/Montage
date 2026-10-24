@@ -105,6 +105,10 @@ struct CameraRaw {
     bool isIdentity() const;
 };
 
+// CameraRaw JSON（camelCase）→ CameraRaw（M23b 起 dng_decode 与 M23c 滤镜路径共用；
+// 未识别字段忽略；畸形点曲线容错回退线性）。
+bool parseCameraJson(const std::string& json, CameraRaw& out);
+
 // 点曲线校验（非受信输入）：空（线性）或 2..=16 个 0..=255 有限点、输入至少逐级递增。
 // 失败返回错误文案。
 std::string validateCurve(const std::vector<std::array<float, 2>>& points);  // 空 = 通过

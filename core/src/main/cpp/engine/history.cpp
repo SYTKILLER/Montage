@@ -137,6 +137,16 @@ void History::clear() {
     pendingFlag_ = false;
 }
 
+bool History::takePending(Document& out) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (!pendingFlag_) {
+        return false;
+    }
+    pendingFlag_ = false;
+    out = pendingSnap_.doc;
+    return true;
+}
+
 bool History::canRedo() const {
     std::lock_guard<std::mutex> lk(mtx_);
     return !redo_.empty();

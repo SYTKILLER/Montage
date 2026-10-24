@@ -1,5 +1,6 @@
 #include "engine/filters.h"
 
+#include "engine/camera_raw.h"
 #include "engine/lens_ops.h"
 
 // M13 滤镜核实现。算法对拍 photocraft algo crate（MIT，07 §3.4 注入，公式语义逐条照抄）：
@@ -919,6 +920,32 @@ bool applyFilter(const uint8_t* src, uint8_t* dst, uint32_t w, uint32_t h,
                         std::clamp(out[i * 4u + c] * inv, 0.0f, 1.0f) * 255.0f + 0.5f);
                 }
                 dst[i * 4u + 3] = static_cast<uint8_t>(a * 255.0f + 0.5f);
+            }
+            break;
+        }
+        case FCameraRaw: {
+            // M23c：Camera Raw 9 级链（cameraJson → CameraRaw；域 = 全帧直 alpha）。
+            CameraRaw cam;
+            parseCameraJson(p.cameraJson, cam);
+            if (cam.isIdentity()) {
+                if (dst != src) {
+                    std::memcpy(dst, src, n * 4u);
+                }
+                break;
+            }
+            std::vector<float> fpx(n * 4u);
+            for (size_t i = 0; i < n; ++i) {
+                fpx[i * 4u] = src[i * 4u] / 255.0f;
+                fpx[i * 4u + 1u] = src[i * 4u + 1u] / 255.0f;
+                fpx[i * 4u + 2u] = src[i * 4u + 2u] / 255.0f;
+                fpx[i * 4u + 3u] = src[i * 4u + 3u] / 255.0f;
+            }
+            cameraRawDevelop(fpx.data(), w, h, cam, false);
+            for (size_t i = 0; i < n; ++i) {
+                for (int c = 0; c < 4; ++c) {
+                    dst[i * 4u + c] = static_cast<uint8_t>(
+                        std::clamp(fpx[i * 4u + c], 0.0f, 1.0f) * 255.0f + 0.5f);
+                }
             }
             break;
         }

@@ -2036,12 +2036,30 @@ export class CompositorEngine {
     return r.ok;
   }
 
-  /** M15e：RAW 重显影（色温/色调/曝光/γ，从会话 RAW 缓存出发；一步 history 事务）。 */
-  async developRaw(temp: number, tint: number, ev: number, gamma: number, cameraJson?: string): Promise<RawDevelopData> {
-    const value: Object = await (native.developRaw(temp, tint, ev, gamma, cameraJson ?? '') as Promise<Object>);
+  /** M15e/M23c：RAW 重显影。mode：0=立即提交（默认）/ 1=实时预览 / 2=终提交 / 3=取消。 */
+  async developRaw(temp: number, tint: number, ev: number, gamma: number, cameraJson?: string,
+    mode?: number): Promise<RawDevelopData> {
+    const value: Object = await (native.developRaw(temp, tint, ev, gamma, cameraJson ?? '',
+      mode ?? 0) as Promise<Object>);
     const r = narrowResult(value);
     if (!r.ok || r.data === null) {
       throw new Error(r.error !== null ? r.error.message : 'developRaw failed');
+    }
+    return {
+      ok: boolOf(r.data, 'ok'),
+      width: num(r.data, 'width'),
+      height: num(r.data, 'height'),
+      layerId: num(r.data, 'layerId'),
+    };
+  }
+
+  /** M23c：Camera Raw 9 级链作层滤镜（mode 语义同 developRaw）。 */
+  async cameraRawFilter(layerId: number, cameraJson: string, mode?: number): Promise<RawDevelopData> {
+    const value: Object = await (native.cameraRawFilter(layerId, cameraJson,
+      mode ?? 0) as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok || r.data === null) {
+      throw new Error(r.error !== null ? r.error.message : 'cameraRawFilter failed');
     }
     return {
       ok: boolOf(r.data, 'ok'),

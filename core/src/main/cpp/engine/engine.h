@@ -131,6 +131,21 @@ class Engine {
     };
     RawDevelopSession rawDevelop;
 
+    // M23c：Camera Raw 实时预览会话（显影面板/滤镜对话框打开期间）。首预览
+    // history.beginEdit 挂 pending，后续预览无事务换像素（fireRevision 通知 UI），
+    // 确定 endEdit 一步撤销 / 取消 takePending 还原。fromRaw=true 走 developRaw
+    // （RAW 字节重显影，target=rawDevelop.layerId）；false 走 cameraRawFilter
+    // （层滤镜：恒从打开时的像素快照出发）。seq = 预览代次，发布段失配即作废
+    // （防旧任务覆盖新参数）；snap = 会话打开时层像素（取消还原 + 层滤镜基底）。
+    struct CameraPreviewSession {
+        bool open = false;
+        bool fromRaw = false;
+        LayerId layerId = 0;
+        uint32_t seq = 0;
+        std::shared_ptr<const TileGrid> snap;
+    };
+    CameraPreviewSession camPreview;
+
     // M10c 内部剪贴板（引擎内存；不随快照/持久化走，关闭文档保留——PS 同语义）
     ClipBuffer clipboard;
     // M17a 样式剪贴板（copyLayerStyle/pasteLayerStyle；跨文档保留，同 ClipBuffer 语义）
