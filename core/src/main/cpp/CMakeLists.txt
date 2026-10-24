@@ -50,6 +50,23 @@ add_library(compositor SHARED
         io/psd_export.cpp
         io/png_decode.cpp
         io/dng_decode.cpp
+        io/raw/raw_tiff.cpp
+        io/raw/raw_color.cpp
+        io/raw/raw_opcodes.cpp
+        io/raw/raw_ljpeg.cpp
+        io/raw/raw_demosaic.cpp
+        io/raw/raw_plane.cpp
+        io/raw/raw_dng.cpp
+        io/raw/raw_cr2.cpp
+        io/raw/raw_tiffep.cpp
+        io/raw/raw_nefc.cpp
+        io/raw/raw_sony.cpp
+        io/raw/raw_rw2.cpp
+        io/raw/raw_orf.cpp
+        io/raw/raw_raf.cpp
+        io/raw/raw_cameras.cpp
+        io/raw/raw_develop.cpp
+        io/raw/raw_decode.cpp
         io/project_open.cpp
         io/project_save.cpp
         io/psd/psd_reader.cpp

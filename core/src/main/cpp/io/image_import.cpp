@@ -275,8 +275,9 @@ ImportCompletion* runImport(int fd, const std::string& fileName) {
         lseek(fd, 0, SEEK_SET);
     }
 
-    // M15d：DNG RAW 显影链（内容探测在系统解码器之前——ImageSource 不识别 RAW）
-    if (!fileBytes.empty() && looksLikeDng(fileBytes)) {
+    // M15d/M23a：相机 RAW 显影链（内容探测在系统解码器与平面 codec 之前——
+    // ImageSource 不识别 RAW；CR2 等是 TIFF 结构，必须先于 M25 的 TIFF codec 分发）。
+    if (!fileBytes.empty() && looksLikeCameraRaw(fileBytes)) {
         {
             const std::vector<uint8_t>& bytes = fileBytes;
             {
@@ -316,11 +317,11 @@ ImportCompletion* runImport(int fd, const std::string& fileName) {
                     }
                     engine.requestRender();
                     OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Dng",
-                                 "imported developed dng %ux%u", w, h);
+                                 "imported developed raw %ux%u", w, h);
                     return makePayload(true, w, h, engine.doc.activeId, "");
                 }
                 OH_LOG_Print(LOG_APP, LOG_WARN, 0x4D30, "Montage.Dng",
-                             "dng develop failed: %{public}s", derr.c_str());
+                             "raw develop failed: %{public}s", derr.c_str());
                 return makePayload(false, 0, 0, 0, derr);
             }
         }

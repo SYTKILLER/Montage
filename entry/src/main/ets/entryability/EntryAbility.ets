@@ -11,7 +11,28 @@ export default class EntryAbility extends UIAbility {
     } catch (err) {
       hilog.error(DOMAIN, 'testTag', 'Failed to set colorMode. Cause: %{public}s', JSON.stringify(err));
     }
+    // M23a：调试直通打开（模拟器嵌套菜单注入被吞的替代 E2E 通道）：
+    // aa start --ps debugOpenB64 <文件字节 base64> → Index aboutToAppear 消费
+    try {
+      const dbg = want.parameters?.debugOpenB64;
+      if (typeof dbg === 'string' && dbg.length > 0) {
+        AppStorage.setOrCreate('debugOpenB64', dbg);
+      }
+    } catch (err) {
+      hilog.error(DOMAIN, 'testTag', 'debugOpenB64 param: %{public}s', JSON.stringify(err));
+    }
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
+  }
+
+  onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    try {
+      const dbg = want.parameters?.debugOpenB64;
+      if (typeof dbg === 'string' && dbg.length > 0) {
+        AppStorage.setOrCreate('debugOpenB64', dbg);
+      }
+    } catch (err) {
+      hilog.error(DOMAIN, 'testTag', 'debugOpenB64 param(new): %{public}s', JSON.stringify(err));
+    }
   }
 
   onDestroy(): void {

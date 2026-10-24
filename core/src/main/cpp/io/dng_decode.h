@@ -1,13 +1,13 @@
 #ifndef MONTAGE_IO_DNG_DECODE_H
 #define MONTAGE_IO_DNG_DECODE_H
 
-// M15d DNG RAW 显影链 v1（04 §D4.4）：自研 TIFF/DNG 容器解析 + 显影核。
-// 能力边界：未压缩（Compression=1）16-bit CFA（PhotometricInterpretation=32803）、
-// 单/多 strip、CFA 2×2（RGGB/GBRG/GRBG/BGGR）、黑电平（标量或 2×2 取均值）、
-// 白电平、AsShotNeutral 白平衡、双线性去马赛克、sRGB 伽马。
-// 不支持（给明确错误）：JPEG/deflate 压缩、tiled、12-bit 打包、非线性码片。
-// 注：规划原文的 createImageRawData 路线改为自研解析——显影参数全部自持，不依赖
-// 系统 RawDescriptor（v1 简化登记）。
+// M23a RAW 显影门面（04 §D4.4 / 07 §3.15 M23）：解码与显影内核在 io/raw/
+// （photocraft raw crate C++ 翻译：DNG 全量/CR2/NEF/ARW/RW2/ORF/RAF +
+// demosaic 三算法+X-Trans + 显影链 ProPhoto），本层负责参数语义（M15e 面板）
+// 与发布（ProPhoto → sRGB → TileGrid）。
+// 能力边界（不支持给明确错误）：CR3、PEF、JPEG XL 瓦片、有损 JPEG 瓦片、
+// Nikon "lossy after split"、Fuji 压缩、Panasonic RawFormat 4。
+// 注：显影参数全部自持，不依赖系统 RawDescriptor。
 
 #include <cstdint>
 #include <memory>
@@ -18,8 +18,8 @@
 namespace montage {
 namespace io {
 
-// 内容探测：TIFF 魔数 + DNGVersion(50706) 标签存在
-bool looksLikeDng(const std::vector<uint8_t>& bytes);
+// 内容探测：相机 raw（DNG/CR2/NEF/ARW/RW2/ORF/RAF…，廉价头与 IFD 检查）。
+bool looksLikeCameraRaw(const std::vector<uint8_t>& bytes);
 
 // M15e 显影参数（相对默认显影的偏移；显影参数面板 P1）
 struct DevelopParams {
@@ -35,7 +35,7 @@ bool developDngToGrid(const std::vector<uint8_t>& bytes,
                       std::shared_ptr<const TileGrid>& out, uint32_t& outW, uint32_t& outH,
                       std::string& err);
 
-// 默认参数显影（M15d 导入路径语义不变）
+// 默认参数显影（导入路径语义不变）
 inline bool developDngToGrid(const std::vector<uint8_t>& bytes,
                              std::shared_ptr<const TileGrid>& out, uint32_t& outW, uint32_t& outH,
                              std::string& err) {
