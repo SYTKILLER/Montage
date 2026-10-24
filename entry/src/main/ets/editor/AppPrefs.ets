@@ -109,6 +109,32 @@ export class AppPrefs {
     }
   }
 
+  // ---------- M24a：字符串偏好（动作持久化 actions_json） ----------
+
+  getString(key: string, def: string): string {
+    if (this.store === null) {
+      return def;
+    }
+    try {
+      const v = this.store.getSync(key, def) as string;
+      return typeof v === 'string' ? v : def;
+    } catch (e) {
+      return def;
+    }
+  }
+
+  setString(key: string, v: string): void {
+    if (this.store === null) {
+      return;
+    }
+    try {
+      this.store.putSync(key, v);
+      this.store.flush();
+    } catch (e) {
+      hilog.error(0x4D30, TAG, 'setString %{public}s failed', key);
+    }
+  }
+
   /** 应用主题到系统（ConfigurationConstant.ColorMode；与 resourceManager.ColorMode 不兼容，勿混用）。 */
   applyTheme(mode: ThemeMode, context: common.Context): void {
     try {

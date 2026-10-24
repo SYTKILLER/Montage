@@ -26,6 +26,11 @@ import { PathsPanel } from '../editor/components/PathsPanel';
 import { HistoryPanel } from '../editor/components/HistoryPanel';
 import { HistogramPanel } from '../editor/components/HistogramPanel';
 import { InfoPanel } from '../editor/components/InfoPanel';
+import { ActionsPanel } from '../editor/components/ActionsPanel';
+import { AutomateDialog } from '../editor/components/AutomateDialog';
+import { automation, ActionStep } from 'core';
+import { Automate, BatchOptions, ProcessorOptions, BatchResult, BatchFileError } from 'core';
+import { controlServer } from '../editor/ControlServer';
 
 const TAG: string = 'Montage.Shell';
 const DOMAIN: number = 0x4D30;
@@ -136,6 +141,20 @@ struct Index {
   @State historyVisible: boolean = true;
   @State histogramVisible: boolean = false;
   @State infoVisible: boolean = false;
+  // M24a 动作面板
+  @State actionsVisible: boolean = false;
+  @State actionsRev: number = 0;
+  @State actionsSel: number = -1;
+  @State showActionRename: boolean = false;
+  @State actionRenameText: string = '';
+  // M24b 批处理 / 图像处理器
+  @State showAutomate: boolean = false;
+  @State automateMode: number = 0;
+  @State automateBusy: boolean = false;
+  @State automateProgress: string = '';
+  @State automateResult: string = '';
+  private automateCancel: boolean = false;
+  private actionNamesMirror: string[] = [];
   @State historyLabels: string[] = [''];
   @State historyCurrent: number = 0;
   @State infoPointerX: number = -1;
@@ -253,6 +272,7 @@ struct Index {
   @State smartEditIndex: number = -1;        // >=0 = 滤镜对话框编辑模式（预填+setSmartFilter）
   @State filterP: number[] = [];        // 当前参数值（schema 序）
   @State filterSeed: number = 1;
+  private filterTargetLayer: number = 0; // M24a：滤镜预览目标层（提交时录 filter.apply）
   private filterDebounce: number = -1;
   @State fillSource: number = 0;        // 0=前景 1=背景 2=黑 3=白
   private gradDragging: boolean = false;
@@ -565,6 +585,17 @@ struct Index {
     this.historyVisible = this.prefs.getBool('panel_history', true);
     this.histogramVisible = this.prefs.getBool('panel_histogram', false);
     this.infoVisible = this.prefs.getBool('panel_info', false);
+    // M24a：动作内核挂载 + 持久化（Preferences actions_json；变更即写，量小）
+    automation.setEngine(this.engine);
+    automation.loadFromJson(this.prefs.getString('actions_json', ''));
+    automation.setDirtyCb((): void => {
+      this.actionsRev++;
+      this.prefs.setString('actions_json', automation.serialize());
+    });
+    this.actionsVisible = this.prefs.getBool('panel_actions', false);
+    // M24c：控制通道（want debugControl=1 或调试菜单手动开启）
+    controlServer.setEngine(this.engine);
+    this.consumeDebugControl();
     this.engine.bindRevisionListener((revision: number): void => {
       hilog.info(DOMAIN, TAG, 'docVersion → %{public}d', revision);
     });
@@ -586,6 +617,38 @@ struct Index {
   // 由 @StorageProp @Watch 驱动重入）。
   private onDebugOpenB64(): void {
     this.consumeDebugOpenB64();
+  }
+
+  /** M24c：want debugControl=1 → 启动控制通道（debug-only；hilog 透出 token）。 */
+  private consumeDebugControl(): void {
+    const flag = AppStorage.get<string>('debugControl');
+    if (flag === '1') {
+      AppStorage.setOrCreate('debugControl', '');
+      const portStr = AppStorage.get<string>('debugControlPort') ?? '';
+      const port = parseInt(portStr.length > 0 ? portStr : '18787');
+      if (controlServer.start(this.engine, this.cacheDir(), isNaN(port) ? 18787 : port)) {
+        this.log(`控制通道已启动（端口 ${controlServer.getPort()}，token 见 hilog Montage.Control）`);
+      }
+    }
+  }
+
+  /** 帮助›调试：手动开关控制通道（与 want 门控同源）。 */
+  private toggleControlServer(): void {
+    if (controlServer.isRunning()) {
+      controlServer.stop();
+      this.log('控制通道已停止');
+      this.toast('控制通道已停止');
+    } else {
+      if (controlServer.start(this.engine, this.cacheDir(), 18787)) {
+        this.log(`控制通道已启动（端口 18787，token 见 hilog Montage.Control）`);
+        this.toast('控制通道已启动');
+      }
+    }
+  }
+
+  private cacheDir(): string {
+    const c = this.getUIContext().getHostContext();
+    return c !== undefined ? c.cacheDir : '';
   }
 
   private consumeDebugOpenB64(): void {
@@ -2394,6 +2457,7 @@ struct Index {
       this.toast('滤镜预览创建失败（空图层？）');
       return;
     }
+    this.filterTargetLayer = a.id;
     this.filterDef = def;
     this.filterP = def.params.map((d: FilterParamDef): number => d.def);
     this.filterSeed = 1;
@@ -2461,6 +2525,14 @@ struct Index {
     }
     this.engine.endFilterPreview(true, def.kind, vals[0], vals[1], vals[2], vals[3], vals[4],
       vals[5], this.filterSeed, def.label);
+    // M24a：滤镜提交 = begin+end 两段会话原语的组合命令，动作步存单条 filter.apply
+    if (this.filterTargetLayer !== 0) {
+      automation.note('filter.apply', {
+        'layerId': this.filterTargetLayer, 'kind': def.kind, 'p0': vals[0], 'p1': vals[1],
+        'p2': vals[2], 'p3': vals[3], 'p4': vals[4], 'p5': vals[5], 'seed': this.filterSeed,
+        'label': def.label,
+      });
+    }
     this.log(`滤镜已应用: ${def.label}`);
     this.filterDef = null;
   }
@@ -3573,6 +3645,90 @@ struct Index {
       this.log(`保存失败: ${e.message}`);
       this.toast('保存失败');
     });
+  }
+
+  // ---------- M24b 批处理 / 图像处理器 ----------
+
+  private refreshActionNames(): void {
+    const r = automation.listActions();
+    this.actionNamesMirror = [];
+    if (r.ok && r.value !== undefined) {
+      const v = r.value as Record<string, Object>;
+      const arr = v['actions'] as Object as Record<string, Object>[];
+      if (arr !== undefined && arr !== null) {
+        for (const row of arr) {
+          const nm = row['name'];
+          if (typeof nm === 'string') {
+            this.actionNamesMirror.push(nm);
+          }
+        }
+      }
+    }
+  }
+
+  private makeAutomate(): Automate {
+    return new Automate(this.engine, (): boolean => this.automateCancel,
+      this.cachePath('automate_restore.montage'));
+  }
+
+  private runAutomate(params: Record<string, Object>): void {
+    const inputDir = params['inputDir'] as string;
+    const output = params['output'] as string;
+    if (inputDir.length === 0 || output.length === 0) {
+      this.toast('输入/输出目录不能为空');
+      return;
+    }
+    this.automateBusy = true;
+    this.automateCancel = false;
+    this.automateProgress = '准备中…';
+    this.automateResult = '';
+    const fmt = params['format'] as string;
+    if (this.automateMode === 0) {
+      const opts: BatchOptions = {
+        inputDir: inputDir, files: [], output: output,
+        actionName: params['actionName'] as string, steps: [], format: fmt, quality: 0,
+      };
+      const preErr = Automate.checkSteps(opts.actionName, opts.steps);
+      if (preErr.length > 0) {
+        this.automateBusy = false;
+        this.automateResult = preErr;
+        return;
+      }
+      this.makeAutomate().runBatch(opts, (done: number, total: number, name: string): void => {
+        this.automateProgress = `${done}/${total} ${name}`;
+      }).then((r: BatchResult): void => {
+        this.automateBusy = false;
+        this.automateProgress = '';
+        this.automateResult = `完成 ${r.files.length} 个` +
+          (r.errors.length > 0 ? `，失败 ${r.errors.length} 个：` +
+            r.errors.slice(0, 5).map((e: BatchFileError): string => `${e.file} ${e.error}`)
+              .join('；') : '');
+        this.log(`批处理: ${this.automateResult}`);
+      }).catch((e: BusinessError): void => {
+        this.automateBusy = false;
+        this.automateResult = `批处理异常: ${e.message}`;
+      });
+    } else {
+      const opts: ProcessorOptions = {
+        inputDir: inputDir, files: [], output: output, format: fmt,
+        width: params['width'] as number, height: params['height'] as number,
+        dontEnlarge: true, quality: params['quality'] as number, convertToSrgb: true,
+      };
+      this.makeAutomate().runProcessor(opts, (done: number, total: number, name: string): void => {
+        this.automateProgress = `${done}/${total} ${name}`;
+      }).then((r: BatchResult): void => {
+        this.automateBusy = false;
+        this.automateProgress = '';
+        this.automateResult = `完成 ${r.files.length} 个` +
+          (r.errors.length > 0 ? `，失败 ${r.errors.length} 个：` +
+            r.errors.slice(0, 5).map((e: BatchFileError): string => `${e.file} ${e.error}`)
+              .join('；') : '');
+        this.log(`图像处理器: ${this.automateResult}`);
+      }).catch((e: BusinessError): void => {
+        this.automateBusy = false;
+        this.automateResult = `图像处理器异常: ${e.message}`;
+      });
+    }
   }
 
   private doExport(format: string, quality: number): void {
@@ -5106,6 +5262,27 @@ struct Index {
         this.infoVisible = !this.infoVisible;
         this.prefs.setBool('panel_info', this.infoVisible);
         break;
+      case 'window.toggleActions':
+        this.actionsVisible = !this.actionsVisible;
+        this.prefs.setBool('panel_actions', this.actionsVisible);
+        break;
+      case 'automate.batch':
+        this.automateMode = 0;
+        this.automateProgress = '';
+        this.automateResult = '';
+        this.refreshActionNames();
+        this.showAutomate = true;
+        break;
+      case 'automate.processor':
+        this.automateMode = 1;
+        this.automateProgress = '';
+        this.automateResult = '';
+        this.refreshActionNames();
+        this.showAutomate = true;
+        break;
+      case 'debug.control':
+        this.toggleControlServer();
+        break;
       case 'help.about':
         this.showAbout = true;
         break;
@@ -5810,6 +5987,11 @@ struct Index {
       leafItem('image.revealAll', '显示全部', '', d),
       // M15e：RAW 显影参数（会话内导入过 DNG 才可用，P1）
       leafItem('image.develop', 'RAW 显影参数…', '', d && this.hasRawDevelop),
+      // M24b：自动（批处理 / 图像处理器）
+      subItem('image.automateSub', '自动', true, [
+        leafItem('automate.batch', '批处理…', '', true),
+        leafItem('automate.processor', '图像处理器…', '', true),
+      ]),
     ];
     const layer: MenuItemVM[] = [
       leafItem('layer.transform', '自由变换', 'Ctrl+T', d),
@@ -5965,6 +6147,7 @@ struct Index {
       leafItem('window.toggleHistory', '历史面板', '', true, this.historyVisible),
       leafItem('window.toggleHistogram', '直方图面板', '', true, this.histogramVisible),
       leafItem('window.toggleInfo', '信息面板', '', true, this.infoVisible),
+      leafItem('window.toggleActions', '动作面板', '', true, this.actionsVisible),
     ];
     const help: MenuItemVM[] = [
       subItem('help.themeSub', '主题', true, [
@@ -5981,6 +6164,8 @@ struct Index {
         leafItem('file.openSandboxDng', '打开沙箱 DNG（RAW 显影）', '', d),
         leafItem('file.openSandboxCr2', '打开沙箱 CR2（M23 厂牌 RAW）', '', d),
         leafItem('file.debugJpeg', 'JPEG 分带校准（M16）', '', true),
+        leafItem('debug.control', controlServer.isRunning() ? '停止控制通道' : '启动控制通道（M24）',
+          '', true),
       ]),
     ];
     return [
@@ -6627,6 +6812,7 @@ struct Index {
         `${this.gridSpacing}${this.snapGuidesOn ? 1 : 0}${this.snapGridOn ? 1 : 0}` +
         `${this.screenMode}${this.guidesMirror.visible ? 1 : 0}${this.guidesMirror.locked ? 1 : 0}` +
         `${this.historyVisible ? 1 : 0}${this.histogramVisible ? 1 : 0}${this.infoVisible ? 1 : 0}` +
+        `${this.actionsVisible ? 1 : 0}${this.actionsRev}${this.docOpen ? 1 : 0}` +  // M24a 动作菜单使能位
         `${this.historyCurrent}${this.historyLabels.length}` +
         `${this.hasRawDevelop ? 1 : 0}`  // M15e：RAW 显影菜单项使能随会话 RAW 翻转
         + `${this.workPathNonEmpty}${this.activeLayer()?.isShape ? 1 : 0}` +
@@ -7358,9 +7544,10 @@ struct Index {
             .border({ width: { left: 1 }, color: { left: $r('app.color.divider') } })
           }
 
-          // M15b 面板坞第二列（历史/直方图/信息；PS 多列面板语义）
+          // M15b 面板坞第二列（历史/直方图/信息/动作；PS 多列面板语义）
           if (this.screenMode === 0 &&
-            (this.historyVisible || this.histogramVisible || this.infoVisible)) {
+            (this.historyVisible || this.histogramVisible || this.infoVisible ||
+              this.actionsVisible)) {
             Column({ space: 6 }) {
               if (this.historyVisible) {
                 HistoryPanel({
@@ -7384,6 +7571,38 @@ struct Index {
                   selW: this.infoSelW,
                   selH: this.infoSelH,
                 })
+              }
+              if (this.actionsVisible) {
+                ActionsPanel({
+                  rev: this.actionsRev,
+                  selected: this.actionsSel,
+                  docOpen: this.docOpen,
+                  onSelect: (idx: number): void => {
+                    this.actionsSel = idx;
+                  },
+                  onMessage: (msg: string): void => {
+                    if (msg === '__rename_action__') {
+                      const g = automation.getAction({ 'action': this.actionsSel });
+                      let name = '';
+                      if (g.ok && g.value !== undefined) {
+                        const v = g.value as Record<string, Object>;
+                        const nm = v['name'];
+                        if (typeof nm === 'string') {
+                          name = nm;
+                        }
+                      }
+                      this.actionRenameText = name;
+                      this.showActionRename = true;
+                    } else {
+                      this.log(msg);
+                      this.toast(msg);
+                    }
+                  },
+                  onMutated: (): void => {
+                    this.actionsRev++;
+                  },
+                })
+                  .layoutWeight(1)
               }
             }
             .width(240)
@@ -7468,8 +7687,81 @@ struct Index {
           .border({ width: 1, color: $r('app.color.border') })
           .width(360)
         }
+      }
+      // M24a：动作重命名对话框
+      if (this.showActionRename) {
+        Stack() {
+          Column()
+            .width('100%')
+            .height('100%')
+            .backgroundColor('#66000000')
+            .onClick((): void => {
+              this.showActionRename = false;
+            })
+          Column({ space: 14 }) {
+            Text('重命名动作').fontSize(16).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+            TextInput({ text: this.actionRenameText })
+              .height(40)
+              .width('100%')
+              .fontSize(14)
+              .onChange((v: string): void => {
+                this.actionRenameText = v;
+              })
+              .defaultFocus(true)
+            Row({ space: 12 }) {
+              Button('取消').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.surface'))
+                .fontColor($r('app.color.text_primary'))
+                .border({ width: 1, color: $r('app.color.border') })
+                .onClick((): void => {
+                  this.showActionRename = false;
+                })
+              Button('确定').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.accent'))
+                .fontColor($r('app.color.on_accent'))
+                .onClick((): void => {
+                  automation.execute('actions.rename', {
+                    'action': this.actionsSel, 'name': this.actionRenameText,
+                  }).then((r): void => {
+                    this.showActionRename = false;
+                    if (!r.ok) {
+                      this.toast(r.error);
+                    } else {
+                      this.actionsRev++;
+                      this.toast('动作已重命名');
+                    }
+                  });
+                })
+            }
+            .justifyContent(FlexAlign.End)
+            .width('100%')
+          }
+          .padding(20)
+          .borderRadius(14)
+          .backgroundColor($r('app.color.surface'))
+          .border({ width: 1, color: $r('app.color.border') })
+          .width(360)
+        }
         .width('100%')
         .height('100%')
+      }
+      // M24b：批处理 / 图像处理器对话框
+      if (this.showAutomate) {
+        AutomateDialog({
+          mode: this.automateMode,
+          busy: this.automateBusy,
+          progressText: this.automateProgress,
+          resultText: this.automateResult,
+          actionNames: this.actionNamesMirror,
+          onRun: (params: Record<string, Object>): void => this.runAutomate(params),
+          onCancelRun: (): void => {
+            this.automateCancel = true;
+          },
+          onClose: (): void => {
+            this.showAutomate = false;
+          },
+        })
       }
       if (this.showSmartFilters && this.smartInfo !== null) {
         Stack() {

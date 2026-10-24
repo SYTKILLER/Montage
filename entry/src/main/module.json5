@@ -36,6 +36,10 @@
         ]
       }
     ],
+    // M24c：控制通道（debug-only TCP loopback）需要 INTERNET（normal/system_grant，安装即授）
+    "requestPermissions": [
+      { "name": "ohos.permission.INTERNET" }
+    ],
     "extensionAbilities": [
       {
         "name": "EntryBackupAbility",

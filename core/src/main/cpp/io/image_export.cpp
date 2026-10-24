@@ -451,6 +451,7 @@ bool WritePngToFd(int fd, uint32_t width, uint32_t height, const std::vector<uin
     uint64_t total = 8 + (12 + 13) + 12;
     std::vector<uint8_t> out(64 * 1024);
     std::vector<uint8_t> row(1 + static_cast<size_t>(width) * 4);
+    std::vector<uint8_t> idat;  // 压缩流缓冲后经 writeChunk 写（IDAT 块头 + CRC）
     bool fail = false;
     auto pump = [&](int flush) -> bool {
         zs.next_out = out.data();
@@ -462,10 +463,7 @@ bool WritePngToFd(int fd, uint32_t width, uint32_t height, const std::vector<uin
             }
             const size_t have = out.size() - zs.avail_out;
             if (have > 0) {
-                if (!writeAll(fd, out.data(), have)) {
-                    return false;
-                }
-                total += have;
+                idat.insert(idat.end(), out.data(), out.data() + have);
                 zs.next_out = out.data();
                 zs.avail_out = static_cast<uInt>(out.size());
             }
@@ -494,9 +492,15 @@ bool WritePngToFd(int fd, uint32_t width, uint32_t height, const std::vector<uin
     }
     deflateEnd(&zs);
     if (fail) {
-        if (err != nullptr) *err = "png: deflate/write failed";
+        if (err != nullptr) *err = "png: deflate failed";
         return false;
     }
+    // M24 批处理对拍抓出：M7.5 起缺 IDAT 块头与 CRC，导出 PNG 恒为非法文件
+    if (!writeChunk(fd, "IDAT", idat.data(), idat.size())) {
+        if (err != nullptr) *err = "png: write IDAT failed";
+        return false;
+    }
+    total += 12 + idat.size();
     if (!writeChunk(fd, "IEND", nullptr, 0)) {
         if (err != nullptr) *err = "png: write IEND failed";
         return false;

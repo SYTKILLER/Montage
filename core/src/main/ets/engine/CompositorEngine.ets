@@ -1,6 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
+import { automation } from './Automation';
 import { EngineStats, ExportPngData, ExportImageData, CodecCapabilities, CodecCap, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, SmartFilterDTO, SmartInfoDTO, } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
@@ -261,6 +262,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'newDocument failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('file.new', { 'width': width, 'height': height });
     return r.ok;
   }
 
@@ -389,6 +391,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return 0;
     }
+    automation.note('layer.add', { 'name': name ?? '' });
     return num(r.data, 'id');
   }
 
@@ -398,6 +401,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'removeLayer failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('layer.remove', { 'id': id });
     return r.ok;
   }
 
@@ -407,6 +411,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'selectLayer failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('layer.select', { 'id': id });
     return r.ok;
   }
 
@@ -416,6 +421,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'setLayerVisible failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('layer.visible', { 'id': id, 'v': v });
     return r.ok;
   }
 
@@ -425,6 +431,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'setLayerOpacity failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('layer.opacity', { 'id': id, 'v': v });
     return r.ok;
   }
 
@@ -434,6 +441,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'setLayerBlendMode failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('layer.blend', { 'id': id, 'mode': mode });
     return r.ok;
   }
 
@@ -444,6 +452,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'setLayerMaskEnabled failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('layer.maskEnable', { 'id': id, 'v': v });
     return r.ok;
   }
 
@@ -454,6 +463,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'setLayerClipping failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('layer.clip', { 'id': id, 'v': v });
     return r.ok;
   }
 
@@ -467,6 +477,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return 0;
     }
+    automation.note('layer.groupAdd', {  });
     return num(r.data, 'id');
   }
 
@@ -477,6 +488,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return 0;
     }
+    automation.note('layer.group', { 'id': id });
     return num(r.data, 'id');
   }
 
@@ -487,6 +499,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('layer.ungroup', { 'id': id });
     return true;
   }
 
@@ -497,6 +510,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('layer.setParent', { 'id': id, 'parent': parent, 'index': index });
     return true;
   }
 
@@ -507,6 +521,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('layer.collapsed', { 'id': id, 'collapsed': collapsed });
     return true;
   }
 
@@ -519,6 +534,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('layer.mergeDown', {  });
     return true;
   }
 
@@ -529,6 +545,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('layer.mergeVisible', {  });
     return true;
   }
 
@@ -539,6 +556,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('layer.flatten', {  });
     return true;
   }
 
@@ -549,6 +567,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return 0;
     }
+    automation.note('layer.stampVisible', {  });
     return num(r.data, 'id');
   }
 
@@ -559,6 +578,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return 0;
     }
+    automation.note('layer.duplicate', { 'id': id });
     return num(r.data, 'id');
   }
 
@@ -569,6 +589,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('layer.link', { 'ids': ids, 'link': link });
     return true;
   }
 
@@ -579,6 +600,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('layer.align', { 'ids': ids, 'mode': mode });
     return true;
   }
 
@@ -594,6 +616,7 @@ export class CompositorEngine {
         r2.error !== null ? r2.error.message : 'unknown');
       return false;
     }
+    automation.note('style.dropShadow', { 'id': id, 'enabled': enabled, 'angle': angle, 'dist': dist, 'size': size, 'opacity': opacity, 'r': r, 'g': g, 'b': b, 'spread': spread, 'useGL': useGL });
     return true;
   }
 
@@ -605,6 +628,7 @@ export class CompositorEngine {
         r2.error !== null ? r2.error.message : 'unknown');
       return false;
     }
+    automation.note('style.stroke', { 'id': id, 'enabled': enabled, 'width': width, 'r': r, 'g': g, 'b': b });
     return true;
   }
 
@@ -616,6 +640,7 @@ export class CompositorEngine {
         r2.error !== null ? r2.error.message : 'unknown');
       return false;
     }
+    automation.note('style.colorOverlay', { 'id': id, 'enabled': enabled, 'r': r, 'g': g, 'b': b, 'opacity': opacity });
     return true;
   }
 
@@ -626,6 +651,7 @@ export class CompositorEngine {
         r2.error !== null ? r2.error.message : 'unknown');
       return false;
     }
+    automation.note('style.clear', { 'id': id });
     return true;
   }
 
@@ -640,6 +666,7 @@ export class CompositorEngine {
         r2.error !== null ? r2.error.message : 'unknown');
       return false;
     }
+    automation.note('style.innerShadow', { 'id': id, 'enabled': enabled, 'angle': angle, 'dist': dist, 'size': size, 'opacity': opacity, 'r': r, 'g': g, 'b': b, 'spread': spread, 'useGL': useGL });
     return true;
   }
 
@@ -653,6 +680,7 @@ export class CompositorEngine {
         r2.error !== null ? r2.error.message : 'unknown');
       return false;
     }
+    automation.note('style.outerGlow', { 'id': id, 'enabled': enabled, 'size': size, 'opacity': opacity, 'r': r, 'g': g, 'b': b, 'spread': spread });
     return true;
   }
 
@@ -666,6 +694,7 @@ export class CompositorEngine {
         r2.error !== null ? r2.error.message : 'unknown');
       return false;
     }
+    automation.note('style.innerGlow', { 'id': id, 'enabled': enabled, 'size': size, 'opacity': opacity, 'r': r, 'g': g, 'b': b, 'spread': spread });
     return true;
   }
 
@@ -679,6 +708,7 @@ export class CompositorEngine {
         r2.error !== null ? r2.error.message : 'unknown');
       return false;
     }
+    automation.note('style.gradientOverlay', { 'id': id, 'enabled': enabled, 'angle': angle, 'opacity': opacity, 'fr': fr, 'fg': fg, 'fb': fb, 'tr': tr, 'tg': tg, 'tb': tb });
     return true;
   }
 
@@ -692,6 +722,7 @@ export class CompositorEngine {
         r2.error !== null ? r2.error.message : 'unknown');
       return false;
     }
+    automation.note('style.satin', { 'id': id, 'enabled': enabled, 'angle': angle, 'dist': dist, 'size': size, 'opacity': opacity, 'r': r, 'g': g, 'b': b, 'invert': invert });
     return true;
   }
 
@@ -706,6 +737,7 @@ export class CompositorEngine {
         r2.error !== null ? r2.error.message : 'unknown');
       return false;
     }
+    automation.note('style.bevel', { 'id': id, 'enabled': enabled, 'style': style, 'depth': depth, 'up': up, 'size': size, 'angle': angle, 'altitude': altitude, 'hiOp': hiOp, 'hr': hr, 'hg': hg, 'hb': hb, 'shOp': shOp, 'sr': sr, 'sg': sg, 'sb': sb });
     return true;
   }
 
@@ -719,6 +751,7 @@ export class CompositorEngine {
         r2.error !== null ? r2.error.message : 'unknown');
       return false;
     }
+    automation.note('style.contour', { 'id': id, 'effect': effect, 'xs': xs, 'ys': ys, 'corners': corners, 'range': range });
     return true;
   }
 
@@ -732,6 +765,7 @@ export class CompositorEngine {
         r2.error !== null ? r2.error.message : 'unknown');
       return false;
     }
+    automation.note('style.patternOverlay', { 'id': id, 'enabled': enabled, 'patternId': patternId, 'scale': scale, 'opacity': opacity });
     return true;
   }
 
@@ -743,6 +777,7 @@ export class CompositorEngine {
         r2.error !== null ? r2.error.message : 'unknown');
       return null;
     }
+    automation.note('style.definePattern', {  });
     return r2.data as Object as PatternInfo;
   }
 
@@ -766,6 +801,7 @@ export class CompositorEngine {
         r2.error !== null ? r2.error.message : 'unknown');
       return false;
     }
+    automation.note('style.globalLight', { 'angle': angle });
     return true;
   }
 
@@ -777,6 +813,7 @@ export class CompositorEngine {
         r2.error !== null ? r2.error.message : 'unknown');
       return false;
     }
+    automation.note('style.copy', { 'id': id });
     return true;
   }
 
@@ -787,6 +824,7 @@ export class CompositorEngine {
         r2.error !== null ? r2.error.message : 'unknown');
       return false;
     }
+    automation.note('style.paste', { 'id': id });
     return true;
   }
 
@@ -797,6 +835,7 @@ export class CompositorEngine {
         r2.error !== null ? r2.error.message : 'unknown');
       return false;
     }
+    automation.note('style.effectsEnabled', { 'id': id, 'enabled': enabled });
     return true;
   }
 
@@ -807,6 +846,7 @@ export class CompositorEngine {
         r2.error !== null ? r2.error.message : 'unknown');
       return 0;
     }
+    automation.note('layer.fillAdd', { 'kind': kind, 'r': r, 'g': g, 'b': b, 'angle': angle });
     return num(r2.data, 'id');
   }
 
@@ -818,6 +858,7 @@ export class CompositorEngine {
         r2.error !== null ? r2.error.message : 'unknown');
       return false;
     }
+    automation.note('layer.fillParams', { 'id': id, 'kind': kind, 'r': r, 'g': g, 'b': b, 'angle': angle });
     return true;
   }
 
@@ -828,6 +869,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('layer.distribute', { 'ids': ids, 'mode': mode });
     return true;
   }
 
@@ -841,6 +883,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('filter.direct', { 'layerId': layerId, 'kind': kind, 'p0': p0, 'p1': p1, 'p2': p2, 'p3': p3, 'p4': p4, 'p5': p5, 'seed': seed });
     return true;
   }
 
@@ -884,6 +927,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return 0;
     }
+    automation.note('text.create', { 'x': x, 'y': y, 'wrapW': wrapW });
     return num(r.data, 'id');
   }
 
@@ -894,6 +938,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('text.content', { 'id': id, 'content': content, 'txn': txn });
     return true;
   }
 
@@ -907,6 +952,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('text.style', { 'id': id, 'family': family, 'fontSize': fontSize, 'lineHeight': lineHeight, 'tracking': tracking, 'bold': bold, 'italic': italic, 'colorR': colorR, 'colorG': colorG, 'colorB': colorB, 'align': align, 'wrapWidth': wrapWidth, 'txn': txn });
     return true;
   }
 
@@ -917,6 +963,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('text.rasterize', { 'id': id });
     return true;
   }
 
@@ -936,6 +983,7 @@ export class CompositorEngine {
       return 0;
     }
     const d = r.data as Record<string, Object>;
+    automation.note('vector.shapeAdd', { 'kind': kind, 'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1, 'radius': radius, 'sides': sides, 'starRatio': starRatio, 'weight': weight, 'fillKind': fillKind, 'fr': fr, 'fg': fg, 'fb': fb, 'fa': fa, 'hasStroke': hasStroke, 'sr': sr, 'sg': sg, 'sb': sb, 'sa': sa, 'strokeWidth': strokeWidth });
     return d['id'] as number;
   }
 
@@ -948,6 +996,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('vector.live', { 'id': id, 'kind': kind, 'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1, 'radius': radius, 'sides': sides, 'starRatio': starRatio, 'weight': weight });
     return true;
   }
 
@@ -958,6 +1007,7 @@ export class CompositorEngine {
         rr.error !== null ? rr.error.message : 'unknown');
       return false;
     }
+    automation.note('vector.fill', { 'id': id, 'kind': kind, 'r': r, 'g': g, 'b': b, 'a': a });
     return true;
   }
 
@@ -969,6 +1019,7 @@ export class CompositorEngine {
         rr.error !== null ? rr.error.message : 'unknown');
       return false;
     }
+    automation.note('vector.stroke', { 'id': id, 'on': on, 'r': r, 'g': g, 'b': b, 'a': a, 'width': width });
     return true;
   }
 
@@ -979,6 +1030,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('vector.rasterize', { 'id': id });
     return true;
   }
 
@@ -989,6 +1041,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('vector.path', { 'id': id, 'flat': flat });
     return true;
   }
 
@@ -999,6 +1052,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('vector.workPath', { 'flat': flat });
     return true;
   }
 
@@ -1033,6 +1087,7 @@ export class CompositorEngine {
       return 0;
     }
     const d = r.data as Record<string, Object>;
+    automation.note('vector.workCommit', { 'fillKind': fillKind, 'fr': fr, 'fg': fg, 'fb': fb, 'fa': fa, 'hasStroke': hasStroke, 'sr': sr, 'sg': sg, 'sb': sb, 'sa': sa, 'strokeWidth': strokeWidth });
     return d['id'] as number;
   }
 
@@ -1043,6 +1098,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('vector.pathToSelection', { 'op': op });
     return true;
   }
 
@@ -1053,6 +1109,7 @@ export class CompositorEngine {
         rr.error !== null ? rr.error.message : 'unknown');
       return false;
     }
+    automation.note('vector.fillPath', { 'r': r, 'g': g, 'b': b, 'a': a });
     return true;
   }
 
@@ -1063,6 +1120,7 @@ export class CompositorEngine {
         rr.error !== null ? rr.error.message : 'unknown');
       return false;
     }
+    automation.note('vector.strokePath', { 'r': r, 'g': g, 'b': b, 'a': a, 'width': width });
     return true;
   }
 
@@ -1073,6 +1131,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('vector.savePath', { 'name': name });
     return true;
   }
 
@@ -1081,6 +1140,7 @@ export class CompositorEngine {
     if (!r.ok) {
       return false;
     }
+    automation.note('vector.deletePath', { 'index': index });
     return true;
   }
 
@@ -1091,6 +1151,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('vector.loadPath', { 'index': index });
     return true;
   }
 
@@ -1101,6 +1162,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('vector.selectionToPath', {  });
     return true;
   }
 
@@ -1111,6 +1173,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('vector.customDefine', { 'name': name });
     return true;
   }
 
@@ -1121,6 +1184,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('vector.mask', { 'id': id, 'flat': flat });
     return true;
   }
 
@@ -1131,6 +1195,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
+    automation.note('vector.maskEnable', { 'id': id, 'v': v });
     return true;
   }
 
@@ -1164,6 +1229,7 @@ export class CompositorEngine {
       return 0;
     }
     const d = r.data as Record<string, Object>;
+    automation.note('vector.placeCustom', { 'id': id, 'cx': cx, 'cy': cy, 'w': w, 'h': h });
     return d['id'] as number;
   }
 
@@ -1273,6 +1339,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return 0;
     }
+    automation.note('layer.adjustAdd', { 'kind': kind ?? 0 });
     return num(r.data, 'id');
   }
 
@@ -1283,6 +1350,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'setAdjustmentParams failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('adjust.params', { 'id': id, 'inBlack': inBlack, 'inWhite': inWhite, 'gamma': gamma });
     return r.ok;
   }
 
@@ -1302,6 +1370,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'setWandSelection failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('select.wand', { 'x': x, 'y': y, 'tolerance': tolerance, 'contiguous': contiguous, 'op': op ?? 0, 'allLayers': allLayers ?? 0, 'sampleSize': sampleSize ?? 1 });
     return r.ok;
   }
 
@@ -1314,6 +1383,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'setRectSelection failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('select.rect', { 'x': x, 'y': y, 'w': w, 'h': h, 'op': op ?? 0 });
     return r.ok;
   }
 
@@ -1326,6 +1396,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'setPolygonSelection failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('select.polygon', { 'points': points, 'op': op ?? 0 });
     return r.ok;
   }
 
@@ -1338,6 +1409,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'setEllipseSelection failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('select.ellipse', { 'x': x, 'y': y, 'w': w, 'h': h, 'op': op ?? 0 });
     return r.ok;
   }
 
@@ -1348,6 +1420,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'selectAll failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('select.all', {  });
     return r.ok;
   }
 
@@ -1357,11 +1430,13 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'invertSelection failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('select.inverse', {  });
     return r.ok;
   }
 
   reselectSelection(): boolean {
     const r = narrowResult(native.reselectSelection() as Object);
+    automation.note('select.reselect', {  });
     return r.ok;
   }
 
@@ -1372,6 +1447,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'featherSelection failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('select.feather', { 'radius': radius });
     return r.ok;
   }
 
@@ -1381,6 +1457,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'expandSelection failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('select.expand', { 'radius': radius });
     return r.ok;
   }
 
@@ -1390,6 +1467,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'contractSelection failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('select.contract', { 'radius': radius });
     return r.ok;
   }
 
@@ -1399,6 +1477,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'borderSelection failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('select.border', { 'radius': radius });
     return r.ok;
   }
 
@@ -1408,6 +1487,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'smoothSelection failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('select.smooth', {  });
     return r.ok;
   }
 
@@ -1422,6 +1502,7 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
       return null;
     }
+    automation.note('select.quickMask', {  });
     return { active: boolOf(r.data, 'active'), hasSelection: boolOf(r.data, 'hasSelection') };
   }
 
@@ -1437,6 +1518,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'applyGradient rejected: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('paint.gradient', { 'layerId': layerId, 'type': type, 'style': style, 'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1, 'target': target });
     return r.ok;
   }
 
@@ -1447,6 +1529,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'fillSelection rejected: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('paint.fill', { 'source': source });
     return r.ok;
   }
 
@@ -1457,6 +1540,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'strokeSelection rejected: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('paint.stroke', { 'width': width });
     return r.ok;
   }
 
@@ -1470,6 +1554,7 @@ export class CompositorEngine {
     if (!r.ok) {
       hilog.error(DOMAIN, TAG, 'bucketFill rejected: %{public}s', r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('paint.bucket', { 'x': x, 'y': y, 'tolerance': tolerance, 'contiguous': contiguous, 'allLayers': allLayers ?? 0, 'sampleSize': sampleSize ?? 1 });
     return r.ok;
   }
 
@@ -1518,6 +1603,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'patchSelection rejected: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('paint.patch', { 'dx': dx, 'dy': dy });
     return r.ok;
   }
 
@@ -1540,6 +1626,7 @@ export class CompositorEngine {
         onDone(false);
       }
     });
+    automation.note('paint.caFill', {  });
     return true;
   }
 
@@ -1561,6 +1648,7 @@ export class CompositorEngine {
         onDone(false);
       }
     });
+    automation.note('paint.caMove', { 'dx': dx, 'dy': dy, 'extend': extend });
     return true;
   }
 
@@ -1575,6 +1663,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'rasterizeShape rejected: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('paint.rasterShape', { 'kind': kind, 'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1, 'cornerRadius': cornerRadius, 'fill': fill, 'stroke': stroke, 'strokeWidth': strokeWidth });
     return r.ok;
   }
 
@@ -1585,6 +1674,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'storeSelection failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('select.store', { 'name': name });
     return r.ok;
   }
 
@@ -1596,11 +1686,13 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'loadSelection failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('select.load', { 'name': name, 'op': op ?? 0 });
     return r.ok;
   }
 
   deleteChannel(name: string): boolean {
     const r = narrowResult(native.deleteChannel(name) as Object);
+    automation.note('select.channelDelete', { 'name': name });
     return r.ok;
   }
 
@@ -1622,6 +1714,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'copySelection failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('edit.copy', { 'merged': merged });
     return r.ok;
   }
 
@@ -1631,6 +1724,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'cutSelection failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('edit.cut', { 'merged': merged });
     return r.ok;
   }
 
@@ -1640,6 +1734,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'pasteClipboard failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('edit.paste', {  });
     return r.ok;
   }
 
@@ -1649,11 +1744,13 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'deleteSelectionPixels failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('edit.clear', {  });
     return r.ok;
   }
 
   clearSelection(): boolean {
     const r = narrowResult(native.clearSelection() as Object);
+    automation.note('select.clear', {  });
     return r.ok;
   }
 
@@ -1663,6 +1760,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'reorderLayer failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('layer.reorder', { 'id': id, 'toIndex': toIndex });
     return r.ok;
   }
 
@@ -1686,6 +1784,7 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'addLayerMask failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('layer.maskAdd', { 'id': id });
     return r.ok;
   }
 
@@ -1743,12 +1842,14 @@ export class CompositorEngine {
       hilog.error(DOMAIN, TAG, 'renameLayer failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
     }
+    automation.note('layer.rename', { 'id': id, 'name': name });
     return r.ok;
   }
 
   /** 画布重设（M8a：裁剪/画布大小；无损，选区清除）。 */
   resizeCanvas(x: number, y: number, w: number, h: number): boolean {
     const r = narrowResult(native.resizeCanvas(x, y, w, h) as Object);
+    automation.note('image.resizeCanvas', { 'x': x, 'y': y, 'w': w, 'h': h });
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
@@ -1756,6 +1857,7 @@ export class CompositorEngine {
   async trimCanvas(): Promise<boolean> {
     const value: Object = await (native.trimCanvas() as Promise<Object>);
     const r = narrowResult(value);
+    automation.note('image.trim', {  });
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
@@ -1763,6 +1865,7 @@ export class CompositorEngine {
   async revealAll(): Promise<boolean> {
     const value: Object = await (native.revealAll() as Promise<Object>);
     const r = narrowResult(value);
+    automation.note('image.revealAll', {  });
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
@@ -1770,6 +1873,7 @@ export class CompositorEngine {
   async rotateDocument90(clockwise: boolean): Promise<boolean> {
     const value: Object = await (native.rotateDocument90(clockwise) as Promise<Object>);
     const r = narrowResult(value);
+    automation.note('image.rotate90', { 'clockwise': clockwise });
     return r.ok;
   }
 
@@ -1777,6 +1881,7 @@ export class CompositorEngine {
   async flipDocument(horizontal: boolean): Promise<boolean> {
     const value: Object = await (native.flipDocument(horizontal) as Promise<Object>);
     const r = narrowResult(value);
+    automation.note('image.flip', { 'horizontal': horizontal });
     return r.ok;
   }
 
@@ -1786,6 +1891,7 @@ export class CompositorEngine {
     if (!r.ok && r.error !== null) {
       hilog.error(DOMAIN, TAG, 'translateLayer rejected: %{public}s', r.error.message);
     }
+    automation.note('layer.translate', { 'id': id, 'dx': dx, 'dy': dy, 'phase': phase });
     return r.ok;
   }
 
@@ -1796,6 +1902,7 @@ export class CompositorEngine {
     if (!r.ok && r.error !== null) {
       hilog.error(DOMAIN, TAG, 'setAdjustmentKind rejected: %{public}s', r.error.message);
     }
+    automation.note('adjust.kind', { 'id': id, 'kind': kind, 'p0': p0, 'p1': p1, 'p2': p2, 'p3': p3 });
     return r.ok;
   }
 
@@ -1803,12 +1910,14 @@ export class CompositorEngine {
   setColors(fgR: number, fgG: number, fgB: number, bgR: number, bgG: number,
             bgB: number): boolean {
     const r = narrowResult(native.setColors(fgR, fgG, fgB, bgR, bgG, bgB) as Object);
+    automation.note('tools.setColors', { 'fgR': fgR, 'fgG': fgG, 'fgB': fgB, 'bgR': bgR, 'bgG': bgG, 'bgB': bgB });
     return r.ok;
   }
 
   /** 曲线控制点设置（M9b；xs/ys 0..1 归一）。 */
   setCurvePoints(id: number, xs: number[], ys: number[]): boolean {
     const r = narrowResult(native.setCurvePoints(id, xs, ys) as Object);
+    automation.note('adjust.curve', { 'id': id, 'xs': xs, 'ys': ys });
     return r.ok;
   }
 
@@ -1835,6 +1944,7 @@ export class CompositorEngine {
   async resampleDocument(w: number, h: number, method?: number): Promise<boolean> {
     const value: Object = await (native.resampleDocument(w, h, method ?? 2) as Promise<Object>);
     const r = narrowResult(value);
+    automation.note('image.resample', { 'w': w, 'h': h, 'method': method ?? 2 });
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
@@ -1842,6 +1952,7 @@ export class CompositorEngine {
   async contentAwareScale(w: number, h: number): Promise<boolean> {
     const value: Object = await (native.contentAwareScale(w, h) as Promise<Object>);
     const r = narrowResult(value);
+    automation.note('image.caScale', { 'w': w, 'h': h });
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
@@ -1850,6 +1961,7 @@ export class CompositorEngine {
   async applyLiquify(layerId: number, strokes: LiquifyStrokeDTO[]): Promise<boolean> {
     const value: Object = await (native.applyLiquify(layerId, strokes) as Promise<Object>);
     const r = narrowResult(value);
+    automation.note('warp.liquify', { 'layerId': layerId, 'strokes': strokes });
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
@@ -1857,6 +1969,7 @@ export class CompositorEngine {
   async applyPuppet(layerId: number, pins: PuppetPinDTO[], mode: number, density: number): Promise<boolean> {
     const value: Object = await (native.applyPuppet(layerId, pins, mode, density) as Promise<Object>);
     const r = narrowResult(value);
+    automation.note('warp.puppet', { 'layerId': layerId, 'pins': pins, 'mode': mode, 'density': density });
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
@@ -1864,6 +1977,7 @@ export class CompositorEngine {
   async applyPerspective(layerId: number, quad8: number[]): Promise<boolean> {
     const value: Object = await (native.applyPerspective(layerId, quad8) as Promise<Object>);
     const r = narrowResult(value);
+    automation.note('warp.perspective', { 'layerId': layerId, 'quad8': quad8 });
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
@@ -1874,6 +1988,7 @@ export class CompositorEngine {
     const value: Object =
       await (native.applyWideAngle(layerId, model, focal, crop, scale, constraints) as Promise<Object>);
     const r = narrowResult(value);
+    automation.note('warp.wideangle', { 'layerId': layerId, 'model': model, 'focal': focal, 'crop': crop, 'scale': scale, 'constraints': constraints });
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
@@ -1883,6 +1998,7 @@ export class CompositorEngine {
     const value: Object = await (native.applyVpClone(layerId, quad8, sx, sy, points, size,
       hardness, opacity) as Promise<Object>);
     const r = narrowResult(value);
+    automation.note('warp.vpClone', { 'layerId': layerId, 'quad8': quad8, 'sx': sx, 'sy': sy, 'points': points, 'size': size, 'hardness': hardness, 'opacity': opacity });
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
@@ -1911,6 +2027,7 @@ export class CompositorEngine {
   async bakeLayerMatrix(id: number, m: number[]): Promise<boolean> {
     const value: Object = await (native.bakeLayerMatrix(id, m[0], m[1], m[2], m[3], m[4], m[5]) as Promise<Object>);
     const r = narrowResult(value);
+    automation.note('transform.bake', { 'id': id, 'm': m });
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
@@ -1927,6 +2044,7 @@ export class CompositorEngine {
     if (!r.ok && r.error !== null) {
       hilog.error(DOMAIN, TAG, 'bakeLayerTransform rejected: %{public}s', r.error.message);
     }
+    automation.note('transform.bakeT', { 'id': id, 'scaleX': scaleX, 'scaleY': scaleY, 'rotDeg': rotDeg, 'skewDeg': skewDeg, 'pivotX': pivotX, 'pivotY': pivotY });
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
@@ -1934,12 +2052,14 @@ export class CompositorEngine {
   async rotateDocumentArbitrary(deg: number): Promise<boolean> {
     const value: Object = await (native.rotateDocumentArbitrary(deg) as Promise<Object>);
     const r = narrowResult(value);
+    automation.note('image.rotateArbitrary', { 'deg': deg });
     return r.ok;
   }
 
   /** 选区平移（M8a/M7d）。 */
   translateSelection(dx: number, dy: number): boolean {
     const r = narrowResult(native.translateSelection(dx, dy) as Object);
+    automation.note('select.translate', { 'dx': dx, 'dy': dy });
     return r.ok && r.data !== null && boolOf(r.data, 'moved');
   }
 
@@ -2045,6 +2165,7 @@ export class CompositorEngine {
     if (!r.ok || r.data === null) {
       throw new Error(r.error !== null ? r.error.message : 'developRaw failed');
     }
+    if (mode === undefined || mode === 0 || mode === 2) { automation.note('develop.raw', { 'temp': temp, 'tint': tint, 'ev': ev, 'gamma': gamma, 'cameraJson': cameraJson ?? '', 'mode': mode ?? 0 }); }
     return {
       ok: boolOf(r.data, 'ok'),
       width: num(r.data, 'width'),
@@ -2061,6 +2182,7 @@ export class CompositorEngine {
     if (!r.ok || r.data === null) {
       throw new Error(r.error !== null ? r.error.message : 'cameraRawFilter failed');
     }
+    if (mode === undefined || mode === 0 || mode === 2) { automation.note('cameraRaw.apply', { 'layerId': layerId, 'cameraJson': cameraJson, 'mode': mode ?? 0 }); }
     return {
       ok: boolOf(r.data, 'ok'),
       width: num(r.data, 'width'),
@@ -2304,6 +2426,7 @@ export class CompositorEngine {
     if (!r.ok || r.data === null) {
       return 0;
     }
+    automation.note('smart.convert', { 'layerIds': layerIds });
     return num(r.data, 'layer');
   }
 
@@ -2329,6 +2452,7 @@ export class CompositorEngine {
   async setSmartTransform(layerId: number, m: number[]): Promise<boolean> {
     const value: Object = await (native.setSmartTransform(layerId, m) as Promise<Object>);
     const r = narrowResult(value);
+    automation.note('smart.transform', { 'layerId': layerId, 'm': m });
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
@@ -2338,6 +2462,7 @@ export class CompositorEngine {
     const value: Object = await (native.addSmartFilter(layerId, kind, p[0], p[1], p[2], p[3],
       p[4], p[5], seed, blend, opacity, name) as Promise<Object>);
     const r = narrowResult(value);
+    automation.note('smart.filterAdd', { 'layerId': layerId, 'kind': kind, 'p': p, 'seed': seed, 'blend': blend, 'opacity': opacity, 'name': name });
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
@@ -2348,18 +2473,21 @@ export class CompositorEngine {
       await (native.setSmartFilter(layerId, index, p[0], p[1], p[2], p[3], p[4], p[5], seed,
         blend, opacity, visible ? 1 : 0, name) as Promise<Object>);
     const r = narrowResult(value);
+    automation.note('smart.filterSet', { 'layerId': layerId, 'index': index, 'p': p, 'seed': seed, 'blend': blend, 'opacity': opacity, 'visible': visible, 'name': name });
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
   async removeSmartFilter(layerId: number, index: number): Promise<boolean> {
     const value: Object = await (native.removeSmartFilter(layerId, index) as Promise<Object>);
     const r = narrowResult(value);
+    automation.note('smart.filterRemove', { 'layerId': layerId, 'index': index });
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
   async moveSmartFilter(layerId: number, from: number, to: number): Promise<boolean> {
     const value: Object = await (native.moveSmartFilter(layerId, from, to) as Promise<Object>);
     const r = narrowResult(value);
+    automation.note('smart.filterMove', { 'layerId': layerId, 'from': from, 'to': to });
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
@@ -2367,6 +2495,7 @@ export class CompositorEngine {
     const value: Object =
       await (native.setSmartFiltersEnabled(layerId, enabled ? 1 : 0) as Promise<Object>);
     const r = narrowResult(value);
+    automation.note('smart.filtersEnabled', { 'layerId': layerId, 'enabled': enabled });
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
@@ -2375,12 +2504,14 @@ export class CompositorEngine {
     const value: Object =
       await (native.setSmartFilterMask(layerId, mode, flag ? 1 : 0) as Promise<Object>);
     const r = narrowResult(value);
+    automation.note('smart.filterMask', { 'layerId': layerId, 'mode': mode, 'flag': flag });
     return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
   /** 栅格化智能对象（像素 = effective 外观，清 smart/蒙版/样式）。 */
   rasterizeSmartObject(layerId: number): boolean {
     const r = narrowResult(native.rasterizeSmartObject(layerId) as Object);
+    automation.note('smart.rasterize', { 'layerId': layerId });
     return r.ok;
   }
 
@@ -2390,6 +2521,7 @@ export class CompositorEngine {
     if (!r.ok || r.data === null) {
       return 0;
     }
+    automation.note('smart.viaCopy', { 'layerId': layerId });
     return num(r.data, 'layer');
   }
 

@@ -36,6 +36,20 @@ export default class EntryAbility extends UIAbility {
     } catch (err) {
       hilog.error(DOMAIN, 'testTag', 'debugOpenB64 param: %{public}s', JSON.stringify(err));
     }
+    // M24c：控制通道门控 —— aa start --ps debugControl 1 [--ps debugControlPort 18787]
+    // （debug-only TCP 测试通道；Index aboutToAppear 消费并启动 ControlServer）
+    try {
+      const ctl = want.parameters?.debugControl;
+      if (typeof ctl === 'string' && ctl === '1') {
+        AppStorage.setOrCreate('debugControl', '1');
+      }
+      const ctlPort = want.parameters?.debugControlPort;
+      if (typeof ctlPort === 'string' && ctlPort.length > 0) {
+        AppStorage.setOrCreate('debugControlPort', ctlPort);
+      }
+    } catch (err) {
+      hilog.error(DOMAIN, 'testTag', 'debugControl param: %{public}s', JSON.stringify(err));
+    }
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
   }
 
@@ -60,6 +74,18 @@ export default class EntryAbility extends UIAbility {
       }
     } catch (err) {
       hilog.error(DOMAIN, 'testTag', 'debugOpenB64 param(new): %{public}s', JSON.stringify(err));
+    }
+    try {
+      const ctl = want.parameters?.debugControl;
+      if (typeof ctl === 'string' && ctl === '1') {
+        AppStorage.setOrCreate('debugControl', '1');
+      }
+      const ctlPort = want.parameters?.debugControlPort;
+      if (typeof ctlPort === 'string' && ctlPort.length > 0) {
+        AppStorage.setOrCreate('debugControlPort', ctlPort);
+      }
+    } catch (err) {
+      hilog.error(DOMAIN, 'testTag', 'debugControl param(new): %{public}s', JSON.stringify(err));
     }
   }
 
