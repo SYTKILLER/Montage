@@ -659,16 +659,14 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
             dilateAlpha(shA, static_cast<int>(w), static_cast<int>(h),
                         static_cast<int>(std::lround(sizeEff * spread)));
             if (sizeEff * (1.0 - spread) > 0.5) {
-                filters::FilterParams p;
-                p.kind = filters::FGaussianBlur;
-                p.p0 = static_cast<float>(sizeEff * (1.0 - spread));
-                std::vector<uint8_t> blurred(shA.size(), 0);
-                if (!filters::applyFilter(shA.data(), blurred.data(),
-                                          static_cast<uint32_t>(w), static_cast<uint32_t>(h), p,
-                                          err)) {
+                // H7 corpus 门禁实证修复（SEGV/堆越界）：shA 是 1 字节/像素覆盖度，
+                // 原式把裸灰度缓冲直接当 RGBA 传 applyFilter（读写 4×w·h）——大域段错误、
+                // 小域静默堆越界。blurAlpha = 打包 A→RGBA strip → FGaussianBlur → 解包，
+                // 与此处的既有意图（σ = size·(1−spread)，photocraft spread_split）一致。
+                if (!blurAlpha(shA, static_cast<int>(w), static_cast<int>(h),
+                               sizeEff * (1.0 - spread), err)) {
                     return false;
                 }
-                shA.swap(blurred);
             }
             applyContourLut8(shA, buildContourLut(st->shadowContour));
             for (size_t i = 0; i < alpha.size(); ++i) {
