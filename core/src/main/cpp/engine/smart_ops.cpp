@@ -77,6 +77,7 @@ inline uint64_t fnvFloats(const float* v, size_t n) {
 
 struct SourceEntry {
     uint64_t hash = 0;
+    int stackMode = 0;  // M21：堆栈模式（缓存键成分——mode 变更重解码）
     uint32_t w = 0;
     uint32_t h = 0;
     std::vector<uint8_t> rgba;  // w*h*4 直 alpha
@@ -96,9 +97,26 @@ struct PlacedEntry {
     size_t bytes() const { return rgba.size(); }
 };
 
+// M21 收口：逐滤镜阶段缓存——编辑栈中部滤镜时命中前缀直接续算（编辑末滤镜
+// 不再重跑整链）。键 = contentsId，值 = 前缀指纹链 + 各阶段缓冲。
+struct PhaseEntry {
+    std::vector<uint64_t> stageHashes;  // stageHashes[i] = 第 i 个可见滤镜后的结果指纹
+    std::vector<std::vector<uint8_t>> stages;  // stages[i] = 该结果（w*h*4）
+    uint32_t w = 0;
+    uint32_t h = 0;
+    uint64_t placedHash = 0;  // 前置 placed 指纹（源+变换）失配整表作废
+    uint64_t lastUse = 0;
+    size_t bytes() const {
+        size_t n = 0;
+        for (const auto& st : stages) n += st.size();
+        return n;
+    }
+};
+
 std::mutex g_cacheMtx;
 std::unordered_map<uint64_t, SourceEntry> g_sourceCache;
 std::unordered_map<uint64_t, PlacedEntry> g_placedCache;
+std::unordered_map<uint64_t, PhaseEntry> g_phaseCache;
 uint64_t g_useTick = 0;
 size_t g_cacheTotal = 0;
 
@@ -152,9 +170,16 @@ std::string lowerExt(const std::string& fileName) {
 
 thread_local int g_decodeDepth = 0;
 
+
+// 层组逐像素统计合成（frames = 各层全幅 RGBA8；photocraft combine：透明样本忽略、
+// alpha = 最大覆盖、颜色统计可能超 0..1 由目的地钳制）。
+
+
 // 子文档 → 扁平合成（源域全幅 strip；restyle 后 BuildFlattenJob/FlattenVisible）
-bool flattenSubDocument(Document& sub, uint32_t& w, uint32_t& h, std::vector<uint8_t>& rgba,
-                        std::string& err) {
+// stackMode > 0 时（photocraft stack_image：源多可见层逐像素统计——单层组取组内层），
+// 每层独立 Normal 渲染（blend/clipped 置平）后统计。
+bool flattenSubDocument(Document& sub, int stackMode, uint32_t& w, uint32_t& h,
+                        std::vector<uint8_t>& rgba, std::string& err) {
     restyleDocument(sub);
     w = sub.width;
     h = sub.height;
@@ -165,6 +190,39 @@ bool flattenSubDocument(Document& sub, uint32_t& w, uint32_t& h, std::vector<uin
     if (static_cast<uint64_t>(w) * h > kMaxSmartPixels) {
         err = "smart source too large";
         return false;
+    }
+    if (stackMode > 0) {
+        // 帧收集：可见层逐层独立渲染（blend=Normal、剪贴解除——photocraft stack_image 同语义）
+        bool any = false;
+        for (const Layer& l : sub.layers) {
+            if (l.visible && l.pixels != nullptr) any = true;
+        }
+        if (!any) {
+            err = "the smart object's contents have no visible layers";
+            return false;
+        }
+        const size_t len = static_cast<size_t>(w) * h;
+        std::vector<std::vector<uint8_t>> frames;
+        frames.reserve(sub.layers.size());
+        for (Layer& l : sub.layers) {
+            if (!l.visible || l.pixels == nullptr) continue;
+            // 独立渲染该层（含派生/蒙版；blend 置 Normal、剪贴解除）
+            Layer one = l;
+            one.blendMode = BlendMode::Normal;
+            one.clipping = false;
+            io::FlattenJob job = io::BuildFlattenJobSingle(one, 0, 0, 0, 0);
+            if (job.layers.empty()) continue;
+            io::FlattenResult res = io::FlattenVisible(job, 0, 0, static_cast<int>(w),
+                                                       static_cast<int>(h));
+            if (!res.ok) continue;
+            frames.push_back(std::move(res.rgba));
+        }
+        if (frames.empty()) {
+            err = "the smart object's contents have no visible layers";
+            return false;
+        }
+        rgba = stackCombine(frames, stackMode, len);
+        return true;
     }
     io::FlattenJob job = io::BuildFlattenJob(sub, 0, 0, 0, 0);
     io::FlattenResult res = io::FlattenVisible(job, 0, 0, static_cast<int>(w), static_cast<int>(h));
@@ -253,7 +311,8 @@ bool getSourceFlat(const SmartLayerState& sm, uint64_t& sourceHashOut, uint32_t&
     {
         std::lock_guard<std::mutex> lk(g_cacheMtx);
         auto it = g_sourceCache.find(sm.contentsId);
-        if (it != g_sourceCache.end() && it->second.hash == hash) {
+        if (it != g_sourceCache.end() && it->second.hash == hash &&
+            it->second.stackMode == sm.stackMode) {
             it->second.lastUse = ++g_useTick;
             w = it->second.w;
             h = it->second.h;
@@ -269,7 +328,7 @@ bool getSourceFlat(const SmartLayerState& sm, uint64_t& sourceHashOut, uint32_t&
     uint32_t dw = 0;
     uint32_t dh = 0;
     std::vector<uint8_t> flat;
-    const bool ok = decodeSourceFlat(name, bytes, dw, dh, flat, err);
+    const bool ok = decodeSourceFlat(name, bytes, sm.stackMode, dw, dh, flat, err);
     --g_decodeDepth;
     if (!ok) {
         return false;
@@ -277,6 +336,7 @@ bool getSourceFlat(const SmartLayerState& sm, uint64_t& sourceHashOut, uint32_t&
     std::lock_guard<std::mutex> lk(g_cacheMtx);
     SourceEntry& e = g_sourceCache[sm.contentsId];
     e.hash = hash;
+    e.stackMode = sm.stackMode;
     e.w = dw;
     e.h = dh;
     e.rgba = flat;  // 保留一份进缓存
@@ -459,6 +519,104 @@ void refreshMaskComposite(Layer& l) {
 
 }  // namespace
 
+// ---- M21 收口：堆栈模式（photocraft algo/stack.rs 全量翻译；oracle 直迁 .debug/m21） ----
+
+// Stat 求值（v 就地排序用于中值；photocraft stat 同语义——HDR/负值保持、
+// Skewness −2..2 → 0..1、Kurtosis 0..10 → 0..1、Entropy 256 箱/ log2(n) 归一）。
+float stackStat(std::vector<float>& v, int s) {
+    const size_t k = v.size();
+    if (k == 0) return 0.0f;
+    const float n = static_cast<float>(k);
+    double sum = 0.0;
+    for (float x : v) sum += x;
+    const double mean = sum / n;
+    auto moment = [&](int p) {
+        double acc = 0.0;
+        for (double x : v) acc += std::pow(x - mean, p);
+        return static_cast<float>(acc / n);
+    };
+    switch (s) {
+        case 3: return static_cast<float>(mean);                       // Mean
+        case 9: {                                                      // Summation
+            double acc = 0.0;
+            for (float x : v) acc += x;
+            return static_cast<float>(acc);
+        }
+        case 5: {                                                      // Minimum
+            float m = v[0];
+            for (float x : v) m = std::min(m, x);
+            return m;
+        }
+        case 2: {                                                      // Maximum
+            float m = v[0];
+            for (float x : v) m = std::max(m, x);
+            return m;
+        }
+        case 6: {                                                      // Range
+            float lo = v[0], hi = v[0];
+            for (float x : v) { lo = std::min(lo, x); hi = std::max(hi, x); }
+            return hi - lo;
+        }
+        case 4: {                                                      // Median
+            std::sort(v.begin(), v.end());
+            const size_t kk = v.size();
+            if (kk % 2 == 1) return v[kk / 2];
+            return (v[kk / 2 - 1] + v[kk / 2]) / 2.0f;
+        }
+        case 10: return moment(2);                                     // Variance
+        case 8: return std::sqrt(moment(2));                           // StandardDeviation
+        case 7: {                                                      // Skewness
+            const float sd = std::sqrt(moment(2));
+            if (sd < 1e-6f) return 0.5f;
+            return std::clamp(moment(3) / std::pow(sd, 3.0f) / 4.0f + 0.5f, 0.0f, 1.0f);
+        }
+        case 1: {                                                      // Kurtosis
+            const float var = moment(2);
+            if (var < 1e-12f) return 0.0f;
+            return std::clamp(moment(4) / (var * var) / 10.0f, 0.0f, 1.0f);
+        }
+        case 0: {                                                      // Entropy
+            if (k < 2) return 0.0f;
+            std::vector<uint32_t> counts(256, 0);
+            for (float x : v) {
+                const int b = static_cast<int>(std::round(std::clamp(x, 0.0f, 1.0f) * 255.0f));
+                ++counts[std::clamp(b, 0, 255)];
+            }
+            float h = 0.0f;
+            for (uint32_t c : counts) {
+                if (c == 0) continue;
+                const float p = static_cast<float>(c) / n;
+                h += -p * std::log2(p);
+            }
+            return h / std::log2(n);
+        }
+        default: return static_cast<float>(mean);
+    }
+}
+std::vector<uint8_t> stackCombine(const std::vector<std::vector<uint8_t>>& frames, int mode,
+                                  size_t len) {
+    std::vector<uint8_t> out(len * 4u, 0);
+    std::vector<float> samples[3];
+    for (size_t i = 0; i < len; ++i) {
+        for (auto& v : samples) v.clear();
+        float alpha = 0.0f;
+        for (const auto& f : frames) {
+            if (i * 4u + 3u >= f.size()) continue;
+            const float a = f[i * 4u + 3u] / 255.0f;
+            if (a <= 0.0f) continue;
+            for (int c = 0; c < 3; ++c) samples[c].push_back(f[i * 4u + c] / 255.0f);
+            alpha = std::max(alpha, a);
+        }
+        if (alpha <= 0.0f) continue;
+        uint8_t* o = out.data() + i * 4u;
+        for (int c = 0; c < 3; ++c) {
+            o[c] = static_cast<uint8_t>(
+                std::clamp(stackStat(samples[c], mode), 0.0f, 1.0f) * 255.0f + 0.5f);
+        }
+        o[3] = static_cast<uint8_t>(alpha * 255.0f + 0.5f);
+    }
+    return out;
+}
 namespace {
 
 // contentsId 进程内单调（nextContentsId / bumpContentsSeqAbove 共享）
@@ -476,12 +634,35 @@ void bumpContentsSeqAbove(uint64_t v) {
     }
 }
 
+// M21 收口：单个可见滤镜的阶段指纹（逐滤镜阶段缓存键成分）。
+uint64_t stageFingerprint(const SmartFilter& f) {
+    uint64_t h = kFnvOffset;
+    fnvMix(h, static_cast<uint64_t>(f.kind));
+    fnvMix(h, fnvBytes(reinterpret_cast<const uint8_t*>(f.psdClass.data()), f.psdClass.size()));
+    fnvMix(h, static_cast<uint64_t>(f.blend));
+    double op = f.opacity;
+    fnvMix(h, fnvDoubles(&op, 1));
+    const double pv[6] = {f.params.p0, f.params.p1, f.params.p2, f.params.p3, f.params.p4,
+                          f.params.p5};
+    fnvMix(h, fnvDoubles(pv, 6));
+    fnvMix(h, f.params.seed);
+    fnvMix(h, fnvFloats(f.params.kernel, 25));
+    fnvMix(h, fnvFloats(f.params.colorFg, 3));
+    fnvMix(h, fnvFloats(f.params.colorBg, 3));
+    double sc = f.params.scale;
+    double of = f.params.offset;
+    fnvMix(h, fnvDoubles(&sc, 1));
+    fnvMix(h, fnvDoubles(&of, 1));
+    return h;
+}
+
 uint64_t fingerprint(const SmartLayerState& sm) {
     uint64_t h = kFnvOffset;
     fnvMix(h, sm.sourceHash != 0 ? sm.sourceHash
                                  : fnvBytes(sm.sourceBytes.data(), sm.sourceBytes.size()));
     fnvMix(h, fnvDoubles(sm.m, 6));
     fnvMix(h, sm.filtersEnabled ? 0x5B : 0x2C);
+    fnvMix(h, static_cast<uint64_t>(sm.stackMode));  // M21：堆栈模式进指纹
     for (const SmartFilter& f : sm.filters) {
         fnvMix(h, static_cast<uint64_t>(f.kind));
         fnvMix(h, fnvBytes(reinterpret_cast<const uint8_t*>(f.psdClass.data()), f.psdClass.size()));
@@ -515,7 +696,8 @@ uint64_t fingerprint(const SmartLayerState& sm) {
 }
 
 bool decodeSourceFlat(const std::string& fileName, const std::vector<uint8_t>& bytes,
-                      uint32_t& w, uint32_t& h, std::vector<uint8_t>& rgba, std::string& err) {
+                      int stackMode, uint32_t& w, uint32_t& h, std::vector<uint8_t>& rgba,
+                      std::string& err) {
     const std::string ext = lowerExt(fileName);
     if (ext == "montage") {
         Document sub;
@@ -523,7 +705,7 @@ bool decodeSourceFlat(const std::string& fileName, const std::vector<uint8_t>& b
         if (!io::openProjectBytes(bytes, sub, &layerCount, err)) {
             return false;
         }
-        return flattenSubDocument(sub, w, h, rgba, err);
+        return flattenSubDocument(sub, stackMode, w, h, rgba, err);
     }
     if (ext == "psd" || ext == "psb") {
         psd::PsdDocument pd;
@@ -541,7 +723,7 @@ bool decodeSourceFlat(const std::string& fileName, const std::vector<uint8_t>& b
             return false;
         }
         sub.layers = std::move(layers);
-        return flattenSubDocument(sub, w, h, rgba, err);
+        return flattenSubDocument(sub, stackMode, w, h, rgba, err);
     }
     if (ext == "png") {
         std::shared_ptr<const TileGrid> grid = io::decodePngToGrid(bytes.data(), bytes.size(), err);
@@ -623,15 +805,69 @@ bool renderLayer(Layer& l, std::string& err) {
     if (needMix) {
         unfiltered = placed;
     }
-    // 滤镜链
-    std::vector<uint8_t> cur = std::move(placed);
+    // 滤镜链（M21 收口：逐滤镜阶段缓存——placed 指纹一致时按前缀续算，
+    // 编辑栈尾部滤镜不再重跑前缀；前置失配整表作废重建）
+    std::vector<uint64_t> visStages;
     if (sm.filtersEnabled) {
+        for (const SmartFilter& f : sm.filters) {
+            if (f.visible && f.kind >= 0) {
+                visStages.push_back(stageFingerprint(f));
+            }
+        }
+    }
+    std::vector<uint8_t> cur = std::move(placed);
+    size_t startIdx = 0;
+    const uint64_t placedHash = fnvBytes(cur.data(), cur.size());
+    {
+        std::lock_guard<std::mutex> lk(g_cacheMtx);
+        auto it = g_phaseCache.find(sm.contentsId);
+        if (it != g_phaseCache.end() && it->second.placedHash == placedHash &&
+            it->second.w == pw && it->second.h == ph) {
+            PhaseEntry& pe = it->second;
+            size_t common = 0;
+            while (common < pe.stageHashes.size() && common < visStages.size() &&
+                   pe.stageHashes[common] == visStages[common]) {
+                ++common;
+            }
+            if (common > 0 && common <= pe.stages.size()) {
+                cur = pe.stages[common - 1];
+                startIdx = common;
+                pe.lastUse = ++g_useTick;
+            }
+        }
+    }
+    if (sm.filtersEnabled && startIdx < visStages.size()) {
+        size_t vi = 0;
+        size_t ran = 0;
         for (const SmartFilter& f : sm.filters) {
             if (!f.visible || f.kind < 0) {
                 continue;  // 未实现滤镜（PSD 保 descriptor）直通
             }
+            const size_t idx = vi++;
+            if (idx < startIdx) {
+                continue;  // 阶段缓存命中前缀
+            }
             if (!applyOneFilter(cur, pw, ph, f, err)) {
                 return false;
+            }
+            ++ran;
+            // 每阶段写缓存（仅末 4 阶段，控内存；evict 走 g_cacheTotal 预算）
+            if (visStages.size() - idx <= 4) {
+                std::lock_guard<std::mutex> lk(g_cacheMtx);
+                PhaseEntry& pe = g_phaseCache[sm.contentsId];
+                if (pe.placedHash != placedHash || pe.w != pw || pe.h != ph) {
+                    pe = PhaseEntry{};
+                    pe.placedHash = placedHash;
+                    pe.w = pw;
+                    pe.h = ph;
+                }
+                pe.stageHashes.resize(idx + 1);
+                pe.stages.resize(idx + 1);
+                pe.stageHashes[idx] = visStages[idx];
+                pe.stages[idx] = cur;
+                pe.lastUse = ++g_useTick;
+                g_cacheTotal += cur.size();
+                (void)ran;
             }
         }
     }
@@ -713,7 +949,7 @@ bool layersToSmart(const std::string& name, LayerId newId, std::vector<Layer>& m
     uint32_t fw = 0;
     uint32_t fh = 0;
     std::vector<uint8_t> flat;
-    if (!flattenSubDocument(sub, fw, fh, flat, err)) {
+    if (!flattenSubDocument(sub, 0, fw, fh, flat, err)) {
         return false;
     }
     // 4) 合成墨迹包围盒 → 裁剪 + 二次平移（源域 = 墨迹精确，photocraft crop_surface 同语义）
@@ -787,6 +1023,7 @@ void clearSessionCaches() {
     std::lock_guard<std::mutex> lk(g_cacheMtx);
     g_sourceCache.clear();
     g_placedCache.clear();
+    g_phaseCache.clear();
     g_cacheTotal = 0;
 }
 

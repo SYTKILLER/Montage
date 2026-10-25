@@ -166,6 +166,7 @@ export interface LayerDTO {
   isSmart: boolean;   // M21 智能对象层
   smartFilters: number;   // M21 智能滤镜数（0 = 无）
   smartFiltersOn: boolean; // M21 整栈开关（非 SO 层恒 true）
+  stackMode: number;      // M21 堆栈模式（0=关闭 1..11 统计量；非 SO 层恒 0）
   smartHasMask: boolean;   // M21 滤镜蒙版存在
   shapeLiveKind: number;  // 0=None 1=Rect 2=Ellipse 3=Polygon 4=Line
   shapeRect: number[];    // [x,y,w,h]
@@ -353,6 +354,7 @@ export interface SmartInfoDTO {
   fileName: string;
   linkedPath: string;
   filtersEnabled: boolean;
+  stackMode: number;
   hasFilterMask: boolean;
   filterMaskEnabled: boolean;
   sourceAvailable: boolean;

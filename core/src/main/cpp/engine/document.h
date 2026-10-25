@@ -408,6 +408,10 @@ struct SmartLayerState {
     double srcW = 0.0;   // 源像素尺寸（SoLd Sz/置入解码/转换裁剪回填；导出四角出参）
     double srcH = 0.0;
     uint64_t psdImportHash = 0;  // 导入时渲染指纹（导出比对判定「未编辑」→ psdRaw 原样回写）
+    // M21 收口：堆栈模式（PS「智能对象 › 堆栈模式」；0 = 关闭，1..11 = StackMode 枚举）。
+    // 源含多可见层时逐像素统计合成（entropy/峰度/最大/均值/中值/最小/极差/偏度/
+    // 标准差/总和/方差）；单层源 = 恒等。渲染指纹已含（fingerprint 混入）。
+    int stackMode = 0;
 };
 
 // 图层（值语义，对齐源 ImageLayer；M2 子集：蒙版/剪贴 M5、调整层 M6a、文本层 M12）。

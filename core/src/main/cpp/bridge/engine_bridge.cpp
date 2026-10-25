@@ -941,6 +941,10 @@ napi_value makeLayerDto(napi_env env, const Layer& l, bool isActive) {
                                                                   : 0)));
     napi_set_named_property(env, obj, "smartFiltersOn",
                             makeBool(env, l.smart == nullptr || l.smart->filtersEnabled));
+    napi_set_named_property(env, obj, "stackMode",
+                            makeDouble(env, static_cast<double>(l.smart != nullptr
+                                                                     ? l.smart->stackMode
+                                                                     : 0)));
     napi_set_named_property(env, obj, "smartHasMask",
                             makeBool(env, l.smart != nullptr && l.smart->filterMask != nullptr));
     if (l.shape != nullptr) {
@@ -6339,18 +6343,25 @@ napi_value BeginFilterPreview(napi_env env, napi_callback_info info) {
             return makeError(env, kErrNoDoc, "beginFilterPreview: no document");
         }
         Layer* layer = findLayerLocked(e.doc, static_cast<LayerId>(id));
-        if (layer == nullptr || layer->pixels == nullptr) {
+        if (layer == nullptr) {
+            return makeError(env, kErrBadParam, "beginFilterPreview: layer not found");
+        }
+        // M21 收口：智能滤镜 1/4 代理预览——SO 层 proxy 源 = smartCache（已渲染放置
+        // +既有滤镜链的结果），新滤镜核跑在其上（PS 语义：智能滤镜预览 = 新滤镜
+        // 叠加在全渲染结果上）；提交由 addSmartFilter 走整链重渲。
+        const TileGrid* srcGrid = layer->smart != nullptr ? layer->smartCache.get() : layer->pixels.get();
+        if (srcGrid == nullptr) {
             return makeError(env, kErrBadParam, "beginFilterPreview: empty layer");
         }
         if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
             return makeError(env, kErrBadParam, "beginFilterPreview: session open");
         }
         uint32_t gx = 0, gy = 0, w = 0, h = 0;
-        if (!layerContentBBox(*layer->pixels, gx, gy, w, h)) {
+        if (!layerContentBBox(*srcGrid, gx, gy, w, h)) {
             return makeError(env, kErrBadParam, "beginFilterPreview: no content");
         }
         std::vector<uint8_t> strip;
-        filterGridToStrip(*layer->pixels, gx, gy, w, h, strip);
+        filterGridToStrip(*srcGrid, gx, gy, w, h, strip);
         auto& fp = e.filterPreview;
         fp = Engine::FilterPreview{};
         fp.active = true;
@@ -6459,7 +6470,10 @@ napi_value EndFilterPreview(napi_env env, napi_callback_info info) {
         std::lock_guard<std::mutex> lk(e.docMutex);
         Engine::FilterPreview& fp = e.filterPreview;
         if (fp.active) {
-            if (commit != 0) {
+            Layer* fl = findLayerLocked(e.doc, fp.layerId);
+            const bool isSmartLayer = fl != nullptr && fl->smart != nullptr;
+            if (commit != 0 && !isSmartLayer) {
+                // M21：SO 层提交走 addSmartFilter（整链重渲），此处只清代理。
                 filters::FilterParams p;
                 if (readFilterArgs(env, argv + 1, argc - 1, p)) {
                     p.colorFg[0] = e.fgColor[0];
@@ -9806,7 +9820,7 @@ napi_value SmartOpAsync(napi_env env, napi_callback_info info, int op) {
         }
         ctx->index = static_cast<int>(a);
         ctx->index2 = static_cast<int>(b);
-    } else if (op == 8 || op == 9) {
+    } else if (op == 8 || op == 9 || op == 10) {
         double a = 0;
         double b = 0;
         if (!num(1, &a)) {
@@ -9815,6 +9829,8 @@ napi_value SmartOpAsync(napi_env env, napi_callback_info info, int op) {
         }
         if (op == 8) {
             ctx->flag = a != 0;
+        } else if (op == 10) {
+            ctx->index = static_cast<int>(std::min(11.0, std::max(0.0, a)));
         } else {
             ctx->maskMode = static_cast<int>(a);
             if (argc >= 3 && num(2, &b)) {
@@ -10091,6 +10107,20 @@ napi_value SmartOpAsync(napi_env env, napi_callback_info info, int op) {
                     c->changed = smart::renderLayer(*l, c->err) || true;
                     break;
                 }
+                case 10: {
+                    // M21 收口：堆栈模式（0=关闭 1..11 统计量；源渲染时统计合成）
+                    Layer* l = findLayerLocked(work, c->layerId);
+                    if (l == nullptr || l->smart == nullptr) {
+                        c->err = "setSmartStackMode: layer is not a smart object";
+                        break;
+                    }
+                    auto sm = std::make_shared<SmartLayerState>(*l->smart);
+                    sm->stackMode = c->index;
+                    l->smart = std::move(sm);
+                    l->smartCacheHash = 0;
+                    c->changed = smart::renderLayer(*l, c->err) || true;
+                    break;
+                }
                 case 9: {
                     Layer* l = findLayerLocked(work, c->layerId);
                     if (l == nullptr || l->smart == nullptr) {
@@ -10181,6 +10211,7 @@ std::string smartOpLabel(int op, const std::string& name) {
         case 7: return "调整智能滤镜顺序";
         case 8: return "智能滤镜开关";
         case 9: return "滤镜蒙版";
+        case 10: return "堆栈模式";
         default: return "智能对象";
     }
 }
@@ -10223,6 +10254,11 @@ napi_value SetSmartFiltersEnabled(napi_env env, napi_callback_info info) {
 
 napi_value SetSmartFilterMask(napi_env env, napi_callback_info info) {
     return SmartOpAsync(env, info, 9);
+}
+
+// M21 收口：堆栈模式（layerId, mode 0..11）
+napi_value SetSmartStackMode(napi_env env, napi_callback_info info) {
+    return SmartOpAsync(env, info, 10);
 }
 
 // 栅格化智能对象（同步：像素 = effective 外观、清 smart/mask/style——全部烘焙）
@@ -10348,6 +10384,8 @@ napi_value GetSmartInfo(napi_env env, napi_callback_info info) {
     napi_set_named_property(env, obj, "linkedPath", t);
     napi_get_boolean(env, sm.filtersEnabled, &t);
     napi_set_named_property(env, obj, "filtersEnabled", t);
+    napi_create_double(env, static_cast<double>(sm.stackMode), &t);
+    napi_set_named_property(env, obj, "stackMode", t);
     napi_get_boolean(env, sm.filterMask != nullptr, &t);
     napi_set_named_property(env, obj, "hasFilterMask", t);
     napi_get_boolean(env, sm.filterMask != nullptr && sm.filterMask->enabled, &t);

@@ -349,7 +349,12 @@ void RenderLoop::doFrame() {
             }
             for (Layer& l : docSnap.layers) {
                 if (l.id == e.filterPreview.layerId) {
-                    l.pixels = e.filterPreview.proxy;
+                    // M21：SO 层替换 smartCache（effectivePixels 优先级在 pixels 之上）
+                    if (l.smart != nullptr) {
+                        l.smartCache = e.filterPreview.proxy;
+                    } else {
+                        l.pixels = e.filterPreview.proxy;
+                    }
                     l.render = nullptr;  // 预览期不叠蒙版（登记）
                     l.mask = nullptr;
                     l.transform.originX = e.filterPreview.originX;

@@ -154,6 +154,29 @@ FlattenJob BuildFlattenJob(const Document& doc, int regionX, int regionY, int re
     return BuildFlattenJobRange(doc, 0, static_cast<int>(doc.layers.size()));
 }
 
+// M21：单层 job（堆栈模式帧；effectivePixels 快照 + 直通 Normal——调用方保证可见/有像素）
+FlattenJob BuildFlattenJobSingle(const Layer& layer, int regionX, int regionY, int regionW,
+                                 int regionH) {
+    (void)regionX;
+    (void)regionY;
+    (void)regionW;
+    (void)regionH;
+    FlattenJob job;
+    FlatLayer fl;
+    fl.blend = BlendMode::Normal;
+    fl.opacity = 1.0;
+    fl.clipping = false;
+    fl.visible = true;
+    fl.isAdjustment = false;
+    fl.pixels = layer.effectivePixels();
+    fl.originX = layer.effectiveOriginX();
+    fl.originY = layer.effectiveOriginY();
+    if (fl.pixels != nullptr) {
+        job.layers.push_back(std::move(fl));
+    }
+    return job;
+}
+
 // 层段内容包围盒并集（组递归计可见子层；全段无可见像素返回 false）
 bool rangeContentBBox(const Document& doc, int start, int end, int& bx, int& by, int& bw, int& bh) {
     bool any = false;

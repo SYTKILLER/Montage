@@ -44,6 +44,10 @@ struct FlattenJob {
 // 剪贴基搜索约束在本层段内（剪贴不跨组边界）。
 FlattenJob BuildFlattenJob(const Document& doc, int regionX, int regionY, int regionW, int regionH);
 
+// M21：单层 job（智能对象堆栈模式帧渲染——独立 Normal 渲染一层的快照）。
+FlattenJob BuildFlattenJobSingle(const Layer& layer, int regionX, int regionY, int regionW,
+                                 int regionH);
+
 // 层段变体（合并族用）：只取平铺序 [start, end) 段；段内有组时同样组感知递归。
 FlattenJob BuildFlattenJobRange(const Document& doc, int start, int end);
 

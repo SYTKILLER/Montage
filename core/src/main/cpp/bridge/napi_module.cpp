@@ -117,6 +117,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"moveSmartFilter", nullptr, montage::bridge::MoveSmartFilter, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setSmartFiltersEnabled", nullptr, montage::bridge::SetSmartFiltersEnabled, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setSmartFilterMask", nullptr, montage::bridge::SetSmartFilterMask, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setSmartStackMode", nullptr, montage::bridge::SetSmartStackMode, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"rasterizeSmartObject", nullptr, montage::bridge::RasterizeSmartObject, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"newSmartObjectViaCopy", nullptr, montage::bridge::NewSmartObjectViaCopy, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getSmartInfo", nullptr, montage::bridge::GetSmartInfo, nullptr, nullptr, nullptr, napi_default, nullptr},

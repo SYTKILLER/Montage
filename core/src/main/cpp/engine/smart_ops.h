@@ -31,7 +31,14 @@ uint64_t fingerprint(const SmartLayerState& sm);
 // .png → 自研确定性解码；.jpg/.jpeg/.bmp/.webp 等 → 系统解码（CreateFromData，
 // mimeType 驱动 swapRB——M16a 校准纪律）。失败返回 false + err。
 bool decodeSourceFlat(const std::string& fileName, const std::vector<uint8_t>& bytes,
-                      uint32_t& w, uint32_t& h, std::vector<uint8_t>& rgba, std::string& err);
+                      int stackMode, uint32_t& w, uint32_t& h, std::vector<uint8_t>& rgba,
+                      std::string& err);
+
+// M21 收口：堆栈模式统计核（photocraft algo/stack.rs 翻译；宿主 oracle 直测）。
+// stackStat：0 熵 1 峰度 2 最大 3 均值 4 中值 5 最小 6 极差 7 偏度 8 标准差 9 总和 10 方差。
+float stackStat(std::vector<float>& v, int s);
+std::vector<uint8_t> stackCombine(const std::vector<std::vector<uint8_t>>& frames, int mode,
+                                  size_t len);
 
 // 重渲一层（指纹命中跳过；蒙版合成跟随）。false = 源不可用（缓存保持，photocraft 同语义：
 // 链接缺失/解码失败时保留旧像素）。重渲回填 transform.origin = 放置域原点。

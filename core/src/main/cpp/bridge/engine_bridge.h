@@ -287,6 +287,7 @@ napi_value RemoveSmartFilter(napi_env env, napi_callback_info info);
 napi_value MoveSmartFilter(napi_env env, napi_callback_info info);
 napi_value SetSmartFiltersEnabled(napi_env env, napi_callback_info info);
 napi_value SetSmartFilterMask(napi_env env, napi_callback_info info);
+napi_value SetSmartStackMode(napi_env env, napi_callback_info info);
 napi_value RasterizeSmartObject(napi_env env, napi_callback_info info);
 napi_value NewSmartObjectViaCopy(napi_env env, napi_callback_info info);
 napi_value GetSmartInfo(napi_env env, napi_callback_info info);

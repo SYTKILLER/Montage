@@ -171,6 +171,7 @@ function narrowLayer(r: Record<string, Object>): LayerDTO {
     isSmart: boolOf(r, 'isSmart'),
     smartFilters: num(r, 'smartFilters'),
     smartFiltersOn: boolOf(r, 'smartFiltersOn'),
+      stackMode: num(r, 'stackMode'),
     smartHasMask: boolOf(r, 'smartHasMask'),
     shapeLiveKind: num(r, 'shapeLiveKind'),
     shapeRect: numArr(r, 'shapeRect'),
@@ -899,6 +900,18 @@ export class CompositorEngine {
       slot: num(r.data, 'slot'),
       title: str(r.data, 'title'),
     };
+  }
+
+  /** M21：堆栈模式（mode 0=关闭 1..11 统计量）。 */
+  async setSmartStackMode(layerId: number, mode: number): Promise<boolean> {
+    const value: Object = await (native.setSmartStackMode(layerId, mode) as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'setSmartStackMode failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return false;
+    }
+    return true;
   }
 
   /** M22：软打样（proofId 空串=清除；视图级 3D LUT 末趟）。 */
@@ -2609,7 +2622,7 @@ export class CompositorEngine {
     const empty: SmartFilterDTO[] = [];
     const emptyInfo: SmartInfoDTO = {
       isSmart: false, contentsId: 0, embedded: true, fileName: '', linkedPath: '',
-      filtersEnabled: true, hasFilterMask: false, filterMaskEnabled: false,
+      filtersEnabled: true, stackMode: 0, hasFilterMask: false, filterMaskEnabled: false,
       sourceAvailable: false, filters: empty
     };
     const r = narrowResult(native.getSmartInfo(layerId) as Object);
@@ -2640,6 +2653,7 @@ export class CompositorEngine {
       isSmart: boolOf(d, 'isSmart'), contentsId: num(d, 'contentsId'),
       embedded: boolOf(d, 'embedded'), fileName: str(d, 'fileName'),
       linkedPath: str(d, 'linkedPath'), filtersEnabled: boolOf(d, 'filtersEnabled'),
+      stackMode: num(d, 'stackMode'),
       hasFilterMask: boolOf(d, 'hasFilterMask'), filterMaskEnabled: boolOf(d, 'filterMaskEnabled'),
       sourceAvailable: boolOf(d, 'sourceAvailable'), filters: filtersArr
     };

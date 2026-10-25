@@ -1273,6 +1273,10 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
             if (jv != nullptr && jv->type == JValue::Bool) {
                 sm->filtersEnabled = jv->b;
             }
+            jv = jsm->find("stackMode");
+            if (jv != nullptr && jv->type == JValue::Num) {
+                sm->stackMode = static_cast<int>(jv->num);
+            }
             jv = jsm->find("filters");
             if (jv != nullptr && jv->type == JValue::Arr) {
                 for (const JValue& fj : jv->arr) {
