@@ -646,6 +646,17 @@ bool traceSelectionToPath(const TileGrid& mask, VectorPath& out, size_t maxPoint
             k.inCtrl = pts[i];
             k.outCtrl = pts[i];
             k.smooth = false;
+            // M18 收口：trace 样条平滑——非角锚点走 smooth（Catmull-Rom 切线
+            // 手柄 = (next − prev) / 6，标准样条张力；photocraft smooth 同构）。
+            if (!corners[i]) {
+                const VPt& prev = pts[(i + pts.size() - 1) % pts.size()];
+                const VPt& next = pts[(i + 1) % pts.size()];
+                const double tx = (next.x - prev.x) / 6.0;
+                const double ty = (next.y - prev.y) / 6.0;
+                k.smooth = true;
+                k.inCtrl = {pts[i].x - tx, pts[i].y - ty};
+                k.outCtrl = {pts[i].x + tx, pts[i].y + ty};
+            }
             sp.knots.push_back(k);
         }
         out.subpaths.push_back(std::move(sp));

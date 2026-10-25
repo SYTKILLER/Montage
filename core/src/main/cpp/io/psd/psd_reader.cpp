@@ -986,7 +986,17 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
         if (!c.u16(&id)) { err = "truncated"; return false; }
         uint8_t nameLength = 0;
         if (!c.u8(&nameLength)) { err = "truncated"; return false; }
-        if (!c.skip(nameLength)) { err = "truncated"; return false; }
+        // M18 收口：保存路径名 = 资源 pascal name（PS「路径 1」等；原登记「路径资源名称丢失」）
+        std::string resName;
+        if (nameLength > 0) {
+            resName.resize(nameLength);
+            if (!c.bytes(reinterpret_cast<uint8_t*>(resName.data()), nameLength)) {
+                err = "truncated";
+                return false;
+            }
+        } else {
+            resName.clear();
+        }
         if ((nameLength + 1) % 2 == 1 && !c.skip(1)) { err = "truncated"; return false; }
         uint32_t len = 0;
         if (!c.u32(&len)) { err = "truncated"; return false; }
@@ -1001,7 +1011,9 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
                         out.workPath = std::move(vp);
                     } else {
                         NamedPathEntry entry;
-                        entry.name = "路径 " + std::to_string(out.paths.size() + 1);
+                        entry.name = resName.empty()
+                                         ? "路径 " + std::to_string(out.paths.size() + 1)
+                                         : resName;
                         entry.path = std::move(vp);
                         out.paths.push_back(std::move(entry));
                     }

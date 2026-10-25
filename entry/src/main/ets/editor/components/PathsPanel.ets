@@ -17,6 +17,14 @@ export struct PathsPanel {
     this.refresh();
   }
 
+  // M18 收口：外部数据版本号（父组件存路径/钢笔提交后 bump——
+  // 原登记「存路径后不自动刷新，点面板任意按钮才刷新」）
+  @Prop @Watch('onRevChanged') rev: number = 0;
+
+  onRevChanged(): void {
+    this.refresh();
+  }
+
   private refresh(): void {
     const flat = this.engine.getWorkPath();
     this.hasWork = flat.length > 1;

@@ -345,6 +345,7 @@ struct Index {
   @State penPoints: number[] = [];
   @State penClosed: boolean = false;
   @State workPathNonEmpty: number = 0;  // M18：菜单使能镜像（引擎工作路径非空）
+  @State pathsRev: number = 0;  // M18 收口：路径面板外部刷新版本号
   @State hasCustomShapes: boolean = false;  // M18：自定义形状库非空
   // M18.1 直接选择：工作副本扁平路径 + 选中集 [sub,knot,…] + 单选手柄
   @State dsPath: number[] = [];
@@ -2008,12 +2009,59 @@ struct Index {
         return;
       }
       if (kind === 1) {
-        // Shift+点击切换选中；点中未选锚点 = 单选它（含清空旧选）
+        // M18.1 收口：转换点——Alt+点击已选锚点在角/平滑间切换（PS 转换点语义）。
+        // 平滑 = Catmull-Rom 切线手柄；角化 = 手柄收回锚点。
         let already = false;
         for (let p2 = 0; p2 + 1 < this.dsSelected.length; p2 += 2) {
           if (this.dsSelected[p2] === hit[1] && this.dsSelected[p2 + 1] === hit[2]) {
             already = true;
           }
+        }
+        if (this.altHeld && already) {
+          const subs = this.dsParse(this.dsPath);
+          const si = hit[1];
+          const ki = hit[2];
+          if (si < subs.length) {
+            const knots = subs[si][2];
+            const off = ki * 7;
+            if ((ki + 1) * 7 <= knots.length) {
+              const n = knots.length / 7;
+              const closed = subs[si][0][0] > 0.5;
+              if (knots[off + 6] > 0.5) {
+                // 平滑 → 角：手柄收回锚点
+                knots[off + 6] = 0;
+                knots[off + 2] = knots[off];
+                knots[off + 3] = knots[off + 1];
+                knots[off + 4] = knots[off];
+                knots[off + 5] = knots[off + 1];
+              } else {
+                // 角 → 平滑：切线手柄 = (next − prev)/6（trace 样条同式）
+                const prevI = (ki + n - 1) % n;
+                const nextI = (ki + 1) % n;
+                if (closed || (ki > 0 && ki + 1 < n)) {
+                  const px2 = knots[prevI * 7];
+                  const py2 = knots[prevI * 7 + 1];
+                  const nx2 = knots[nextI * 7];
+                  const ny2 = knots[nextI * 7 + 1];
+                  const tx = (nx2 - px2) / 6.0;
+                  const ty = (ny2 - py2) / 6.0;
+                  knots[off + 6] = 1;
+                  knots[off + 2] = knots[off] - tx;
+                  knots[off + 3] = knots[off + 1] - ty;
+                  knots[off + 4] = knots[off] + tx;
+                  knots[off + 5] = knots[off + 1] + ty;
+                }
+              }
+              this.dsPath = this.dsSerialize(subs);
+              const lid = this.activeLayer()?.id ?? 0;
+              if (this.engine.setShapePath(lid, this.dsPath)) {
+                this.log('转换点已切换');
+                this.dsReloadPath();
+              }
+              this.dsRefreshPreview();
+            }
+          }
+          return;
         }
         if (this.shiftHeld) {
           if (already) {
@@ -2226,6 +2274,7 @@ struct Index {
     if (this.engine.saveWorkPath('')) {
       this.penPoints = [];
       this.penClosed = false;
+      this.pathsRev++;
       this.log('钢笔: 已存为路径');
     }
   }
@@ -2505,7 +2554,10 @@ struct Index {
       return;
     }
     if (a.isSmart) {
-      // M21：SO 层 = 智能滤镜化（无实时预览；编辑模式预填当前参数）
+      // M21 收口：智能滤镜 1/4 代理预览（proxy = smartCache；提交走 addSmartFilter）
+      if (this.smartEditIndex < 0 && this.engine.beginFilterPreview(a.id)) {
+        this.log(`智能滤镜预览: ${def.label}`);
+      }
       this.filterDef = def;
       if (this.smartEditIndex >= 0 && this.smartInfo !== null &&
           this.smartEditIndex < this.smartInfo.filters.length) {
@@ -2574,7 +2626,8 @@ struct Index {
     const a = this.activeLayer();
     if (a !== undefined && a.isSmart) {
       // M21：智能滤镜化——新滤镜走 addSmartFilter（选区自动成滤镜蒙版，PS 语义），
-      // 编辑模式走 setSmartFilter；无 1/4 代理预览管线（登记）
+      // 编辑模式走 setSmartFilter；代理会话收尾（不重渲，提交由 addSmartFilter 负责）
+      this.engine.endFilterPreview(false, 0, 0, 0, 0, 0, 0, 0, 0);
       if (this.smartEditIndex >= 0) {
         this.engine.setSmartFilter(a.id, this.smartEditIndex, vals, this.filterSeed, 0, 1.0,
           true, def.label).then((ok: boolean): void => {
@@ -2616,7 +2669,7 @@ struct Index {
     this.showFilter = false;
     const def = this.filterDef;
     const a = this.activeLayer();
-    if (def !== null && a !== undefined && !a.isSmart) {
+    if (def !== null && a !== undefined) {
       const p = this.filterP;
       const vals: number[] = [p[0] ?? 0, p[1] ?? 0, p[2] ?? 0, p[3] ?? 0, p[4] ?? 0, p[5] ?? 0];
       this.engine.endFilterPreview(false, def.kind, vals[0], vals[1], vals[2], vals[3], vals[4],
@@ -4949,6 +5002,39 @@ struct Index {
         this.onAlignPick(alignModes[id] ?? 0, id.startsWith('layer.align'));
         break;
       }
+      case 'layer.stackOff':
+      case 'layer.stackEntropy':
+      case 'layer.stackMean':
+      case 'layer.stackMedian':
+      case 'layer.stackMin':
+      case 'layer.stackMax':
+      case 'layer.stackRange':
+      case 'layer.stackSum':
+      case 'layer.stackSd':
+      case 'layer.stackVar': {
+        // M21：堆栈模式（id → 统计量；photocraft StackMode 序）
+        const modes: Record<string, number> = {
+          'layer.stackOff': 0, 'layer.stackEntropy': 1, 'layer.stackMean': 3,
+          'layer.stackMedian': 4, 'layer.stackMin': 5, 'layer.stackMax': 2,
+          'layer.stackRange': 6, 'layer.stackSum': 9, 'layer.stackSd': 8,
+          'layer.stackVar': 10,
+        };
+        const a = this.activeLayer();
+        if (a === undefined || !a.isSmart) {
+          this.toast('活动图层不是智能对象');
+          break;
+        }
+        const mode = modes[id] ?? 0;
+        this.engine.setSmartStackMode(a.id, mode).then((ok: boolean): void => {
+          if (ok) {
+            this.toast(mode === 0 ? '堆栈模式已关闭' : '堆栈模式已应用');
+            this.log(`堆栈模式: 层${a.id} mode=${mode}`);
+          } else {
+            this.toast('堆栈模式失败（源需多可见层）');
+          }
+        });
+        break;
+      }
       case 'layer.convertSmart': {
         const a = this.activeLayer();
         if (a === undefined || a.isGroup || a.isSmart) {
@@ -6157,6 +6243,20 @@ struct Index {
       leafItem('layer.smartFiltersToggle', '禁用/启用智能滤镜', '',
         d && this.activeLayer()?.isSmart === true && (this.activeLayer()?.smartFilters ?? 0) > 0,
         this.activeLayer()?.isSmart === true && this.activeLayer()?.smartFiltersOn === false),
+      // M21 收口：堆栈模式（源多可见层逐像素统计；photocraft StackMode 11 统计）
+      subItem('layer.stackModeSub', '堆栈模式', d && this.activeLayer()?.isSmart === true, [
+        leafItem('layer.stackOff', '关闭', '', true,
+          this.activeLayer()?.stackMode === 0),
+        leafItem('layer.stackMean', '平均值', '', true, this.activeLayer()?.stackMode === 3),
+        leafItem('layer.stackMedian', '中间值', '', true, this.activeLayer()?.stackMode === 4),
+        leafItem('layer.stackMin', '最小值', '', true, this.activeLayer()?.stackMode === 5),
+        leafItem('layer.stackMax', '最大值', '', true, this.activeLayer()?.stackMode === 2),
+        leafItem('layer.stackRange', '极差', '', true, this.activeLayer()?.stackMode === 6),
+        leafItem('layer.stackSum', '总和', '', true, this.activeLayer()?.stackMode === 9),
+        leafItem('layer.stackSd', '标准偏差', '', true, this.activeLayer()?.stackMode === 8),
+        leafItem('layer.stackVar', '方差', '', true, this.activeLayer()?.stackMode === 10),
+        leafItem('layer.stackEntropy', '熵', '', true, this.activeLayer()?.stackMode === 1),
+      ]),
       leafItem('layer.smartMaskClear', '清除滤镜蒙版', '',
         d && this.activeLayer()?.isSmart === true &&
           this.activeLayer()?.smartHasMask === true),
@@ -7550,6 +7650,7 @@ struct Index {
               if (this.tool === 'pen' || this.engine.getWorkPath().length > 1) {
                 PathsPanel({
                   engine: this.engine,
+                  rev: this.pathsRev,
                   fgHex: this.brushColor,
                   onChanged: (): void => {
                     this.refreshLayers();
