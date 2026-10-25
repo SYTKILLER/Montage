@@ -2533,39 +2533,11 @@ napi_value SetBrushHeal(napi_env env, napi_callback_info info) {
 }
 
 // M19a：修补工具（选区 = 目标，(dx,dy) 平移取源，泊松融入选区；一步撤销事务）
+// M19 收口：修补工具异步化（原同步泊松融入在大选区秒级阻塞 JS 线程——登记的
+// 「patchSelection 同步大选区风险」；CaOpAsync 同范式锁内快照→锁外求解→发布段复核）。
+napi_value CaOpAsync(napi_env env, napi_callback_info info, int op);
 napi_value PatchSelection(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value argv[2] = {nullptr, nullptr};
-    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    if (argc < 2) {
-        return makeError(env, kErrBadParam, "patchSelection(dx, dy) requires 2 args");
-    }
-    double dx = 0, dy = 0;
-    if (napi_get_value_double(env, argv[0], &dx) != napi_ok ||
-        napi_get_value_double(env, argv[1], &dy) != napi_ok) {
-        return makeError(env, kErrBadParam, "patchSelection: invalid args");
-    }
-    auto& e = Engine::get();
-    {
-        std::lock_guard<std::mutex> lg(e.docMutex);
-        if (e.doc.width == 0) {
-            return makeError(env, kErrNoDoc, "patchSelection: no document");
-        }
-        e.history.beginEdit(e.doc, "patch", static_cast<uint64_t>(e.docRevision));
-        std::string err;
-        const bool ok = patchSelection(e.doc, static_cast<int>(std::lround(dx)),
-                                       static_cast<int>(std::lround(dy)), err);
-        if (!ok) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
-            return makeError(env, kErrBadParam, "patchSelection: " + err);
-        }
-        restyleDocument(e.doc);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
-        e.bumpRevisionLocked();
-        e.requestRender();
-    }
-    e.historyVersion.fetch_add(1);
-    return makeOk(env, nullptr);
+    return CaOpAsync(env, info, 2);
 }
 
 // M19b：内容感知填充/移动——异步 Promise（PatchMatch 秒级，同步会 ANR；
@@ -2587,7 +2559,8 @@ napi_value CaOpAsync(napi_env env, napi_callback_info info, int op) {
     auto& e = Engine::get();
     auto* ctx = new CaOpCtx();
     ctx->op = op;
-    if (op == 1) {
+    if (op == 1 || op == 2) {
+        // op 2 = patchSelection（M19 收口：大选区泊松融入秒级 → 异步化，同 ANR 范式）
         size_t argc = 3;
         napi_value argv[3] = {nullptr, nullptr, nullptr};
         napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
@@ -2614,7 +2587,8 @@ napi_value CaOpAsync(napi_env env, napi_callback_info info, int op) {
         if (e.doc.width == 0) {
             delete ctx;
             return makeError(env, kErrNoDoc, op == 0 ? "contentAwareFill: no document"
-                                                     : "contentAwareMove: no document");
+                                                     : op == 2 ? "patchSelection: no document"
+                                                               : "contentAwareMove: no document");
         }
         ctx->docSnap = e.doc;
         ctx->epoch = e.docEpoch;
@@ -2631,6 +2605,8 @@ napi_value CaOpAsync(napi_env env, napi_callback_info info, int op) {
             Document work = c->docSnap;
             if (c->op == 0) {
                 c->changed = contentAwareFill(work, c->err);
+            } else if (c->op == 2) {
+                c->changed = patchSelection(work, c->dx, c->dy, c->err);
             } else {
                 c->changed = contentAwareMove(work, c->dx, c->dy, c->extend, c->err);
             }
@@ -2640,7 +2616,9 @@ napi_value CaOpAsync(napi_env env, napi_callback_info info, int op) {
             auto& eg = Engine::get();
             std::lock_guard<std::mutex> lk(eg.docMutex);
             if (c->changed && eg.docEpoch == c->epoch && eg.docRevision == c->revision) {
-                eg.history.beginEdit(eg.doc, c->op == 0 ? "content-aware fill" : "content-aware move",
+                eg.history.beginEdit(eg.doc,
+                                     c->op == 0 ? "content-aware fill"
+                                                : c->op == 2 ? "patch" : "content-aware move",
                                      static_cast<uint64_t>(eg.docRevision));
                 eg.doc = std::move(work);
                 eg.history.endEdit(eg.doc, static_cast<uint64_t>(eg.docRevision));

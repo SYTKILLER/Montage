@@ -1689,15 +1689,28 @@ export class CompositorEngine {
     return r.ok;
   }
 
-  // M19a 修补工具：选区 = 目标，(dx,dy) 平移取源，泊松融入选区（一步撤销事务）
-  patchSelection(dx: number, dy: number): boolean {
-    const r = narrowResult(native.patchSelection(dx, dy) as Object);
-    if (!r.ok) {
-      hilog.error(DOMAIN, TAG, 'patchSelection rejected: %{public}s',
-        r.error !== null ? r.error.message : 'unknown');
-    }
-    automation.note('paint.patch', { 'dx': dx, 'dy': dy });
-    return r.ok;
+  // M19a 修补工具：选区 = 目标，(dx,dy) 平移取源，泊松融入选区。
+  // M19 收口：异步化（原同步泊松在大选区秒级阻塞 JS 线程——登记的「patchSelection
+  // 同步大选区风险」；CaOp 同范式，受理即返回，结果经 onDone 回调）。
+  patchSelection(dx: number, dy: number, onDone?: (changed: boolean) => void): boolean {
+    const p = native.patchSelection(dx, dy) as Promise<Object>;
+    p.then((v: Object): void => {
+      const r = narrowResult(v);
+      const changed = r.ok && r.data !== null && boolOf(r.data, 'changed');
+      if (!r.ok && r.error !== null) {
+        hilog.error(DOMAIN, TAG, 'patchSelection rejected: %{public}s', r.error.message);
+      }
+      automation.note('paint.patch', { 'dx': dx, 'dy': dy });
+      if (onDone !== undefined) {
+        onDone(changed);
+      }
+    }).catch((e: Object): void => {
+      hilog.error(DOMAIN, TAG, 'patchSelection failed: %{public}s', String(e));
+      if (onDone !== undefined) {
+        onDone(false);
+      }
+    });
+    return true;
   }
 
   // M19b 内容感知填充：选区 = 孔，采样窗口内受限源补全。异步 Promise（PatchMatch 秒级，

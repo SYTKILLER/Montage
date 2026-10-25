@@ -3204,8 +3204,13 @@ struct Index {
         this.log('修补：位移为 0，已取消');
         return;
       }
-      const ok = this.engine.patchSelection(dx, dy);
-      this.log(`修补: 源位移(${dx},${dy}) → ${ok ? '已应用' : '失败（见日志）'}`);
+      this.engine.patchSelection(dx, dy, (changed: boolean): void => {
+        this.log(`修补: 源位移(${dx},${dy}) → ${changed ? '已应用' : '失败（见日志）'}`);
+        if (!changed) {
+          this.toast('修补失败（见日志）');
+        }
+      });
+      this.log(`修补: 源位移(${dx},${dy}) → 已受理`);
     }
   }
 
