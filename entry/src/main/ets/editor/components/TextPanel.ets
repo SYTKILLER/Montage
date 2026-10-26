@@ -1,8 +1,9 @@
 /**
  * M12 文字面板（字符/段落合一 v1，06 规划）：
- * 字体列表 / 字号 / 行距 / 字距 / 颜色 / B·I / 对齐 / 内容编辑 / 栅格化。
+ * 字体列表 / 字号 / 行距 / 字距 / 颜色 / B·I / 对齐 / 段落缩进 / 内容编辑 / 栅格化。
  * 受控组件：活动文本层 DTO 由父组件传值；操作回调发引擎命令（txn 由父按编辑会话态决定）。
- * 段落缩进 v1 不做（TypographySetIndents 登记后续）；直排 P1 不做。
+ * 段落缩进（P2）：左缩进/首行缩进走 TypographySetIndents（逐段首行缩进不生效，登记）。
+ * 直排 P1 不做（SDK 无竖排布局，已核验）。
  */
 
 const TEXT_SWATCHES: string[] = ['#111111', '#FFFFFF', '#D93025', '#F9AB00', '#188038', '#1A6BD9', '#7B1FA2', '#8D6E63'];
@@ -20,6 +21,8 @@ export struct TextPanel {
   @Prop colorHex: string = '#000000';
   @Prop alignIdx: number = 0;
   @Prop wrapW: number = 0;             // 0 = 点文字
+  @Prop indentLeft: number = 0;        // P2 段落左缩进（文档 px）
+  @Prop indentFirst: number = 0;       // P2 首行缩进（文档 px）
   @Prop @Watch('syncContentBox') content: string = '';  // 活动文本层内容（审查修复：
                                                         // 原先零消费——选中已有层后应用会以
                                                         // 框内残留旧值覆写/清空层文字）
@@ -32,7 +35,10 @@ export struct TextPanel {
   onToggleBold: () => void = () => {};
   onToggleItalic: () => void = () => {};
   onPickColor: (c: string) => void = (_c: string) => {};
+  // P2 HSV 拾色器入口（父组件开 ColorPicker 模态，确认回 onPickColor）
+  onOpenPicker: () => void = () => {};
   onAlign: (a: number) => void = (_a: number) => {};
+  onIndent: (left: number, first: number) => void = (_l: number, _f: number) => {};
   onContent: (text: string) => void = (_t: string) => {};
   onRasterize: () => void = () => {};
   onImportFont: () => void = () => {};
@@ -157,6 +163,32 @@ export struct TextPanel {
           .margin({ left: 'auto' })
       }.width('100%')
 
+      // P2 段落缩进（左/首行，px；提交合一步撤销）
+      Row({ space: 6 }) {
+        Text('左缩').fontSize(10).fontColor($r('app.color.text_secondary')).width(30)
+        Slider({ value: this.indentLeft, min: 0, max: 500, step: 2 })
+          .layoutWeight(1)
+          .onChange((v: number, mode: SliderChangeMode): void => {
+            if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+              this.onIndent(Math.round(v), this.indentFirst);
+            }
+          })
+        Text(`${Math.round(this.indentLeft)}`)
+          .fontSize(10).fontColor($r('app.color.text_primary')).width(34).textAlign(TextAlign.End)
+      }.width('100%')
+      Row({ space: 6 }) {
+        Text('首行').fontSize(10).fontColor($r('app.color.text_secondary')).width(30)
+        Slider({ value: this.indentFirst, min: -200, max: 500, step: 2 })
+          .layoutWeight(1)
+          .onChange((v: number, mode: SliderChangeMode): void => {
+            if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+              this.onIndent(this.indentLeft, Math.round(v));
+            }
+          })
+        Text(`${Math.round(this.indentFirst)}`)
+          .fontSize(10).fontColor($r('app.color.text_primary')).width(34).textAlign(TextAlign.End)
+      }.width('100%')
+
       // 颜色
       Row({ space: 6 }) {
         Text('颜色').fontSize(10).fontColor($r('app.color.text_secondary')).width(30)
@@ -173,6 +205,12 @@ export struct TextPanel {
             })
             .onClick((): void => this.onPickColor(c))
         }, (c: string): string => c)
+        // P2 HSV 拾色器入口
+        Button('编辑…')
+          .fontSize(9).height(20).padding({ left: 6, right: 6 })
+          .backgroundColor($r('app.color.surface'))
+          .fontColor($r('app.color.text_primary'))
+          .onClick((): void => this.onOpenPicker())
       }.width('100%')
 
       // 内容（面板直改入口：编辑 overlay 之外亦可用；blur 提交）

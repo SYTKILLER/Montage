@@ -14,9 +14,11 @@
 namespace montage {
 
 // 一次栅格化输出：整幅直 alpha RGBA8888（行距 = width*4），空内容时 width=height=0。
+// baseline = 位图顶→首行字母基线距离（px，含位图 padding；P2 基线锚点用；空内容 0）。
 struct TextRasterResult {
     uint32_t width = 0;
     uint32_t height = 0;
+    double baseline = 0.0;
     std::vector<uint8_t> rgba;
 };
 

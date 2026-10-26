@@ -51,6 +51,7 @@ export struct OptionsBar {
   @Link wandAllLayers: boolean;
   @Link wandSampleSize: number;
   @Prop brushColor: string = '#000000';
+  @Prop bgColor: string = '#FFFFFF';
   @Prop maskTarget: boolean = false;
   @Prop hasMaskOnActive: boolean = false;
   @Prop quickMaskActive: boolean = false;  // M10d：快速蒙版模式中（笔画自动落通道）
@@ -118,6 +119,8 @@ export struct OptionsBar {
   onSelShapeToggle: () => void = () => {};
   onToggleMaskTarget: () => void = () => {};
   onColorPick: (hex: string) => void = (_hex: string) => {};
+  // P2 拾色器入口（0=前景 1=背景；父组件开 ColorPicker 模态）
+  onOpenPicker: (target: number) => void = (_t: number) => {};
   onZoom: (cmd: string) => void = (_cmd: string) => {};
   onCropCommand: (cmd: string) => void = (_cmd: string) => {};
   // M14b 对齐/分布（move 工具选项条；PS 同布局）
@@ -274,6 +277,29 @@ export struct OptionsBar {
       }
       .height(28)
       Row({ space: 6 }) {
+        // P2 前景/背景方块（PS 前后景叠放语义）+ 拾色器入口（HSV 色域盘）
+        Stack({ alignContent: Alignment.End }) {
+          Column()
+            .width(18)
+            .height(18)
+            .backgroundColor(this.bgColor)
+            .border({ width: 1, color: $r('app.color.border') })
+            .offset({ x: 6, y: 6 })
+            .onClick((): void => {
+              this.onOpenPicker(1);
+            })
+          Column()
+            .width(18)
+            .height(18)
+            .backgroundColor(this.brushColor)
+            .border({ width: 1, color: $r('app.color.text_primary') })
+            .offset({ x: -4, y: -4 })
+            .onClick((): void => {
+              this.onOpenPicker(0);
+            })
+        }
+        .width(30)
+        .height(30)
         ForEach(SWATCHES, (c: string) => {
           Column()
             .width(20)

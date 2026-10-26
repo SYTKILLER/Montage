@@ -1054,6 +1054,10 @@ napi_value makeLayerDto(napi_env env, const Layer& l, bool isActive) {
     napi_set_named_property(env, obj, "textColor", makeString(env, textHex));
     napi_set_named_property(env, obj, "textAlign", makeInt32(env, l.text ? l.text->align : 0));
     napi_set_named_property(env, obj, "textWrapWidth", makeDouble(env, l.text ? l.text->wrapWidth : 0));
+    napi_set_named_property(env, obj, "textIndentLeft",
+                            makeDouble(env, l.text ? l.text->indentLeft : 0));
+    napi_set_named_property(env, obj, "textIndentFirst",
+                            makeDouble(env, l.text ? l.text->indentFirst : 0));
     napi_set_named_property(env, obj, "textX", makeDouble(env, l.text ? l.transform.originX : 0));
     napi_set_named_property(env, obj, "textY", makeDouble(env, l.text ? l.transform.originY : 0));
     napi_set_named_property(env, obj, "textW", makeDouble(env, l.text ? l.text->rasterW : 0));
@@ -5673,6 +5677,7 @@ napi_value CreateTextLayer(napi_env env, napi_callback_info info) {
         t->color[1] = e.fgColor[1];
         t->color[2] = e.fgColor[2];
         t->wrapWidth = wrapW > 0.0 ? wrapW : 0.0;
+        t->baselineOff = 0.0;  // P2 基线锚点：待首次栅格锚定（originY -= 基线）
         layer.text = std::move(t);
         layer.transform.originX = x;
         layer.transform.originY = y;
@@ -5778,6 +5783,14 @@ napi_value SetTextLayerStyle(napi_env env, napi_callback_info info) {
     if (argc >= 13) {
         ok = ok && napi_get_value_int32(env, argv[12], &txn) == napi_ok;
     }
+    // P2 段落缩进（可选尾参：indentLeft, indentFirst，文档 px）
+    double indentLeft = 0, indentFirst = 0;
+    if (argc >= 14) {
+        ok = ok && getDoubleArg(env, argv[13], &indentLeft);
+    }
+    if (argc >= 15) {
+        ok = ok && getDoubleArg(env, argv[14], &indentFirst);
+    }
     if (!ok) {
         return makeError(env, kErrBadParam, "setTextLayerStyle: invalid args");
     }
@@ -5808,6 +5821,8 @@ napi_value SetTextLayerStyle(napi_env env, napi_callback_info info) {
         nt->color[2] = static_cast<float>(std::min(1.0, std::max(0.0, b)));
         nt->align = static_cast<int32_t>(std::min(2.0, std::max(0.0, align)));
         nt->wrapWidth = wrapW > 0.0 ? wrapW : 0.0;
+        nt->indentLeft = std::min(4096.0, std::max(-4096.0, indentLeft));
+        nt->indentFirst = std::min(4096.0, std::max(-4096.0, indentFirst));
         l->text = std::move(nt);
         std::string err;
         relayoutTextLayer(*l, err);

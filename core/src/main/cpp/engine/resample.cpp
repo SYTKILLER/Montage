@@ -1,5 +1,6 @@
 #include "engine/resample.h"
 
+#include "engine/text_ops.h"
 #include "engine/vector_render.h"
 
 #include <algorithm>
@@ -159,6 +160,51 @@ bool resampleDocument(Document& doc, uint32_t newW, uint32_t newH) {
             std::ceil(static_cast<double>(l.pixels ? l.pixels->cols : 1) * sx)));
         const uint32_t newRows = std::max(1u, static_cast<uint32_t>(
             std::ceil(static_cast<double>(l.pixels ? l.pixels->rows : 1) * sy)));
+        if (l.text != nullptr) {
+            // P2 文字跟随重采样（M12 登记项）：文字参数随文档缩放 + relayout 再生清晰
+            // 栅格（warp 像素仅兜底——重排失败时保留）。字号随 sy（行高垂直主导）、
+            // 换行宽/缩进随 sx；非等比缩放为近似（登记）。基线锚定层的 originY 预补偿：
+            // relayout 保基线不动 → 须先把基线 doc 位置放到 sy×原位再重排。
+            const double bOld = l.text->baselineOff;
+            auto nt = std::make_shared<TextLayerState>(*l.text);
+            nt->fontSize = std::min(800.0, std::max(4.0, nt->fontSize * sy));
+            if (nt->wrapWidth > 0.0) {
+                nt->wrapWidth *= sx;
+            }
+            nt->indentLeft *= sx;
+            nt->indentFirst *= sx;
+            l.text = std::move(nt);
+            if (l.pixels != nullptr) {
+                l.pixels = warpGridAffine(*l.pixels, m, newCols, newRows);
+            }
+            l.transform.originX *= sx;
+            if (bOld > 0.0) {
+                l.transform.originY = sy * l.transform.originY + (sy - 1.0) * bOld;
+            } else {
+                l.transform.originY *= sy;
+            }
+            if (l.mask != nullptr) {
+                auto m2 = std::make_shared<LayerMask>(*l.mask);
+                if (m2->pixels != nullptr) {
+                    const uint32_t mCols = std::max(1u, static_cast<uint32_t>(
+                        std::ceil(m2->pixels->cols * sx)));
+                    const uint32_t mRows = std::max(1u, static_cast<uint32_t>(
+                        std::ceil(m2->pixels->rows * sy)));
+                    m2->pixels = warpGridAffine(*m2->pixels, m, mCols, mRows);
+                }
+                m2->width = std::max(1u, static_cast<uint32_t>(std::lround(m2->width * sx)));
+                m2->height = std::max(1u, static_cast<uint32_t>(std::lround(m2->height * sy)));
+                m2->offsetX = static_cast<int>(std::lround(m2->offsetX * sx));
+                m2->offsetY = static_cast<int>(std::lround(m2->offsetY * sy));
+                l.mask = std::move(m2);
+            }
+            if (l.mask != nullptr && l.mask->enabled && l.pixels != nullptr) {
+                l.render = composeMasked(l.pixels, *l.mask);
+            }
+            std::string terr;
+            relayoutTextLayer(l, terr);
+            continue;
+        }
         if (l.shape != nullptr) {
             // M18：形状路径同步缩放（x'=sx·x, y'=sy·y）
             affineShapeLayer(l, sx, 0.0, 0.0, sy, 0.0, 0.0);

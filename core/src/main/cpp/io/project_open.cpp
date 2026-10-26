@@ -976,6 +976,34 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
                 return false;
             }
             t->wrapWidth = ww;
+            // P2 段落缩进（可选；缺省 0）+ 基线锚缓存（可选；缺省 -1 = 旧档顶左锚定）
+            const JValue* jindl = jtx->find("indentLeft");
+            if (jindl != nullptr) {
+                double iv = 0;
+                if (!getDouble(*jindl, iv) || !std::isfinite(iv) || iv < -4096 || iv > 4096) {
+                    err = "bad text indentLeft";
+                    return false;
+                }
+                t->indentLeft = iv;
+            }
+            const JValue* jindf = jtx->find("indentFirst");
+            if (jindf != nullptr) {
+                double iv = 0;
+                if (!getDouble(*jindf, iv) || !std::isfinite(iv) || iv < -4096 || iv > 4096) {
+                    err = "bad text indentFirst";
+                    return false;
+                }
+                t->indentFirst = iv;
+            }
+            const JValue* jbase = jtx->find("baselineOff");
+            if (jbase != nullptr) {
+                double bv = -1.0;
+                if (!getDouble(*jbase, bv) || !std::isfinite(bv) || bv < 0 || bv > 1e6) {
+                    err = "bad text baselineOff";
+                    return false;
+                }
+                t->baselineOff = bv;
+            }
             l.text = std::move(t);
         }
         // v7 组字段（可选；旧版无此字段 = 普通根层）

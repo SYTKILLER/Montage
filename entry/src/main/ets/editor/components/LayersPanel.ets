@@ -422,7 +422,7 @@ export struct LayersPanel {
         this.dragFromId = 0;
       })
 
-      // 操作条
+      // 操作条（P2 两行：9 柄单行 318px > 坞内宽 260，矮/窄窗口横向裁切——登记项收口）
       Row({ space: 6 }) {
         Button() {
           SymbolGlyph($r('sys.symbol.plus')).fontSize(16)
@@ -467,7 +467,7 @@ export struct LayersPanel {
         .backgroundColor(Color.Transparent)
         .enabled(this.active()?.isGroup === true)
         .onClick((): void => this.onUngroup())
-        // M14b：复制图层（M7.5 欠账）+ 链接/解除链接
+        // M14b：复制图层（M7.5 欠账）
         Button() {
           SymbolGlyph($r('sys.symbol.plus_square_on_square')).fontSize(16)
             .fontColor([$r('app.color.text_primary')])
@@ -477,6 +477,10 @@ export struct LayersPanel {
         .backgroundColor(Color.Transparent)
         .enabled(this.active() !== undefined)
         .onClick((): void => this.onDuplicate())
+      }
+      .width('100%')
+      Row({ space: 6 }) {
+        // M14b：链接/解除链接 + 样式
         Button() {
           SymbolGlyph(this.anySelectedLinked() ? $r('sys.symbol.link_slash') : $r('sys.symbol.link'))
             .fontSize(16)

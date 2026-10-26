@@ -152,6 +152,15 @@ bool rasterizeText(const TextLayerState& t, double maxWidth, TextRasterResult& o
         OH_Drawing_TypographyHandlerPopTextStyle(handler);
         typo = OH_Drawing_CreateTypography(handler);
         if (typo != nullptr) {
+            // P2 段落缩进（TypographySetIndents since 12，SDK 核验）：按绝对行号取缩进，
+            // 越界行取末元素 → [首行 = 左+首行缩进, 其余 = 左缩进]。OHOS 语义按绝对行号
+            // 而非逐段首行，多段首行缩进不逐段生效（登记）。
+            if (t.indentLeft != 0.0 || t.indentFirst != 0.0) {
+                const float inds[2] = {
+                    static_cast<float>(t.indentLeft + t.indentFirst),
+                    static_cast<float>(t.indentLeft)};
+                OH_Drawing_TypographySetIndents(typo, 2, inds);
+            }
             OH_Drawing_TypographyLayout(typo, std::max(1.0, maxWidth));
             const double textW = OH_Drawing_TypographyGetLongestLine(typo);
             const double textH = OH_Drawing_TypographyGetHeight(typo);
@@ -159,6 +168,8 @@ bool rasterizeText(const TextLayerState& t, double maxWidth, TextRasterResult& o
             if (std::isfinite(textW) && textW > 0.0 && textH > 0.0) {
                 const uint32_t w = static_cast<uint32_t>(std::ceil(textW)) + 2 * kPad;
                 const uint32_t h = static_cast<uint32_t>(std::ceil(textH)) + 2 * kPad;
+                // P2 基线锚点：首行字母基线（位图顶原点，layout 后有效）+ 位图 padding
+                const double baseline = OH_Drawing_TypographyGetAlphabeticBaseline(typo) + kPad;
                 OH_Drawing_BitmapFormat fmt;
                 fmt.colorFormat = COLOR_FORMAT_RGBA_8888;
                 fmt.alphaFormat = ALPHA_FORMAT_PREMUL;
@@ -182,6 +193,7 @@ bool rasterizeText(const TextLayerState& t, double maxWidth, TextRasterResult& o
                         }
                         out.width = w;
                         out.height = h;
+                        out.baseline = std::isfinite(baseline) ? std::max(0.0, baseline) : 0.0;
                         ok = true;
                     }
                 }

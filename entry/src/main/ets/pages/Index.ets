@@ -17,6 +17,7 @@ import { WelcomeView } from '../editor/components/WelcomeView';
 import { LayersPanel, ThumbEntry } from '../editor/components/LayersPanel';
 import { ExportDialog } from '../editor/components/ExportDialog';
 import { TransformOverlay } from '../editor/components/TransformOverlay';
+import { HsvPicker } from '../editor/components/ColorPicker';
 import { AdjustPanel } from '../editor/components/AdjustPanel';
 import { ChannelsPanel } from '../editor/components/ChannelsPanel';
 import { FILTER_CATALOG, FilterDef, FilterParamDef } from '../editor/FilterCatalog';
@@ -163,6 +164,9 @@ struct Index {
   @State curGradientTrans: number[][] = [];     // 透明度标（预设持久化用）
   @State showStopsEd: boolean = false;          // 渐变 stops 编辑器
   @State showPatternPick: boolean = false;      // 图案源选择器（填充/油漆桶共用）
+  // P2 HSV 拾色器（前景/背景/文字色共用模态；target 0=前景 1=背景 2=文字色）
+  @State showColorPick: boolean = false;
+  @State colorPickTarget: number = 0;
   @State patternPickTarget: number = 0;         // 0=填充 1=油漆桶
   @State patternStampId: string = '';           // 当前图案源（图章/填充/油漆桶共用）
   @State patternStampScale: number = 1.0;
@@ -407,6 +411,8 @@ struct Index {
   @State textItalic: boolean = false;
   @State textColor: string = '#000000';
   @State textAlignIdx: number = 0;
+  @State textIndentLeft: number = 0;    // P2 段落缩进镜像（文档 px）
+  @State textIndentFirst: number = 0;
   @State textPanelContent: string = '';      // 面板内容框镜像（blur 提交）
   private textDragging: boolean = false;
   private textStartDocX: number = 0;
@@ -2471,6 +2477,8 @@ struct Index {
     this.textItalic = a.textItalic;
     this.textColor = a.textColor;
     this.textAlignIdx = a.textAlign;
+    this.textIndentLeft = a.textIndentLeft;
+    this.textIndentFirst = a.textIndentFirst;
   }
 
   // 面板/样式改动 → 引擎（编辑会话中 txn=0，否则独立事务）
@@ -2485,7 +2493,7 @@ struct Index {
       ? this.fontOptions()[this.panelFontSel] : '', this.textFontSize,
       this.textLineHeightPct / 100, this.textTracking, this.textBold, this.textItalic,
       rgb[0], rgb[1], rgb[2], this.textAlignIdx,
-      a.textWrapWidth, txn);
+      a.textWrapWidth, txn, this.textIndentLeft, this.textIndentFirst);
     this.log(`文本样式: ${ok ? '已应用' : '失败'} (size=${this.textFontSize} lh=${this.textLineHeightPct}%)`);
   }
 
@@ -4164,6 +4172,24 @@ struct Index {
     const f = this.hexToRgb(fg);
     const b = this.hexToRgb(bg);
     this.engine.setColors(f[0], f[1], f[2], b[0], b[1], b[2]);
+  }
+
+  /** P2 拾色器色板库快选（P1 库扁平化，去重上限 48；无库 = 固定 6 色兜底）。 */
+  private pickerLibSwatches(): string[] {
+    const out: string[] = [];
+    for (const g of this.swatchLib) {
+      for (const s of g.swatches) {
+        const hex = `#${[s.r, s.g, s.b].map((v: number): string =>
+          Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0')).join('').toUpperCase()}`;
+        if (!out.includes(hex)) {
+          out.push(hex);
+        }
+        if (out.length >= 48) {
+          return out;
+        }
+      }
+    }
+    return out.length > 0 ? out : SWATCHES.slice();
   }
 
   // ---------- P1 预设库（四库持久化 + 导入 + 消费点接线） ----------
@@ -6854,20 +6880,24 @@ struct Index {
     this.engine.cancelTransformOverlay();
     this.overlayBox = null;
   }
-  private composeOverlayMat(tx: number, ty: number, sx: number, sy: number): number[] {
+  private composeOverlayMat(tx: number, ty: number, sx: number, sy: number,
+    rot: number = 0, kx: number = 0, ky: number = 0): number[] {
     const box = this.overlayBox;
     if (box === null) {
       return [1, 0, 0, 0, 1, 0];
     }
     const cx = box.left + box.width / 2;
     const cy = box.top + box.height / 2;
-    // M = T(tx,ty) - T(C) - S - T(-C)（围绕框中心缩放 + 平移）
-    const m0 = sx;
-    const m1 = 0;
-    const m2 = tx + cx - sx * cx;
-    const m3 = 0;
-    const m4 = sy;
-    const m5 = ty + cy - sy * cy;
+    // M = T(t)·T(C)·R(rot)·Sk(kx,ky)·S·T(-C)（行主序 [a b e; c d f]）
+    const r = rot * 3.14159265358979323846 / 180.0;
+    const c = Math.cos(r);
+    const s = Math.sin(r);
+    const m0 = sx * (c - s * ky);
+    const m1 = sy * (c * kx - s);
+    const m3 = sx * (s + c * ky);
+    const m4 = sy * (s * kx + c);
+    const m2 = tx + cx - (m0 * cx + m1 * cy);
+    const m5 = ty + cy - (m3 * cx + m4 * cy);
     return [m0, m1, m2, m3, m4, m5];
   }
   private scheduleHistogram(): void {
@@ -7308,7 +7338,7 @@ struct Index {
       return;
     }
     // 对话框打开时：Esc 关闭，其余不抢
-    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform || this.showModify || this.showStoreSel || this.showLoadSel || this.showFill || this.showStyle || this.showFilter || this.showDevelop || this.showGlobalLight || this.showContour || this.showStopsEd || this.showPatternPick) {
+    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform || this.showModify || this.showStoreSel || this.showLoadSel || this.showFill || this.showStyle || this.showFilter || this.showDevelop || this.showGlobalLight || this.showContour || this.showStopsEd || this.showPatternPick || this.showColorPick) {
       if (e.keyCode === KC_ESC) {
         this.showTransform = false;
         this.showExport = false;
@@ -7328,6 +7358,7 @@ struct Index {
         this.showContour = false;
         this.showStopsEd = false;
         this.showPatternPick = false;
+        this.showColorPick = false;
         this.cancelFilterDialog();
       }
       return;
@@ -7896,6 +7927,7 @@ struct Index {
           wandAllLayers: $wandAllLayers,
           wandSampleSize: $wandSampleSize,
           brushColor: this.brushColor,
+          bgColor: this.bgColor,
           maskTarget: this.maskTarget,
           hasMaskOnActive: this.activeLayerHasMask(),
           quickMaskActive: this.quickMaskActive,
@@ -8006,6 +8038,10 @@ struct Index {
           onToggleMaskTarget: (): void => this.onToggleMaskTarget(),
           onColorPick: (hex: string): void => {
             this.applyColors(hex, this.bgColor);
+          },
+          onOpenPicker: (target: number): void => {
+            this.colorPickTarget = target;
+            this.showColorPick = true;
           },
           onZoom: (cmd: string): void => this.runCommand(`view.${cmd === 'fit' ? 'fit' : cmd === '100' ? 'zoom100' : cmd === 'in' ? 'zoomIn' : 'zoomOut'}`),
           onCropCommand: (cmd: string): void => this.runCommand(`crop.${cmd}`),
@@ -8141,10 +8177,12 @@ struct Index {
                 panX: this.panX,
                 panY: this.panY,
                 pxPerVp: this.pxPerVp(),
-                onMatrix: (tx: number, ty: number, sx: number, sy: number): void => {
-                  this.overlayMat = this.composeOverlayMat(tx, ty, sx, sy);
+                onMatrix: (tx: number, ty: number, sx: number, sy: number, rot: number,
+                  kx: number, ky: number): void => {
+                  this.overlayMat = this.composeOverlayMat(tx, ty, sx, sy, rot, kx, ky);
                   this.engine.setTransformPreview(true, this.overlayMat);  // GL 实时预览
-                }
+                },
+                getMods: (): boolean[] => [this.ctrlHeld, this.shiftHeld, this.altHeld],
               })
             }
                         // 选框拖拽预览（矩形方框 / 椭圆圆角框；GL 蚂蚁线在提交后接管）
@@ -8513,6 +8551,8 @@ struct Index {
                   colorHex: this.textColor,
                   alignIdx: this.textAlignIdx,
                   wrapW: this.activeLayer()?.textWrapWidth ?? 0,
+                  indentLeft: this.textIndentLeft,
+                  indentFirst: this.textIndentFirst,
                   content: this.textPanelContent,
                   editing: this.editingTextId !== 0,
                   isText: this.activeLayer()?.isText === true,
@@ -8533,6 +8573,11 @@ struct Index {
                     this.textTracking = v;
                     this.pushTextStyle();
                   },
+                  onIndent: (left: number, first: number): void => {
+                    this.textIndentLeft = left;
+                    this.textIndentFirst = first;
+                    this.pushTextStyle();
+                  },
                   onToggleBold: (): void => {
                     this.textBold = !this.textBold;
                     this.pushTextStyle();
@@ -8544,6 +8589,10 @@ struct Index {
                   onPickColor: (c: string): void => {
                     this.textColor = c;
                     this.pushTextStyle();
+                  },
+                  onOpenPicker: (): void => {
+                    this.colorPickTarget = 2;
+                    this.showColorPick = true;
                   },
                   onAlign: (al: number): void => {
                     this.textAlignIdx = al;
@@ -9925,6 +9974,34 @@ struct Index {
             }.justifyContent(FlexAlign.End).width('100%')
           }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
             .border({ width: 1, color: $r('app.color.border') }).width(400)
+        }.width('100%').height('100%')
+      }
+      if (this.showColorPick) {
+        // P2 HSV 拾色器（前景/背景/文字色；target 0/1/2）
+        Stack() {
+          Column().width('100%').height('100%').backgroundColor('#66000000')
+            .onClick((): void => { this.showColorPick = false; })
+          HsvPicker({
+            initHex: this.colorPickTarget === 0 ? this.brushColor
+              : this.colorPickTarget === 1 ? this.bgColor : this.textColor,
+            title: this.colorPickTarget === 0 ? '前景色'
+              : this.colorPickTarget === 1 ? '背景色' : '文字颜色',
+            libSwatches: this.pickerLibSwatches(),
+            onConfirm: (hex: string): void => {
+              if (this.colorPickTarget === 2) {
+                this.textColor = hex;
+                this.pushTextStyle();
+              } else if (this.colorPickTarget === 1) {
+                this.applyColors(this.brushColor, hex);
+              } else {
+                this.applyColors(hex, this.bgColor);
+              }
+              this.showColorPick = false;
+            },
+            onCancel: (): void => {
+              this.showColorPick = false;
+            },
+          })
         }.width('100%').height('100%')
       }
       if (this.showFill) {

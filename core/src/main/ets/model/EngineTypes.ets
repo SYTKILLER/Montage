@@ -157,6 +157,8 @@ export interface LayerDTO {
   textColor: string;   // #RRGGBB
   textAlign: number;   // 0=左 1=中 2=右
   textWrapWidth: number;
+  textIndentLeft: number;   // P2 段落左缩进（文档 px）
+  textIndentFirst: number;  // P2 首行缩进（文档 px）
   textX: number;       // 文本框左上角（文档域）
   textY: number;
   textW: number;       // 最近栅格化像素尺寸（空内容 = 0）

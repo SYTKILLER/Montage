@@ -213,6 +213,8 @@ function narrowLayer(r: Record<string, Object>): LayerDTO {
     textColor: str(r, 'textColor'),
     textAlign: num(r, 'textAlign'),
     textWrapWidth: num(r, 'textWrapWidth'),
+    textIndentLeft: num(r, 'textIndentLeft'),
+    textIndentFirst: num(r, 'textIndentFirst'),
     textX: num(r, 'textX'),
     textY: num(r, 'textY'),
     textW: num(r, 'textW'),
@@ -1253,15 +1255,17 @@ export class CompositorEngine {
 
   setTextLayerStyle(id: number, family: string, fontSize: number, lineHeight: number,
     tracking: number, bold: boolean, italic: boolean, colorR: number, colorG: number,
-    colorB: number, align: number, wrapWidth: number, txn: boolean): boolean {
+    colorB: number, align: number, wrapWidth: number, txn: boolean,
+    indentLeft: number = 0, indentFirst: number = 0): boolean {
     const r = narrowResult(native.setTextLayerStyle(id, family, fontSize, lineHeight, tracking,
-      bold, italic, colorR, colorG, colorB, align, wrapWidth, txn ? 1 : 0) as Object);
+      bold, italic, colorR, colorG, colorB, align, wrapWidth, txn ? 1 : 0,
+      indentLeft, indentFirst) as Object);
     if (!r.ok) {
       hilog.error(DOMAIN, TAG, 'setTextLayerStyle failed: %{public}s',
         r.error !== null ? r.error.message : 'unknown');
       return false;
     }
-    automation.note('text.style', { 'id': id, 'family': family, 'fontSize': fontSize, 'lineHeight': lineHeight, 'tracking': tracking, 'bold': bold, 'italic': italic, 'colorR': colorR, 'colorG': colorG, 'colorB': colorB, 'align': align, 'wrapWidth': wrapWidth, 'txn': txn });
+    automation.note('text.style', { 'id': id, 'family': family, 'fontSize': fontSize, 'lineHeight': lineHeight, 'tracking': tracking, 'bold': bold, 'italic': italic, 'colorR': colorR, 'colorG': colorG, 'colorB': colorB, 'align': align, 'wrapWidth': wrapWidth, 'txn': txn, 'indentLeft': indentLeft, 'indentFirst': indentFirst });
     return true;
   }
 

@@ -40,6 +40,8 @@ uint64_t textStyleHash(const TextLayerState& t) {
     hashMix(h, &flags, 1);
     hashMix(h, t.color, sizeof(t.color));
     hashMix(h, &t.wrapWidth, sizeof(t.wrapWidth));
+    hashMix(h, &t.indentLeft, sizeof(t.indentLeft));
+    hashMix(h, &t.indentFirst, sizeof(t.indentFirst));
     return h;
 }
 
@@ -66,7 +68,8 @@ bool relayoutTextLayer(Layer& l, std::string& err) {
                      "font missing, fallback default: %{public}s", t.fontFamily.c_str());
     }
     if (ras.width == 0 || ras.height == 0) {
-        // 空内容：无像素（编辑态由 overlay 承担视觉）
+        // 空内容：无像素（编辑态由 overlay 承担视觉）。baselineOff 保留（内容恢复后
+        // 基线锚继续生效），origin 不动。
         l.pixels = nullptr;
         l.render = nullptr;
         t.rasterW = 0.0;
@@ -74,6 +77,17 @@ bool relayoutTextLayer(Layer& l, std::string& err) {
         t.styleHash = hash;
         return true;
     }
+    // P2 基线锚点：originY 平移使首行基线的文档位置不变（baselineOff > 0 = 已锚定态）。
+    // baselineOff == 0 = 新层首次栅格：originY -= 基线（创建落点即基线锚，PS 点文字语义）。
+    // baselineOff < 0 = 旧档（无该字段）：维持顶左锚定不平移，只登记当前基线。
+    const double newBase = ras.baseline;
+    const double oldBase = t.baselineOff;
+    if (oldBase > 0.0) {
+        l.transform.originY += oldBase - newBase;
+    } else if (oldBase == 0.0) {
+        l.transform.originY -= newBase;
+    }
+    t.baselineOff = newBase;
     OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag,
                  "relayout: content=%{public}zu chars -> raster %{public}du x %{public}du",
                  t.content.size(), ras.width, ras.height);

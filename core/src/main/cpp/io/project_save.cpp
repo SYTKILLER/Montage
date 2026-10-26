@@ -1018,6 +1018,19 @@ std::string buildManifest(const DocSnapshot& doc) {
             std::snprintf(num, sizeof(num), "%.6g", t.wrapWidth);
             tf += "      \"wrapWidth\": ";
             tf += num;
+            // P2 文字项（非默认才写——旧包字节不变）：缩进 + 基线锚缓存
+            if (t.indentLeft != 0.0) {
+                tf += ",\n      \"indentLeft\": ";
+                tf += jsonNumber(t.indentLeft);
+            }
+            if (t.indentFirst != 0.0) {
+                tf += ",\n      \"indentFirst\": ";
+                tf += jsonNumber(t.indentFirst);
+            }
+            if (t.baselineOff > 0.0) {
+                tf += ",\n      \"baselineOff\": ";
+                tf += jsonNumber(t.baselineOff);
+            }
             fields.push_back("      \"text\": {\n" + tf + "\n      }");
         }
         if (l.shape != nullptr) {

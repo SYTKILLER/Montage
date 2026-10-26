@@ -317,7 +317,8 @@ struct FillLayerState {
 
 // 文本层状态（M12，路线 A：native OH_Drawing_Typography 栅格化）。随 Layer 走 History
 // 快照（COW 换指针）；pixels 网格 = 最近一次排版栅格结果（直 alpha），origin = 文本框
-// 左上角文档落点（PS 点文字锚点在首行基线左，v1 简化左上角，登记）。
+// 左上角文档落点。P2 基线锚点（PS 点文字语义）：originY 由 relayout 按 baselineOff
+// 维护，使首行基线钉在创建落点（见 text_ops.cpp）。
 struct TextLayerState {
     std::string content;      // UTF-8；\n 分行
     std::string fontFamily;   // FontParser/系统字体族名；空 = 系统默认
@@ -329,6 +330,12 @@ struct TextLayerState {
     float color[3] = {0.0f, 0.0f, 0.0f};  // 直 alpha 0..1
     int32_t align = 0;        // 0=左 1=中 2=右（OH_Drawing_TextAlign LEFT/CENTER/RIGHT）
     double wrapWidth = 0.0;   // >0 = 段落文字换行宽（文档 px）；0 = 点文字（不自动换行）
+    double indentLeft = 0.0;  // P2 段落左缩进（文档 px，全部行）
+    double indentFirst = 0.0; // P2 首行缩进（文档 px，相对左缩进；负 = 悬挂，v1 仅作用于
+                              // 整个排版的绝对首行——OHOS indents 按绝对行号，非逐段）
+    double baselineOff = -1.0; // 栅格顶→首行基线距离（派生缓存）：-1 = 旧档/未初始化（origin
+                               // 固定顶左锚定，不随重排平移）；0 = 新层待首次锚定；>0 =
+                               // 基线锚定生效（relayout 平移 originY 保基线 doc 位置不变）
     uint64_t styleHash = 0;   // 参数指纹（relayout 缓存键；0 = 从未栅格化）
     double rasterW = 0.0;     // 最近栅格化实际像素尺寸（派生缓存，不入指纹；DTO/overlay 用）
     double rasterH = 0.0;
