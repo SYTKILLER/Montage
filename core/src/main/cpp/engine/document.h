@@ -297,6 +297,15 @@ struct LayerStyle {
     std::string patternId;
     double poScale = 1.0;    // 0.01..10
     double poOpacity = 1.0;  // 0..1
+    // P1 纹理（PS 斜面/光泽「纹理」子效果）：灰度图案调制高度场（bevel）/光泽域（satin），
+    // depth = 调制深度 0..1（photocraft textureDepth 语义，Multiply 模式简化）。图案引用
+    // 进程级 PresetLib（libpat_*，不入 .montage——重启后图案缺失即不渲染，登记）。
+    bool texture = false;
+    std::string texPatternId;
+    double texScale = 1.0;   // 0.01..10
+    double texDepth = 0.5;   // 0..1
+    bool bevelTexOn = true;  // 纹理分别作用于斜面/光泽（PS 每效果独立纹理的 v1 合并）
+    bool satinTexOn = false;
 };
 
 // M14c 填充图层（非破坏内容层）：无像素，渲染 = 全文档域派生网格（改参重生成）。
@@ -328,11 +337,17 @@ struct TextLayerState {
 // M18 形状层状态（非破坏矢量内容层）：path（文档域坐标）+ 填充 + 描边 + live（参数形状，
 // kind != None = 可再编辑；路径经钢笔/直接选择编辑后 live 清 None）。渲染 = shapeRender
 // 派生网格（文字层/样式层同架构：shapeCache 随 History 快照走，变更点主动维护）。
-// v1 填充/描边 paint = 纯色（渐变/图案登记后续批，随 M11 stops 遗留合并）。
+// P1 填充扩 stops 渐变/图案（M18 登记项）：fillKind 2 = 线性渐变（fillStops 扁平
+// [t,r,g,b,a,…] 直 alpha，域 = 形状 ink bbox 角度投影，PS「与图层对齐」语义），
+// 3 = 图案（fillPatternId = PresetLib 库图案，文档原点锚定平铺——重启丢失即不渲染，登记）。
 struct ShapeLayerState {
     VectorPath path;
-    int fillKind = 1;  // 0=无填充 1=纯色
-    float fillColor[4] = {1.0f, 0.0f, 0.0f, 1.0f};  // 直 alpha
+    int fillKind = 1;  // 0=无填充 1=纯色 2=线性渐变 3=图案
+    float fillColor[4] = {1.0f, 0.0f, 0.0f, 1.0f};  // 直 alpha（fillKind 1）
+    std::vector<float> fillStops;  // fillKind 2：[t,r,g,b,a,…]（0..1 直 alpha，t 升序）
+    double fillAngleDeg = 90.0;    // fillKind 2：渐变角度（90 = 上→下）
+    std::string fillPatternId;     // fillKind 3：PresetLib 图案 id
+    double fillPatScale = 1.0;     // fillKind 3：0.01..10
     bool hasStroke = false;
     ShapeStroke stroke;
     LiveShape live;

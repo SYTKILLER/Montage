@@ -79,6 +79,8 @@ add_library(compositor SHARED
         io/psd/descriptor.cpp
         io/psd/smart_psd.cpp
         io/psdsrc_blob.cpp
+        io/presets/preset_io.cpp
+        engine/preset_lib.cpp
         io/cms/curve.cpp
         io/cms/clut.cpp
         io/cms/pipeline.cpp

@@ -33,6 +33,31 @@ export default class EntryAbility extends UIAbility {
           AppStorage.setOrCreate('debugB64Accum', '');
         }
       }
+      // P1：预设资源导入通道（debugPreKind 0=aco/ase 1=grd 2=pat 3=abr + debugPreName +
+      // debugPrePart/debugPreFlush 分段；flush 拼 "kind|name|b64" → Index 消费入四库）
+      const preKind = want.parameters?.debugPreKind;
+      if (typeof preKind === 'string' && preKind.length > 0) {
+        AppStorage.setOrCreate('debugPreKind', preKind);
+      }
+      const preName = want.parameters?.debugPreName;
+      if (typeof preName === 'string' && preName.length > 0) {
+        AppStorage.setOrCreate('debugPreName', preName);
+      }
+      const prePart = want.parameters?.debugPrePart;
+      if (typeof prePart === 'string' && prePart.length > 0) {
+        const prev2 = AppStorage.get<string>('debugPreAccum') ?? '';
+        AppStorage.setOrCreate('debugPreAccum', prev2 + prePart);
+      }
+      const preFlush = want.parameters?.debugPreFlush;
+      if (typeof preFlush === 'string' && preFlush === '1') {
+        const acc2 = AppStorage.get<string>('debugPreAccum') ?? '';
+        if (acc2.length > 0) {
+          const kind2 = AppStorage.get<string>('debugPreKind') ?? '0';
+          const name2 = AppStorage.get<string>('debugPreName') ?? 'sample.aco';
+          AppStorage.setOrCreate('debugPresetB64', `${kind2}|${name2}|${acc2}`);
+          AppStorage.setOrCreate('debugPreAccum', '');
+        }
+      }
       // M22：调试命令直通（runCommand；uitest 注入退化时的 E2E 旁路）
       const dbgCmd = want.parameters?.debugCmd;
       if (typeof dbgCmd === 'string' && dbgCmd.length > 0) {
@@ -75,6 +100,29 @@ export default class EntryAbility extends UIAbility {
         if (acc.length > 0) {
           AppStorage.setOrCreate('debugOpenB64', acc);
           AppStorage.setOrCreate('debugB64Accum', '');
+        }
+      }
+      const preKind = want.parameters?.debugPreKind;
+      if (typeof preKind === 'string' && preKind.length > 0) {
+        AppStorage.setOrCreate('debugPreKind', preKind);
+      }
+      const preName = want.parameters?.debugPreName;
+      if (typeof preName === 'string' && preName.length > 0) {
+        AppStorage.setOrCreate('debugPreName', preName);
+      }
+      const prePart = want.parameters?.debugPrePart;
+      if (typeof prePart === 'string' && prePart.length > 0) {
+        const prev2 = AppStorage.get<string>('debugPreAccum') ?? '';
+        AppStorage.setOrCreate('debugPreAccum', prev2 + prePart);
+      }
+      const preFlush = want.parameters?.debugPreFlush;
+      if (typeof preFlush === 'string' && preFlush === '1') {
+        const acc2 = AppStorage.get<string>('debugPreAccum') ?? '';
+        if (acc2.length > 0) {
+          const kind2 = AppStorage.get<string>('debugPreKind') ?? '0';
+          const name2 = AppStorage.get<string>('debugPreName') ?? 'sample.aco';
+          AppStorage.setOrCreate('debugPresetB64', `${kind2}|${name2}|${acc2}`);
+          AppStorage.setOrCreate('debugPreAccum', '');
         }
       }
       const dbgCmd = want.parameters?.debugCmd;

@@ -8,10 +8,12 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 #include "engine/filter_ops.h"
 #include "engine/filters.h"
+#include "engine/preset_lib.h"
 #include "engine/vector_render.h"
 #include "engine/vector_raster.h"
 #include "engine/vector_flatten.h"
@@ -24,6 +26,57 @@ namespace {
 constexpr double kMaxBlurBudget = 64.0;   // 单项扩展上限（px）——防御异常参数
 constexpr double kMaxPadBudget = 200.0;   // 派生域 pad 总上限
 constexpr double kMaxDomainPixels = 64e6; // 派生域像素预算（M13 同量级）
+
+// P1 纹理灰度场（PS 斜面/光泽「纹理」子效果）：PresetLib 图案按文档原点锚定平铺，
+// nearest × scale → 域内逐像素灰度 0..1。图案缺失/未选 = 空表（调用方按无纹理处理）。
+bool buildTexGray(const LayerStyle* st, int x0, int y0, int w, int h,
+                  std::vector<float>& gray) {
+    gray.clear();
+    if (st == nullptr || !st->texture || st->texPatternId.empty()) {
+        return false;
+    }
+    std::shared_ptr<const TileGrid> patGrid;
+    uint32_t pw = 0, ph = 0;
+    double scale = 1.0;
+    {
+        std::lock_guard<std::mutex> lk(PresetLib::get().mtx);
+        const PresetLib::LibPattern* p = PresetLib::get().findPattern(st->texPatternId);
+        if (p == nullptr || p->pixels == nullptr) {
+            return false;
+        }
+        patGrid = p->pixels;
+        pw = p->w;
+        ph = p->h;
+        scale = std::clamp(st->texScale, 0.01, 10.0);
+    }
+    const double sw = static_cast<double>(pw) * scale;
+    const double sh = static_cast<double>(ph) * scale;
+    gray.resize(static_cast<size_t>(w) * h);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            int sx = static_cast<int>(std::floor((x0 + x + 0.5) / sw * pw)) % static_cast<int>(pw);
+            if (sx < 0) sx += static_cast<int>(pw);
+            int sy = static_cast<int>(std::floor((y0 + y + 0.5) / sh * ph)) % static_cast<int>(ph);
+            if (sy < 0) sy += static_cast<int>(ph);
+            auto it = patGrid->tiles.find(static_cast<uint32_t>(sy) / kTileSize * patGrid->cols +
+                                          static_cast<uint32_t>(sx) / kTileSize);
+            float g = 1.0f;  // 缺瓦片 = 白（不调制）
+            if (it != patGrid->tiles.end() && it->second != nullptr &&
+                it->second->pixels != nullptr) {
+                const uint8_t* p = it->second->pixels->mapCpu();
+                if (p != nullptr) {
+                    const uint8_t* q = p + static_cast<size_t>(
+                                                 static_cast<uint32_t>(sy) % kTileSize) *
+                                                     it->second->pixels->rowBytes() +
+                                       static_cast<size_t>(static_cast<uint32_t>(sx) % kTileSize) * 4;
+                    g = (0.299f * q[0] + 0.587f * q[1] + 0.114f * q[2]) / 255.0f;
+                }
+            }
+            gray[static_cast<size_t>(y) * w + x] = g;
+        }
+    }
+    return true;
+}
 
 // 底片（绕开样式派生——矢量蒙版派生（已含像素蒙版）→ 蒙版合成结果 → 形状缓存/原像素。
 // M18：形状层无 pixels，样式作用于形状派生结果——PS「效果栅格化后的形状」语义）
@@ -336,7 +389,7 @@ void applyContourLut8(std::vector<uint8_t>& m, const std::vector<float>& l) {
 // k=shade−sinE：>0 高光、<0 暗影。region：Inner=×alpha；Outer=非本体 × on_bevel（高度/4邻域>ε）。
 bool bevelShade(const std::vector<uint8_t>& alpha, int w, int h, const LayerStyle* st,
                 double angleDeg, std::vector<uint8_t>& hi, std::vector<uint8_t>& sh,
-                std::string& err) {
+                const std::vector<float>* tex, std::string& err) {
     std::vector<uint8_t> h8 = alpha;
     if (!blurAlpha(h8, w, h, std::min(kMaxBlurBudget, std::max(0.0, st->bevelSize)), err)) {
         return false;
@@ -353,6 +406,14 @@ bool bevelShade(const std::vector<uint8_t>& alpha, int w, int h, const LayerStyl
     if (!hcLut.empty()) {
         for (size_t i = 0; i < n; ++i) {
             hf[i] = contourLutAt(hcLut, hf[i]);
+        }
+    }
+    // P1 纹理：高度场 × (1 − depth·(1−texGray))（photocraft textureDepth Multiply 简化，
+    // 每效果独立纹理的 v1 合并为单一 texture 段 + bevelTexOn 开关，登记）
+    if (tex != nullptr && tex->size() == n) {
+        const float depth = std::clamp(static_cast<float>(st->texDepth), 0.0f, 1.0f);
+        for (size_t i = 0; i < n; ++i) {
+            hf[i] *= std::max(0.0f, 1.0f - depth * (1.0f - (*tex)[i]));
         }
     }
     const double az = angleDeg * 3.14159265358979323846 / 180.0;
@@ -725,12 +786,17 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
             srcOver(canvas.data() + i * 4, src);
         }
     }
+    // P1 纹理灰度场（斜面/光泽共用一份；图案缺失 = 空 = 无纹理）
+    std::vector<float> texGray;
+    if (st != nullptr && st->texture && (st->bevelTexOn || st->satinTexOn)) {
+        buildTexGray(st, x0, y0, static_cast<int>(w), static_cast<int>(h), texGray);
+    }
     // 2b) 外斜面（M17b，photocraft BevelPaint::Outer：明暗画在层下、外发光之后）
     if (st->bevel && st->bevelStyle == 1) {
         const double angDeg = st->bevelUseGL ? doc.globalLightAngle : st->bevelAngleDeg;
         std::vector<uint8_t> hi, sh;
         if (!bevelShade(alpha, static_cast<int>(w), static_cast<int>(h), st, angDeg, hi, sh,
-                        err)) {
+                        st->bevelTexOn && !texGray.empty() ? &texGray : nullptr, err)) {
             return false;
         }
         for (size_t i = 0; i < hi.size(); ++i) {
@@ -919,6 +985,11 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
             if (!satinLut.empty()) {
                 m = contourLutAt(satinLut, m);
             }
+            // P1 纹理：光泽覆盖度 × (1 − depth·(1−texGray))
+            if (st->satinTexOn && texGray.size() == alpha.size()) {
+                m *= std::max(0.0f, 1.0f - static_cast<float>(st->texDepth) *
+                                           (1.0f - texGray[i]));
+            }
             m *= alpha[i] / 255.0f;
             if (m <= 0.0f) {
                 continue;
@@ -1009,7 +1080,7 @@ bool restyleLayer(Document& doc, Layer& l, uint64_t rev, std::string& err) {
         const double angDeg = st->bevelUseGL ? doc.globalLightAngle : st->bevelAngleDeg;
         std::vector<uint8_t> hi, sh;
         if (!bevelShade(alpha, static_cast<int>(w), static_cast<int>(h), st, angDeg, hi, sh,
-                        err)) {
+                        st->bevelTexOn && !texGray.empty() ? &texGray : nullptr, err)) {
             return false;
         }
         for (size_t i = 0; i < hi.size(); ++i) {

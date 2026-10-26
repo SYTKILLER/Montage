@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "engine/filter_ops.h"
+#include "engine/preset_lib.h"
 #include "engine/vector_flatten.h"
 #include "engine/vector_raster.h"
 #include "engine/vector_shapes.h"
@@ -56,6 +57,14 @@ uint64_t shapeCacheHash(const ShapeLayerState& s, uint32_t docW, uint32_t docH) 
     hashPath(f, s.path);
     f.mixU64(static_cast<uint64_t>(s.fillKind));
     f.mix(s.fillColor, sizeof(s.fillColor));
+    // P1 填充扩面（渐变 stops/图案）：新字段入指纹（改动即重渲）
+    f.mixU64(s.fillStops.size());
+    for (float v : s.fillStops) {
+        f.mixD(static_cast<double>(v));
+    }
+    f.mixD(s.fillAngleDeg);
+    f.mix(s.fillPatternId.data(), s.fillPatternId.size());
+    f.mixD(s.fillPatScale);
     f.mixU64(s.hasStroke ? 1 : 0);
     if (s.hasStroke) {
         f.mixD(s.stroke.width);
@@ -79,12 +88,30 @@ uint64_t shapeCacheHash(const ShapeLayerState& s, uint32_t docW, uint32_t docH) 
 namespace {
 
 // 填充/描边覆盖度到 strip（直 alpha RGBA8888）。返回 false = 域为空。
+// gradDomain = 形状 ink bbox（fillKind 2 渐变域；非渐变忽略）。
 bool renderShapeStrip(const ShapeLayerState& s, const VectorPath& path, int32_t x0, int32_t y0,
-                      uint32_t w, uint32_t h, std::vector<uint8_t>& strip) {
+                      uint32_t w, uint32_t h, std::vector<uint8_t>& strip,
+                      const double gradDomain[4]) {
     const size_t n = static_cast<size_t>(w) * h;
     strip.assign(n * 4, 0);
     const double tol = kVectorTolerance;
-    bool hasFill = s.fillKind == 1 && (s.fillColor[3] > 0.0f || path.inverted);
+    // P1 填充源：kind 1 纯色 / 2 stops 渐变（≥2 停）/ 3 图案库引用
+    std::shared_ptr<const TileGrid> patGrid;
+    uint32_t patW = 0, patH = 0;
+    double patScale = 1.0;
+    if (s.fillKind == 3) {
+        std::lock_guard<std::mutex> lk(PresetLib::get().mtx);
+        const PresetLib::LibPattern* p = PresetLib::get().findPattern(s.fillPatternId);
+        if (p != nullptr && p->pixels != nullptr) {
+            patGrid = p->pixels;
+            patW = p->w;
+            patH = p->h;
+            patScale = std::clamp(s.fillPatScale, 0.01, 10.0);
+        }
+    }
+    bool hasFill = ((s.fillKind == 1 && (s.fillColor[3] > 0.0f || path.inverted)) ||
+                    (s.fillKind == 2 && s.fillStops.size() >= 10) ||
+                    (s.fillKind == 3 && patGrid != nullptr));
     std::vector<float> fillCov;
     if (hasFill) {
         VectorRasterizer r = fillRasterizer(path, tol);
@@ -126,11 +153,95 @@ bool renderShapeStrip(const ShapeLayerState& s, const VectorPath& path, int32_t 
         if (hasFill) {
             float cov = fillCov[i];
             if (cov > 0.0f) {
-                double sa = static_cast<double>(s.fillColor[3]) * cov;
-                cr = s.fillColor[0];
-                cg = s.fillColor[1];
-                cb = s.fillColor[2];
-                ca = sa;
+                if (s.fillKind == 2) {
+                    // 线性渐变（style_ops 填充层同式投影，域 = 形状 ink bbox；90 = 上→下）
+                    const double rad = s.fillAngleDeg * 3.14159265358979323846 / 180.0;
+                    const double gdx = std::cos(rad);
+                    const double gdy = std::sin(rad);
+                    const double cx = (gradDomain[0] + gradDomain[2]) / 2.0;
+                    const double cy = (gradDomain[1] + gradDomain[3]) / 2.0;
+                    const double halfLen = std::fabs(gdx) * (gradDomain[2] - gradDomain[0]) / 2.0 +
+                                           std::fabs(gdy) * (gradDomain[3] - gradDomain[1]) / 2.0;
+                    const double docX = static_cast<double>(x0) + static_cast<double>(i % w) + 0.5;
+                    const double docY = static_cast<double>(y0) + static_cast<double>(i / w) + 0.5;
+                    double t = halfLen > 0.0
+                                   ? (((docX - cx) * gdx + (docY - cy) * gdy) / halfLen + 1.0) / 2.0
+                                   : 0.0;
+                    t = std::clamp(t, 0.0, 1.0);
+                    // stops 升序分段线性（gradient_ops evalStops 同式，直 alpha 域；
+                    // fillStops = [t,r,g,b,a,…]，ns ≥ 2 由 hasFill 保证）
+                    const size_t ns = s.fillStops.size() / 5;
+                    const float* st0 = s.fillStops.data();
+                    const float* stL = s.fillStops.data() + (ns - 1) * 5;
+                    float col[4];
+                    if (t <= st0[0]) {
+                        col[0] = st0[1];
+                        col[1] = st0[2];
+                        col[2] = st0[3];
+                        col[3] = st0[4];
+                    } else if (t >= stL[0]) {
+                        col[0] = stL[1];
+                        col[1] = stL[2];
+                        col[2] = stL[3];
+                        col[3] = stL[4];
+                    } else {
+                        col[0] = col[1] = col[2] = col[3] = 0.0f;
+                        for (size_t k = 1; k < ns; ++k) {
+                            const float* sb = s.fillStops.data() + k * 5;
+                            const float* sa0 = sb - 5;
+                            if (t <= sb[0]) {
+                                const float span = sb[0] - sa0[0];
+                                const float uu = span > 1e-9f
+                                                     ? (static_cast<float>(t) - sa0[0]) / span
+                                                     : 1.0f;
+                                col[0] = sa0[1] + (sb[1] - sa0[1]) * uu;
+                                col[1] = sa0[2] + (sb[2] - sa0[2]) * uu;
+                                col[2] = sa0[3] + (sb[3] - sa0[3]) * uu;
+                                col[3] = sa0[4] + (sb[4] - sa0[4]) * uu;
+                                break;
+                            }
+                        }
+                    }
+                    double sa = static_cast<double>(col[3]) * cov;
+                    cr = col[0];
+                    cg = col[1];
+                    cb = col[2];
+                    ca = sa;
+                } else if (s.fillKind == 3) {
+                    // 图案平铺（文档原点锚定，nearest × scale；缺失瓦片 = 透明）
+                    const double docX = static_cast<double>(x0) + static_cast<double>(i % w) + 0.5;
+                    const double docY = static_cast<double>(y0) + static_cast<double>(i / w) + 0.5;
+                    const double sw = static_cast<double>(patW) * patScale;
+                    const double sh = static_cast<double>(patH) * patScale;
+                    int sx = static_cast<int>(std::floor(docX / sw * patW)) % static_cast<int>(patW);
+                    if (sx < 0) sx += static_cast<int>(patW);
+                    int sy = static_cast<int>(std::floor(docY / sh * patH)) % static_cast<int>(patH);
+                    if (sy < 0) sy += static_cast<int>(patH);
+                    auto it = patGrid->tiles.find(
+                        static_cast<uint32_t>(sy) / kTileSize * patGrid->cols +
+                        static_cast<uint32_t>(sx) / kTileSize);
+                    if (it != patGrid->tiles.end() && it->second != nullptr &&
+                        it->second->pixels != nullptr) {
+                        const uint8_t* q = it->second->pixels->mapCpu();
+                        if (q != nullptr) {
+                            const uint8_t* p = q + static_cast<size_t>(
+                                                         static_cast<uint32_t>(sy) % kTileSize) *
+                                                         it->second->pixels->rowBytes() +
+                                               static_cast<size_t>(static_cast<uint32_t>(sx) % kTileSize) * 4;
+                            double sa = static_cast<double>(p[3]) / 255.0 * cov;
+                            cr = p[0] / 255.0;
+                            cg = p[1] / 255.0;
+                            cb = p[2] / 255.0;
+                            ca = sa;
+                        }
+                    }
+                } else {
+                    double sa = static_cast<double>(s.fillColor[3]) * cov;
+                    cr = s.fillColor[0];
+                    cg = s.fillColor[1];
+                    cb = s.fillColor[2];
+                    ca = sa;
+                }
             }
         }
         if (hasStroke) {
@@ -184,10 +295,11 @@ bool shapeRenderLayer(Document& doc, Layer& l, std::string& err) {
     int32_t x0 = 0, y0 = 0;
     int32_t x1 = static_cast<int32_t>(doc.width), y1 = static_cast<int32_t>(doc.height);
     const bool inverted = path.inverted;
+    double gradDomain[4] = {0, 0, 0, 0};  // 形状 ink bbox（fillKind 2 渐变域）
     if (!inverted) {
         double bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
         bool any = false;
-        if (s.fillKind == 1 || s.hasStroke) {
+        if (s.fillKind != 0 || s.hasStroke) {
             VectorRasterizer r = fillRasterizer(path, kVectorTolerance);
             int32_t fx0, fy0, fx1, fy1;
             if (r.pixelBounds(fx0, fy0, fx1, fy1)) {
@@ -224,6 +336,10 @@ bool shapeRenderLayer(Document& doc, Layer& l, std::string& err) {
             s.cacheHash = hash;
             return true;
         }
+        gradDomain[0] = bx0;
+        gradDomain[1] = by0;
+        gradDomain[2] = bx1;
+        gradDomain[3] = by1;
         x0 = std::max(x0, static_cast<int32_t>(std::floor(bx0)));
         y0 = std::max(y0, static_cast<int32_t>(std::floor(by0)));
         x1 = std::min(x1, static_cast<int32_t>(std::ceil(bx1)));
@@ -241,7 +357,7 @@ bool shapeRenderLayer(Document& doc, Layer& l, std::string& err) {
         return false;
     }
     std::vector<uint8_t> strip;
-    if (!renderShapeStrip(s, path, x0, y0, w, h, strip)) {
+    if (!renderShapeStrip(s, path, x0, y0, w, h, strip, gradDomain)) {
         l.shapeCache = nullptr;
         s.cacheHash = hash;
         return true;

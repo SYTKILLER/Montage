@@ -2,7 +2,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
 import { automation } from './Automation';
-import { EngineStats, ExportPngData, ExportImageData, CodecCapabilities, CodecCap, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, SmartFilterDTO, SmartInfoDTO, LookupPresetDTO, LookupImportData, ViewTransformData, } from '../model/EngineTypes';
+import { EngineStats, ExportPngData, ExportImageData, CodecCapabilities, CodecCap, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, SmartFilterDTO, SmartInfoDTO, LookupPresetDTO, LookupImportData, ViewTransformData, PresetSwatchDTO, PresetGroupDTO, PresetGradientDTO, GradientFileData, LibPatternDTO, BrushPresetDTO, BrushFileData, PresetThumbDTO, } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -792,6 +792,222 @@ export class CompositorEngine {
       }
     }
     return out;
+  }
+
+  // ==================== P1 预设库与资源生态 ====================
+
+  /** P1：解析色板文件（.aco/.ase，b64 = 文件字节）。纯解析不入库，失败返回 null。 */
+  parseSwatchesFile(fileName: string, b64: string): PresetGroupDTO[] | null {
+    const r2 = narrowResult(native.parseSwatchesFile(fileName, b64) as Object);
+    if (!r2.ok || r2.data === null || r2.data === undefined) {
+      hilog.error(DOMAIN, TAG, 'parseSwatchesFile failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return null;
+    }
+    const rec = r2.data as Record<string, Object>;
+    const out: PresetGroupDTO[] = [];
+    const groups = rec['groups'] as Object[];
+    if (groups !== null && groups !== undefined) {
+      for (const g of groups) {
+        const gr = g as Record<string, Object>;
+        const swatches: PresetSwatchDTO[] = [];
+        const items = gr['swatches'] as Object[];
+        if (items !== null && items !== undefined) {
+          for (const it of items) {
+            swatches.push(it as Object as PresetSwatchDTO);
+          }
+        }
+        out.push({ name: gr['name'] as string, swatches: swatches });
+      }
+    }
+    return out;
+  }
+
+  /** P1：解析渐变文件（.grd v5）。noise 渐变跳过计数。失败返回 null。 */
+  parseGradientsFile(fileName: string, b64: string): GradientFileData | null {
+    const r2 = narrowResult(native.parseGradientsFile(fileName, b64) as Object);
+    if (!r2.ok || r2.data === null || r2.data === undefined) {
+      hilog.error(DOMAIN, TAG, 'parseGradientsFile failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return null;
+    }
+    const rec = r2.data as Record<string, Object>;
+    const gradients: PresetGradientDTO[] = [];
+    const arr = rec['gradients'] as Object[];
+    if (arr !== null && arr !== undefined) {
+      for (const g of arr) {
+        gradients.push(g as Object as PresetGradientDTO);
+      }
+    }
+    const data: GradientFileData = {
+      gradients: gradients,
+      skippedNoise: num(rec, 'skippedNoise')
+    };
+    return data;
+  }
+
+  /** P1：导入图案文件（.pat，入引擎进程库）。失败返回 null。 */
+  importPatternsFile(fileName: string, b64: string): LibPatternDTO[] | null {
+    const r2 = narrowResult(native.importPatternsFile(fileName, b64) as Object);
+    if (!r2.ok || r2.data === null || r2.data === undefined) {
+      hilog.error(DOMAIN, TAG, 'importPatternsFile failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return null;
+    }
+    const rec = r2.data as Record<string, Object>;
+    const out: LibPatternDTO[] = [];
+    const arr = rec['patterns'] as Object[];
+    if (arr !== null && arr !== undefined) {
+      for (const p of arr) {
+        out.push(p as Object as LibPatternDTO);
+      }
+    }
+    automation.note('presets.importPatterns', { 'count': out.length });
+    return out;
+  }
+
+  /** P1：导入笔刷文件（.abr，映射参数预设 + 采样 tip 入进程库）。失败返回 null。 */
+  importBrushesFile(fileName: string, b64: string): BrushFileData | null {
+    const r2 = narrowResult(native.importBrushesFile(fileName, b64) as Object);
+    if (!r2.ok || r2.data === null || r2.data === undefined) {
+      hilog.error(DOMAIN, TAG, 'importBrushesFile failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return null;
+    }
+    const rec = r2.data as Record<string, Object>;
+    const brushes: BrushPresetDTO[] = [];
+    const arr = rec['brushes'] as Object[];
+    if (arr !== null && arr !== undefined) {
+      for (const b of arr) {
+        brushes.push(b as Object as BrushPresetDTO);
+      }
+    }
+    const warnings: string[] = strArr(rec, 'warnings');
+    automation.note('presets.importBrushes', { 'count': brushes.length });
+    const data: BrushFileData = { brushes: brushes, warnings: warnings };
+    return data;
+  }
+
+  /** P1：预设像素缩略图（kind 0=图案 1=笔刷 tip）。失败返回 null。 */
+  getPresetThumb(kind: number, id: string): PresetThumbDTO | null {
+    const r2 = narrowResult(native.getPresetThumb(kind, id) as Object);
+    if (!r2.ok || r2.data === null || r2.data === undefined) {
+      return null;
+    }
+    return r2.data as Object as PresetThumbDTO;
+  }
+
+  /** P1：释放预设像素（TS 删除库项时调用；kind 0=图案 1=tip）。 */
+  dropPresetPixels(kind: number, id: string): boolean {
+    const r2 = narrowResult(native.dropPresetPixels(kind, id) as Object);
+    return r2.ok;
+  }
+
+  /** P1：库图案转文档图案（样式「图案叠加」可用）。失败返回 null。 */
+  libraryPatternToDoc(id: string): PatternInfo | null {
+    const r2 = narrowResult(native.libraryPatternToDoc(id) as Object);
+    if (!r2.ok || r2.data === null || r2.data === undefined) {
+      hilog.error(DOMAIN, TAG, 'libraryPatternToDoc failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return null;
+    }
+    automation.note('presets.patternToDoc', { 'id': id });
+    return r2.data as Object as PatternInfo;
+  }
+
+  /** P1：多停渐变（stops 编辑器/预设库入口；stops = [t,r,g,b,a,…] 0..1）。 */
+  applyGradientStops(layerId: number, type: number, x0: number, y0: number, x1: number,
+    y1: number, target: number, stops: number[]): boolean {
+    // @State 代理数组过 napi 长度探测会失败（M10a 同款坑）——先拷成普通数组
+    const plain: number[] = [];
+    for (const v of stops) {
+      plain.push(v);
+    }
+    const r2 = narrowResult(native.applyGradientStops(layerId, type, x0, y0, x1, y1, target,
+      plain as Object as number[]) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'applyGradientStops failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return false;
+    }
+    automation.note('gradient.stops', { 'type': type, 'target': target, 'stops': plain.length / 5 });
+    return true;
+  }
+
+  /** P1：油漆桶图案填充（掩码机制与 bucketFill 同源）。 */
+  bucketFillPattern(x: number, y: number, patternId: string, scale: number, tolerance: number,
+    contiguous: boolean, allLayers: boolean, sampleSize: number): boolean {
+    const r2 = narrowResult(native.bucketFillPattern(x, y, patternId, scale, tolerance,
+      contiguous, allLayers, sampleSize) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'bucketFillPattern failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return false;
+    }
+    automation.note('bucket.pattern', { 'pattern': patternId, 'scale': scale });
+    return true;
+  }
+
+  /** P1：填充对话框图案源（Shift+F5「图案」）。 */
+  fillWithPattern(patternId: string, scale: number): boolean {
+    const r2 = narrowResult(native.fillWithPatternCmd(patternId, scale) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'fillWithPattern failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return false;
+    }
+    automation.note('fill.pattern', { 'pattern': patternId, 'scale': scale });
+    return true;
+  }
+
+  /** P1：图案图章（patternId 空 = 关闭；与克隆/效果/修复族互斥）。 */
+  setBrushPatternStamp(patternId: string, scale: number): boolean {
+    const r2 = narrowResult(native.setBrushPatternStamp(patternId, scale) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'setBrushPatternStamp failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return false;
+    }
+    return true;
+  }
+
+  /** P1：样式纹理段（斜面高度场/光泽覆盖度调制）。 */
+  setLayerTexture(id: number, on: boolean, patternId: string, scale: number, depth: number,
+    bevelOn: boolean, satinOn: boolean): boolean {
+    const r2 = narrowResult(native.setLayerTexture(id, on, patternId, scale, depth, bevelOn,
+      satinOn) as Object);
+    if (!r2.ok) {
+      hilog.error(DOMAIN, TAG, 'setLayerTexture failed: %{public}s',
+        r2.error !== null ? r2.error.message : 'unknown');
+      return false;
+    }
+    automation.note('style.texture', { 'on': on, 'pattern': patternId });
+    return true;
+  }
+
+  /** P1：形状填充扩面（kind 1 纯色 / 2 stops 渐变 / 3 图案；kind 1 时 stops 传 []）。 */
+  setShapeFillEx(id: number, kind: number, r: number, g: number, b: number, a: number,
+    stops: number[], angleDeg: number, patternId: string, patScale: number): boolean {
+    // @State 代理数组防（M10a 同款坑）
+    const plain: number[] = [];
+    for (const v of stops) {
+      plain.push(v);
+    }
+    const rr = narrowResult(native.setShapeFillEx(id, kind, r, g, b, a, plain as Object as number[],
+      angleDeg, patternId, patScale) as Object);
+    if (!rr.ok) {
+      hilog.error(DOMAIN, TAG, 'setShapeFillEx failed: %{public}s',
+        rr.error !== null ? rr.error.message : 'unknown');
+      return false;
+    }
+    automation.note('shape.fillEx', { 'kind': kind });
+    return true;
+  }
+
+  /** P1：克隆源槽切换（0..4）。 */
+  setCloneSlot(slot: number): boolean {
+    const r2 = narrowResult(native.setCloneSlot(slot) as Object);
+    return r2.ok;
   }
 
   /** M17b：全局光角度（文档级，无 History）。 */

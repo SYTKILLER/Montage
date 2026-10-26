@@ -57,9 +57,21 @@ bool applyGradient(Document& doc, LayerId layerId, const GradientSpec& spec,
                    GradientTarget target, const float fg[3], const float bg[3],
                    std::string& err);
 
+// P1 stops 版：显式多停（pos 升序不校验，直 alpha 域；空表 = 报错）。stops 编辑器/
+// 渐变预设库的引擎入口（预设的「前景/背景」停靠由调用方 resolve 成具体色后传入）。
+bool applyGradientStops(Document& doc, LayerId layerId, const GradientSpec& spec,
+                        GradientTarget target, const std::vector<GradientStop>& stops,
+                        std::string& err);
+
 // 填充（像素目标）：选区掩码约束（无选区 = 整层）；fg/bg 取引擎当前值。
 bool fillWithColor(Document& doc, LayerId layerId, FillSource source, float fr, float fg,
                    float fb, float br, float bg_, float bb, std::string& err);
+
+// P1 图案填充（油漆桶图案源/填充对话框图案项）：选区掩码约束，图案按文档原点锚定
+// 环形平铺（PS「与图层对齐」off 语义简化，登记），nearest × scale（0.01..10 钳制）。
+// pat = 图案像素网格（直 alpha；PresetLib 库图案或文档图案均可）。
+bool fillWithPattern(Document& doc, LayerId layerId, const TileGrid& pat, uint32_t pw,
+                     uint32_t ph, double scale, std::string& err);
 
 // 描边（像素目标）：选区边界环带 × 前景色；width = 描边宽度 px（中心位置语义）。
 bool strokeSelectionBorder(Document& doc, LayerId layerId, int width, float fr, float fgn,

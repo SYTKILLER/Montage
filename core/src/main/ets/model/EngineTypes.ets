@@ -360,3 +360,63 @@ export interface SmartInfoDTO {
   sourceAvailable: boolean;
   filters: SmartFilterDTO[];
 }
+
+/** P1 预设库：色板（.aco/.ase 解析结果，sRGB 0..255）。 */
+export interface PresetSwatchDTO {
+  name: string;
+  r: number;
+  g: number;
+  b: number;
+}
+
+/** P1 预设库：色板组（.ase 组 / .aco 单隐式组）。 */
+export interface PresetGroupDTO {
+  name: string;
+  swatches: PresetSwatchDTO[];
+}
+
+/** P1 预设库：渐变预设（.grd 解析结果）。stops = [t,kind,r,g,b]（kind 0=RGB 1=前景 2=背景），
+ *  transparency = [t,opacity0..1]。 */
+export interface PresetGradientDTO {
+  name: string;
+  stops: number[][];
+  transparency: number[][];
+}
+
+/** P1 预设库：渐变文件解析结果。 */
+export interface GradientFileData {
+  gradients: PresetGradientDTO[];
+  skippedNoise: number;
+}
+
+/** P1 预设库：引擎进程图案（importPatternsFile 结果）。 */
+export interface LibPatternDTO {
+  id: string;
+  name: string;
+  w: number;
+  h: number;
+}
+
+/** P1 预设库：笔刷预设（.abr 映射；opacity/flow < 0 = 未携带；tipId 空 = 无采样位图）。 */
+export interface BrushPresetDTO {
+  name: string;
+  size: number;
+  hardness: number;
+  spacing: number;
+  opacity: number;
+  flow: number;
+  tipId: string;
+}
+
+/** P1 预设库：笔刷文件导入结果。 */
+export interface BrushFileData {
+  brushes: BrushPresetDTO[];
+  warnings: string[];
+}
+
+/** P1 预设库：缩略图（≤128 边 RGBA8）。 */
+export interface PresetThumbDTO {
+  w: number;
+  h: number;
+  rgba: ArrayBuffer;
+}

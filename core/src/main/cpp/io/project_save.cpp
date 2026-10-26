@@ -25,7 +25,7 @@ namespace {
 constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Save";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
-constexpr int kFormatVersion = 14;  // v14：+深色 PSD 往返（文档 psd 块 + 层 psdSrc blob，M22，无深色数据 = 字节兼容 v13）；v13：+智能对象（smart 块 + 包内源文件/滤镜蒙版 PNG，M21，无 SO 层 = 字节兼容 v12）；v12：+形状层/矢量蒙版/工作路径/保存路径/自定义形状（M18）；v11：+等高线/Range/图案叠加/文档图案（M17d）；v10：+图层样式效果扩展（M17a 内阴影/外发光/内发光/渐变叠加，非默认才写）；v9：+参考线 guides 块（M15a，空则不写兼容 v8 包）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
+constexpr int kFormatVersion = 15;  // v15：+形状填充 stops 渐变/图案（fillStops/fillAngleDeg/fillPatternId/fillPatScale，P1，非默认才写 = v14 包字节不变）；v14：+深色 PSD 往返（文档 psd 块 + 层 psdSrc blob，M22，无深色数据 = 字节兼容 v13）；v13：+智能对象（smart 块 + 包内源文件/滤镜蒙版 PNG，M21，无 SO 层 = 字节兼容 v12）；v12：+形状层/矢量蒙版/工作路径/保存路径/自定义形状（M18）；v11：+等高线/Range/图案叠加/文档图案（M17d）；v10：+图层样式效果扩展（M17a 内阴影/外发光/内发光/渐变叠加，非默认才写）；v9：+参考线 guides 块（M15a，空则不写兼容 v8 包）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
 constexpr int kDeflateLevel = 6;
 // 04 §1.3 格式上限（沿用上游档位，与引擎运行预算分立）
 constexpr uint32_t kMaxSide = 30000;
@@ -1032,6 +1032,20 @@ std::string buildManifest(const DocSnapshot& doc) {
                 if (ci < 3) sf += ", ";
             }
             sf += "]";
+            // v15（P1 形状填充扩面；非默认才写——v14 包字节不变）
+            if (sh.fillKind == 2 && sh.fillStops.size() >= 10) {
+                sf += ",\n      \"fillStops\": [";
+                for (size_t i = 0; i < sh.fillStops.size(); ++i) {
+                    sf += jsonNumber(sh.fillStops[i]);
+                    if (i + 1 < sh.fillStops.size()) sf += ", ";
+                }
+                sf += "]";
+                sf += std::string(",\n      \"fillAngleDeg\": ") + jsonNumber(sh.fillAngleDeg);
+            }
+            if (sh.fillKind == 3 && !sh.fillPatternId.empty()) {
+                sf += ",\n      \"fillPatternId\": " + jsonEscape(sh.fillPatternId);
+                sf += std::string(",\n      \"fillPatScale\": ") + jsonNumber(sh.fillPatScale);
+            }
             sf += std::string(",\n      \"hasStroke\": ") + (sh.hasStroke ? "true" : "false");
             if (sh.hasStroke) {
                 const ShapeStroke& st = sh.stroke;

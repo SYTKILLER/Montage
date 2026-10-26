@@ -79,6 +79,12 @@ class StrokeDraft {
         double offsetY = 0.0;
         bool restoreMode = false;           // M11f 历史画笔：RGBA 直混恢复（含 alpha 还原——
                                             // src-over 无法把快照透明恢复到有像素处）
+        // P1 图案图章（patternMode = true）：srcGrid = 图案网格，采样坐标 = 文档坐标
+        // ÷ scale 对 patW×patH 取模（相位锚定文档原点，PS「对齐」语义简化版）。
+        bool patternMode = false;
+        int patW = 0;
+        int patH = 0;
+        double patScale = 1.0;
     };
     bool begin(const Document& doc, LayerId layerId, const BrushSettings& settings, bool onMask,
                bool onQuickMask, const CloneParams* cloneSrc, std::string& err,
@@ -152,6 +158,10 @@ class StrokeDraft {
     double srcOffsetX_ = 0.0;
     double srcOffsetY_ = 0.0;
     bool restoreMode_ = false;  // M11f：历史画笔恢复语义（RGBA 直混含 alpha）
+    bool patternMode_ = false;  // P1：图案图章（wrap 采样 + 文档原点相位）
+    int patW_ = 0;
+    int patH_ = 0;
+    double patScale_ = 1.0;
     BrushEffect effect_ = BrushEffect::None;  // M11e：dab 内核族
     HealKind healKind_ = HealKind::None;      // M19a：修复族（Heal 复用克隆 live 采样）
     int canvasW_ = 0;          // 画布尺寸（污点修复采样窗口钳制用；begin 时捕获）

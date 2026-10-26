@@ -127,6 +127,17 @@ export struct OptionsBar {
   // M19b 内容感知移动（move 工具选项条三态：0 普通/1 感知移动/2 感知扩展）
   @Prop caMoveMode: number = 0;
   onCaMoveMode: (m: number) => void = (_m: number) => {};
+  // P1 预设库：渐变 stops / 图案图章 / 油漆桶图案源 / 克隆槽
+  @Prop gradientName: string = '前景→背景';
+  onEditGradient: () => void = () => {};
+  @Prop patternStampOn: boolean = false;
+  @Prop patternStampName: string = '';
+  onPatternStampPick: () => void = () => {};
+  onPatternStampOff: () => void = () => {};
+  @Link bucketPatternOn: boolean;
+  onBucketPatternPick: () => void = () => {};
+  @Prop cloneSlot: number = 0;
+  onCloneSlot: (slot: number) => void = (_slot: number) => {};
 
   @Builder
   alignButton(symbol: string, mode: number, isAlign: boolean) {
@@ -368,6 +379,15 @@ export struct OptionsBar {
         .onClick((): void => {
           this.gradientTarget = this.gradientTarget === 0 ? 1 : 0;
         })
+      Button(`渐变: ${this.gradientName}`)
+        .fontSize(12).height(28)
+        .constraintSize({ maxWidth: 170 })
+        .backgroundColor($r('app.color.surface'))
+        .fontColor($r('app.color.text_primary'))
+        .border({ width: 1, color: $r('app.color.border') })
+        .onClick((): void => {
+          this.onEditGradient();
+        })
       Text('拖线定方向与长度 · 选区约束生效')
         .fontSize(11)
         .fontColor($r('app.color.text_secondary'))
@@ -375,10 +395,18 @@ export struct OptionsBar {
     .height(36)
   }
 
-  // M11b 油漆桶选项（与魔棒同参：容差/连续/所有图层/取样）
+  // M11b 油漆桶选项（与魔棒同参：容差/连续/所有图层/取样；P1 + 图案源开关）
   @Builder
   bucketOptions() {
     Row({ space: 10 }) {
+      Button(this.bucketPatternOn ? '源:图案' : '源:前景色')
+        .fontSize(12).height(28).width(84)
+        .backgroundColor($r('app.color.surface'))
+        .fontColor(this.bucketPatternOn ? $r('app.color.accent') : $r('app.color.text_primary'))
+        .border({ width: 1, color: $r('app.color.border') })
+        .onClick((): void => {
+          this.onBucketPatternPick();
+        })
       OptionSlider({
         label: '容差',
         min: 1,
@@ -421,7 +449,7 @@ export struct OptionsBar {
     return labels[this.shapeKind] ?? '形状';
   }
 
-  // M11d 仿制图章选项：取源按钮/对齐开关 + 提示
+  // M11d 仿制图章选项：取源按钮/对齐开关 + 克隆槽（P1 五槽） + 提示
   @Builder
   stampOptions() {
     Row({ space: 10 }) {
@@ -445,10 +473,59 @@ export struct OptionsBar {
           })
       }
       .height(28)
-      Text(this.cloneSourceSet ? '已取源 · 涂抹克隆' :
+      Row({ space: 2 }) {
+        Text('槽')
+          .fontSize(12)
+          .fontColor($r('app.color.text_secondary'))
+        ForEach([1, 2, 3, 4, 5], (s: number) => {
+          Text(`${s}`)
+            .fontSize(11)
+            .width(20)
+            .height(20)
+            .textAlign(TextAlign.Center)
+            .borderRadius(10)
+            .fontColor(this.cloneSlot === s - 1 ? '#FFFFFF' : $r('app.color.text_secondary'))
+            .backgroundColor(this.cloneSlot === s - 1 ? $r('app.color.accent') : '#00000000')
+            .onClick((): void => {
+              this.onCloneSlot(s - 1);
+            })
+        }, (s: number) => `slot${s}`)
+      }
+      .height(28)
+      Text(this.cloneSourceSet ? '已取源 · 涂抹克隆（Shift+1..5 切槽）' :
         'Alt+点击或取源模式选点 → 涂抹克隆')
         .fontSize(11)
         .fontColor(this.cloneSourceSet ? $r('app.color.text_secondary') : $r('app.color.danger'))
+    }
+    .height(36)
+  }
+
+  // P1 图案图章选项（图案作为笔画源；开启后与克隆取源互斥）
+  @Builder
+  patternStampOptions() {
+    Row({ space: 10 }) {
+      Button(this.patternStampOn ? `图案: ${this.patternStampName}` : '选择图案…')
+        .fontSize(12).height(28)
+        .constraintSize({ maxWidth: 180 })
+        .backgroundColor(this.patternStampOn ? $r('app.color.accent') : $r('app.color.surface'))
+        .fontColor(this.patternStampOn ? $r('app.color.on_accent') : $r('app.color.text_primary'))
+        .border({ width: 1, color: $r('app.color.border') })
+        .onClick((): void => {
+          this.onPatternStampPick();
+        })
+      if (this.patternStampOn) {
+        Button('关闭')
+          .fontSize(12).height(28).width(56)
+          .backgroundColor($r('app.color.surface'))
+          .fontColor($r('app.color.text_primary'))
+          .border({ width: 1, color: $r('app.color.border') })
+          .onClick((): void => {
+            this.onPatternStampOff();
+          })
+      }
+      Text('以图案为笔画源平铺（相位锚定文档原点）')
+        .fontSize(11)
+        .fontColor($r('app.color.text_secondary'))
     }
     .height(36)
   }
@@ -856,7 +933,11 @@ export struct OptionsBar {
       } else if (this.tool === 'directSelect') {
         this.dsOptions()
       } else if (this.tool === 'stamp') {
-        this.stampOptions()
+        if (this.patternStampOn) {
+          this.patternStampOptions()
+        } else {
+          this.stampOptions()
+        }
       } else if (this.tool === 'historyBrush') {
         this.historyBrushOptions()
       } else if (this.tool === 'liquify') {

@@ -69,6 +69,21 @@ napi_value RasterizeShape(napi_env env, napi_callback_info info);
 napi_value SetCloneSource(napi_env env, napi_callback_info info);
 napi_value SetCloneAligned(napi_env env, napi_callback_info info);
 napi_value SetBrushClone(napi_env env, napi_callback_info info);
+// P1 预设库与资源生态：五格式导入解析（b64）+ 进程库（图案/tip）+ 消费点命令
+napi_value ParseSwatchesFile(napi_env env, napi_callback_info info);
+napi_value ParseGradientsFile(napi_env env, napi_callback_info info);
+napi_value ImportPatternsFile(napi_env env, napi_callback_info info);
+napi_value ImportBrushesFile(napi_env env, napi_callback_info info);
+napi_value GetPresetThumb(napi_env env, napi_callback_info info);
+napi_value DropPresetPixels(napi_env env, napi_callback_info info);
+napi_value LibraryPatternToDoc(napi_env env, napi_callback_info info);
+napi_value ApplyGradientStops(napi_env env, napi_callback_info info);
+napi_value BucketFillPattern(napi_env env, napi_callback_info info);
+napi_value FillWithPatternCmd(napi_env env, napi_callback_info info);
+napi_value SetBrushPatternStamp(napi_env env, napi_callback_info info);
+napi_value SetLayerTexture(napi_env env, napi_callback_info info);
+napi_value SetShapeFillEx(napi_env env, napi_callback_info info);
+napi_value SetCloneSlot(napi_env env, napi_callback_info info);
 // M11e dab 内核族：setBrushEffect(mode 0..6，对齐 BrushEffect 枚举)
 napi_value SetBrushEffect(napi_env env, napi_callback_info info);
 // M19a 修复族：setBrushHeal(kind 0..4，对齐 HealKind 枚举) / patchSelection(dx,dy) 修补工具

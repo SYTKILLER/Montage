@@ -33,7 +33,7 @@ constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Open";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
 constexpr int kMinVersion = 1;
-constexpr int kMaxVersion = 14;  // v14：+深色 PSD 往返（文档 psd 块 + 层 psdSrc blob，M22，可选字段读兼容 v1–v13）；v13：+智能对象（smart 块 + 包内源文件/滤镜蒙版 PNG，M21，可选字段读兼容 v1–v12）；v12：+形状层/矢量蒙版/工作路径/保存路径/自定义形状（M18）；v11：+等高线/Range/图案叠加/文档图案（M17d）；v10：+图层样式效果扩展（M17a）；v9：+参考线 guides 块（M15a）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
+constexpr int kMaxVersion = 15;  // v15：+形状填充 stops 渐变/图案（fillStops/fillAngleDeg/fillPatternId/fillPatScale，P1，可选字段读兼容 v1–v14）；v14：+深色 PSD 往返（文档 psd 块 + 层 psdSrc blob，M22，可选字段读兼容 v1–v13）；v13：+智能对象（smart 块 + 包内源文件/滤镜蒙版 PNG，M21，可选字段读兼容 v1–v12）；v12：+形状层/矢量蒙版/工作路径/保存路径/自定义形状（M18）；v11：+等高线/Range/图案叠加/文档图案（M17d）；v10：+图层样式效果扩展（M17a）；v9：+参考线 guides 块（M15a）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
 constexpr uint32_t kMaxSide = 30000;
 constexpr uint64_t kMaxTotalPixels = 100ull * 1000 * 1000;
 constexpr size_t kMaxLayers = 10000;
@@ -1017,11 +1017,57 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
             const JValue* jfk = jsh->find("fillKind");
             if (jfk != nullptr) {
                 double fk = 1;
-                if (!getDouble(*jfk, fk) || fk < 0 || fk > 1) {
+                if (!getDouble(*jfk, fk) || fk < 0 || fk > 3) {
                     err = "bad shape fillKind";
                     return false;
                 }
                 sh->fillKind = static_cast<int32_t>(fk);
+            }
+            // v15（P1 形状填充扩面）：stops/角度/图案引用（可选；缺省保持纯色语义）
+            const JValue* jfs = jsh->find("fillStops");
+            if (jfs != nullptr) {
+                if (jfs->type != JValue::Arr || jfs->arr.size() < 10 || jfs->arr.size() % 5 != 0) {
+                    err = "bad shape fillStops";
+                    return false;
+                }
+                sh->fillStops.reserve(jfs->arr.size());
+                for (const JValue& jv : jfs->arr) {
+                    double v = 0;
+                    if (!getDouble(jv, v) || !std::isfinite(v) || v < 0 || v > 1) {
+                        err = "bad shape fillStops value";
+                        return false;
+                    }
+                    sh->fillStops.push_back(static_cast<float>(v));
+                }
+            }
+            const JValue* jfa = jsh->find("fillAngleDeg");
+            if (jfa != nullptr) {
+                double fa = 90.0;
+                if (!getDouble(*jfa, fa) || !std::isfinite(fa) || fa < -3600 || fa > 3600) {
+                    err = "bad shape fillAngleDeg";
+                    return false;
+                }
+                sh->fillAngleDeg = fa;
+            }
+            const JValue* jfp = jsh->find("fillPatternId");
+            if (jfp != nullptr && jfp->type == JValue::Str) {
+                // id 白名单（字母数字下划线——图案 manifest 同规则防路径注入）
+                for (char c : jfp->str) {
+                    if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_')) {
+                        err = "bad fillPatternId";
+                        return false;
+                    }
+                }
+                sh->fillPatternId = jfp->str;
+            }
+            const JValue* jfps = jsh->find("fillPatScale");
+            if (jfps != nullptr) {
+                double fs = 1.0;
+                if (!getDouble(*jfps, fs) || !std::isfinite(fs) || fs < 0.01 || fs > 10) {
+                    err = "bad fillPatScale";
+                    return false;
+                }
+                sh->fillPatScale = fs;
             }
             const JValue* jfc = jsh->find("fillColor");
             if (jfc != nullptr) {

@@ -1,6 +1,7 @@
 #include "bridge/engine_bridge.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <functional>
@@ -30,6 +31,8 @@
 #include "engine/engine.h"
 #include "engine/heal_ops.h"
 #include "engine/filter_ops.h"
+#include "engine/preset_lib.h"
+#include "io/presets/preset_io.h"
 #include "engine/group_ops.h"
 #include "engine/layer_ops.h"
 #include "engine/style_ops.h"
@@ -2409,16 +2412,20 @@ napi_value RasterizeShape(napi_env env, napi_callback_info info) {
 
 // Alt+点击取源：记录源点 = 当前活动层（v1 采样源层原像素）
 napi_value SetCloneSource(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value argv[2] = {nullptr, nullptr};
+    // setCloneSource(x, y, slot?)——P1 多槽：slot 省略 = 活动槽（0..4）
+    size_t argc = 3;
+    napi_value argv[3] = {nullptr, nullptr, nullptr};
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 2) {
-        return makeError(env, kErrBadParam, "setCloneSource(x, y) requires 2 args");
+        return makeError(env, kErrBadParam, "setCloneSource(x, y, slot?) requires 2+ args");
     }
-    double x = 0, y = 0;
+    double x = 0, y = 0, slot = -1;
     if (napi_get_value_double(env, argv[0], &x) != napi_ok ||
         napi_get_value_double(env, argv[1], &y) != napi_ok) {
         return makeError(env, kErrBadParam, "setCloneSource: invalid args");
+    }
+    if (argc >= 3 && napi_get_value_double(env, argv[2], &slot) != napi_ok) {
+        return makeError(env, kErrBadParam, "setCloneSource: invalid slot");
     }
     auto& e = Engine::get();
     {
@@ -2429,13 +2436,19 @@ napi_value SetCloneSource(napi_env env, napi_callback_info info) {
         if (e.doc.activeId == 0) {
             return makeError(env, kErrBadParam, "setCloneSource: no active layer");
         }
-        e.cloneSource.active = true;
-        e.cloneSource.layerId = e.doc.activeId;
-        e.cloneSource.srcX = x;
-        e.cloneSource.srcY = y;
-        e.cloneSource.hasOffset = false;  // 新源点：对齐偏移重新锁定
-        e.cloneSource.lockOffsetX = 0;
-        e.cloneSource.lockOffsetY = 0;
+        if (slot >= 0) {
+            if (slot > 4) {
+                return makeError(env, kErrBadParam, "setCloneSource: slot out of range");
+            }
+            e.cloneSlot = static_cast<int>(slot);
+        }
+        e.cs().active = true;
+        e.cs().layerId = e.doc.activeId;
+        e.cs().srcX = x;
+        e.cs().srcY = y;
+        e.cs().hasOffset = false;  // 新源点：对齐偏移重新锁定
+        e.cs().lockOffsetX = 0;
+        e.cs().lockOffsetY = 0;
     }
     OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "clone source set (%.0f, %.0f)", x, y);
     return makeOk(env, nullptr);
@@ -2455,8 +2468,8 @@ napi_value SetCloneAligned(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        e.cloneSource.aligned = aligned;
-        e.cloneSource.hasOffset = false;  // 切换模式：偏移重锁
+        e.cs().aligned = aligned;
+        e.cs().hasOffset = false;  // 切换模式：偏移重锁
     }
     return makeOk(env, nullptr);
 }
@@ -10471,6 +10484,793 @@ napi_value ExportSmartContents(napi_env env, napi_callback_info info) {
     napi_value bv = makeDouble(env, static_cast<double>(bytes.size()));
     napi_set_named_property(env, obj, "bytes", bv);
     return makeOk(env, obj);
+}
+
+// ==================== P1 预设库与资源生态（io/presets + engine/preset_lib） ====================
+
+namespace {
+
+// b64 → 字节（ImportLookupTable 同款手写表；上限 maxBytes）
+bool p1DecodeB64(napi_env env, napi_value arg, size_t maxBytes, std::vector<uint8_t>& bytes,
+                 std::string& err) {
+    size_t b64Len = 0;
+    if (napi_get_value_string_utf8(env, arg, nullptr, 0, &b64Len) != napi_ok || b64Len == 0 ||
+        b64Len > maxBytes) {
+        err = "bad base64";
+        return false;
+    }
+    std::string b64(b64Len, '\0');
+    napi_get_value_string_utf8(env, arg, b64.data(), b64Len + 1, &b64Len);
+    static const std::string tab =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    auto idx = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    bytes.reserve(b64.size() / 4 * 3);
+    uint32_t acc = 0;
+    int bits = 0;
+    for (char c : b64) {
+        if (c == '=' || c == '\n' || c == '\r') continue;
+        const int v = idx(c);
+        if (v < 0) {
+            err = "bad base64 char";
+            return false;
+        }
+        acc = (acc << 6) | static_cast<uint32_t>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            bytes.push_back(static_cast<uint8_t>((acc >> bits) & 0xFF));
+        }
+    }
+    if (bytes.empty()) {
+        err = "empty file";
+        return false;
+    }
+    return true;
+}
+
+bool p1FileNameArg(napi_env env, napi_value arg, std::string& fileName) {
+    size_t nameLen = 0;
+    if (napi_get_value_string_utf8(env, arg, nullptr, 0, &nameLen) != napi_ok || nameLen == 0 ||
+        nameLen > 256) {
+        return false;
+    }
+    fileName.resize(nameLen);
+    napi_get_value_string_utf8(env, arg, fileName.data(), nameLen + 1, &nameLen);
+    return true;
+}
+
+// 扩展名小写化（".ACO" → "aco"）
+std::string p1FileExt(const std::string& fileName) {
+    const size_t dot = fileName.rfind('.');
+    if (dot == std::string::npos) {
+        return "";
+    }
+    std::string ext = fileName.substr(dot + 1);
+    for (char& c : ext) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return ext;
+}
+
+// stops 扁平数组参数（napi number[] → vector<float>，长度 = 5 的倍数、值 0..1）
+bool p1StopsArg(napi_env env, napi_value arg, std::vector<float>& stops) {
+    uint32_t n = 0;
+    if (napi_get_array_length(env, arg, &n) != napi_ok || n == 0 || n > 4096 || n % 5 != 0) {
+        return false;
+    }
+    stops.resize(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        napi_value v;
+        double d = 0;
+        if (napi_get_element(env, arg, i, &v) != napi_ok ||
+            napi_get_value_double(env, v, &d) != napi_ok || !std::isfinite(d) || d < 0 || d > 1) {
+            return false;
+        }
+        stops[i] = static_cast<float>(d);
+    }
+    return true;
+}
+
+napi_value p1SwatchObj(napi_env env, const std::string& name, float r, float g, float b) {
+    napi_value o;
+    napi_create_object(env, &o);
+    napi_set_named_property(env, o, "name", makeString(env, name));
+    napi_set_named_property(env, o, "r", makeDouble(env, std::lround(std::clamp(r, 0.0f, 1.0f) * 255.0f)));
+    napi_set_named_property(env, o, "g", makeDouble(env, std::lround(std::clamp(g, 0.0f, 1.0f) * 255.0f)));
+    napi_set_named_property(env, o, "b", makeDouble(env, std::lround(std::clamp(b, 0.0f, 1.0f) * 255.0f)));
+    return o;
+}
+
+}  // namespace
+
+// parseSwatchesFile(fileName, base64) → {groups: [{name, swatches: [{name,r,g,b}]}]}
+//（纯解析不入库——库状态在 TS 侧 AppPrefs；.aco/.ase 按扩展名分派）
+napi_value ParseSwatchesFile(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    std::string fileName;
+    std::vector<uint8_t> bytes;
+    std::string err;
+    if (argc < 2 || !p1FileNameArg(env, argv[0], fileName) ||
+        !p1DecodeB64(env, argv[1], presets::kPresetFileMaxBytes, bytes, err)) {
+        return makeError(env, kErrBadParam, "parseSwatchesFile(fileName, base64) invalid");
+    }
+    presets::SwatchFile f;
+    const std::string ext = p1FileExt(fileName);
+    if (ext == "aco") {
+        if (!presets::parseAco(bytes.data(), bytes.size(), f, err)) {
+            return makeError(env, kErrBadParam, "parseSwatchesFile: " + err);
+        }
+    } else if (ext == "ase") {
+        if (!presets::parseAse(bytes.data(), bytes.size(), f, err)) {
+            return makeError(env, kErrBadParam, "parseSwatchesFile: " + err);
+        }
+    } else {
+        return makeError(env, kErrBadParam, "parseSwatchesFile: unsupported type ." + ext);
+    }
+    napi_value groups;
+    napi_create_array_with_length(env, f.groups.size(), &groups);
+    for (size_t gi = 0; gi < f.groups.size(); ++gi) {
+        napi_value g;
+        napi_create_object(env, &g);
+        napi_set_named_property(env, g, "name", makeString(env, f.groups[gi].name));
+        napi_value items;
+        napi_create_array_with_length(env, f.groups[gi].items.size(), &items);
+        for (size_t si = 0; si < f.groups[gi].items.size(); ++si) {
+            const presets::Swatch& s = f.groups[gi].items[si];
+            napi_set_element(env, items, static_cast<uint32_t>(si),
+                             p1SwatchObj(env, s.name, s.r, s.g, s.b));
+        }
+        napi_set_named_property(env, g, "swatches", items);
+        napi_set_element(env, groups, static_cast<uint32_t>(gi), g);
+    }
+    napi_value data;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "groups", groups);
+    return makeOk(env, data);
+}
+
+// parseGradientsFile(fileName, base64) → {skippedNoise, gradients: [{name, stops:
+// [[t,kind,r,g,b]…]（kind 0=RGB 1=前景 2=背景）, transparency: [[t,0..1]…]}]}
+napi_value ParseGradientsFile(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    std::string fileName;
+    std::vector<uint8_t> bytes;
+    std::string err;
+    if (argc < 2 || !p1FileNameArg(env, argv[0], fileName) ||
+        !p1DecodeB64(env, argv[1], presets::kPresetFileMaxBytes, bytes, err)) {
+        return makeError(env, kErrBadParam, "parseGradientsFile(fileName, base64) invalid");
+    }
+    if (p1FileExt(fileName) != "grd") {
+        return makeError(env, kErrBadParam, "parseGradientsFile: unsupported type (need .grd)");
+    }
+    std::vector<presets::GrdGradient> gs;
+    int skipped = 0;
+    if (!presets::parseGrd(bytes.data(), bytes.size(), gs, skipped, err)) {
+        return makeError(env, kErrBadParam, "parseGradientsFile: " + err);
+    }
+    napi_value arr;
+    napi_create_array_with_length(env, gs.size(), &arr);
+    for (size_t i = 0; i < gs.size(); ++i) {
+        napi_value g;
+        napi_create_object(env, &g);
+        napi_set_named_property(env, g, "name", makeString(env, gs[i].name));
+        napi_value stops;
+        napi_create_array_with_length(env, gs[i].stops.size(), &stops);
+        for (size_t k = 0; k < gs[i].stops.size(); ++k) {
+            const presets::GrdStop& s = gs[i].stops[k];
+            napi_value st;
+            napi_create_array_with_length(env, 5, &st);
+            napi_set_element(env, st, 0, makeDouble(env, s.loc));
+            napi_set_element(env, st, 1, makeDouble(env, s.kind));
+            napi_set_element(env, st, 2, makeDouble(env, s.r));
+            napi_set_element(env, st, 3, makeDouble(env, s.g));
+            napi_set_element(env, st, 4, makeDouble(env, s.b));
+            napi_set_element(env, stops, static_cast<uint32_t>(k), st);
+        }
+        napi_set_named_property(env, g, "stops", stops);
+        napi_value trns;
+        napi_create_array_with_length(env, gs[i].opacity.size(), &trns);
+        for (size_t k = 0; k < gs[i].opacity.size(); ++k) {
+            napi_value ot;
+            napi_create_array_with_length(env, 2, &ot);
+            napi_set_element(env, ot, 0, makeDouble(env, gs[i].opacity[k].loc));
+            napi_set_element(env, ot, 1, makeDouble(env, gs[i].opacity[k].opacity));
+            napi_set_element(env, trns, static_cast<uint32_t>(k), ot);
+        }
+        napi_set_named_property(env, g, "transparency", trns);
+        napi_set_element(env, arr, static_cast<uint32_t>(i), g);
+    }
+    napi_value data;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "gradients", arr);
+    napi_set_named_property(env, data, "skippedNoise", makeDouble(env, skipped));
+    return makeOk(env, data);
+}
+
+// importPatternsFile(fileName, base64) → {patterns: [{id,name,w,h}]}（入 PresetLib 进程库）
+napi_value ImportPatternsFile(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    std::string fileName;
+    std::vector<uint8_t> bytes;
+    std::string err;
+    if (argc < 2 || !p1FileNameArg(env, argv[0], fileName) ||
+        !p1DecodeB64(env, argv[1], presets::kPresetFileMaxBytes, bytes, err)) {
+        return makeError(env, kErrBadParam, "importPatternsFile(fileName, base64) invalid");
+    }
+    if (p1FileExt(fileName) != "pat") {
+        return makeError(env, kErrBadParam, "importPatternsFile: unsupported type (need .pat)");
+    }
+    std::vector<presets::PatTile> tiles;
+    if (!presets::parsePat(bytes.data(), bytes.size(), tiles, err)) {
+        return makeError(env, kErrBadParam, "importPatternsFile: " + err);
+    }
+    PresetLib& lib = PresetLib::get();
+    napi_value arr;
+    napi_create_array_with_length(env, tiles.size(), &arr);
+    size_t added = 0;
+    {
+        std::lock_guard<std::mutex> lk(lib.mtx);
+        std::string base = fileName;
+        const size_t dot = base.rfind('.');
+        if (dot != std::string::npos) base = base.substr(0, dot);
+        for (presets::PatTile& t : tiles) {
+            const std::string name = t.name.empty() ? base : t.name;
+            std::string id;
+            if (!lib.addPattern(name, t.w, t.h, t.rgba.data(), id, err)) {
+                break;  // 库满/超限：停止追加（已入的保留）
+            }
+            napi_value o;
+            napi_create_object(env, &o);
+            napi_set_named_property(env, o, "id", makeString(env, id));
+            napi_set_named_property(env, o, "name", makeString(env, name));
+            napi_set_named_property(env, o, "w", makeDouble(env, t.w));
+            napi_set_named_property(env, o, "h", makeDouble(env, t.h));
+            napi_set_element(env, arr, static_cast<uint32_t>(added), o);
+            added++;
+        }
+    }
+    if (added == 0) {
+        return makeError(env, kErrBadParam, "importPatternsFile: " + err);
+    }
+    napi_value data;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "patterns", arr);
+    return makeOk(env, data);
+}
+
+// importBrushesFile(fileName, base64) → {brushes: [{name,size,hardness,spacing,opacity,flow,tipId}],
+// warnings}（tip 位图入 PresetLib；opacity/flow < 0 = 预设未携带）
+napi_value ImportBrushesFile(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    std::string fileName;
+    std::vector<uint8_t> bytes;
+    std::string err;
+    if (argc < 2 || !p1FileNameArg(env, argv[0], fileName) ||
+        !p1DecodeB64(env, argv[1], presets::kPresetFileMaxBytes, bytes, err)) {
+        return makeError(env, kErrBadParam, "importBrushesFile(fileName, base64) invalid");
+    }
+    if (p1FileExt(fileName) != "abr") {
+        return makeError(env, kErrBadParam, "importBrushesFile: unsupported type (need .abr)");
+    }
+    presets::AbrFile f;
+    if (!presets::parseAbr(bytes.data(), bytes.size(), f, err)) {
+        return makeError(env, kErrBadParam, "importBrushesFile: " + err);
+    }
+    PresetLib& lib = PresetLib::get();
+    napi_value arr;
+    napi_create_array_with_length(env, f.brushes.size(), &arr);
+    size_t added = 0;
+    {
+        std::lock_guard<std::mutex> lk(lib.mtx);
+        for (const presets::AbrBrush& b : f.brushes) {
+            std::string tipId;
+            if (b.sampled && b.sampleIndex < f.samples.size()) {
+                const presets::AbrSample& s = f.samples[b.sampleIndex];
+                if (s.w <= PresetLib::kMaxEdge && s.h <= PresetLib::kMaxEdge) {
+                    // 16 位 → 8 位（高字节）
+                    std::vector<uint8_t> gray(static_cast<size_t>(s.w) * s.h);
+                    for (size_t i = 0; i < gray.size(); ++i) {
+                        gray[i] = s.depth == 16 ? s.data[i * 2] : s.data[i];
+                    }
+                    lib.addTip(b.name, s.w, s.h, gray.data(), tipId, err);
+                }
+            }
+            napi_value o;
+            napi_create_object(env, &o);
+            napi_set_named_property(env, o, "name", makeString(env, b.name));
+            napi_set_named_property(env, o, "size", makeDouble(env, b.diameter));
+            napi_set_named_property(env, o, "hardness", makeDouble(env, b.hardness));
+            napi_set_named_property(env, o, "spacing", makeDouble(env, b.spacing));
+            napi_set_named_property(env, o, "opacity", makeDouble(env, b.opacity));
+            napi_set_named_property(env, o, "flow", makeDouble(env, b.flow));
+            napi_set_named_property(env, o, "tipId", makeString(env, tipId));
+            napi_set_element(env, arr, static_cast<uint32_t>(added), o);
+            added++;
+        }
+    }
+    if (added == 0) {
+        return makeError(env, kErrBadParam, "importBrushesFile: no readable brushes");
+    }
+    napi_value data;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "brushes", arr);
+    napi_value warns;
+    const size_t wn = std::min<size_t>(f.warnings.size(), 32);
+    napi_create_array_with_length(env, wn, &warns);
+    for (size_t i = 0; i < wn; ++i) {
+        napi_set_element(env, warns, static_cast<uint32_t>(i), makeString(env, f.warnings[i]));
+    }
+    napi_set_named_property(env, data, "warnings", warns);
+    return makeOk(env, data);
+}
+
+// getPresetThumb(kind, id) → {w, h, rgba: ArrayBuffer}（kind 0=pattern 1=brush tip；
+// ≤128 边 box 下采样；UI 侧 image.createPixelMap 消费）
+napi_value GetPresetThumb(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double kind = 0;
+    size_t idLen = 0;
+    if (argc < 2 || napi_get_value_double(env, argv[0], &kind) != napi_ok ||
+        napi_get_value_string_utf8(env, argv[1], nullptr, 0, &idLen) != napi_ok || idLen == 0 ||
+        idLen > 64) {
+        return makeError(env, kErrBadParam, "getPresetThumb(kind, id) invalid");
+    }
+    std::string id(idLen, '\0');
+    napi_get_value_string_utf8(env, argv[1], id.data(), idLen + 1, &idLen);
+    PresetLib& lib = PresetLib::get();
+    uint32_t w = 0, h = 0;
+    std::vector<uint8_t> rgba;
+    {
+        std::lock_guard<std::mutex> lk(lib.mtx);
+        if (!lib.thumb(id, kind >= 0.5, w, h, rgba)) {
+            return makeError(env, kErrBadParam, "getPresetThumb: not found");
+        }
+    }
+    void* buf = nullptr;
+    napi_value ab;
+    if (napi_create_arraybuffer(env, rgba.size(), &buf, &ab) != napi_ok) {
+        return makeError(env, kErrBadParam, "getPresetThumb: alloc failed");
+    }
+    std::memcpy(buf, rgba.data(), rgba.size());
+    napi_value data;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "w", makeDouble(env, w));
+    napi_set_named_property(env, data, "h", makeDouble(env, h));
+    napi_set_named_property(env, data, "rgba", ab);
+    return makeOk(env, data);
+}
+
+// dropPresetPixels(kind, id)：释放库位（TS 删除预设时调用；kind 0=pattern 1=tip）
+napi_value DropPresetPixels(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double kind = 0;
+    size_t idLen = 0;
+    if (argc < 2 || napi_get_value_double(env, argv[0], &kind) != napi_ok ||
+        napi_get_value_string_utf8(env, argv[1], nullptr, 0, &idLen) != napi_ok || idLen == 0 ||
+        idLen > 64) {
+        return makeError(env, kErrBadParam, "dropPresetPixels(kind, id) invalid");
+    }
+    std::string id(idLen, '\0');
+    napi_get_value_string_utf8(env, argv[1], id.data(), idLen + 1, &idLen);
+    PresetLib& lib = PresetLib::get();
+    std::lock_guard<std::mutex> lk(lib.mtx);
+    const bool ok = kind >= 0.5 ? lib.dropTip(id) : lib.dropPattern(id);
+    if (!ok) {
+        return makeError(env, kErrBadParam, "dropPresetPixels: not found");
+    }
+    return makeOk(env, nullptr);
+}
+
+// libraryPatternToDoc(id) → {id, name}：库图案转文档图案（样式「图案叠加」消费
+// doc.patterns；转档动作不入 History——definePattern 同语义）
+napi_value LibraryPatternToDoc(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    size_t idLen = 0;
+    if (argc < 1 || napi_get_value_string_utf8(env, argv[0], nullptr, 0, &idLen) != napi_ok ||
+        idLen == 0 || idLen > 64) {
+        return makeError(env, kErrBadParam, "libraryPatternToDoc(id) invalid");
+    }
+    std::string id(idLen, '\0');
+    napi_get_value_string_utf8(env, argv[0], id.data(), idLen + 1, &idLen);
+    auto& e = Engine::get();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    PresetLib& lib = PresetLib::get();
+    std::lock_guard<std::mutex> lk2(lib.mtx);
+    const PresetLib::LibPattern* p = lib.findPattern(id);
+    if (p == nullptr || p->pixels == nullptr) {
+        return makeError(env, kErrBadParam, "libraryPatternToDoc: pattern not found");
+    }
+    if (e.doc.width == 0 || e.doc.height == 0) {
+        return makeError(env, kErrNoDoc, "libraryPatternToDoc: no document");
+    }
+    DocumentPattern dp;
+    dp.id = "pat_" + std::to_string(++e.patternSeq);
+    dp.name = p->name;
+    dp.w = p->w;
+    dp.h = p->h;
+    dp.pixels = p->pixels;
+    const std::string docId = dp.id;
+    const std::string name = dp.name;
+    e.doc.patterns.push_back(std::move(dp));
+    e.bumpRevisionLocked();
+    napi_value data;
+    napi_create_object(env, &data);
+    napi_set_named_property(env, data, "id", makeString(env, docId));
+    napi_set_named_property(env, data, "name", makeString(env, name));
+    return makeOk(env, data);
+}
+
+// applyGradientStops(layerId, type, x0, y0, x1, y1, target, stopsFlat)——stops 编辑器/
+// 渐变预设库的引擎入口（stops = [t,r,g,b,a,…] 0..1 直 alpha）
+napi_value ApplyGradientStops(napi_env env, napi_callback_info info) {
+    size_t argc = 8;
+    napi_value argv[8] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 8) {
+        return makeError(env, kErrBadParam,
+                         "applyGradientStops(layerId,type,x0,y0,x1,y1,target,stops) requires 8 args");
+    }
+    double a[7] = {0};
+    for (size_t i = 0; i < 7; ++i) {
+        if (napi_get_value_double(env, argv[i], &a[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "applyGradientStops: invalid args");
+        }
+    }
+    std::vector<float> flat;
+    if (!p1StopsArg(env, argv[7], flat)) {
+        return makeError(env, kErrBadParam, "applyGradientStops: bad stops (need [t,r,g,b,a,…])");
+    }
+    std::vector<GradientStop> stops(flat.size() / 5);
+    for (size_t i = 0; i < stops.size(); ++i) {
+        stops[i].pos = flat[i * 5 + 0];
+        stops[i].r = flat[i * 5 + 1];
+        stops[i].g = flat[i * 5 + 2];
+        stops[i].b = flat[i * 5 + 3];
+        stops[i].a = flat[i * 5 + 4];
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "applyGradientStops: no document");
+        }
+        GradientSpec spec;
+        spec.type = static_cast<GradientType>(static_cast<int32_t>(a[1]));
+        spec.x0 = a[2];
+        spec.y0 = a[3];
+        spec.x1 = a[4];
+        spec.y1 = a[5];
+        const auto gt = static_cast<GradientTarget>(static_cast<int32_t>(a[6]));
+        std::string err;
+        e.history.beginEdit(e.doc, "gradient", static_cast<uint64_t>(e.docRevision));
+        const bool ok = applyGradientStops(e.doc, static_cast<LayerId>(a[0]), spec, gt, stops, err);
+        if (!ok) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, err);
+        }
+        restyleAllLocked(e);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// bucketFillPattern(x, y, patternId, scale, tolerance, contiguous, allLayers?, sampleSize?)
+//——油漆桶图案源（掩码机制与 bucketFill 同源：魔棒域 ∩ 选区 → fillWithPattern）
+napi_value BucketFillPattern(napi_env env, napi_callback_info info) {
+    size_t argc = 8;
+    napi_value argv[8] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 6) {
+        return makeError(env, kErrBadParam,
+                         "bucketFillPattern(x,y,patternId,scale,tolerance,contiguous,...) requires 6+ args");
+    }
+    double x = 0, y = 0, tol = 32, allLayersNum = 0, sampleSize = 1, scale = 1;
+    bool contiguous = true;
+    size_t idLen = 0;
+    if (napi_get_value_double(env, argv[0], &x) != napi_ok ||
+        napi_get_value_double(env, argv[1], &y) != napi_ok ||
+        napi_get_value_string_utf8(env, argv[2], nullptr, 0, &idLen) != napi_ok || idLen == 0 ||
+        idLen > 64 ||
+        napi_get_value_double(env, argv[3], &scale) != napi_ok ||
+        napi_get_value_double(env, argv[4], &tol) != napi_ok ||
+        napi_get_value_bool(env, argv[5], &contiguous) != napi_ok) {
+        return makeError(env, kErrBadParam, "bucketFillPattern: invalid args");
+    }
+    std::string patternId(idLen, '\0');
+    napi_get_value_string_utf8(env, argv[2], patternId.data(), idLen + 1, &idLen);
+    if (argc >= 7 && napi_get_value_double(env, argv[6], &allLayersNum) != napi_ok) {
+        return makeError(env, kErrBadParam, "bucketFillPattern: invalid allLayers");
+    }
+    if (argc >= 8 && napi_get_value_double(env, argv[7], &sampleSize) != napi_ok) {
+        return makeError(env, kErrBadParam, "bucketFillPattern: invalid sampleSize");
+    }
+    PresetLib& lib = PresetLib::get();
+    std::shared_ptr<const TileGrid> patGrid;
+    uint32_t pw = 0, ph = 0;
+    {
+        std::lock_guard<std::mutex> lk(lib.mtx);
+        const PresetLib::LibPattern* p = lib.findPattern(patternId);
+        if (p == nullptr) {
+            return makeError(env, kErrBadParam, "bucketFillPattern: pattern not found");
+        }
+        patGrid = p->pixels;
+        pw = p->w;
+        ph = p->h;
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lg(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "bucketFillPattern: no document");
+        }
+        std::string err;
+        auto mask = computeWandMaskLocked(e, static_cast<int>(x), static_cast<int>(y),
+                                          static_cast<int>(tol), contiguous, allLayersNum != 0,
+                                          static_cast<int>(sampleSize), err);
+        if (mask == nullptr) {
+            return makeError(env, kErrBadParam, "bucketFillPattern: " + err);
+        }
+        std::shared_ptr<const TileGrid> saved = e.doc.selection;
+        if (saved != nullptr) {
+            mask = tiles::combineSelection(e.doc, mask, tiles::SelectionOp::Intersect);
+            if (mask == nullptr) {
+                return makeError(env, kErrBadParam, "bucketFillPattern: empty intersection");
+            }
+        }
+        e.history.beginEdit(e.doc, "pattern fill", static_cast<uint64_t>(e.docRevision));
+        e.doc.selection = std::move(mask);
+        const bool ok = fillWithPattern(e.doc, e.doc.activeId, *patGrid, pw, ph, scale, err);
+        e.doc.selection = saved;
+        if (!ok) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, err);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// fillWithPatternCmd(patternId, scale)——填充对话框（Shift+F5）图案源
+napi_value FillWithPatternCmd(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    size_t idLen = 0;
+    double scale = 1;
+    if (argc < 2 || napi_get_value_string_utf8(env, argv[0], nullptr, 0, &idLen) != napi_ok ||
+        idLen == 0 || idLen > 64 || napi_get_value_double(env, argv[1], &scale) != napi_ok) {
+        return makeError(env, kErrBadParam, "fillWithPattern(patternId, scale) invalid");
+    }
+    std::string patternId(idLen, '\0');
+    napi_get_value_string_utf8(env, argv[0], patternId.data(), idLen + 1, &idLen);
+    PresetLib& lib = PresetLib::get();
+    std::shared_ptr<const TileGrid> patGrid;
+    uint32_t pw = 0, ph = 0;
+    {
+        std::lock_guard<std::mutex> lk(lib.mtx);
+        const PresetLib::LibPattern* p = lib.findPattern(patternId);
+        if (p == nullptr) {
+            return makeError(env, kErrBadParam, "fillWithPattern: pattern not found");
+        }
+        patGrid = p->pixels;
+        pw = p->w;
+        ph = p->h;
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lg(e.docMutex);
+        if (e.doc.width == 0 || e.doc.height == 0) {
+            return makeError(env, kErrNoDoc, "fillWithPattern: no document");
+        }
+        std::string err;
+        e.history.beginEdit(e.doc, "pattern fill", static_cast<uint64_t>(e.docRevision));
+        const bool ok = fillWithPattern(e.doc, e.doc.activeId, *patGrid, pw, ph, scale, err);
+        if (!ok) {
+            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            return makeError(env, kErrBadParam, err);
+        }
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// setBrushPatternStamp(patternId, scale)——图案图章（patternId 空 = 关闭；与克隆/效果/
+// 修复族互斥——激活时清位，工具切换语义在 UI 侧）
+napi_value SetBrushPatternStamp(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    size_t idLen = 0;
+    double scale = 1;
+    if (argc < 1 || napi_get_value_string_utf8(env, argv[0], nullptr, 0, &idLen) != napi_ok ||
+        idLen > 64) {
+        return makeError(env, kErrBadParam, "setBrushPatternStamp(patternId, scale?) invalid");
+    }
+    std::string patternId(idLen, '\0');
+    napi_get_value_string_utf8(env, argv[0], patternId.data(), idLen + 1, &idLen);
+    if (argc >= 2 && napi_get_value_double(env, argv[1], &scale) != napi_ok) {
+        return makeError(env, kErrBadParam, "setBrushPatternStamp: invalid scale");
+    }
+    auto& e = Engine::get();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    e.patternStampGrid.reset();
+    e.patternStampW = e.patternStampH = 0;
+    e.patternStampScale = std::clamp(scale, 0.01, 10.0);
+    e.brushIsPattern = !patternId.empty();
+    if (e.brushIsPattern) {
+        PresetLib& lib = PresetLib::get();
+        std::lock_guard<std::mutex> lk2(lib.mtx);
+        const PresetLib::LibPattern* p = lib.findPattern(patternId);
+        if (p == nullptr || p->pixels == nullptr) {
+            e.brushIsPattern = false;
+            return makeError(env, kErrBadParam, "setBrushPatternStamp: pattern not found");
+        }
+        e.patternStampGrid = p->pixels;
+        e.patternStampW = p->w;
+        e.patternStampH = p->h;
+        e.brushIsClone = false;
+        e.brushEffect = BrushEffect::None;
+        e.brushHealKind = 0;
+        e.historyBrushSteps = 0;
+    }
+    return makeOk(env, nullptr);
+}
+
+// setLayerTexture(layerId, on, patternId, scale, depth, bevelOn, satinOn)——样式纹理段
+//（斜面高度场/光泽覆盖度调制；图案引用 PresetLib 进程库，缺失时渲染按无纹理跳过）
+napi_value SetLayerTexture(napi_env env, napi_callback_info info) {
+    size_t argc = 7;
+    napi_value argv[7] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 7) {
+        return makeError(env, kErrBadParam,
+                         "setLayerTexture(id,on,patternId,scale,depth,bevelOn,satinOn) requires 7 args");
+    }
+    double a[7] = {0};
+    for (size_t i : {size_t{0}, size_t{1}, size_t{3}, size_t{4}, size_t{5}, size_t{6}}) {
+        if (napi_get_value_double(env, argv[i], &a[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "setLayerTexture: invalid args");
+        }
+    }
+    size_t idLen = 0;
+    if (napi_get_value_string_utf8(env, argv[2], nullptr, 0, &idLen) != napi_ok || idLen > 64) {
+        return makeError(env, kErrBadParam, "setLayerTexture: invalid patternId");
+    }
+    std::string patternId(idLen, '\0');
+    napi_get_value_string_utf8(env, argv[2], patternId.data(), idLen + 1, &idLen);
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(a[0]));
+        if (l == nullptr) {
+            return makeError(env, kErrBadParam, "setLayerTexture: layer not found");
+        }
+        auto next = l->style != nullptr ? std::make_shared<LayerStyle>(*l->style)
+                                        : std::make_shared<LayerStyle>();
+        next->texture = a[1] != 0;
+        next->texPatternId = patternId;
+        next->texScale = std::clamp(a[3], 0.01, 10.0);
+        next->texDepth = std::clamp(a[4], 0.0, 1.0);
+        next->bevelTexOn = a[5] != 0;
+        next->satinTexOn = a[6] != 0;
+        e.history.beginEdit(e.doc, "layer texture", static_cast<uint64_t>(e.docRevision));
+        l->style = std::move(next);
+        std::string err;
+        restyleLayer(e.doc, *l, nextGridRevision(), err);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// setShapeFillEx(id, kind, r, g, b, a, stopsFlat?, angleDeg?, patternId?, patScale?)——形状
+// 填充扩面（kind 1 纯色同 setShapeFill；2 stops 渐变；3 图案库引用）
+napi_value SetShapeFillEx(napi_env env, napi_callback_info info) {
+    size_t argc = 10;
+    napi_value argv[10] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 6) {
+        return makeError(env, kErrBadParam, "setShapeFillEx requires 6+ args");
+    }
+    double a[6] = {0};
+    for (size_t i = 0; i < 6; i++) {
+        if (napi_get_value_double(env, argv[i], &a[i]) != napi_ok) {
+            return makeError(env, kErrBadParam, "setShapeFillEx: invalid args");
+        }
+    }
+    const int32_t kind = static_cast<int32_t>(a[1]);
+    if (kind < 0 || kind > 3) {
+        return makeError(env, kErrBadParam, "setShapeFillEx: bad fillKind");
+    }
+    std::vector<float> stops;
+    double angleDeg = 90.0;
+    double patScale = 1.0;
+    std::string patternId;
+    if (kind == 2) {
+        if (argc < 8 || !p1StopsArg(env, argv[6], stops) ||
+            napi_get_value_double(env, argv[7], &angleDeg) != napi_ok) {
+            return makeError(env, kErrBadParam, "setShapeFillEx: bad stops/angle");
+        }
+    } else if (kind == 3) {
+        size_t idLen = 0;
+        if (argc < 10 || napi_get_value_string_utf8(env, argv[8], nullptr, 0, &idLen) != napi_ok ||
+            idLen == 0 || idLen > 64 ||
+            napi_get_value_double(env, argv[9], &patScale) != napi_ok) {
+            return makeError(env, kErrBadParam, "setShapeFillEx: bad pattern args");
+        }
+        patternId.resize(idLen);
+        napi_get_value_string_utf8(env, argv[8], patternId.data(), idLen + 1, &idLen);
+    }
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(a[0]));
+        if (l == nullptr || l->shape == nullptr) {
+            return makeError(env, kErrBadParam, "setShapeFillEx: shape layer not found");
+        }
+        auto next = std::make_shared<ShapeLayerState>(*l->shape);
+        next->fillKind = kind;
+        next->fillColor[0] = static_cast<float>(a[2]);
+        next->fillColor[1] = static_cast<float>(a[3]);
+        next->fillColor[2] = static_cast<float>(a[4]);
+        next->fillColor[3] = static_cast<float>(a[5]);
+        next->fillStops = stops;
+        next->fillAngleDeg = std::clamp(angleDeg, -3600.0, 3600.0);
+        next->fillPatternId = patternId;
+        next->fillPatScale = std::clamp(patScale, 0.01, 10.0);
+        e.history.beginEdit(e.doc, "形状填充", static_cast<uint64_t>(e.docRevision));
+        l->shape = std::move(next);
+        std::string err;
+        shapeRenderLayer(e.doc, *l, err);
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.bumpRevisionLocked();
+        e.requestRender();
+    }
+    return makeOk(env, nullptr);
+}
+
+// setCloneSlot(slot)——克隆源槽切换（0..4；Shift+数字）
+napi_value SetCloneSlot(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    double slot = 0;
+    if (argc < 1 || napi_get_value_double(env, argv[0], &slot) != napi_ok || slot < 0 ||
+        slot > 4) {
+        return makeError(env, kErrBadParam, "setCloneSlot(slot 0..4) invalid");
+    }
+    auto& e = Engine::get();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    e.cloneSlot = static_cast<int>(slot);
+    return makeOk(env, nullptr);
 }
 
 }  // namespace bridge

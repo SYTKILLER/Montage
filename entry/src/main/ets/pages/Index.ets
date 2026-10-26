@@ -5,7 +5,8 @@ import { common } from '@kit.AbilityKit';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
 import { window } from '@kit.ArkUI';
-import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, RawDevelopData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, SmartInfoDTO, SmartFilterDTO, LookupPresetDTO, LookupImportData } from 'core';
+import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, RawDevelopData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, SmartInfoDTO, SmartFilterDTO, LookupPresetDTO, LookupImportData, PresetGroupDTO, PresetSwatchDTO, PresetGradientDTO, BrushPresetDTO, LibPatternDTO } from 'core';
+import { PresetLibrary } from '../editor/components/PresetLibrary';
 import { AppPrefs, RecentProject, ThemeMode } from '../editor/AppPrefs';
 import { leafItem, MenuGroupVM, MenuItemVM, subItem, ToolVM } from '../editor/MenuModel';
 import { SWATCHES } from '../editor/components/OptionsBar';
@@ -120,6 +121,8 @@ struct Index {
   @StorageProp('debugOpenB64') @Watch('onDebugOpenB64') debugOpenB64Prop: string = '';
   // M22：调试命令直通（want debugCmd → runCommand；uitest 注入退化的 E2E 旁路）
   @StorageProp('debugCmd') @Watch('onDebugCmd') debugCmdProp: string = '';
+  // P1：预设资源导入通道（EntryAbility flush 拼 "kind|name|b64" → consumeDebugPresetB64）
+  @StorageProp('debugPresetB64') @Watch('onDebugPresetB64') debugPresetB64Prop: string = '';
   @StorageProp('importProgress') importProgress: number = 0;
   @State docOpen: boolean = false;
   @State docW: number = 0;
@@ -149,6 +152,27 @@ struct Index {
   @State actionsSel: number = -1;
   @State showActionRename: boolean = false;
   @State actionRenameText: string = '';
+  // P1 预设库（四库：色板/渐变/图案/笔刷；数据 Index 持有 + AppPrefs 持久化）
+  @State presetsVisible: boolean = false;
+  @State swatchLib: PresetGroupDTO[] = [];
+  @State gradientLib: PresetGradientDTO[] = [];
+  @State brushLib: BrushPresetDTO[] = [];
+  @State patternLib: LibPatternDTO[] = [];
+  @State curGradientName: string = '前景→背景';
+  @State curGradientStops: number[] = [];       // 当前渐变（合并 RGBA 扁平；空 = fg/bg 旧语义）
+  @State curGradientTrans: number[][] = [];     // 透明度标（预设持久化用）
+  @State showStopsEd: boolean = false;          // 渐变 stops 编辑器
+  @State showPatternPick: boolean = false;      // 图案源选择器（填充/油漆桶共用）
+  @State patternPickTarget: number = 0;         // 0=填充 1=油漆桶
+  @State patternStampId: string = '';           // 当前图案源（图章/填充/油漆桶共用）
+  @State patternStampScale: number = 1.0;
+  @State bucketUsePattern: boolean = false;     // 油漆桶图案源开关
+  @State cloneSlotIdx: number = 0;              // P1 克隆源槽（0..4，Shift+1..5 切换）
+  @State stampToolPattern: boolean = false;     // 图章工具 = 图案模式（vs 克隆模式）
+  @State shapeFillKind: number = 1;             // 形状填充 UI 态（1 纯色 2 渐变 3 图案）
+  @State shapeFillAngle: number = 90.0;
+  @State shapeFillPattern: string = '';
+  @State textureDepth: number = 0.5;            // 纹理深度（样式斜面纹理段）
   // M24b 批处理 / 图像处理器
   @State showAutomate: boolean = false;
   @State automateMode: number = 0;
@@ -600,6 +624,21 @@ struct Index {
       this.prefs.setString('actions_json', automation.serialize());
     });
     this.actionsVisible = this.prefs.getBool('panel_actions', false);
+    // P1：预设库载入（色板/渐变/笔刷参数全量 + 图案/笔刷 tip 清单；像素进程级重启丢失）
+    this.loadPresetLib();
+    this.presetsVisible = this.prefs.getBool('panel_presets', false);
+    const stampPref = this.prefs.getString('preset_stamp', '');
+    if (stampPref.length > 0) {
+      const bar = stampPref.indexOf('|');
+      if (bar > 0) {
+        this.patternStampId = stampPref.substring(0, bar);
+        const sc = parseFloat(stampPref.substring(bar + 1));
+        if (!isNaN(sc) && sc >= 0.01 && sc <= 10) {
+          this.patternStampScale = sc;
+        }
+      }
+    }
+    this.consumeDebugPresetB64();
     // M24c：控制通道（want debugControl=1 或调试菜单手动开启）
     controlServer.setEngine(this.engine);
     this.consumeDebugControl();
@@ -640,6 +679,30 @@ struct Index {
       AppStorage.setOrCreate('debugCmd', '');
       this.log(`debugCmd: ${cmd}`);
       this.runCommand(cmd);
+    }
+  }
+
+  // P1：预设导入通道消费（watch + 主动消费双入口——aboutToAppear 前到达也不丢）
+  private onDebugPresetB64(): void {
+    this.consumeDebugPresetB64();
+  }
+
+  private consumeDebugPresetB64(): void {
+    const raw = AppStorage.get<string>('debugPresetB64');
+    if (raw === undefined || raw.length === 0) {
+      return;
+    }
+    AppStorage.setOrCreate('debugPresetB64', '');
+    const sep1 = raw.indexOf('|');
+    const sep2 = raw.indexOf('|', sep1 + 1);
+    if (sep1 < 0 || sep2 < 0) {
+      return;
+    }
+    const kind = parseInt(raw.substring(0, sep1));
+    const name = raw.substring(sep1 + 1, sep2);
+    const b64 = raw.substring(sep2 + 1);
+    if (kind >= 0 && kind <= 3 && b64.length > 0) {
+      this.importPresetB64(kind, name, b64);
     }
   }
 
@@ -1317,9 +1380,18 @@ struct Index {
         break;
       case 'bucket':
         if (e.type === TouchType.Down) {
-          const ok = this.engine.bucketFill(docX, docY, this.wandTolerance,
-            this.wandContiguous, this.wandAllLayers ? 1 : 0, this.wandSampleSize);
-          this.log(`油漆桶: (${docX.toFixed(0)},${docY.toFixed(0)}) tol=${this.wandTolerance} ` +
+          // P1：图案源开关（选项条/选择器设定）→ bucketFillPattern
+          let ok = false;
+          if (this.bucketUsePattern && this.patternStampId.length > 0) {
+            ok = this.engine.bucketFillPattern(docX, docY, this.patternStampId,
+              this.patternStampScale, this.wandTolerance, this.wandContiguous,
+              this.wandAllLayers, this.wandSampleSize);
+          } else {
+            ok = this.engine.bucketFill(docX, docY, this.wandTolerance,
+              this.wandContiguous, this.wandAllLayers ? 1 : 0, this.wandSampleSize);
+          }
+          this.log(`油漆桶${this.bucketUsePattern ? '(图案)' : ''}: ` +
+            `(${docX.toFixed(0)},${docY.toFixed(0)}) tol=${this.wandTolerance} ` +
             `→ ${ok ? '已填充' : '失败'}`);
         }
         break;
@@ -3242,10 +3314,16 @@ struct Index {
         this.toast('拖线过短');
         return;
       }
-      const ok = this.engine.applyGradient(a.id, this.gradientType, this.gradientStyle,
-        line[0], line[1], line[2], line[3], this.gradientTarget);
+      // P1：当前渐变有 stops（预设/编辑器设定）走 stops 版，否则旧 fg/bg 两停语义
+      let ok = this.gradientCommitStops(a, this.gradientType, line[0], line[1], line[2],
+        line[3], this.gradientTarget);
+      if (!ok && this.curGradientStops.length < 10) {
+        ok = this.engine.applyGradient(a.id, this.gradientType, this.gradientStyle,
+          line[0], line[1], line[2], line[3], this.gradientTarget);
+      }
       this.log(`渐变(${this.gradientType === 0 ? '线性' : '径向'}/` +
-        `${this.gradientTarget === 0 ? '像素' : '蒙版'}): ${ok ? '已应用' : '失败'}`);
+        `${this.gradientTarget === 0 ? '像素' : '蒙版'}` +
+        `${this.curGradientStops.length >= 10 ? '/stops' : ''}): ${ok ? '已应用' : '失败'}`);
     }
   }
 
@@ -3984,6 +4062,10 @@ struct Index {
     }
     if (id !== 'stamp' && this.tool === 'stamp') {
       this.engine.setBrushClone(false);  // 离开图章工具即清除克隆标志
+      if (this.stampToolPattern) {
+        this.stampToolPattern = false;
+        this.engine.setBrushPatternStamp('', 1.0);  // P1：同步清除图案图章
+      }
     }
     if (id === 'historyBrush') {
       // M11f 历史画笔：互斥克隆/效果/蒙版目标
@@ -4050,7 +4132,12 @@ struct Index {
     if (id === 'stamp') {
       this.maskTarget = false;  // 图章与蒙版目标互斥（克隆优先走像素）
       this.engine.setBrushTarget(false);
-      this.engine.setBrushClone(true);
+      if (this.stampToolPattern && this.patternStampId.length > 0) {
+        // P1：图案图章模式（setBrushPatternStamp 内部清克隆标志）
+        this.engine.setBrushPatternStamp(this.patternStampId, this.patternStampScale);
+      } else {
+        this.engine.setBrushClone(true);
+      }
     }
     this.log(`工具 → ${id}`);
   }
@@ -4077,6 +4164,612 @@ struct Index {
     const f = this.hexToRgb(fg);
     const b = this.hexToRgb(bg);
     this.engine.setColors(f[0], f[1], f[2], b[0], b[1], b[2]);
+  }
+
+  // ---------- P1 预设库（四库持久化 + 导入 + 消费点接线） ----------
+
+  private savePresetLib(): void {
+    // 色板/渐变/笔刷参数全量；图案/笔刷 tip 只存清单（像素进程级，重启丢失登记）
+    const obj: Record<string, Object> = {
+      'swatches': this.swatchLib as Object as Object,
+      'gradients': this.gradientLib as Object as Object,
+      'brushes': this.brushLib as Object as Object,
+      'patterns': this.patternLib as Object as Object,
+      'curGradient': ([this.curGradientName, this.curGradientStops,
+        this.curGradientTrans] as Object) as Object
+    };
+    try {
+      this.prefs.setString('preset_lib_json', JSON.stringify(obj));
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'preset lib save failed');
+    }
+  }
+
+  private loadPresetLib(): void {
+    const raw = this.prefs.getString('preset_lib_json', '');
+    if (raw.length === 0) {
+      return;
+    }
+    try {
+      const obj = JSON.parse(raw) as Record<string, Object>;
+      const sw = obj['swatches'];
+      if (Array.isArray(sw)) {
+        this.swatchLib = sw as Object as PresetGroupDTO[];
+      }
+      const gr = obj['gradients'];
+      if (Array.isArray(gr)) {
+        this.gradientLib = gr as Object as PresetGradientDTO[];
+      }
+      const br = obj['brushes'];
+      if (Array.isArray(br)) {
+        this.brushLib = br as Object as BrushPresetDTO[];
+      }
+      // 图案清单读入后逐项验证引擎侧像素仍在（进程级——重启后 stale 项剔除）
+      const pt = obj['patterns'];
+      if (Array.isArray(pt)) {
+        const stale: string[] = [];
+        const loaded: LibPatternDTO[] = [];
+        for (const p of pt as Object as LibPatternDTO[]) {
+          if (this.engine.getPresetThumb(0, p.id) !== null) {
+            loaded.push(p);
+          } else {
+            stale.push(p.id);
+          }
+        }
+        this.patternLib = loaded;
+        if (stale.length > 0) {
+          hilog.warn(DOMAIN, TAG, 'preset patterns stale: %{public}d', stale.length);
+        }
+      }
+      const cg = obj['curGradient'] as Object[];
+      if (Array.isArray(cg) && cg.length === 3) {
+        this.curGradientName = cg[0] as string;
+        this.curGradientStops = cg[1] as number[];
+        this.curGradientTrans = cg[2] as number[][];
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'preset lib load failed');
+    }
+  }
+
+  /** P1：当前渐变 stops（预设「前景/背景」停靠 resolve 成引擎 fg/bg 现值；空 = 旧语义）。 */
+  private currentGradientFlat(): number[] {
+    return this.curGradientStops;
+  }
+
+  private resolvePresetStops(g: PresetGradientDTO): number[] {
+    const fg = this.hexToRgb(this.brushColor);
+    const bg = this.hexToRgb(this.bgColor);
+    const out: number[] = [];
+    for (const s of g.stops) {
+      const t = s[0];
+      const kind = s[1];
+      let r = s[2];
+      let gg = s[3];
+      let b = s[4];
+      if (kind === 1) {
+        r = fg[0];
+        gg = fg[1];
+        b = fg[2];
+      } else if (kind === 2) {
+        r = bg[0];
+        gg = bg[1];
+        b = bg[2];
+      }
+      const a = this.transAt(g.transparency, t);
+      out.push(t, r, gg, b, a);
+    }
+    return out;
+  }
+
+  private transAt(tr: number[][], t: number): number {
+    if (tr.length === 0) {
+      return 1;
+    }
+    if (t <= tr[0][0]) {
+      return tr[0][1];
+    }
+    if (t >= tr[tr.length - 1][0]) {
+      return tr[tr.length - 1][1];
+    }
+    for (let k = 1; k < tr.length; k++) {
+      if (t <= tr[k][0]) {
+        const t0 = tr[k - 1][0];
+        const t1 = tr[k][0];
+        const u = t1 > t0 ? (t - t0) / (t1 - t0) : 1;
+        return tr[k - 1][1] + (tr[k][1] - tr[k - 1][1]) * u;
+      }
+    }
+    return 1;
+  }
+
+  private applyGradientPreset(g: PresetGradientDTO): void {
+    this.curGradientName = g.name;
+    this.curGradientStops = this.resolvePresetStops(g);
+    this.curGradientTrans = g.transparency;
+    this.savePresetLib();
+  }
+
+  /** P1：色板文件导入（picker 真机项；debug.importB64 通道走 importPresetB64）。 */
+  private importPresetB64(kind: number, fileName: string, b64: string): void {
+    if (kind === 0) {
+      const groups = this.engine.parseSwatchesFile(fileName, b64);
+      if (groups === null) {
+        this.log('色板导入失败');
+        return;
+      }
+      let n = 0;
+      for (const g of groups) {
+        if (g.name.length === 0 && groups.length === 1) {
+          g.name = fileName.replace(/\.[^.]+$/, '');
+        }
+        n += g.swatches.length;
+      }
+      this.swatchLib = this.swatchLib.concat(groups);
+      this.log(`色板导入：${groups.length} 组 ${n} 色`);
+    } else if (kind === 1) {
+      const data = this.engine.parseGradientsFile(fileName, b64);
+      if (data === null) {
+        this.log('渐变导入失败');
+        return;
+      }
+      const base = fileName.replace(/\.[^.]+$/, '');
+      const existing = new Set<string>(this.gradientLib.map((x: PresetGradientDTO): string => x.name));
+      for (const g of data.gradients) {
+        let name = g.name.length > 0 ? g.name : base;
+        let k = 2;
+        while (existing.has(name)) {
+          name = `${g.name} ${k}`;
+          k++;
+        }
+        existing.add(name);
+        g.name = name;
+      }
+      this.gradientLib = this.gradientLib.concat(data.gradients);
+      this.log(`渐变导入：${data.gradients.length} 个（noise 跳过 ${data.skippedNoise}）`);
+    } else if (kind === 2) {
+      const list = this.engine.importPatternsFile(fileName, b64);
+      if (list === null) {
+        this.log('图案导入失败（库满/超限?）');
+        return;
+      }
+      this.patternLib = this.patternLib.concat(list);
+      this.log(`图案导入：${list.length} 个`);
+    } else if (kind === 3) {
+      const data = this.engine.importBrushesFile(fileName, b64);
+      if (data === null) {
+        this.log('笔刷导入失败');
+        return;
+      }
+      this.brushLib = this.brushLib.concat(data.brushes);
+      this.log(`笔刷导入：${data.brushes.length} 个`);
+    }
+    this.savePresetLib();
+  }
+
+  /** P1：真机/模拟器 picker 导入（kind 0=色板 1=渐变 2=图案 3=笔刷）。 */
+  private importPresetFile(kind: number): void {
+    const exts: string[] = kind === 0 ? ['aco', 'ase'] : kind === 1 ? ['grd'] :
+      kind === 2 ? ['pat'] : ['abr'];
+    const title = kind === 0 ? '导入色板' : kind === 1 ? '导入渐变' : kind === 2 ? '导入图案' : '导入笔刷';
+    try {
+      const doc = new picker.DocumentSelectOptions();
+      doc.maxSelectNumber = 1;
+      doc.fileSuffixFilters = exts.map((e: string): string => '.' + e);
+      const dv = new picker.DocumentViewPicker();
+      dv.select(doc).then((uris: string[]): void => {
+        if (uris.length === 0) {
+          return;
+        }
+        this.readPresetFileB64(kind, uris[0], title);
+      }).catch((): void => {});
+    } catch (e) {
+      this.log('picker 不可用（真机项）');
+    }
+  }
+
+  private readPresetFileB64(kind: number, uri: string, title: string): void {
+    try {
+      const file = fs.openSync(uri, fs.OpenMode.READ_ONLY);
+      const stat = fs.statSync(file.fd);
+      const size = stat.size;
+      if (size > 64 * 1024 * 1024) {
+        fs.closeSync(file);
+        this.log(`${title}：文件过大`);
+        return;
+      }
+      const buf = new ArrayBuffer(size);
+      fs.readSync(file.fd, buf);
+      fs.closeSync(file);
+      const helper = new util.Base64Helper();
+      const b64 = helper.encodeToStringSync(new Uint8Array(buf));
+      const name = uri.substring(uri.lastIndexOf('/') + 1);
+      this.importPresetB64(kind, name, b64);
+    } catch (e) {
+      this.log(`${title}：读取失败`);
+    }
+  }
+
+  /** P1：四库删除（长按；图案/tip 同步释放引擎像素）。 */
+  private deletePreset(kind: number, idx: number, sub: number): void {
+    if (kind === 0) {
+      if (idx < this.swatchLib.length && sub < this.swatchLib[idx].swatches.length) {
+        const items = this.swatchLib[idx].swatches;
+        const next: PresetSwatchDTO[] = [];
+        for (let i = 0; i < items.length; i++) {
+          if (i !== sub) {
+            next.push(items[i]);
+          }
+        }
+        const g = this.swatchLib[idx];
+        this.swatchLib[idx] = { name: g.name, swatches: next };
+      }
+    } else if (kind === 1) {
+      if (idx >= 0 && idx < this.gradientLib.length) {
+        const next: PresetGradientDTO[] = [];
+        for (let i = 0; i < this.gradientLib.length; i++) {
+          if (i !== idx) {
+            next.push(this.gradientLib[i]);
+          }
+        }
+        this.gradientLib = next;
+      }
+    } else if (kind === 2) {
+      if (idx >= 0 && idx < this.patternLib.length) {
+        this.engine.dropPresetPixels(0, this.patternLib[idx].id);
+        const next: LibPatternDTO[] = [];
+        for (let i = 0; i < this.patternLib.length; i++) {
+          if (i !== idx) {
+            next.push(this.patternLib[i]);
+          }
+        }
+        this.patternLib = next;
+      }
+    } else if (kind === 3) {
+      if (idx >= 0 && idx < this.brushLib.length) {
+        const tipId = this.brushLib[idx].tipId;
+        if (tipId.length > 0) {
+          this.engine.dropPresetPixels(1, tipId);
+        }
+        const next: BrushPresetDTO[] = [];
+        for (let i = 0; i < this.brushLib.length; i++) {
+          if (i !== idx) {
+            next.push(this.brushLib[i]);
+          }
+        }
+        this.brushLib = next;
+      }
+    }
+    this.savePresetLib();
+  }
+
+  private applyBrushPreset(b: BrushPresetDTO): void {
+    // 参数面（位图盖章登记后续批）：尺寸/硬度/不透明度（预设携带时）
+    const rgb = this.hexToRgb(this.brushColor);
+    this.brushSize = Math.max(1, Math.min(5000, Math.round(b.size)));
+    this.brushHardness = Math.round(b.hardness * 100);
+    this.pushBrushSettings();
+  }
+
+  private savePresetStampState(): void {
+    this.prefs.setString('preset_stamp', `${this.patternStampId}|${this.patternStampScale}`);
+  }
+
+  /** P1：形状填充源（kind 1 纯色/2 stops 渐变（当前渐变）/3 图案库项）。 */
+  private applyShapeFill(kind: number): void {
+    this.shapeFillKind = kind;
+    const a = this.activeLayer();
+    if (a === undefined) {
+      return;
+    }
+    const c = this.hexToRgb(this.fillColor);
+    let ok = false;
+    if (kind === 2) {
+      const stops = this.curGradientStops.length >= 10 ? this.curGradientStops
+        : (() => {
+          const fg = this.hexToRgb(this.brushColor);
+          const bg = this.hexToRgb(this.bgColor);
+          return [0, fg[0], fg[1], fg[2], 1, 1, bg[0], bg[1], bg[2], 1];
+        })();
+      ok = this.engine.setShapeFillEx(a.id, 2, c[0], c[1], c[2], 1, stops, this.shapeFillAngle,
+        '', 1.0);
+    } else if (kind === 3) {
+      if (this.shapeFillPattern.length === 0) {
+        this.toast('请先选择图案');
+        return;
+      }
+      ok = this.engine.setShapeFillEx(a.id, 3, c[0], c[1], c[2], 1, [], 90,
+        this.shapeFillPattern, 1.0);
+    } else {
+      ok = this.engine.setShapeFillEx(a.id, 1, c[0], c[1], c[2], 1, [], 90, '', 1.0);
+    }
+    this.log(`形状填充 kind=${kind}: ${ok}`);
+  }
+
+  private patternNameOf(id: string): string {
+    for (const p of this.patternLib) {
+      if (p.id === id) {
+        return p.name;
+      }
+    }
+    return '图案';
+  }
+
+  // ---------- P1 渐变 stops 编辑器（M11 登记项：多色标 + 透明度标 + 预设下拉） ----------
+
+  // 编辑态：颜色停 [t,r,g,b]（a 恒 1）与透明度停 [t,a]；提交时合并成引擎 RGBA 扁平
+  @State private stEdColor: number[][] = [];
+  @State private stEdAlpha: number[][] = [];
+  @State private stEdSelC: number = 0;
+  @State private stEdSelA: number = -1;
+  @State private stEdName: string = '';
+  @State private stEdAlphaVal: number = 100;  // 选中透明度标的不透明度（%显示）
+  private stEdCtx: CanvasRenderingContext2D = new CanvasRenderingContext2D(new RenderingContextSettings(true));
+  private stEdPrevCtx: CanvasRenderingContext2D = new CanvasRenderingContext2D(new RenderingContextSettings(true));
+  private stEdDragTrack: number = -1;  // 0=色标轨 1=透明度轨 -1=无
+  private stEdDragIdx: number = -1;
+
+  private openStopsEditor(): void {
+    // 从当前渐变载入（merged → 颜色停丢 alpha 通道置 1；透明度标用独立存储或端点默认）
+    const cs: number[][] = [];
+    const st = this.curGradientStops;
+    if (st.length >= 10) {
+      for (let i = 0; i * 5 < st.length; i++) {
+        cs.push([st[i * 5], st[i * 5 + 1], st[i * 5 + 2], st[i * 5 + 3]]);
+      }
+    } else {
+      const fg = this.hexToRgb(this.brushColor);
+      const bg = this.hexToRgb(this.bgColor);
+      cs.push([0, fg[0], fg[1], fg[2]], [1, bg[0], bg[1], bg[2]]);
+    }
+    this.stEdColor = cs;
+    this.stEdAlpha = this.curGradientTrans.length > 0 ? this.curGradientTrans : [[0, 1], [1, 1]];
+    this.stEdSelC = 0;
+    this.stEdSelA = -1;
+    this.stEdAlphaVal = 100;
+    this.stEdName = this.curGradientName;
+    this.showStopsEd = true;
+    this.redrawStopsEd();
+  }
+
+  /** 合并色/透明度标为引擎扁平（photocraft apply_opacity 同式：并集 + 段内 4 细分）。 */
+  private mergeStopsEd(): number[] {
+    const ts: number[] = [0, 1];
+    for (const c of this.stEdColor) {
+      ts.push(c[0]);
+    }
+    for (const a of this.stEdAlpha) {
+      ts.push(a[0]);
+    }
+    ts.sort((x: number, y: number): number => x - y);
+    const all: number[] = [];
+    for (let i = 0; i + 1 < ts.length; i++) {
+      for (let k = 0; k < 4; k++) {
+        all.push(ts[i] + (ts[i + 1] - ts[i]) * k / 4);
+      }
+    }
+    all.push(1);
+    const out: number[] = [];
+    for (const t of all) {
+      const c = this.lerpStopsAt(this.stEdColor, t, 3);
+      const a = this.lerpStopsAt(this.stEdAlpha, t, 1);
+      const alpha = c[3] * a[0];
+      out.push(t, c[0], c[1], c[2], Math.max(0, Math.min(1, alpha)));
+    }
+    // 去重连续同 t（保首）
+    const dedup: number[] = [];
+    for (let i = 0; i * 5 < out.length; i++) {
+      if (i > 0 && Math.abs(out[i * 5] - out[(i - 1) * 5]) < 1e-4) {
+        continue;
+      }
+      for (let k = 0; k < 5; k++) {
+        dedup.push(out[i * 5 + k]);
+      }
+    }
+    return dedup;
+  }
+
+  /** 分段线性采样（arr = [t,v…] 每行 dim 值；引擎 evalStops 同式）。 */
+  private lerpStopsAt(arr: number[][], t: number, dim: number): number[] {
+    if (arr.length === 0) {
+      return new Array<number>(dim + 1).fill(1);
+    }
+    const out = new Array<number>(dim + 1).fill(0);
+    if (t <= arr[0][0]) {
+      for (let k = 0; k <= dim; k++) {
+        out[k] = arr[0][k + 1];
+      }
+      return out;
+    }
+    const last = arr[arr.length - 1];
+    if (t >= last[0]) {
+      for (let k = 0; k <= dim; k++) {
+        out[k] = last[k + 1];
+      }
+      return out;
+    }
+    for (let i = 1; i < arr.length; i++) {
+      if (t <= arr[i][0]) {
+        const a = arr[i - 1];
+        const b = arr[i];
+        const span = b[0] - a[0];
+        const u = span > 1e-9 ? (t - a[0]) / span : 1;
+        for (let k = 0; k <= dim; k++) {
+          out[k] = a[k + 1] + (b[k + 1] - a[k + 1]) * u;
+        }
+        return out;
+      }
+    }
+    return out;
+  }
+
+  private redrawStopsEd(): void {
+    const c = this.stEdCtx;
+    const w = c.width;
+    const h = c.height;
+    if (w <= 0) {
+      return;
+    }
+    c.clearRect(0, 0, w, h);
+    const halfH = h / 2;
+    // 上半：透明度轨（棋盘底 + 黑线）
+    for (let y = 0; y < halfH; y += 6) {
+      for (let x = ((y / 6) % 2) * 6; x < w; x += 12) {
+        c.fillStyle = '#E8E8E8';
+        c.fillRect(x, y, 6, 6);
+      }
+    }
+    c.strokeStyle = '#333333';
+    c.lineWidth = 2;
+    c.beginPath();
+    for (let x = 0; x <= w; x++) {
+      const t = x / w;
+      const a = this.lerpStopsAt(this.stEdAlpha, t, 1)[0];
+      const y = halfH - a * (halfH - 4);
+      if (x === 0) {
+        c.moveTo(x, y);
+      } else {
+        c.lineTo(x, y);
+      }
+    }
+    c.stroke();
+    // 下半：颜色轨
+    for (let x = 0; x <= w; x++) {
+      const t = x / w;
+      const col = this.lerpStopsAt(this.stEdColor, t, 3);
+      const a = this.lerpStopsAt(this.stEdAlpha, t, 1)[0];
+      const r = Math.round(col[0] * 255);
+      const g2 = Math.round(col[1] * 255);
+      const b = Math.round(col[2] * 255);
+      c.fillStyle = `rgba(${r},${g2},${b},${a})`;
+      c.fillRect(x, halfH, 1, halfH);
+    }
+    // 标记：色标（下方三角位菱形）+ 透明度标（上方小方块）
+    for (let i = 0; i < this.stEdColor.length; i++) {
+      const x = this.stEdColor[i][0] * w;
+      c.fillStyle = i === this.stEdSelC ? '#0A66C2' : '#555555';
+      c.fillRect(x - 3, h - 8, 6, 8);
+    }
+    for (let i = 0; i < this.stEdAlpha.length; i++) {
+      const x = this.stEdAlpha[i][0] * w;
+      c.fillStyle = i === this.stEdSelA ? '#0A66C2' : '#888888';
+      c.fillRect(x - 3, 0, 6, 7);
+    }
+  }
+
+  private drawStopsPreview(): void {
+    const c = this.stEdPrevCtx;
+    const w = c.width;
+    const h = c.height;
+    if (w <= 0) {
+      return;
+    }
+    const merged = this.mergeStopsEd();
+    const rows: number[][] = [];
+    for (let i = 0; i * 5 < merged.length; i++) {
+      rows.push([merged[i * 5], merged[i * 5 + 1], merged[i * 5 + 2], merged[i * 5 + 3],
+        merged[i * 5 + 4]]);
+    }
+    for (let x = 0; x < w; x++) {
+      const t = x / (w - 1);
+      const col = this.lerpStopsAt(rows, t, 4);
+      c.fillStyle = `rgba(${Math.round(col[0] * 255)},${Math.round(col[1] * 255)},${Math.round(col[2] * 255)},${col[4]})`;
+      c.fillRect(x, 0, 1, h);
+    }
+  }
+
+  private stEdTouch(locX: number, locY: number, isUp: boolean): void {
+    const w = this.stEdCtx.width;
+    const h = this.stEdCtx.height;
+    if (w <= 0) {
+      return;
+    }
+    const halfH = h / 2;
+    const t = Math.max(0, Math.min(1, locX / w));
+    if (isUp) {
+      this.stEdDragTrack = -1;
+      this.stEdDragIdx = -1;
+      return;
+    }
+    if (locY < halfH) {
+      // 透明度轨：近标拖拽，空白新增
+      let near = -1;
+      let bestD = 12 / w;
+      for (let i = 0; i < this.stEdAlpha.length; i++) {
+        const d = Math.abs(this.stEdAlpha[i][0] - t);
+        if (d < bestD) {
+          bestD = d;
+          near = i;
+        }
+      }
+      if (near < 0) {
+        const a = this.lerpStopsAt(this.stEdAlpha, t, 1)[0];
+        this.stEdAlpha.push([t, a]);
+        this.stEdAlpha.sort((x: number[], y: number[]): number => x[0] - y[0]);
+        near = this.stEdAlpha.findIndex((x: number[]): boolean => Math.abs(x[0] - t) < 1e-4);
+      }
+      this.stEdSelA = near;
+      this.stEdSelC = -1;
+      if (this.stEdSelA >= 0) {
+        this.stEdAlphaVal = Math.round(this.stEdAlpha[this.stEdSelA][1] * 100);
+        this.stEdAlpha[this.stEdSelA][0] = t;
+      }
+      this.stEdDragTrack = 1;
+      this.stEdDragIdx = near;
+    } else {
+      let near = -1;
+      let bestD = 12 / w;
+      for (let i = 0; i < this.stEdColor.length; i++) {
+        const d = Math.abs(this.stEdColor[i][0] - t);
+        if (d < bestD) {
+          bestD = d;
+          near = i;
+        }
+      }
+      if (near < 0) {
+        const col = this.lerpStopsAt(this.stEdColor, t, 3);
+        this.stEdColor.push([t, col[0], col[1], col[2]]);
+        this.stEdColor.sort((x: number[], y: number[]): number => x[0] - y[0]);
+        near = this.stEdColor.findIndex((x: number[]): boolean => Math.abs(x[0] - t) < 1e-4);
+      }
+      this.stEdSelC = near;
+      this.stEdSelA = -1;
+      this.stEdColor[near][0] = t;
+      this.stEdDragTrack = 0;
+      this.stEdDragIdx = near;
+    }
+    this.redrawStopsEd();
+    this.drawStopsPreview();
+  }
+
+  private stEdCommit(): void {
+    this.curGradientStops = this.mergeStopsEd();
+    this.curGradientTrans = this.stEdAlpha.map((a: number[]): number[] => [a[0], a[1]]);
+    // 与库中同名预设同步（编辑已有预设语义）
+    for (let i = 0; i < this.gradientLib.length; i++) {
+      if (this.gradientLib[i].name === this.stEdName) {
+        const stops: number[][] = [];
+        for (const c of this.stEdColor) {
+          stops.push([c[0], 0, c[1], c[2], c[3]]);
+        }
+        this.gradientLib[i] = { name: this.stEdName, stops: stops, transparency: this.curGradientTrans };
+        this.savePresetLib();
+        break;
+      }
+    }
+    this.curGradientName = this.stEdName;
+    this.showStopsEd = false;
+  }
+
+  /** 渐变工具提交（拖线终点）：有 stops 用 stops 版，否则旧 fg/bg 语义。 */
+  private gradientCommitStops(a: Object, type: number, x0: number, y0: number, x1: number,
+    y1: number, target: number): boolean {
+    if (this.curGradientStops.length < 10) {
+      return false;
+    }
+    const rec = a as Record<string, Object>;
+    const id = rec['id'] as number;
+    return this.engine.applyGradientStops(id, type, x0, y0, x1, y1, target, this.curGradientStops);
   }
 
   // ---------- M14c 图层样式/填充层参数应用（滑条/色板实时生效，一步撤销/命令） ----------
@@ -4179,6 +4872,33 @@ struct Index {
     this.ctRange = target === 2 ? this.styOgRange : (target === 3 ? this.styIgRange : 50);
     this.ctDrag = -1;
     this.showContour = true;
+  }
+
+  // P1：等高线内置预设（PS 内建等高线的 clean-room 程序点列；x/y 交错 0..1，corners 1=折角）
+  private ctPresetNames: string[] = ['锥形', '波浪', '半圆', '滚动斜坡', '高斯'];
+
+  private applyContourPreset(idx: number): void {
+    const presets: number[][] = [
+      // 锥形：满值直落（角点折线）
+      [0, 1, 1, 0],
+      // 波浪：两周期正弦（平滑）
+      [0, 0.5, 0.125, 1, 0.25, 0.5, 0.375, 0, 0.5, 0.5, 0.625, 1, 0.75, 0.5, 0.875, 0, 1, 0.5],
+      // 半圆：上凸弧（平滑）
+      [0, 0, 0.5, 1, 1, 0],
+      // 滚动斜坡：锯齿爬升（角点）
+      [0, 0, 0.5, 1, 0.5, 0, 1, 1],
+      // 高斯：钟形（平滑）
+      [0, 0, 0.25, 0.2, 0.5, 1, 0.75, 0.2, 1, 0],
+    ];
+    if (idx < 0 || idx >= presets.length) {
+      return;
+    }
+    this.ctPts = presets[idx].slice();
+    const jagged = idx === 0 || idx === 3;
+    this.ctCorners = presets[idx].map((_: number, i: number): number => jagged && i % 2 === 0 ? 1 : 0);
+    this.ctCommit();
+    this.drawContour();
+    this.toast(`等高线预设「${this.ctPresetNames[idx]}」`);
   }
 
   private ctLabel(): string {
@@ -5474,6 +6194,77 @@ struct Index {
         this.actionsVisible = !this.actionsVisible;
         this.prefs.setBool('panel_actions', this.actionsVisible);
         break;
+      case 'window.togglePresets':
+        this.presetsVisible = !this.presetsVisible;
+        this.prefs.setBool('panel_presets', this.presetsVisible);
+        break;
+      case 'window.editGradient':
+        this.openStopsEditor();
+        break;
+      case 'debug.importAco':
+      case 'debug.importGrd':
+      case 'debug.importPat':
+      case 'debug.importAbr': {
+        // E2E 通道：内置小型样例库注入（宿主测试生成格式样张 → want debugB64 通道常备；
+        // 此 case 仅用于 debugCmd 触发「用最近 debug 预设 b64 导入」——见 onDebugPresetB64）
+        this.consumeDebugPresetB64();
+        break;
+      }
+      case 'debug.applyGradient0': {
+        // P1 E2E：库渐变[0] → 设为当前 → 全幅横向 stops 渐变（像素实证）
+        if (!this.docOpen || this.gradientLib.length === 0) {
+          this.toast('E2E: 需要文档与库渐变');
+          break;
+        }
+        this.applyGradientPreset(this.gradientLib[0]);
+        const a2 = this.activeLayer();
+        if (a2 !== undefined) {
+          const ok2 = this.engine.applyGradientStops(a2.id, 0, 0, this.docH / 2, this.docW,
+            this.docH / 2, 0, this.curGradientStops);
+          this.log(`E2E applyGradient0: ${ok2}`);
+        }
+        break;
+      }
+      case 'debug.fillPattern0': {
+        // P1 E2E：库图案[0] → 整层图案填充（像素实证）
+        if (!this.docOpen || this.patternLib.length === 0) {
+          this.toast('E2E: 需要文档与库图案');
+          break;
+        }
+        this.patternStampId = this.patternLib[0].id;
+        const ok3 = this.engine.fillWithPattern(this.patternLib[0].id, 1.0);
+        this.log(`E2E fillPattern0: ${ok3}`);
+        break;
+      }
+      case 'debug.stampPattern0': {
+        // P1 E2E：库图案[0] → 图案图章激活（工具切换 + 引擎标志实证走 hilog）
+        if (!this.docOpen || this.patternLib.length === 0) {
+          this.toast('E2E: 需要文档与库图案');
+          break;
+        }
+        this.patternStampId = this.patternLib[0].id;
+        this.stampToolPattern = true;
+        if (this.tool !== 'stamp') {
+          this.pickTool('stamp');
+        } else {
+          this.engine.setBrushPatternStamp(this.patternLib[0].id, 1.0);
+        }
+        this.log('E2E stampPattern0 activated');
+        break;
+      }
+      case 'debug.newSmall':
+        // P1 E2E：小文档（截图/像素对比友好）
+        this.docW = 96;
+        this.docH = 96;
+        this.engine.newDocument(96, 96);
+        this.afterDocChanged();
+        this.log('E2E newSmall 96x96');
+        break;
+      case 'debug.layerAdd':
+        this.engine.addLayer('e2e');
+        this.afterDocChanged();
+        this.log('E2E layerAdd');
+        break;
       case 'automate.batch':
         this.automateMode = 0;
         this.automateProgress = '';
@@ -5990,6 +6781,16 @@ struct Index {
   // M11a 填充提交（色源 = 引擎 fg/bg 现值或黑白）
   private commitFill(): void {
     this.showFill = false;
+    if (this.fillSource === 4) {
+      // P1：图案源（需先经「图案…」选定库项）
+      if (this.patternStampId.length === 0) {
+        this.toast('未选择图案');
+        return;
+      }
+      const okp = this.engine.fillWithPattern(this.patternStampId, this.patternStampScale);
+      this.log(`填充（图案 ${this.patternNameOf(this.patternStampId)}）: ${okp}`);
+      return;
+    }
     const ok = this.engine.fillSelection(this.fillSource);
     const names: string[] = ['前景色', '背景色', '黑色', '白色'];
     this.log(`填充（${names[this.fillSource]}）: ${ok}`);
@@ -6386,6 +7187,7 @@ struct Index {
       leafItem('window.toggleHistogram', '直方图面板', '', true, this.histogramVisible),
       leafItem('window.toggleInfo', '信息面板', '', true, this.infoVisible),
       leafItem('window.toggleActions', '动作面板', '', true, this.actionsVisible),
+      leafItem('window.togglePresets', '预设库', '', true, this.presetsVisible),
     ];
     const help: MenuItemVM[] = [
       subItem('help.themeSub', '主题', true, [
@@ -6506,7 +7308,7 @@ struct Index {
       return;
     }
     // 对话框打开时：Esc 关闭，其余不抢
-    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform || this.showModify || this.showStoreSel || this.showLoadSel || this.showFill || this.showStyle || this.showFilter || this.showDevelop || this.showGlobalLight || this.showContour) {
+    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform || this.showModify || this.showStoreSel || this.showLoadSel || this.showFill || this.showStyle || this.showFilter || this.showDevelop || this.showGlobalLight || this.showContour || this.showStopsEd || this.showPatternPick) {
       if (e.keyCode === KC_ESC) {
         this.showTransform = false;
         this.showExport = false;
@@ -6524,6 +7326,8 @@ struct Index {
         this.showStyle = false;
         this.showGlobalLight = false;
         this.showContour = false;
+        this.showStopsEd = false;
+        this.showPatternPick = false;
         this.cancelFilterDialog();
       }
       return;
@@ -6701,6 +7505,15 @@ struct Index {
       // Shift+U 循环形状种类（矩形→圆角→椭圆→直线）
       this.shapeKind = (this.shapeKind + 1) % 6;
       this.log(`形状种类: ${this.shapeKindLabel()}`);
+      return;
+    }
+    if (this.shiftHeld && e.keyCode >= 2001 && e.keyCode <= 2005) {
+      // P1 克隆源槽 Shift+1..5（KEYCODE_1=2001 … KEYCODE_5=2005，d.ts 已核验；
+      // PS Clone Source 面板语义）
+      const slot = e.keyCode - 2000;
+      this.engine.setCloneSlot(slot - 1);
+      this.cloneSlotIdx = slot - 1;
+      this.log(`克隆源槽 ${slot}`);
       return;
     }
     switch (code) {
@@ -7051,6 +7864,7 @@ struct Index {
         `${this.screenMode}${this.guidesMirror.visible ? 1 : 0}${this.guidesMirror.locked ? 1 : 0}` +
         `${this.historyVisible ? 1 : 0}${this.histogramVisible ? 1 : 0}${this.infoVisible ? 1 : 0}` +
         `${this.actionsVisible ? 1 : 0}${this.actionsRev}${this.docOpen ? 1 : 0}` +  // M24a 动作菜单使能位
+        `${this.presetsVisible ? 1 : 0}` +  // P1 预设库菜单勾选位
         `${this.historyCurrent}${this.historyLabels.length}` +
         `${this.hasRawDevelop ? 1 : 0}`  // M15e：RAW 显影菜单项使能随会话 RAW 翻转
         + `${this.workPathNonEmpty}${this.activeLayer()?.isShape ? 1 : 0}` +
@@ -7201,6 +8015,29 @@ struct Index {
           onCaMoveMode: (m: number): void => {
             this.caMoveMode = m;
             this.log(`移动模式: ${m === 0 ? '普通' : m === 1 ? '感知移动' : '感知扩展'}`);
+          },
+          gradientName: this.curGradientName,
+          onEditGradient: (): void => this.openStopsEditor(),
+          patternStampOn: this.tool === 'stamp' && this.patternStampId.length > 0 &&
+            this.stampToolPattern,
+          patternStampName: this.patternNameOf(this.patternStampId),
+          onPatternStampPick: (): void => {
+            this.patternPickTarget = 2;
+            this.showPatternPick = true;
+          },
+          onPatternStampOff: (): void => {
+            this.stampToolPattern = false;
+            this.engine.setBrushPatternStamp('', 1.0);
+          },
+          bucketPatternOn: this.bucketUsePattern,
+          onBucketPatternPick: (): void => {
+            this.patternPickTarget = 1;
+            this.showPatternPick = true;
+          },
+          cloneSlot: this.cloneSlotIdx,
+          onCloneSlot: (slot: number): void => {
+            this.cloneSlotIdx = slot;
+            this.engine.setCloneSlot(slot);
           },
         })
         }
@@ -7783,10 +8620,10 @@ struct Index {
             .border({ width: { left: 1 }, color: { left: $r('app.color.divider') } })
           }
 
-          // M15b 面板坞第二列（历史/直方图/信息/动作；PS 多列面板语义）
+          // M15b 面板坞第二列（历史/直方图/信息/动作/预设库；PS 多列面板语义）
           if (this.screenMode === 0 &&
             (this.historyVisible || this.histogramVisible || this.infoVisible ||
-              this.actionsVisible)) {
+              this.actionsVisible || this.presetsVisible)) {
             Column({ space: 6 }) {
               if (this.historyVisible) {
                 HistoryPanel({
@@ -7839,6 +8676,51 @@ struct Index {
                   },
                   onMutated: (): void => {
                     this.actionsRev++;
+                  },
+                })
+                  .layoutWeight(1)
+              }
+              if (this.presetsVisible) {
+                PresetLibrary({
+                  swatchLib: this.swatchLib,
+                  gradientLib: this.gradientLib,
+                  brushLib: this.brushLib,
+                  patternLib: this.patternLib,
+                  engineRef: this.engine,
+                  onPickSwatch: (r: number, g: number, b: number): void => {
+                    this.applyColors(this.rgbToHex(r, g, b), this.bgColor);
+                  },
+                  onUseGradient: (idx: number): void => {
+                    this.applyGradientPreset(this.gradientLib[idx]);
+                  },
+                  onEditGradient: (idx: number): void => {
+                    if (idx >= 0 && idx < this.gradientLib.length) {
+                      this.applyGradientPreset(this.gradientLib[idx]);
+                    }
+                    this.openStopsEditor();
+                  },
+                  onNewGradient: (): void => {
+                    this.openStopsEditor();
+                  },
+                  onUsePattern: (id: string): void => {
+                    this.engine.setBrushPatternStamp(id, 1.0);
+                    this.toast('图案图章源已设');
+                  },
+                  onAddToDoc: (id: string): void => {
+                    const dp = this.engine.libraryPatternToDoc(id);
+                    if (dp !== null) {
+                      this.patternList = this.engine.getPatterns();
+                      this.toast('已添加到文档图案');
+                    }
+                  },
+                  onUseBrush: (b: BrushPresetDTO): void => {
+                    this.applyBrushPreset(b);
+                  },
+                  onImport: (kind: number): void => {
+                    this.importPresetFile(kind);
+                  },
+                  onDelete: (kind: number, idx: number, sub: number): void => {
+                    this.deletePreset(kind, idx, sub);
                   },
                 })
                   .layoutWeight(1)
@@ -8750,6 +9632,15 @@ struct Index {
                 .fontColor($r('app.color.danger'))
                 .border({ width: 1, color: $r('app.color.border') })
                 .onClick((): void => { this.ctDeletePoint(); })
+              Select(this.ctPresetNames.map((n: string): SelectOption => {
+                const o: SelectOption = { value: n };
+                return o;
+              }) as SelectOption[])
+                .value('预设…')
+                .fontColor($r('app.color.text_primary'))
+                .onSelect((idx: number): void => {
+                  this.applyContourPreset(idx);
+                })
             }
             if (this.ctTarget === 2 || this.ctTarget === 3) {
               Row({ space: 10 }) {
@@ -8782,6 +9673,260 @@ struct Index {
             .border({ width: 1, color: $r('app.color.border') }).width(400)
         }.width('100%').height('100%')
       }
+      if (this.showStopsEd) {
+        // P1 渐变 stops 编辑器（M11 登记项）：上半透明度标轨 / 下半颜色标轨 + 预设下拉
+        Stack() {
+          Column().width('100%').height('100%').backgroundColor('#66000000')
+            .onClick((): void => { this.showStopsEd = false; })
+          Column({ space: 10 }) {
+            Text('渐变编辑器').fontSize(16).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+            Canvas(this.stEdPrevCtx)
+              .width(320).height(22)
+              .borderRadius(4)
+              .onReady((): void => this.drawStopsPreview())
+            Canvas(this.stEdCtx)
+              .width(320).height(120)
+              .borderRadius(4)
+              .backgroundColor($r('app.color.surface'))
+              .onReady((): void => this.redrawStopsEd())
+              .onTouch((e: TouchEvent): void => {
+                const t: TouchObject = e.changedTouches.length > 0 ? e.changedTouches[0] : e.touches[0];
+                this.stEdTouch(t.x, t.y, e.type === TouchType.Up || e.type === TouchType.Cancel);
+              })
+            Text('上半 = 透明度标 · 下半 = 颜色标 · 单击空白加点 · 拖拽移动')
+              .fontSize(10).fontColor($r('app.color.text_secondary'))
+            Row({ space: 8 }) {
+              Text('预设').fontSize(12).fontColor($r('app.color.text_primary'))
+              Select(this.gradientLib.map((g: PresetGradientDTO): SelectOption => {
+                const o: SelectOption = { value: g.name };
+                return o;
+              }) as SelectOption[])
+                .selected(0)
+                .value('载入预设…')
+                .fontColor($r('app.color.text_primary'))
+                .onSelect((idx: number): void => {
+                  if (idx >= 0 && idx < this.gradientLib.length) {
+                    const g = this.gradientLib[idx];
+                    this.stEdName = g.name;
+                    const cs: number[][] = [];
+                    for (const s of g.stops) {
+                      const kind = s[1];
+                      let r = s[2];
+                      let g2 = s[3];
+                      let b = s[4];
+                      if (kind === 1) {
+                        const f = this.hexToRgb(this.brushColor);
+                        r = f[0];
+                        g2 = f[1];
+                        b = f[2];
+                      } else if (kind === 2) {
+                        const f2 = this.hexToRgb(this.bgColor);
+                        r = f2[0];
+                        g2 = f2[1];
+                        b = f2[2];
+                      }
+                      cs.push([s[0], r, g2, b]);
+                    }
+                    this.stEdColor = cs;
+                    this.stEdAlpha = g.transparency.length > 0 ? g.transparency : [[0, 1], [1, 1]];
+                    this.stEdSelC = 0;
+                    this.stEdSelA = -1;
+                    this.redrawStopsEd();
+                    this.drawStopsPreview();
+                  }
+                })
+              Blank()
+              Button('存为预设').fontSize(12).height(30)
+                .onClick((): void => {
+                  const stops: number[][] = [];
+                  for (const c of this.stEdColor) {
+                    stops.push([c[0], 0, c[1], c[2], c[3]]);
+                  }
+                  const name = this.stEdName.length > 0 ? this.stEdName : '渐变';
+                  let final = name;
+                  let k = 2;
+                  const names = new Set<string>(this.gradientLib.map((g: PresetGradientDTO): string => g.name));
+                  while (names.has(final)) {
+                    final = `${name} ${k}`;
+                    k++;
+                  }
+                  this.gradientLib = this.gradientLib.concat([{
+                    name: final, stops: stops, transparency: this.stEdAlpha
+                  }] as PresetGradientDTO[]);
+                  this.stEdName = final;
+                  this.savePresetLib();
+                  this.toast('已存为预设「' + final + '」');
+                })
+            }.width('100%')
+            Row({ space: 8 }) {
+              Text('名称').fontSize(12).fontColor($r('app.color.text_primary'))
+              TextInput({ text: this.stEdName })
+                .fontSize(12).height(30).layoutWeight(1)
+                .onChange((v: string): void => {
+                  this.stEdName = v;
+                })
+            }.width('100%')
+            Row({ space: 8 }) {
+              Text('选中透明度').fontSize(12).fontColor($r('app.color.text_primary'))
+              Slider({ value: this.stEdAlphaVal, min: 0, max: 100, style: SliderStyle.OutSet })
+                .layoutWeight(1)
+                .onChange((v: number, mode: SliderChangeMode): void => {
+                  if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                    this.stEdAlphaVal = v;
+                    if (this.stEdSelA >= 0 && this.stEdSelA < this.stEdAlpha.length) {
+                      this.stEdAlpha[this.stEdSelA][1] = v / 100;
+                      this.redrawStopsEd();
+                      this.drawStopsPreview();
+                    }
+                  }
+                })
+              Text(`${this.stEdAlphaVal}%`).fontSize(12).width(44).textAlign(TextAlign.End)
+                .fontColor($r('app.color.text_primary'))
+              Button('删标').fontSize(12).height(30)
+                .onClick((): void => {
+                  if (this.stEdSelA > 0 && this.stEdSelA < this.stEdAlpha.length - 1) {
+                    const next: number[][] = [];
+                    for (let i = 0; i < this.stEdAlpha.length; i++) {
+                      if (i !== this.stEdSelA) {
+                        next.push(this.stEdAlpha[i]);
+                      }
+                    }
+                    this.stEdAlpha = next;
+                    this.stEdSelA = -1;
+                    this.redrawStopsEd();
+                    this.drawStopsPreview();
+                  } else if (this.stEdSelC > 0 && this.stEdSelC < this.stEdColor.length - 1) {
+                    const next2: number[][] = [];
+                    for (let i = 0; i < this.stEdColor.length; i++) {
+                      if (i !== this.stEdSelC) {
+                        next2.push(this.stEdColor[i]);
+                      }
+                    }
+                    this.stEdColor = next2;
+                    this.stEdSelC = 0;
+                    this.redrawStopsEd();
+                    this.drawStopsPreview();
+                  }
+                })
+            }.width('100%')
+            Row({ space: 12 }) {
+              Button('确定').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.accent'))
+                .fontColor($r('app.color.on_accent'))
+                .onClick((): void => { this.stEdCommit(); })
+              Button('取消').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.surface'))
+                .fontColor($r('app.color.text_primary'))
+                .onClick((): void => { this.showStopsEd = false; })
+            }.justifyContent(FlexAlign.End).width('100%')
+          }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
+            .border({ width: 1, color: $r('app.color.border') }).width(400)
+        }.width('100%').height('100%')
+      }
+      if (this.showPatternPick) {
+        // P1 图案源选择器（填充/油漆桶/图案图章共用：库图案 chips + 缩放）
+        Stack() {
+          Column().width('100%').height('100%').backgroundColor('#66000000')
+            .onClick((): void => { this.showPatternPick = false; })
+          Column({ space: 10 }) {
+            Text(this.patternPickTarget === 0 ? '填充 · 图案源'
+              : this.patternPickTarget === 1 ? '油漆桶 · 图案源'
+              : this.patternPickTarget === 3 ? '形状填充 · 图案'
+              : this.patternPickTarget === 4 ? '斜面纹理 · 图案' : '图案图章 · 图案源')
+              .fontSize(16).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+            Flex({ wrap: FlexWrap.Wrap }) {
+              ForEach(this.patternLib, (p: LibPatternDTO) => {
+                Text(p.name)
+                  .fontSize(12)
+                  .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+                  .margin(3)
+                  .borderRadius(12)
+                  .backgroundColor(this.patternStampId === p.id ? '#0A66C2' : $r('app.color.surface'))
+                  .fontColor(this.patternStampId === p.id ? '#FFFFFF' : $r('app.color.text_primary'))
+                  .border({ width: 1, color: $r('app.color.border') })
+                  .onClick((): void => {
+                    this.patternStampId = p.id;
+                    this.savePresetStampState();
+                  })
+              }, (p: LibPatternDTO) => p.id)
+            }.width('100%')
+            Row({ space: 8 }) {
+              Text('缩放').fontSize(12).fontColor($r('app.color.text_secondary'))
+              Slider({ value: Math.round(this.patternStampScale * 100), min: 1, max: 400,
+                style: SliderStyle.OutSet })
+                .layoutWeight(1)
+                .onChange((v: number, mode: SliderChangeMode): void => {
+                  if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                    this.patternStampScale = v / 100;
+                  }
+                })
+              Text(`${Math.round(this.patternStampScale * 100)}%`).fontSize(12).width(48)
+                .textAlign(TextAlign.End).fontColor($r('app.color.text_primary'))
+            }.width('100%')
+            if (this.patternPickTarget === 4) {
+              Row({ space: 8 }) {
+                Text('深度').fontSize(12).fontColor($r('app.color.text_secondary'))
+                Slider({ value: Math.round(this.textureDepth * 100), min: 0, max: 100,
+                  style: SliderStyle.OutSet })
+                  .layoutWeight(1)
+                  .onChange((v: number, mode: SliderChangeMode): void => {
+                    if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                      this.textureDepth = v / 100;
+                    }
+                  })
+                Text(`${Math.round(this.textureDepth * 100)}%`).fontSize(12).width(48)
+                  .textAlign(TextAlign.End).fontColor($r('app.color.text_primary'))
+              }.width('100%')
+            }
+            Row({ space: 12 }) {
+              Button('应用').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.accent'))
+                .fontColor($r('app.color.on_accent'))
+                .onClick((): void => {
+                  if (this.patternStampId.length === 0) {
+                    this.toast('请先选择图案');
+                    return;
+                  }
+                  if (this.patternPickTarget === 0) {
+                    const ok = this.engine.fillWithPattern(this.patternStampId, this.patternStampScale);
+                    this.log(`填充(图案): ${ok}`);
+                  } else if (this.patternPickTarget === 1) {
+                    this.bucketUsePattern = true;
+                    this.toast('油漆桶已切图案源');
+                  } else if (this.patternPickTarget === 3) {
+                    this.shapeFillPattern = this.patternStampId;
+                    this.applyShapeFill(3);
+                  } else if (this.patternPickTarget === 4) {
+                    // 斜面纹理（PS Bevel Texture 子效果；satin 纹理 v1 共用配置，登记）
+                    const a = this.activeLayer();
+                    if (a !== undefined) {
+                      const ok2 = this.engine.setLayerTexture(a.id, true, this.patternStampId,
+                        this.patternStampScale, this.textureDepth, true, false);
+                      this.log(`纹理: ${ok2}`);
+                    }
+                  } else {
+                    // 图章源：激活图案模式并切到图章工具（与克隆互斥由引擎/工具切换保证）
+                    this.stampToolPattern = true;
+                    if (this.engine.setBrushPatternStamp(this.patternStampId, this.patternStampScale)) {
+                      if (this.tool !== 'stamp') {
+                        this.pickTool('stamp');
+                      }
+                      this.toast('图案图章已激活');
+                    }
+                  }
+                  this.showPatternPick = false;
+                })
+              Button('取消').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.surface'))
+                .fontColor($r('app.color.text_primary'))
+                .onClick((): void => { this.showPatternPick = false; })
+            }.justifyContent(FlexAlign.End).width('100%')
+          }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
+            .border({ width: 1, color: $r('app.color.border') }).width(400)
+        }.width('100%').height('100%')
+      }
       if (this.showFill) {
         Stack() {
           Column().width('100%').height('100%').backgroundColor('#66000000')
@@ -8807,6 +9952,22 @@ struct Index {
                     this.fillSource = idx;
                   })
               }, (label: string): string => label)
+              // P1：第五源「图案」（fillSource 4；提交走 fillWithPattern，源 = 图案库当前项）
+              Button('图案…')
+                .fontSize(12).height(32)
+                .backgroundColor(this.fillSource === 4
+                  ? $r('app.color.accent_container') : $r('app.color.surface'))
+                .fontColor(this.fillSource === 4
+                  ? $r('app.color.accent') : $r('app.color.text_primary'))
+                .border({
+                  width: this.fillSource === 4 ? 1.5 : 1,
+                  color: this.fillSource === 4 ? $r('app.color.accent') : $r('app.color.border')
+                })
+                .onClick((): void => {
+                  this.fillSource = 4;
+                  this.patternPickTarget = 0;
+                  this.showPatternPick = true;
+                })
             }
             Row({ space: 12 }) {
               Button('取消').fontSize(14).height(40).width(96)
@@ -8879,6 +10040,73 @@ struct Index {
                         })
                       Text(`${Math.round(this.fillAngle)}°`).fontSize(11).width(36)
                         .fontColor($r('app.color.text_primary'))
+                    }.width('100%')
+                  }
+                }
+                .width('100%').padding(10).borderRadius(8)
+                .backgroundColor($r('app.color.accent_container'))
+              }
+              // P1 形状填充段（活动层为形状层时：纯色/stops 渐变/图案）
+              if (this.activeLayer()?.isShape === true) {
+                Column({ space: 8 }) {
+                  Text('形状填充').fontSize(13).fontWeight(FontWeight.Medium)
+                    .fontColor($r('app.color.text_primary'))
+                  Row({ space: 8 }) {
+                    Button('纯色')
+                      .fontSize(12).height(30)
+                      .backgroundColor(this.shapeFillKind === 1
+                        ? $r('app.color.accent_container') : $r('app.color.surface'))
+                      .fontColor(this.shapeFillKind === 1
+                        ? $r('app.color.accent') : $r('app.color.text_primary'))
+                      .onClick((): void => { this.applyShapeFill(1); })
+                    Button('渐变')
+                      .fontSize(12).height(30)
+                      .backgroundColor(this.shapeFillKind === 2
+                        ? $r('app.color.accent_container') : $r('app.color.surface'))
+                      .fontColor(this.shapeFillKind === 2
+                        ? $r('app.color.accent') : $r('app.color.text_primary'))
+                      .onClick((): void => { this.applyShapeFill(2); })
+                    Button('图案')
+                      .fontSize(12).height(30)
+                      .backgroundColor(this.shapeFillKind === 3
+                        ? $r('app.color.accent_container') : $r('app.color.surface'))
+                      .fontColor(this.shapeFillKind === 3
+                        ? $r('app.color.accent') : $r('app.color.text_primary'))
+                      .onClick((): void => { this.applyShapeFill(3); })
+                  }
+                  if (this.shapeFillKind === 2) {
+                    Row({ space: 6 }) {
+                      Text('渐变').fontSize(12).fontColor($r('app.color.text_secondary'))
+                      Button(`当前: ${this.curGradientName}`)
+                        .fontSize(11).height(28)
+                        .constraintSize({ maxWidth: 200 })
+                        .backgroundColor($r('app.color.surface'))
+                        .fontColor($r('app.color.text_primary'))
+                        .border({ width: 1, color: $r('app.color.border') })
+                        .onClick((): void => { this.openStopsEditor(); })
+                      Slider({ value: this.shapeFillAngle, min: 0, max: 360, step: 5 })
+                        .layoutWeight(1).height(24)
+                        .onChange((v: number, mode: SliderChangeMode): void => {
+                          if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                            this.shapeFillAngle = v;
+                            this.applyShapeFill(2);
+                          }
+                        })
+                    }.width('100%')
+                  }
+                  if (this.shapeFillKind === 3) {
+                    Row({ space: 6 }) {
+                      Text('图案').fontSize(12).fontColor($r('app.color.text_secondary'))
+                      Button(`当前: ${this.patternNameOf(this.shapeFillPattern)}`)
+                        .fontSize(11).height(28)
+                        .constraintSize({ maxWidth: 240 })
+                        .backgroundColor($r('app.color.surface'))
+                        .fontColor($r('app.color.text_primary'))
+                        .border({ width: 1, color: $r('app.color.border') })
+                        .onClick((): void => {
+                          this.patternPickTarget = 3;
+                          this.showPatternPick = true;
+                        })
                     }.width('100%')
                   }
                 }
@@ -9536,6 +10764,14 @@ struct Index {
                       this.applyBevel();
                     })
                   Text('斜面浮雕').fontSize(13).fontColor($r('app.color.text_primary'))
+                  Button('纹理…')
+                    .fontSize(11).height(26)
+                    .backgroundColor($r('app.color.accent_container'))
+                    .fontColor($r('app.color.accent'))
+                    .onClick((): void => {
+                      this.patternPickTarget = 4;
+                      this.showPatternPick = true;
+                    })
                   Button(this.styBevelOuter ? '外斜面' : '内斜面')
                     .fontSize(11).height(26)
                     .backgroundColor($r('app.color.accent_container'))

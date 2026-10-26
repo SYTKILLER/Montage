@@ -146,6 +146,12 @@ double gradientT(const GradientSpec& spec, double docX, double docY) {
 bool applyGradient(Document& doc, LayerId layerId, const GradientSpec& spec,
                    GradientTarget target, const float fg[3], const float bg[3],
                    std::string& err) {
+    return applyGradientStops(doc, layerId, spec, target, buildStops(spec.style, fg, bg), err);
+}
+
+bool applyGradientStops(Document& doc, LayerId layerId, const GradientSpec& spec,
+                        GradientTarget target, const std::vector<GradientStop>& stops,
+                        std::string& err) {
     Layer* layer = nullptr;
     for (Layer& l : doc.layers) {
         if (l.id == layerId) {
@@ -167,7 +173,10 @@ bool applyGradient(Document& doc, LayerId layerId, const GradientSpec& spec,
         err = "gradient: degenerate drag line";
         return false;
     }
-    const std::vector<GradientStop> stops = buildStops(spec.style, fg, bg);
+    if (stops.empty()) {
+        err = "gradient: empty stops";
+        return false;
+    }
     const TileGrid* selGrid = doc.selection != nullptr ? doc.selection.get() : nullptr;
 
     if (target == GradientTarget::LayerMask) {
@@ -366,6 +375,113 @@ bool fillWithColor(Document& doc, LayerId layerId, FillSource source, float fr, 
                     }
                     srcOver(out.data() + (static_cast<size_t>(r) * kTileSize + c) * 4u,
                             col[0], col[1], col[2], sa);
+                }
+            }
+            publishTileIfChanged(builder, tx, ty, orig, out);
+        }
+    }
+    layer->pixels = mergeWithBase(base, builder.publish(grid.revision + 1), grid.cols,
+                                  grid.rows, grid.revision + 1);
+    if (layer->mask != nullptr && layer->mask->enabled) {
+        layer->render = composeMasked(layer->pixels, *layer->mask);
+    }
+    return true;
+}
+
+// P1 图案填充：图案按文档原点锚定环形平铺，nearest × scale；选区掩码约束
+//（sa = 选区灰度 × 图案 alpha），src-over 叠加。空层先建文档域网格（fillWithColor 同）。
+bool fillWithPattern(Document& doc, LayerId layerId, const TileGrid& pat, uint32_t pw,
+                     uint32_t ph, double scale, std::string& err) {
+    Layer* layer = nullptr;
+    for (Layer& l : doc.layers) {
+        if (l.id == layerId) {
+            layer = &l;
+            break;
+        }
+    }
+    if (layer == nullptr) {
+        err = "fillPattern: layer not found";
+        return false;
+    }
+    if (doc.width == 0 || doc.height == 0) {
+        err = "fillPattern: no document";
+        return false;
+    }
+    if (pw == 0 || ph == 0 || pat.tiles.empty()) {
+        err = "fillPattern: empty pattern";
+        return false;
+    }
+    scale = std::clamp(scale, 0.01, 10.0);
+    if (layer->pixels == nullptr) {
+        const uint32_t cols = (doc.width + kTileSize - 1u) / kTileSize;
+        const uint32_t rows = (doc.height + kTileSize - 1u) / kTileSize;
+        TileGridBuilder builder(cols, rows);
+        layer->pixels = builder.publish(1);
+    }
+    const std::shared_ptr<const TileGrid> base = layer->pixels;
+    const TileGrid& grid = *base;
+    const TileGrid* selGrid = doc.selection != nullptr ? doc.selection.get() : nullptr;
+    const int originX = static_cast<int>(std::lround(layer->transform.originX));
+    const int originY = static_cast<int>(std::lround(layer->transform.originY));
+    // 采样：文档坐标 → 缩放后图案域取模（nearest，style_ops patAt 同式）
+    const double sw = static_cast<double>(pw) * scale;
+    const double sh = static_cast<double>(ph) * scale;
+    auto patAt = [&](int docX, int docY, uint8_t out[4]) -> bool {
+        int sx = static_cast<int>(std::floor((static_cast<double>(docX) + 0.5) / sw * pw));
+        int sy = static_cast<int>(std::floor((static_cast<double>(docY) + 0.5) / sh * ph));
+        sx %= static_cast<int>(pw);
+        if (sx < 0) sx += static_cast<int>(pw);
+        sy %= static_cast<int>(ph);
+        if (sy < 0) sy += static_cast<int>(ph);
+        auto it = pat.tiles.find(static_cast<uint32_t>(sy) / kTileSize * pat.cols +
+                                 static_cast<uint32_t>(sx) / kTileSize);
+        if (it == pat.tiles.end() || it->second == nullptr || it->second->pixels == nullptr) {
+            return false;
+        }
+        const uint8_t* p = it->second->pixels->mapCpu();
+        if (p == nullptr) return false;
+        const uint8_t* q = p + static_cast<size_t>(static_cast<uint32_t>(sy) % kTileSize) *
+                                     it->second->pixels->rowBytes() +
+                           static_cast<size_t>(static_cast<uint32_t>(sx) % kTileSize) * 4;
+        out[0] = q[0];
+        out[1] = q[1];
+        out[2] = q[2];
+        out[3] = q[3];
+        return true;
+    };
+    TileGridBuilder builder(grid.cols, grid.rows);
+    std::vector<uint8_t> out(static_cast<size_t>(kTileSize) * kTileSize * 4u);
+    for (uint32_t ty = 0; ty < grid.rows; ++ty) {
+        for (uint32_t tx = 0; tx < grid.cols; ++tx) {
+            std::fill(out.begin(), out.end(), static_cast<uint8_t>(0));
+            std::shared_ptr<const Tile> orig;
+            auto it = grid.tiles.find(ty * grid.cols + tx);
+            if (it != grid.tiles.end() && it->second != nullptr) {
+                orig = it->second;
+                const uint8_t* src = orig->pixels->mapCpu();
+                if (src != nullptr) {
+                    std::memcpy(out.data(), src, out.size());
+                    orig->pixels->unmap();
+                }
+            }
+            for (uint32_t r = 0; r < kTileSize; ++r) {
+                const int docY = originY + static_cast<int>(ty * kTileSize + r);
+                for (uint32_t c = 0; c < kTileSize; ++c) {
+                    const int docX = originX + static_cast<int>(tx * kTileSize + c);
+                    float sa = 1.0f;
+                    if (selGrid != nullptr) {
+                        sa = static_cast<float>(selectionGrayAt(*selGrid, docX, docY)) / 255.0f;
+                    }
+                    if (sa <= 0.0f) {
+                        continue;
+                    }
+                    uint8_t q[4];
+                    if (!patAt(docX, docY, q) || q[3] == 0) {
+                        continue;
+                    }
+                    srcOver(out.data() + (static_cast<size_t>(r) * kTileSize + c) * 4u,
+                            q[0] / 255.0f, q[1] / 255.0f, q[2] / 255.0f,
+                            q[3] / 255.0f * sa);
                 }
             }
             publishTileIfChanged(builder, tx, ty, orig, out);

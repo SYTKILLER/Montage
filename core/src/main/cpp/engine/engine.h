@@ -66,7 +66,16 @@ class Engine {
     int brushHealKind = 0;                  // M19a：修复族（0 无/1 修复画笔/2-4 污点三模式；setBrushHeal 写入）
     int historyBrushSteps = 0;              // M11f：历史画笔源步数（0=未激活；setHistoryBrush 写入）
 
-    // M11d 仿制图章克隆源（会话态：不随快照/持久化走；Alt+点击设置）
+    // P1 图案图章（setBrushPatternStamp 写入）：激活时笔画 = 图案库网格 wrap 采样
+    //（相位锚定文档原点；QM 优先、与克隆/历史画笔/修复族互斥——bridge 侧切换时清位）。
+    bool brushIsPattern = false;
+    std::shared_ptr<const TileGrid> patternStampGrid;
+    uint32_t patternStampW = 0;
+    uint32_t patternStampH = 0;
+    double patternStampScale = 1.0;
+
+    // M11d 仿制图章克隆源（会话态：不随快照/持久化走；Alt+点击设置）。
+    // P1 五槽（PS Clone Source 面板语义）：Shift+数字切换活动槽，cs() = 活动槽引用。
     struct CloneSource {
         bool active = false;
         LayerId layerId = 0;   // 取源时的活动层（v1 同层/跨层均可，采样用源层原像素）
@@ -77,7 +86,9 @@ class Engine {
         double lockOffsetX = 0.0;
         double lockOffsetY = 0.0;
     };
-    CloneSource cloneSource;
+    CloneSource cloneSlots[5];
+    int cloneSlot = 0;
+    CloneSource& cs() { return cloneSlots[cloneSlot]; }  // 须持 docMutex
     std::thread strokeThread_;
     bool strokeThreadStarted_ = false;
     void ensureStrokeThreadLocked();        // 须持 strokeMtx；幂等，先 join 已退出线程

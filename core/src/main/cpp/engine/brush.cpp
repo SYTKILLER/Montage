@@ -45,6 +45,7 @@ bool StrokeDraft::begin(const Document& doc, LayerId layerId, const BrushSetting
     maskTarget_ = false;
     qmTarget_ = false;
     cloneMode_ = false;
+    patternMode_ = false;
     srcGrid_ = nullptr;
     srcCacheBase_ = nullptr;
     srcCacheKey_ = 0;
@@ -92,6 +93,10 @@ bool StrokeDraft::begin(const Document& doc, LayerId layerId, const BrushSetting
         srcOffsetX_ = cloneSrc->offsetX;
         srcOffsetY_ = cloneSrc->offsetY;
         restoreMode_ = cloneSrc->restoreMode;
+        patternMode_ = cloneSrc->patternMode;
+        patW_ = cloneSrc->patW;
+        patH_ = cloneSrc->patH;
+        patScale_ = std::clamp(cloneSrc->patScale, 0.01, 10.0);
         cloneMode_ = true;
     } else if (onQuickMask) {
         // M10d 快速蒙版：绑定文档域通道网格（灰度落笔；网格 = 通道网格，origin=(0,0)）
@@ -681,10 +686,25 @@ void StrokeDraft::paintTile(uint32_t key) {
                     continue;
                 }
                 // 源网格局部坐标 = 目标网格局部 − 偏移（两网格 origin 同为层 origin，同层恒成立；
-                // 跨层 v1 约定双方 origin≈0，登记跨 origin 蒙版/位移层后续批）
-                const uint8_t* src = srcAt(
-                    static_cast<int>(tx + static_cast<float>(c) - static_cast<float>(srcOffsetX_)),
-                    static_cast<int>(ty + static_cast<float>(r) - static_cast<float>(srcOffsetY_)));
+                // 跨层 v1 约定双方 origin≈0，登记跨 origin 蒙版/位移层后续批）。
+                // P1 图案图章：采样 = 文档坐标 ÷ scale 对 patW×patH 取模（相位锚定文档原点），
+                // srcAt 收到的已是图案网格局部坐标（wrap 后恒在界内）。
+                const uint8_t* src = nullptr;
+                if (patternMode_) {
+                    const double docX = originX_ + tx + static_cast<double>(c) + 0.5;
+                    const double docY = originY_ + ty + static_cast<double>(r) + 0.5;
+                    long long sxF = static_cast<long long>(std::floor(docX / patScale_));
+                    long long syF = static_cast<long long>(std::floor(docY / patScale_));
+                    int sx = static_cast<int>(sxF % patW_);
+                    if (sx < 0) sx += patW_;
+                    int sy = static_cast<int>(syF % patH_);
+                    if (sy < 0) sy += patH_;
+                    src = srcAt(sx, sy);
+                } else {
+                    src = srcAt(
+                        static_cast<int>(tx + static_cast<float>(c) - static_cast<float>(srcOffsetX_)),
+                        static_cast<int>(ty + static_cast<float>(r) - static_cast<float>(srcOffsetY_)));
+                }
                 uint8_t* p = px + i;
                 float srcP[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                 if (src != nullptr) {

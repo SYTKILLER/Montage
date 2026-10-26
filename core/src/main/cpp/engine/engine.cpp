@@ -116,8 +116,8 @@ void Engine::strokeThreadMain() {
                     // M11d：克隆模式 = 图章工具激活 + 克隆源已设（QM 优先；蒙版目标与克隆互斥，
                     // UI 侧切换工具时已互斥置位）
                     StrokeDraft::CloneParams cloneParams;
-                    const bool useClone = !qm && brushIsClone && cloneSource.active &&
-                                          cloneSource.layerId != 0;
+                    const bool useClone = !qm && brushIsClone && cs().active &&
+                                          cs().layerId != 0;
                     // M11f 历史画笔：源 = History steps 步前快照的同层像素（1:1 无偏移恢复，
                     // 复用克隆管线；克隆工具优先——两者互斥由 UI 切换保证）
                     bool useHistoryBrush = false;
@@ -137,12 +137,25 @@ void Engine::strokeThreadMain() {
                                          historyBrushSteps);
                         }
                     }
+                    // P1 图案图章：源 = 图案库网格（wrap 采样；无克隆源/偏移语义，相位锚定
+                    // 文档原点）。与克隆/历史画笔/修复族互斥（bridge 切换时清位，此处再护栏）。
+                    bool usePattern = false;
+                    if (!qm && !useClone && !useHistoryBrush && brushIsPattern &&
+                        patternStampGrid != nullptr && patternStampW > 0 && patternStampH > 0 &&
+                        healKind == HealKind::None) {
+                        cloneParams.srcGrid = patternStampGrid.get();
+                        cloneParams.patternMode = true;
+                        cloneParams.patW = static_cast<int>(patternStampW);
+                        cloneParams.patH = static_cast<int>(patternStampH);
+                        cloneParams.patScale = patternStampScale;
+                        usePattern = true;
+                    }
                     // 修复画笔与图章共用克隆源/偏移机制（photocraft clone_mapping 同源）
                     const bool healNeedsSrc = healKind == HealKind::Heal;
                     if (useClone || healNeedsSrc) {
                         const Layer* srcLayer = nullptr;
                         for (const Layer& l : doc.layers) {
-                            if (l.id == cloneSource.layerId) {
+                            if (l.id == cs().layerId) {
                                 srcLayer = &l;
                                 break;
                             }
@@ -154,16 +167,16 @@ void Engine::strokeThreadMain() {
                             cloneParams.srcOriginY =
                                 static_cast<int>(std::lround(srcLayer->transform.originY));
                             // 对齐：首个克隆笔画锁定偏移持续复用；非对齐：每笔重置为源点起步
-                            if (cloneSource.aligned && cloneSource.hasOffset) {
-                                cloneParams.offsetX = cloneSource.lockOffsetX;
-                                cloneParams.offsetY = cloneSource.lockOffsetY;
+                            if (cs().aligned && cs().hasOffset) {
+                                cloneParams.offsetX = cs().lockOffsetX;
+                                cloneParams.offsetY = cs().lockOffsetY;
                             } else {
-                                cloneParams.offsetX = p.x - cloneSource.srcX;
-                                cloneParams.offsetY = p.y - cloneSource.srcY;
-                                if (cloneSource.aligned) {
-                                    cloneSource.lockOffsetX = cloneParams.offsetX;
-                                    cloneSource.lockOffsetY = cloneParams.offsetY;
-                                    cloneSource.hasOffset = true;
+                                cloneParams.offsetX = p.x - cs().srcX;
+                                cloneParams.offsetY = p.y - cs().srcY;
+                                if (cs().aligned) {
+                                    cs().lockOffsetX = cloneParams.offsetX;
+                                    cs().lockOffsetY = cloneParams.offsetY;
+                                    cs().hasOffset = true;
                                 }
                             }
                         } else {
@@ -181,6 +194,7 @@ void Engine::strokeThreadMain() {
                                         : healKind != HealKind::None ? "spot healing"
                                         : useHistoryBrush ? "history brush"
                                         : useClone ? "clone stamp"
+                                        : usePattern ? "pattern stamp"
                                         : qm ? "quick mask"
                                         : (brushOnMask ? "mask brush"
                                           : (brush.erasing ? "eraser" : "brush")),
@@ -495,7 +509,9 @@ void Engine::resetDocument() {
         brushIsClone = false;
         brushEffect = BrushEffect::None;
         historyBrushSteps = 0;
-        cloneSource = CloneSource{};
+        brushIsPattern = false;  // P1：图案图章随文档清（图案库进程级保留）
+        patternStampGrid.reset();
+        for (CloneSource& s : cloneSlots) { s = CloneSource{}; }
         textEditOpen = false;  // M12：编辑会话随文档清空
         textEditLayerId = 0;
         filterPreview = FilterPreview{};  // M13：预览会话随文档清空
