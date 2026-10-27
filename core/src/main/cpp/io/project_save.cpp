@@ -1755,12 +1755,12 @@ bool saveProject(int fd, size_t* outLayers, uint64_t* outBytes, std::string& err
     {
         auto& e = Engine::get();
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             close(fd);
             err = "no document";
             return false;
         }
-        buildDocSnapshot(e.doc, snap);
+        buildDocSnapshot(e.doc(), snap);
     }
 
     // 2) 格式校验（04 §1.3：超限给明确错误）

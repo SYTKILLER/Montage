@@ -471,7 +471,7 @@ bool WritePngToFd(int fd, uint32_t width, uint32_t height, const std::vector<uin
         if (err != nullptr) *err = "png: deflateInit failed";
         return false;
     }
-    uint64_t total = 8 + (12 + 13) + 12;
+    uint64_t total = 8 + (12 + 13);  // sig + IHDR（IEND 12 在尾部累计——勿双计，p4 回读单测实证）
     std::vector<uint8_t> out(64 * 1024);
     std::vector<uint8_t> row(1 + static_cast<size_t>(width) * 4);
     std::vector<uint8_t> idat;  // 压缩流缓冲后经 writeChunk 写（IDAT 块头 + CRC）

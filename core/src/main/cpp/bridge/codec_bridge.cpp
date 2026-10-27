@@ -123,12 +123,12 @@ napi_value ExportImage(napi_env env, napi_callback_info info) {
     ctx->quality = quality;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             delete ctx;
             close(fd);
             return makeErrorLocal(env, kErrNoDoc, "exportImage: no document");
         }
-        ctx->job = io::BuildFlattenJob(e.doc, 0, 0, 0, 0);
+        ctx->job = io::BuildFlattenJob(e.doc(), 0, 0, 0, 0);
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);

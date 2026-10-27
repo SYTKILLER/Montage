@@ -6,8 +6,9 @@
  * - 逐文件 scratch 语义：openFileFromFd 整档替换 → automation.execute 逐步 → exportImage 写
  *   输出；每文件错误收集不中断（photocraft process_files 同义）；
  * - 输出命名 <stem>.<ext>（format=same 跟随输入）；OutputClaims（lowercase）检出同名覆盖；
- * - 原文档保护：批处理前 saveProject 到 cacheDir 临时包，结束/失败/取消后 openProject 恢复
- *   （无原文档则收尾关档）；全程 automation.suspendRecording（scratch 不污染录制）；
+ * - P4 D2 scratch 会话化：批处理在新会话标签内逐文件「新会话→打开→执行→导出→关闭」，
+ *   原文档全程不动——撤销历史天然保留（旧 saveProject/openProject 恢复路径删除，其
+ *   恢复恒丢 undo 栈即本项登记的根因）；全程 automation.suspendRecording；
  * - 异步纪律：整批 async 循环（每文件 await 让出 JS 线程），进度回调 + cancel 标志。
  */
 import { fileIo as fs } from '@kit.CoreFileKit';
@@ -108,7 +109,7 @@ function joinDir(dir: string, name: string): string {
 export class Automate {
   private engine: CompositorEngine;
   private cancelFlag: () => boolean;
-  private tempProjectPath: string;
+  private tempProjectPath: string;  // P4 后不再使用（scratch 会话替代存/恢复包；字段留 API 稳定）
 
   constructor(engine: CompositorEngine, cancelFlag: () => boolean, tempProjectPath: string) {
     this.engine = engine;
@@ -178,30 +179,14 @@ export class Automate {
     return out;
   }
 
-  /** 原文档保护：开档 → saveProject 临时包。返回是否需要恢复。 */
-  private async protectDoc(): Promise<boolean> {
-    const w = this.engine.getStats().docWidth;
-    if (w <= 0) {
-      return false;
-    }
-    const fd = fs.openSync(this.tempProjectPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE |
-      fs.OpenMode.TRUNC).fd;
-    await this.engine.saveProject(fd);
-    return true;
-  }
-
-  /** 结束/失败/取消后恢复原文档；无原文档则关掉批处理残留档。 */
-  private async restoreDoc(hadDoc: boolean): Promise<void> {
-    try {
-      if (hadDoc) {
-        const fd = fs.openSync(this.tempProjectPath, fs.OpenMode.READ_ONLY).fd;
-        await this.engine.openProject(fd);
-      } else {
-        this.engine.closeDocument();
+  /** P4 D2：当前 active 会话 id（scratch 落位前闩锁；批后切回）。 */
+  private currentDocId(): number {
+    for (const d of this.engine.docsList()) {
+      if (d.active) {
+        return d.id;
       }
-    } catch (e) {
-      hilog.error(DOMAIN, TAG, 'restoreDoc failed: %{public}s', (e as Error).message);
     }
+    return 0;
   }
 
   /** 共用逐文件循环（batch 与 imageProcessor；photocraft process_files 同构）。 */
@@ -210,7 +195,8 @@ export class Automate {
     perFile: () => Promise<void>): Promise<BatchResult> {
     const result: BatchResult = { files: [], errors: [] };
     const claims = new OutputClaims();
-    const hadDoc = await this.protectDoc();
+    // P4 D2 scratch：原文档 id 闩锁（整个批处理原文档/撤销历史原样不动）
+    const origId = this.currentDocId();
     try {
       let done = 0;
       for (const path of inputs) {
@@ -221,14 +207,15 @@ export class Automate {
         const ext = format === 'same' ? (extOf(path).length > 0 ? extOf(path) : 'png') : format;
         const fmt = extToFormat(ext);
         const out = joinDir(output, `${stem(path)}.${ext}`);
+        // 每文件独立 scratch 会话：新会话（激活）→ openFileFromFd 空档建档 → 执行 → 导出 → 关
+        const scratch = this.engine.docNew();
+        const scratchId = scratch !== null ? scratch.id : 0;
         try {
           const claimErr = claims.check(out);
           if (claimErr.length > 0) {
             throw new Error(claimErr);
           }
           const fd = fs.openSync(path, fs.OpenMode.READ_ONLY).fd;
-          // openFileFromFd = M1「追加图层」语义（无档才建档）——scratch 必须先关档重建
-          this.engine.closeDocument();
           await this.engine.openFileFromFd(fd, stem(path));
           for (const s of steps) {
             const rr = await automation.execute(s.id, s.params);
@@ -249,12 +236,19 @@ export class Automate {
           result.files.push(out);
         } catch (e) {
           result.errors.push({ file: path, error: (e as Error).message });
+        } finally {
+          if (scratchId !== 0) {
+            this.engine.docClose(scratchId);
+          }
         }
         done++;
         onProgress(done, inputs.length, stem(path));
       }
     } finally {
-      await this.restoreDoc(hadDoc);
+      // 切回原文档（关 scratch 后 active 已回邻位，显式按 id 切回更稳）
+      if (origId !== 0) {
+        this.engine.docSwitch(origId);
+      }
     }
     return result;
   }

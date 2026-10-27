@@ -296,7 +296,7 @@ void RenderLoop::doFrame() {
     bool overlayOnly = false;
     if (!dirty) {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.selection != nullptr) {
+        if (e.doc().selection != nullptr) {
             const auto now = std::chrono::steady_clock::now();
             if (!antsTickValid_ || now - lastAntsTick_ >= std::chrono::milliseconds(100)) {
                 lastAntsTick_ = now;
@@ -313,24 +313,24 @@ void RenderLoop::doFrame() {
     Document docSnap;
     Viewport vp;
     Engine::StrokeSnapshot strokeSnap;
-    Engine::TransformPreview transformPreview;
+    TransformPreview transformPreview;
     bool viewXformDirtyLocal = false;  // M22
     Engine::ViewTransform vtLocal;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        docSnap = e.doc;  // shared_ptr 拷贝（02 §7 帧快照）
-        vp = e.viewport;
+        docSnap = e.doc();  // shared_ptr 拷贝（02 §7 帧快照）
+        vp = e.viewport();
         strokeSnap = e.copyStrokeSnapshotLocked();
-        transformPreview = e.transformPreview;
+        transformPreview = e.active().transformPreview;
         if (e.viewXformDirty) {  // M22：显示变换字节随帧快照锁内拷贝（防撕裂）
             e.viewXformDirty = false;
             viewXformDirtyLocal = true;
             vtLocal = e.viewXform;
         }
         // M12：文本编辑会话中隐藏该层（RichEditor overlay 承担编辑态视觉，防 GL+overlay 双影）
-        if (e.textEditOpen && e.textEditLayerId != 0) {
+        if (e.active().textEditOpen && e.active().textEditLayerId != 0) {
             for (Layer& l : docSnap.layers) {
-                if (l.id == e.textEditLayerId) {
+                if (l.id == e.active().textEditLayerId) {
                     l.pixels = nullptr;
                     l.render = nullptr;
                     break;
@@ -338,31 +338,31 @@ void RenderLoop::doFrame() {
             }
         }
         // M13：滤镜预览——该层像素换 1/4 proxy 网格 + 复用 M8.1 xform 矩阵放大显示
-        if (e.filterPreview.active && e.filterPreview.proxy != nullptr) {
+        if (e.active().filterPreview.active && e.active().filterPreview.proxy != nullptr) {
             static std::atomic<int> fpLogCount{0};
             if (fpLogCount.fetch_add(1) < 3) {
                 OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.FilterRender",
                              "preview frame: layer=%{public}llu proxy %ux%u scale=%.1f",
-                             static_cast<unsigned long long>(e.filterPreview.layerId),
-                             e.filterPreview.proxy->cols * 256, e.filterPreview.proxy->rows * 256,
-                             e.filterPreview.scale);
+                             static_cast<unsigned long long>(e.active().filterPreview.layerId),
+                             e.active().filterPreview.proxy->cols * 256, e.active().filterPreview.proxy->rows * 256,
+                             e.active().filterPreview.scale);
             }
             for (Layer& l : docSnap.layers) {
-                if (l.id == e.filterPreview.layerId) {
+                if (l.id == e.active().filterPreview.layerId) {
                     // M21：SO 层替换 smartCache（effectivePixels 优先级在 pixels 之上）
                     if (l.smart != nullptr) {
-                        l.smartCache = e.filterPreview.proxy;
+                        l.smartCache = e.active().filterPreview.proxy;
                     } else {
-                        l.pixels = e.filterPreview.proxy;
+                        l.pixels = e.active().filterPreview.proxy;
                     }
                     l.render = nullptr;  // 预览期不叠蒙版（登记）
                     l.mask = nullptr;
-                    l.transform.originX = e.filterPreview.originX;
-                    l.transform.originY = e.filterPreview.originY;
+                    l.transform.originX = e.active().filterPreview.originX;
+                    l.transform.originY = e.active().filterPreview.originY;
                     if (!transformPreview.active) {
-                        const double s = e.filterPreview.scale;
-                        const double ox = e.filterPreview.originX;
-                        const double oy = e.filterPreview.originY;
+                        const double s = e.active().filterPreview.scale;
+                        const double ox = e.active().filterPreview.originX;
+                        const double oy = e.active().filterPreview.originY;
                         transformPreview.active = true;
                         transformPreview.layerId = l.id;
                         transformPreview.m[0] = s;
@@ -462,7 +462,7 @@ void RenderLoop::parkAndSchedule() {
     bool selectionLive = false;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        selectionLive = e.doc.selection != nullptr;
+        selectionLive = e.doc().selection != nullptr;
     }
     idleParks_.fetch_add(1);
     if (selectionLive) {

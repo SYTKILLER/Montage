@@ -104,6 +104,23 @@ export struct ActionsPanel {
                 .fontSize(12).maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
                 .fontColor($r('app.color.text_primary')).layoutWeight(1)
+              // P4：F 键绑定 chip（点击循环 0→F2..F12→0；跳过被占用键）
+              Text(typeof row['fkey'] === 'number' && (row['fkey'] as number) > 0
+                ? `F${row['fkey']}` : 'F·')
+                .fontSize(10).fontColor('#8A8A8A')
+                .borderRadius(4)
+                .padding({ left: 4, right: 4, top: 1, bottom: 1 })
+                .backgroundColor('#14006BD9')
+                .onClick((): void => {
+                  const r = automation.cycleFkey(idx);
+                  if (r.ok) {
+                    this.onMessage(r.value !== undefined
+                      ? `F 键 → F${(r.value as Record<string, Object>)['key']}` : 'F 键已解绑');
+                    this.onMutated();
+                  } else {
+                    this.onMessage(r.error);
+                  }
+                })
               Text(`${row['steps']}`).fontSize(11).fontColor('#8A8A8A')
             }
             .width('100%').padding({ left: 8, right: 6, top: 5, bottom: 5 })

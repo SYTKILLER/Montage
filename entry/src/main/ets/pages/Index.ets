@@ -33,7 +33,7 @@ import { AutomateDialog } from '../editor/components/AutomateDialog';
 import { automation, ActionStep } from 'core';
 import { Automate, BatchOptions, ProcessorOptions, BatchResult, BatchFileError } from 'core';
 import { controlServer } from '../editor/ControlServer';
-import { ActiveSnap, buildMenuVM, buildShortcutMap, MenuState, registerLangPacks, ShortcutEntry } from '../editor/CommandRegistry';
+import { ActiveSnap, buildMenuVM, buildShortcutMap, MenuDoc, MenuState, registerLangPacks, ShortcutEntry } from '../editor/CommandRegistry';
 import { getLang, setLang } from '../editor/I18n';
 
 const TAG: string = 'Montage.Shell';
@@ -95,6 +95,8 @@ const KC_NUM0: number = 2000;
 const KC_NUM1: number = 2001;
 const KC_ESC: number = 2070;
 const KC_F6: number = 2095;  // @ohos.multimodalInput.keyCode KEYCODE_F6（SDK 核验）
+const KC_TAB: number = 2049;  // @ohos.multimodalInput.keyCode KEYCODE_TAB（SDK 核验，P4 D2）
+const KC_F12: number = 2101;  // @ohos.multimodalInput.keyCode KEYCODE_F12（SDK 核验，P4）
 const KC_F5: number = 2094;  // KEYCODE_F5（SDK 核验，2026-10-11）
 const KC_G: number = 2023;   // KEYCODE_G（SDK 核验，2026-10-11）
 const KC_J: number = 2026;   // KEYCODE_J（A=2017 起序列；KC_X=2040/KC_G=2023 双锚点核对，2026-10-13）
@@ -524,6 +526,11 @@ struct Index {
   private prefs: AppPrefs = new AppPrefs();
   private statsTimer: number = -1;
   private saveUri: string = '';
+  // D2 多文档（P4）：标签条镜像 + per-doc 保存路径（saveUri 保留为单档兼容回退）
+  private docTabs: MenuDoc[] = [];
+  private activeDocId: number = 0;
+  private docTabRev: number = 0;  // 标签条 ForEach 重建代次
+  private saveUris: Map<number, string> = new Map();
   private fittedOnce: boolean = false;
   private pinchActive: boolean = false;
   private pinchBaseZoom: number = 1;
@@ -560,6 +567,7 @@ struct Index {
   // UI 线程等 docMutex——笔画线程的提交/重样式（样式层含高斯模糊）和渲染线程的
   // 逐帧快照都长持该锁，撞上即秒级冻结（appfreeze 实证，冻结栈＝SamplePixel←mutex::lock）
   private strokeDrawing: boolean = false;
+  private strokeRecPts: number[] | null = null;  // P4：笔画录制点列（收笔入动作）
   // 收笔护栏（修复③）：Up 后到提交完成（docVersion 事件）之间的取色仍会撞笔画线程
   // commit/重样式临界区。护栏期 800ms 兜底，收到 revision 广播即提前解除；
   // Up 事件本身的取色因 strokeDrawing 尚未复位天然跳过，此处只管收笔后的第一波 Move/悬停
@@ -657,6 +665,10 @@ struct Index {
     // M24c：控制通道（want debugControl=1 或调试菜单手动开启）
     controlServer.setEngine(this.engine);
     controlServer.setStateProvider((): MenuState => this.menuState());  // P3-H1 commands.list 求值
+    controlServer.setStrokeHandler((x0: number, y0: number, x1: number, y1: number): void => {
+      this.debugStroke(x0, y0, x1, y1);  // P4：ui.stroke 无头笔画（录制/回放 E2E 通路）
+    });
+    this.refreshDocTabs();  // D2：activeDocId 初始化（保存路径键）
     this.consumeDebugControl();
     this.engine.bindRevisionListener((revision: number): void => {
       hilog.info(DOMAIN, TAG, 'docVersion → %{public}d', revision);
@@ -821,6 +833,7 @@ struct Index {
 
   private onDocVersion(): void {
     this.strokeEndGuardUntil = 0;  // 修复③：提交/撤销完成（含重样式发布），取色护栏解除
+    this.refreshDocMirror();
     this.refreshLayers();
     this.refreshStats();  // M10d：撤销跨 Q 边界时同步快速蒙版镜像（canUndo/Redo 同步受益）
     if (this.tool === 'directSelect') {
@@ -1711,8 +1724,12 @@ struct Index {
     const pressure: number = (t.pressure !== undefined && t.pressure > 0) ? t.pressure : 1.0;
     if (e.type === TouchType.Down) {
       this.pushBrushSettings();
+      this.strokeRecPts = [docX, docY, pressure];  // P4：录制点列起步
       this.engine.beginStroke(docX, docY, pressure);
     } else if (e.type === TouchType.Move) {
+      if (this.strokeRecPts !== null) {
+        this.strokeRecPts.push(docX, docY, pressure);
+      }
       this.engine.continueStroke(docX, docY, pressure);
     } else if (e.type === TouchType.Up || e.type === TouchType.Cancel) {
       // 修复③：先立护栏再复位标志（Up 的取色因 strokeDrawing 未复位天然跳过；
@@ -1720,7 +1737,67 @@ struct Index {
       this.strokeEndGuardUntil = Date.now() + 800;
       this.strokeDrawing = false;  // 提交在笔画线程异步进行，此刻取色仍可能撞长临界区，故先复位再收笔
       this.engine.endStroke();
+      this.noteStrokeIfRecording();
     }
+  }
+
+  /** P4：收笔后把整笔点列入动作（录制窗内才生效；笔刷参数/目标层随步走）。 */
+  private noteStrokeIfRecording(): void {
+    if (this.strokeRecPts === null || !automation.isRecordingActive()) {
+      this.strokeRecPts = null;
+      return;
+    }
+    const pts = this.strokeRecPts;
+    this.strokeRecPts = null;
+    const a = this.activeLayer();
+    const rgb = this.hexToRgb(this.brushColor);
+    const hardness = this.tool === 'pencil' ? 1.0 : this.brushHardness / 100;
+    automation.noteStroke({
+      'layerId': a !== undefined ? a.id : 0,
+      'size': this.brushSize,
+      'hardness': hardness,
+      'opacity': this.brushOpacity / 100,
+      'r': rgb[0], 'g': rgb[1], 'b': rgb[2],
+      'erasing': this.tool === 'eraser',
+      'mask': this.maskTarget,
+      'points': pts as Object as Object[],
+    });
+  }
+
+  /**
+   * P4 控制通道 ui.stroke：无头笔画驱动（E2E 用；与 strokeTouch 同管线——
+   * pushBrushSettings→begin→直线插值 continue→end→录制钩子）。
+   */
+  debugStroke(x0: number, y0: number, x1: number, y1: number): void {
+    if (!this.docOpen) {
+      return;
+    }
+    this.pushBrushSettings();
+    this.strokeRecPts = [x0, y0, 1];
+    this.engine.beginStroke(x0, y0, 1);
+    const steps = Math.max(1, Math.ceil(Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0)) / 4));
+    for (let i = 1; i <= steps; i++) {
+      const x = x0 + (x1 - x0) * i / steps;
+      const y = y0 + (y1 - y0) * i / steps;
+      this.strokeRecPts.push(x, y, 1);
+      this.engine.continueStroke(x, y, 1);
+    }
+    this.engine.endStroke();
+    this.noteStrokeIfRecording();
+  }
+
+  /** P4：动作 F 键回放入口（onKey 裸 F2..F12 分发）。 */
+  private playActionByName(name: string): void {
+    automation.execute('actions.play', { 'action': name }).then((r): void => {
+      if (r.ok) {
+        const v = r.value as Record<string, Object>;
+        this.toast(`动作「${name}」已回放 ${v['ran']} 步`);
+      } else {
+        this.toast(r.error);
+      }
+      this.actionsRev++;
+      this.refreshLayers();
+    });
   }
 
   // M11c 形状拖拽：Down 定对角起点 / Move 更新预览 / Up 提交单事务
@@ -3418,11 +3495,131 @@ struct Index {
   }
 
   private docName(): string {
-    if (this.saveUri !== '') {
-      const seg = this.saveUri.split('/');
+    const uri = this.docUri();
+    if (uri !== '') {
+      const seg = uri.split('/');
       return decodeURIComponent(seg[seg.length - 1]);
     }
     return '未命名';
+  }
+
+  // ---------- D2 多文档（P4）：标签条镜像/切换/关闭 ----------
+
+  private docUri(): string {
+    const u = this.saveUris.get(this.activeDocId);
+    if (u !== undefined) {
+      return u;
+    }
+    return this.saveUri;  // 单档兼容（activeDocId 未初始化前的存量路径）
+  }
+
+  private tabLabel(t: MenuDoc): string {
+    const u = this.saveUris.get(t.id);
+    if (u !== undefined) {
+      const seg = u.split('/');
+      return decodeURIComponent(seg[seg.length - 1]);
+    }
+    return t.name;  // refreshDocTabs 兜底：会话名或「文档 N」
+  }
+
+  private refreshDocTabs(): void {
+    const tabs: MenuDoc[] = [];
+    for (const d of this.engine.docsList()) {
+      const m: MenuDoc = {
+        id: d.id, name: d.name.length > 0 ? d.name : `文档 ${d.id}`,
+        modified: d.modified, active: d.active,
+      };
+      tabs.push(m);
+      if (d.active) {
+        this.activeDocId = d.id;
+      }
+    }
+    this.docTabs = tabs;
+    this.docTabRev++;
+  }
+
+  /** 切档/关档后的镜像重绑：文档尺寸/视口/标签条/标题（面板全家桶由 onDocVersion 驱动）。 */
+  private refreshDocMirror(): void {
+    const s = this.engine.getStats();
+    this.docW = s.docWidth;
+    this.docH = s.docHeight;
+    const open = s.docWidth > 0;
+    if (open !== this.docOpen) {
+      this.docOpen = open;
+    }
+    this.zoom = s.zoom;
+    this.panX = s.panX;
+    this.panY = s.panY;
+    this.refreshDocTabs();
+  }
+
+  private switchDocTab(id: number): void {
+    if (id === this.activeDocId) {
+      return;
+    }
+    if (this.editingTextId !== 0) {
+      this.commitTextEditing();  // 文本会话先落账（PS 切标签提交语义）
+    }
+    if (this.showFilter) {
+      this.showFilter = false;  // 滤镜对话框随切档收起（引擎 filterPreview 随会话走）
+      this.filterDef = null;
+    }
+    if (this.filterDebounce >= 0) {
+      clearTimeout(this.filterDebounce);
+      this.filterDebounce = -1;
+    }
+    if (this.engine.docSwitch(id)) {
+      this.refreshDocMirror();
+      this.refreshLayers();
+      this.refreshStats();
+      this.refreshHistory();
+      this.updateTitle();
+      this.log('切换文档');
+    }
+  }
+
+  private cycleDoc(delta: number): void {
+    if (this.docTabs.length < 2) {
+      return;
+    }
+    let idx = 0;
+    for (let i = 0; i < this.docTabs.length; i++) {
+      if (this.docTabs[i].id === this.activeDocId) {
+        idx = i;
+        break;
+      }
+    }
+    const next = (idx + delta + this.docTabs.length) % this.docTabs.length;
+    this.switchDocTab(this.docTabs[next].id);
+  }
+
+  private closeDocTab(id: number): void {
+    if (id !== this.activeDocId) {
+      this.engine.docClose(id);
+      this.saveUris.delete(id);
+      this.refreshDocTabs();
+      return;
+    }
+    this.doCloseDocument();  // 关 active 走统一路径（含单档退化）
+  }
+
+  private closeAllDocs(): void {
+    const ids: number[] = [];
+    for (const t of this.docTabs) {
+      ids.push(t.id);
+    }
+    for (const id of ids) {
+      this.engine.docClose(id);
+    }
+    this.saveUris.clear();
+    this.saveUri = '';
+    this.docOpen = false;
+    this.layers = [];
+    this.thumbCache.clear();
+    this.refreshDocMirror();
+    this.refreshLayers();
+    this.updateTitle();
+    this.log('已关闭全部文档');
   }
 
   private updateTitle(): void {
@@ -3480,11 +3677,18 @@ struct Index {
       this.showFilter = false;  // M13：预览会话随文档清空（引擎 resetDocument 已清）
       this.filterDef = null;
     }
-    const ok = this.engine.closeDocument();
-    this.docOpen = false;
+    const ok = this.engine.closeDocument();  // D2：单档=清空会话；多档=关 active 标签
+    this.saveUris.delete(this.activeDocId);
     this.saveUri = '';
     this.layers = [];
     this.thumbCache.clear();
+    this.refreshDocMirror();
+    if (this.docOpen) {
+      // 多档关 active：邻档接管 → 面板镜像重绑
+      this.refreshLayers();
+      this.refreshStats();
+      this.refreshHistory();
+    }
     this.log(`关闭文档: ${ok ? '成功' : '失败'}`);
     this.updateTitle();
   }
@@ -3757,7 +3961,8 @@ struct Index {
       this.busyText = '';
       this.docW = d.width;
       this.docH = d.height;
-      this.saveUri = uri;  // 已关联包：保存直达覆写
+      this.refreshDocTabs();  // D2：先取落位后的 active 会话 id，保存路径按标签登记
+      this.saveUris.set(this.activeDocId, uri);  // 已关联包：保存直达覆写
       this.afterDocChanged();
       const seg = uri.split('/');
       this.recents = this.prefs.addRecent(decodeURIComponent(seg[seg.length - 1]), uri);
@@ -3794,21 +3999,38 @@ struct Index {
     // M25：文件名透传（TGA 等无魔数格式的嗅探兜底；native 侧魔数优先）
     const dot = uri.lastIndexOf('.');
     const baseName = dot >= 0 ? uri.slice(dot) : '';
+    // D2：文件打开 = 新标签（PS 语义；旧「追加图层」行为归 file.placeEmbedded/置入）。
+    // 有档先落空会话（import 无档建档语义在空会话上成立）
+    const hadDoc = this.docOpen;
+    let slotId = 0;
+    if (hadDoc) {
+      const dn = this.engine.docNew();
+      slotId = dn !== null ? dn.id : 0;
+    }
     this.engine.openFileFromFd(f.fd, baseName).then((d: OpenFileData): void => {
       // fd 所有权已移交 native（含失败路径）
       this.importing = false;
-      if (d.width > this.docW || d.height > this.docH) {
+      if (hadDoc || !this.docOpen) {
+        this.docW = d.width;
+        this.docH = d.height;
+      } else if (d.width > this.docW || d.height > this.docH) {
         this.docW = Math.max(this.docW, d.width);
         this.docH = Math.max(this.docH, d.height);
       }
-      this.log(`图层已添加 ${d.width}x${d.height} (id=${d.layerId})`);
-      if (!this.docOpen) {
+      this.log(`文档已打开 ${d.width}x${d.height} (id=${d.layerId})`);
+      this.refreshDocTabs();
+      if (!this.docOpen || hadDoc) {
         this.afterDocChanged();
       } else {
         this.refreshLayers();
       }
     }).catch((e: BusinessError): void => {
       this.importing = false;
+      if (hadDoc && slotId !== 0) {
+        // 失败收走空标签（不残留空白 tab）
+        this.engine.docClose(slotId);
+        this.refreshDocTabs();
+      }
       this.log(`导入失败: ${e.message}`);
     });
   }
@@ -3821,8 +4043,8 @@ struct Index {
     if (this.busyText !== '') {
       return;
     }
-    if (!saveAs && this.saveUri !== '') {
-      this.writeProjectTo(this.saveUri);
+    if (!saveAs && this.docUri() !== '') {
+      this.writeProjectTo(this.docUri());
       return;
     }
     const opt = new picker.DocumentSaveOptions();
@@ -3833,6 +4055,7 @@ struct Index {
         return;
       }
       this.saveUri = uris[0];
+      this.saveUris.set(this.activeDocId, uris[0]);  // D2：路径随标签
       this.writeProjectTo(uris[0]);
     }).catch((e: BusinessError): void => {
       this.log(`保存选择失败: ${e.code} ${e.message}`);
@@ -5399,6 +5622,14 @@ struct Index {
       this.openCameraRawFilterDialog();
       return;
     }
+    // D2 多文档：标签条/窗口菜单动态命令
+    if (id.startsWith('doc.switch:')) {
+      const did = parseInt(id.substring(11));
+      if (!isNaN(did)) {
+        this.switchDocTab(did);
+      }
+      return;
+    }
     // M13 滤镜命令：'filter.<id>' → 查目录开对话框（proxy 预览）
     if (id.startsWith('filter.')) {
       const def = FILTER_CATALOG.find((f: FilterDef): boolean => f.id === id.substring(7));
@@ -5425,6 +5656,15 @@ struct Index {
         break;
       case 'file.close':
         this.doCloseDocument();
+        break;
+      case 'window.nextDoc':
+        this.cycleDoc(1);
+        break;
+      case 'window.prevDoc':
+        this.cycleDoc(-1);
+        break;
+      case 'window.closeAll':
+        this.closeAllDocs();
         break;
       case 'file.saveSandbox': {
         // 隐藏调试通道（模拟器 picker 保存缺陷的往返验证替代，M12 定案）：cacheDir/rt_check.montage
@@ -7068,6 +7308,7 @@ struct Index {
       themeMode: this.themeMode,
       lang: getLang(),
       controlRunning: controlServer.isRunning(),
+      docs: this.docTabs,
     };
     return ms;
   }
@@ -7153,6 +7394,14 @@ struct Index {
     }
     if (code === KC_F6) {
       return 'F6';
+    }
+    if (code === KC_TAB) {
+      return 'Tab';
+    }
+    // D2/P4：F2..F12（动作 F 键绑定 + 注册表 Ctrl+F 族预留）
+    if (code >= 2091 && code <= 2101) {
+      const fkeys: string[] = ['F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12'];
+      return fkeys[code - 2091];
     }
     return '';
   }
@@ -7331,6 +7580,14 @@ struct Index {
       this.cloneSlotIdx = slot - 1;
       this.log(`克隆源槽 ${slot}`);
       return;
+    }
+    // P4：动作 F 键绑定（F2..F12 裸键；修饰键按下时不触发——避免与注册表 Ctrl 族冲突）
+    if (!this.ctrlHeld && !this.altHeld && !this.shiftHeld && code >= 2091 && code <= 2101) {
+      const bound = automation.actionByFkey(code - 2090);  // F2→2 … F12→12
+      if (bound !== null) {
+        this.playActionByName(bound);
+        return;
+      }
     }
     // H1 全量：单键命令快捷键（Q 快速蒙版）→ 注册表查表
     const sid = this.matchShortcut(code);
@@ -7697,11 +7954,60 @@ struct Index {
     .border({ width: { bottom: 1 }, color: { bottom: $r('app.color.divider') } })
   }
 
+  // D2 多文档标签条（PS 语义：名+修改点+关闭钮；点击切换；菜单栏下横滚）
+  @Builder
+  docTabBar() {
+    Scroll() {
+      Row({ space: 2 }) {
+        ForEach(this.docTabs, (t: MenuDoc) => {
+          Row({ space: 4 }) {
+            Text(this.tabLabel(t))
+              .fontSize(12)
+              .fontColor(t.active ? $r('app.color.text_primary') : $r('app.color.text_secondary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .constraintSize({ maxWidth: 160 })
+            if (t.modified) {
+              Circle({ width: 5, height: 5 }).fill($r('app.color.text_secondary'))
+            }
+            Text('✕')
+              .fontSize(11)
+              .fontColor($r('app.color.text_secondary'))
+              .padding({ left: 3, right: 3 })
+              .onClick((): void => {
+                this.closeDocTab(t.id);
+              })
+          }
+          .padding({ left: 10, right: 8, top: 4, bottom: 4 })
+          .borderRadius(6)
+          .backgroundColor(t.active ? $r('app.color.page_background') : Color.Transparent)
+          .border({
+            width: { bottom: t.active ? 2 : 1 },
+            color: { bottom: t.active ? $r('app.color.text_primary') : $r('app.color.divider') },
+          })
+          .onClick((): void => {
+            this.switchDocTab(t.id);
+          })
+        }, (t: MenuDoc): string => `${t.id}|${t.active ? 1 : 0}|${t.modified ? 1 : 0}|${this.docTabRev}`)
+      }
+      .padding({ left: 8, right: 8 })
+    }
+    .scrollable(ScrollDirection.Horizontal)
+    .scrollBar(BarState.Off)
+    .width('100%')
+    .height(30)
+    .backgroundColor($r('app.color.bar_background'))
+    .border({ width: { bottom: 1 }, color: { bottom: $r('app.color.divider') } })
+  }
+
   build() {
     Stack() {
       Column() {
         if (this.screenMode < 2) {
           this.menuBar()
+        }
+        if (this.screenMode < 2 && (this.docTabs.length > 1 || this.docOpen)) {
+          this.docTabBar()
         }
         if (this.screenMode === 0) {
         OptionsBar({

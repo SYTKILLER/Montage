@@ -5,7 +5,9 @@
  * - 回放 = 逐 enabled 步注册表 apply，首错即停，每步一历史事务；
  * - 嵌套 play ≤16 层、按名循环检测、播放中挂起录制并回填 actions.play 命名调用；
  * - 管理命令 list/get/record/stop/delete/move/toggle/rename（含 moved_index 联动）。
- * 排除（不可重放）：文件开存导出（fd 瞬态）、undo/redo、视图/工具/会话原语、交互笔画。
+ * 排除（不可重放）：文件开存导出（fd 瞬态）、undo/redo、视图/工具/会话原语。
+ * P4 增强：交互笔画录制（paint.brushStroke 点列步骤化+回放重放）；动作 F 键绑定
+ *（F2..F12 全局唯一，持久化 v2）；replayStroke 等待笔画线程落账（strokeBusy 轮询）。
  * 持久化：actions JSON 存 Preferences（Index 接线）；C++ 零改动。
  */
 
@@ -22,11 +24,12 @@ export interface ActionStep {
   params: Record<string, Object>;
 }
 
-/** 一个动作：步列表 + 回放跳过索引（面板勾选关）。 */
+/** 一个动作：步列表 + 回放跳过索引（面板勾选关）+ F 键绑定（0=无，2..12）。 */
 export interface Action {
   name: string;
   steps: ActionStep[];
   disabled: number[];
+  fkey: number;
 }
 
 /** 回放失败步描述。 */
@@ -271,6 +274,39 @@ function buildRegistry(): Map<string, CmdEntry> {
         pb(p, 'contiguous', true), pn(p, 'allLayers', 0), pn(p, 'sampleSize', 1)) },
     { id: 'paint.patch', label: '修补', coalesce: false,
       apply: (e, p) => e.patchSelection(pn(p, 'dx', 0), pn(p, 'dy', 0)) },
+    // P4 交互笔画录制：点列步骤化（flat [x,y,pressure,...]；回放=设笔刷→选层→逐点重放，
+    // 轮询 strokeBusy 等笔画线程落账再放行下一步——回放确定性保证）
+    { id: 'paint.brushStroke', label: '画笔笔画', coalesce: false,
+      apply: (e, p) => new Promise<boolean>((resolve: (v: boolean) => void) => {
+        const layerId = pn(p, 'layerId', 0);
+        if (layerId > 0) {
+          e.selectLayer(layerId);  // 目标层存在才选择（缺失返回 false 但不阻断笔画，PS 容错）
+        }
+        e.setBrushTarget(pb(p, 'mask', false));
+        e.setBrushSettings(pn(p, 'size', 16), pn(p, 'hardness', 0.8), pn(p, 'opacity', 1),
+          pn(p, 'r', 0), pn(p, 'g', 0), pn(p, 'b', 0), pb(p, 'erasing', false));
+        const pts = pna(p, 'points');
+        if (pts.length < 3) {
+          resolve(false);
+          return;
+        }
+        e.beginStroke(pts[0], pts[1], pts.length >= 3 ? pts[2] : 1);
+        for (let i = 3; i + 2 < pts.length; i += 3) {
+          e.continueStroke(pts[i], pts[i + 1], pts[i + 2]);
+        }
+        e.endStroke();
+        // 等笔画线程提交完成（busy 轮询 200ms 上限；超时按成功放行——后续步的
+        // beginEdit 会并入本条 pending，历史仍单条）
+        const started = Date.now();
+        const poll = (): void => {
+          if (!e.getStats().strokeBusy || Date.now() - started > 200) {
+            resolve(true);
+          } else {
+            setTimeout(poll, 8);
+          }
+        };
+        setTimeout(poll, 8);
+      }) },
     { id: 'paint.caFill', label: '内容识别填充', coalesce: false,
       apply: (e) => new Promise<boolean>((resolve: (v: boolean) => void) => {
         const started = e.contentAwareFill((changed: boolean): void => resolve(changed));
@@ -459,6 +495,9 @@ function buildRegistry(): Map<string, CmdEntry> {
 // ---------- 播放栈上限 / 管理常量 ----------
 
 const MAX_PLAY_NESTING: number = 16;
+/** P4 F 键绑定域：F2..F12（F1 保留系统帮助；裸键触发，与注册表 Ctrl 族无冲突）。 */
+const FKEY_MIN: number = 2;
+const FKEY_MAX: number = 12;
 
 /** 引用参数解析：name|index（photocraft resolve 同义）。 */
 function resolveRef(list: Action[], p: Record<string, Object>): number {
@@ -619,13 +658,113 @@ export class Automation {
     this.buffer.push({ id: id, params: params });
   }
 
+  /** P4：录制窗内（Index 笔画收笔点调用）。 */
+  isRecordingActive(): boolean {
+    return this.recording >= 0 && !this.isSuspended();
+  }
+
+  /**
+   * P4 交互笔画录制：收笔后把整笔点列步骤化入 buffer（photocraft Action::Stroke 同义）。
+   * 超过 2100 数（700 点）等距抽稀（保首尾）——回放确定性优先，轨迹近似可接受。
+   */
+  noteStroke(params: Record<string, Object>): void {
+    if (!this.isRecordingActive()) {
+      return;
+    }
+    const raw = pna(params, 'points');
+    if (raw.length > 2100) {
+      const step = Math.ceil(raw.length / 2100);
+      const pts: number[] = [];
+      for (let i = 0; i < raw.length; i += 3 * step) {
+        pts.push(raw[i], raw[i + 1], raw[i + 2]);
+      }
+      // 保尾点（起止完整 = 轨迹端点不变）
+      if ((raw.length - 3) % (3 * step) !== 0) {
+        pts.push(raw[raw.length - 3], raw[raw.length - 2], raw[raw.length - 1]);
+      }
+      params['points'] = pts as Object as Object[];
+    }
+    this.note('paint.brushStroke', params);
+  }
+
+  /** P4：面板 F 键循环点击（0→F2→…→F12→0，跳过被占用键；全占用退化为解绑）。 */
+  cycleFkey(idx: number): AutoResult {
+    const cands: number[] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    if (idx < 0 || idx >= this.list.length) {
+      return { ok: false, error: '没有这个动作' };
+    }
+    const cur = this.list[idx].fkey;
+    let pos = cands.indexOf(cur);
+    if (pos < 0) {
+      pos = 0;
+    }
+    for (let i = 1; i <= cands.length; i++) {
+      const cand = cands[(pos + i) % cands.length];
+      const r = this.setFkey({ 'action': idx, 'key': cand });
+      if (r.ok) {
+        return r;
+      }
+    }
+    return { ok: false, error: '没有可用的 F 键' };
+  }
+
+  /** P4：F 键 → 绑定动作名（无 = null）。Index onKey 裸 F2..F12 分发用。 */
+  actionByFkey(key: number): string | null {
+    if (key < FKEY_MIN || key > FKEY_MAX) {
+      return null;
+    }
+    for (const a of this.list) {
+      if (a.fkey === key) {
+        return a.name;
+      }
+    }
+    return null;
+  }
+
+  /** P4 actions.fkey {action, key}：绑定（key=0 解绑；全局唯一——旧主自动让位）。 */
+  setFkey(p: Record<string, Object>): AutoResult {
+    if (this.playing > 0) {
+      return { ok: false, error: '回放中不能绑定 F 键' };
+    }
+    const idx = resolveRef(this.list, p);
+    if (idx < 0) {
+      return { ok: false, error: '没有这个动作' };
+    }
+    const keyV: Object = p['key'];
+    let key = 0;
+    if (keyV !== undefined && keyV !== null) {
+      if (typeof keyV !== 'number') {
+        return { ok: false, error: 'key 必须是 0（解绑）或 2..12' };
+      }
+      key = Math.floor(keyV);
+      if (key !== 0 && (key < FKEY_MIN || key > FKEY_MAX)) {
+        return { ok: false, error: 'key 必须是 0（解绑）或 2..12' };
+      }
+    }
+    // 同键唯一：占用即拒绝（显式报错优于静默抢键；key=0 解绑无冲突）
+    if (key !== 0) {
+      for (const a of this.list) {
+        if (a.fkey === key) {
+          return { ok: false, error: `F${key} 已绑定动作「${a.name}」` };
+        }
+      }
+    }
+    this.list[idx].fkey = key;
+    this.touch();
+    const value: Record<string, Object> = {
+      'action': this.list[idx].name, 'key': key,
+    };
+    return { ok: true, error: '', value: value };
+  }
+
   // ---------- 管理命令（photocraft actions.* 对拍） ----------
 
   listActions(): AutoResult {
     const arr: Record<string, Object>[] = [];
     for (const a of this.list) {
       const item: Record<string, Object> = {
-        'name': a.name, 'steps': a.steps.length, 'recording': this.recording >= 0 && this.list[this.recording] === a,
+        'name': a.name, 'steps': a.steps.length, 'fkey': a.fkey,
+        'recording': this.recording >= 0 && this.list[this.recording] === a,
       };
       arr.push(item);
     }
@@ -647,6 +786,7 @@ export class Automation {
       'name': a.name,
       'steps': steps as Object as Object[],
       'disabled': a.disabled as Object as Object[],
+      'fkey': a.fkey,
     };
     return { ok: true, error: '', value: value };
   }
@@ -675,7 +815,7 @@ export class Automation {
           return { ok: false, error: '同名动作已存在' };
         }
       }
-      this.list.push({ name: name, steps: [], disabled: [] });
+      this.list.push({ name: name, steps: [], disabled: [], fkey: 0 });
       idx = this.list.length - 1;
       this.touch();
     }
@@ -1069,6 +1209,9 @@ export class Automation {
       if (sub === 'rename') {
         return this.renameAction(params);
       }
+      if (sub === 'fkey') {
+        return this.setFkey(params);
+      }
       return { ok: false, error: `未知动作命令 actions.${sub}` };
     }
     const entry = this.registry.get(id);
@@ -1107,10 +1250,11 @@ export class Automation {
         'name': a.name,
         'steps': a.steps as Object as Object[],
         'disabled': a.disabled as Object as Object[],
+        'fkey': a.fkey,  // P4 v2（旧档缺省读 0）
       };
       actions.push(item);
     }
-    const root: Record<string, Object> = { 'version': 1, 'actions': actions as Object as Object[] };
+    const root: Record<string, Object> = { 'version': 2, 'actions': actions as Object as Object[] };
     return JSON.stringify(root);
   }
 
@@ -1158,7 +1302,9 @@ export class Automation {
             }
           }
         }
-        this.list.push({ name: name, steps: steps, disabled: disabled });
+        const fk: Object = a['fkey'];
+        const fkey = typeof fk === 'number' ? Math.floor(fk) : 0;  // P4 v2（v1 档缺省 0）
+        this.list.push({ name: name, steps: steps, disabled: disabled, fkey: fkey });
       }
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'loadFromJson failed: %{public}s', (err as Error).message);

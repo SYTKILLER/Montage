@@ -2,7 +2,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
 import { automation } from './Automation';
-import { EngineStats, ExportPngData, ExportImageData, CodecCapabilities, CodecCap, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, SmartFilterDTO, SmartInfoDTO, LookupPresetDTO, LookupImportData, ViewTransformData, PresetSwatchDTO, PresetGroupDTO, PresetGradientDTO, GradientFileData, LibPatternDTO, BrushPresetDTO, BrushFileData, PresetThumbDTO, } from '../model/EngineTypes';
+import { EngineStats, ExportPngData, ExportImageData, CodecCapabilities, CodecCap, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, SmartFilterDTO, SmartInfoDTO, LookupPresetDTO, LookupImportData, ViewTransformData, PresetSwatchDTO, PresetGroupDTO, PresetGradientDTO, GradientFileData, LibPatternDTO, BrushPresetDTO, BrushFileData, PresetThumbDTO, DocTabDTO, DocNewData } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -109,6 +109,7 @@ function narrowStats(r: Record<string, Object>): EngineStats {
     devEv: num(r, 'devEv'),
     devGamma: num(r, 'devGamma'),
     hasStyleClipboard: boolOf(r, 'hasStyleClipboard'),
+    strokeBusy: boolOf(r, 'strokeBusy'),
   };
 }
 
@@ -276,6 +277,60 @@ export class CompositorEngine {
         r.error !== null ? r.error.message : 'unknown');
     }
     return r.ok;
+  }
+
+  // ---------- D2 多文档标签条（P4；不录制——会话原语同 file.close 豁免） ----------
+
+  docsList(): DocTabDTO[] {
+    const r = narrowResult(native.docsList() as Object);
+    if (!r.ok || r.data === null) {
+      hilog.error(DOMAIN, TAG, 'docsList failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return [];
+    }
+    const rows = r.data as Object as Object[];
+    const out: DocTabDTO[] = [];
+    for (const row of rows) {
+      const rec = row as Record<string, Object>;
+      out.push({
+        id: num(rec, 'id'),
+        name: typeof rec['name'] === 'string' ? rec['name'] as string : '',
+        width: num(rec, 'width'),
+        height: num(rec, 'height'),
+        active: boolOf(rec, 'active'),
+        modified: boolOf(rec, 'modified'),
+      });
+    }
+    return out;
+  }
+
+  docSwitch(id: number): boolean {
+    const r = narrowResult(native.docSwitch(id) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'docSwitch(%{public}d) failed: %{public}s', id,
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  docClose(id: number): boolean {
+    const r = narrowResult(native.docClose(id) as Object);
+    if (!r.ok) {
+      hilog.error(DOMAIN, TAG, 'docClose(%{public}d) failed: %{public}s', id,
+        r.error !== null ? r.error.message : 'unknown');
+    }
+    return r.ok;
+  }
+
+  docNew(): DocNewData | null {
+    const r = narrowResult(native.docNew() as Object);
+    if (!r.ok || r.data === null) {
+      hilog.error(DOMAIN, TAG, 'docNew failed: %{public}s',
+        r.error !== null ? r.error.message : 'unknown');
+      return null;
+    }
+    const rec = r.data as Record<string, Object>;
+    return { id: num(rec, 'id') };
   }
 
   /**
@@ -2530,6 +2585,7 @@ export class CompositorEngine {
         historyVersion: 0, paceTier: 0, fullFrames: 0, overlayFrames: 0, idleParks: 0,
         renderCallbacks: 0, hasRawDevelop: false, devTemp: 0, devTint: 0, devEv: 0, devGamma: 1,
         hasStyleClipboard: false,
+        strokeBusy: false,
       };
     }
     return narrowStats(r.data);

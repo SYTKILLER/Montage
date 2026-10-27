@@ -83,7 +83,7 @@ enum : int32_t {
 
 // M14c：几何/重采样操作后重算带样式/填充层的派生渲染（像素已重排，styledRender 陈旧）
 void restyleAllLocked(Engine& e) {
-    restyleDocument(e.doc);
+    restyleDocument(e.doc());
 }
 
 // ---------- Result 对象工具 ----------
@@ -181,6 +181,9 @@ void progressJsCallback(napi_env env, napi_value jsCb, void* /*context*/, void* 
 struct OpenCtx {
     napi_deferred deferred = nullptr;
     napi_threadsafe_function tsfn = nullptr;
+    // D2：保存归属（saveDone 标记该会话 savedRevision——标签条修改指示）
+    uint64_t saveDocId = 0;
+    uint32_t saveRev = 0;
 };
 
 void importDoneJsCallback(napi_env env, napi_value /*jsCb*/, void* context, void* data) {
@@ -282,18 +285,20 @@ napi_value NewDocument(napi_env env, napi_callback_info info) {
     }
     auto& e = Engine::get();
     io::cancelImageImport();
-    e.resetDocument();  // 统一入口：清撤销/会话态（撤销不许跨文档）
+    // D2：落位后重置（active 空档复用=旧语义；非空则新标签，旧档与历史保留）
+    e.prepareOpenSlot();
+    e.resetDocument();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        e.doc.width = static_cast<uint32_t>(w);
-        e.doc.height = static_cast<uint32_t>(h);
-        e.doc.name = "Untitled";
+        e.doc().width = static_cast<uint32_t>(w);
+        e.doc().height = static_cast<uint32_t>(h);
+        e.doc().name = "Untitled";
         // M7.5：PS 语义——新建文档自带初始图层（此前零图层，首笔直接画会 no active layer）
         Layer initial;
         initial.id = e.nextLayerId();
         initial.name = "图层 " + std::to_string(initial.id);
-        e.doc.layers.push_back(std::move(initial));
-        e.doc.activeId = e.doc.layers.back().id;
+        e.doc().layers.push_back(std::move(initial));
+        e.doc().activeId = e.doc().layers.back().id;
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -304,13 +309,91 @@ napi_value NewDocument(napi_env env, napi_callback_info info) {
 napi_value CloseDocument(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
     io::cancelImageImport();
-    e.resetDocument();  // 统一入口：清撤销/会话态
+    // D2：关闭 active 标签（唯一会话退化为 resetDocument 旧语义）
+    size_t idx = 0;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        idx = e.activeIdx;
+    }
+    e.closeDocAt(idx);
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
         e.bumpRevisionLocked();
         e.requestRender();
     }
     return makeOk(env, nullptr);
+}
+
+// ---------- D2 多文档标签条 ----------
+
+// 会话清单（标签条/窗口菜单动态子树）：{id, name, width, height, active, modified}
+napi_value DocsList(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    napi_value arr = nullptr;
+    napi_create_array(env, &arr);
+    uint32_t i = 0;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        for (auto& s : e.docs) {
+            napi_value d = nullptr;
+            napi_create_object(env, &d);
+            napi_set_named_property(env, d, "id", makeDouble(env, static_cast<double>(s->id)));
+            napi_set_named_property(env, d, "name", makeString(env, s->doc.name));
+            napi_set_named_property(env, d, "width", makeUint32(env, s->doc.width));
+            napi_set_named_property(env, d, "height", makeUint32(env, s->doc.height));
+            napi_set_named_property(env, d, "active", makeBool(env, &*s == &e.active()));
+            napi_set_named_property(env, d, "modified",
+                                     makeBool(env, s->revision != s->savedRevision));
+            napi_set_element(env, arr, i++, d);
+        }
+    }
+    return makeOk(env, arr);
+}
+
+// 切换 active（docSwitch(id)）：强制收尾在途笔画 + 广播刷新
+napi_value DocSwitch(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "docSwitch(id) requires 1 arg");
+    }
+    double id = 0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok || id <= 0) {
+        return makeError(env, kErrBadParam, "docSwitch: invalid id");
+    }
+    if (!Engine::get().switchDocById(static_cast<uint64_t>(id))) {
+        return makeError(env, kErrBadParam, "docSwitch: no such document");
+    }
+    return makeOk(env, nullptr);
+}
+
+// 关闭指定标签（docClose(id)）
+napi_value DocClose(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "docClose(id) requires 1 arg");
+    }
+    double id = 0;
+    if (napi_get_value_double(env, argv[0], &id) != napi_ok || id <= 0) {
+        return makeError(env, kErrBadParam, "docClose: invalid id");
+    }
+    if (!Engine::get().closeDocById(static_cast<uint64_t>(id))) {
+        return makeError(env, kErrBadParam, "docClose: no such document");
+    }
+    return makeOk(env, nullptr);
+}
+
+// 新建空会话并激活（批处理 scratch / 控制通道测试用）；返回 {id}
+napi_value DocNew(napi_env env, napi_callback_info /*info*/) {
+    const uint64_t id = Engine::get().newSession(true);
+    Engine::get().requestRender();
+    napi_value d = nullptr;
+    napi_create_object(env, &d);
+    napi_set_named_property(env, d, "id", makeDouble(env, static_cast<double>(id)));
+    return makeOk(env, d);
 }
 
 // ---------- 导入 ----------
@@ -541,6 +624,17 @@ void saveDoneJsCallback(napi_env env, napi_value /*jsCb*/, void* context, void* 
     } else {
         result = makeError(env, kErrInternal, p != nullptr ? std::string(p->error) : "save failed");
     }
+    if (p != nullptr && p->ok && ctx->saveDocId != 0) {
+        // D2：保存成功 → 该会话修改指示清零（保存起点 revision；期间新编辑仍显示为已修改）
+        auto& e = Engine::get();
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        for (auto& s : e.docs) {
+            if (s->id == ctx->saveDocId) {
+                s->savedRevision = ctx->saveRev;
+                break;
+            }
+        }
+    }
     delete p;
     napi_resolve_deferred(env, ctx->deferred, result);
     napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);
@@ -560,7 +654,7 @@ napi_value SaveProject(napi_env env, napi_callback_info info) {
     {
         auto& e = Engine::get();
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             close(fd);
             return makeError(env, kErrNoDoc, "saveProject: no document");
         }
@@ -583,6 +677,13 @@ napi_value SaveProject(napi_env env, napi_callback_info info) {
         finalizeOpenCtx(env, ctx, nullptr);
         napi_resolve_deferred(env, deferred, makeError(env, kErrInternal, "create tsfn failed"));
         return promise;
+    }
+    {
+        // D2：保存归属闩锁（会话 id + 起点 revision）
+        auto& e = Engine::get();
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        ctx->saveDocId = e.active().id;
+        ctx->saveRev = e.active().revision;
     }
     // saveProject 全路径接管 fd（成功/失败都关闭）
     std::thread([fd, tsfn = ctx->tsfn]() {
@@ -626,7 +727,7 @@ void openProjectDoneJsCallback(napi_env env, napi_value /*jsCb*/, void* context,
         {
             auto& e = Engine::get();
             std::lock_guard<std::mutex> lk(e.docMutex);
-            for (const Layer& l : e.doc.layers) {
+            for (const Layer& l : e.doc().layers) {
                 if (l.text == nullptr || l.text->fontFamily.empty() ||
                     fontFamilyAvailable(l.text->fontFamily)) {
                     continue;
@@ -718,7 +819,7 @@ napi_value SetViewport(napi_env env, napi_callback_info info) {
     vp.panY = panY;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        e.viewport = vp;
+        e.viewport() = vp;
         e.requestRender();
     }
     return makeOk(env, makeViewportData(env, vp));
@@ -741,13 +842,13 @@ napi_value FitToWindow(napi_env env, napi_callback_info info) {
     Viewport vp;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "fitToWindow: no document");
         }
-        vp.zoom = clampZoom(std::min(cw / e.doc.width, ch / e.doc.height));
-        vp.panX = (static_cast<double>(e.doc.width) - cw / vp.zoom) / 2.0;
-        vp.panY = (static_cast<double>(e.doc.height) - ch / vp.zoom) / 2.0;
-        e.viewport = vp;
+        vp.zoom = clampZoom(std::min(cw / e.doc().width, ch / e.doc().height));
+        vp.panX = (static_cast<double>(e.doc().width) - cw / vp.zoom) / 2.0;
+        vp.panY = (static_cast<double>(e.doc().height) - ch / vp.zoom) / 2.0;
+        e.viewport() = vp;
         e.requestRender();
     }
     return makeOk(env, makeViewportData(env, vp));
@@ -811,15 +912,20 @@ napi_value GetStats(napi_env env, napi_callback_info /*info*/) {
     bool quickMask = false;
     bool hasRaw = false;               // M15e
     io::DevelopParams devLast;         // M15e
+    bool strokeBusy = false;           // P4：笔画线程在途（动作回放步等落账用）
+    {
+        std::lock_guard<std::mutex> sm(e.strokeMtx);
+        strokeBusy = !e.strokeQueue.empty();
+    }
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        vp = e.viewport;
-        rev = e.docRevision;
-        dw = e.doc.width;
-        dh = e.doc.height;
-        quickMask = e.doc.quickMask != nullptr;  // M10d：UI 镜像（撤销跨 Q 边界后刷新）
-        hasRaw = e.rawDevelop.valid;             // M15e：RAW 显影会话镜像（导入线程会写，须锁内读）
-        devLast = e.rawDevelop.last;
+        vp = e.viewport();
+        rev = e.docRevision();
+        dw = e.doc().width;
+        dh = e.doc().height;
+        quickMask = e.doc().quickMask != nullptr;  // M10d：UI 镜像（撤销跨 Q 边界后刷新）
+        hasRaw = e.active().rawDevelop.valid;             // M15e：RAW 显影会话镜像（导入线程会写，须锁内读）
+        devLast = e.active().rawDevelop.last;
     }
     {
         std::lock_guard<std::mutex> lk(e.import.mtx);
@@ -842,8 +948,10 @@ napi_value GetStats(napi_env env, napi_callback_info /*info*/) {
     napi_set_named_property(env, data, "importProgress", makeDouble(env, progress));
     napi_set_named_property(env, data, "renderRunning", makeBool(env, snap.running));
     napi_set_named_property(env, data, "lastError", makeString(env, snap.lastError));
-    napi_set_named_property(env, data, "canUndo", makeBool(env, e.history.canUndo()));
-    napi_set_named_property(env, data, "canRedo", makeBool(env, e.history.canRedo()));
+    napi_set_named_property(env, data, "strokeBusy",
+                            makeBool(env, strokeBusy || e.draft != nullptr));
+    napi_set_named_property(env, data, "canUndo", makeBool(env, e.history().canUndo()));
+    napi_set_named_property(env, data, "canRedo", makeBool(env, e.history().canRedo()));
     napi_set_named_property(env, data, "quickMask", makeBool(env, quickMask));
     napi_set_named_property(env, data, "historyVersion",
                             makeDouble(env, static_cast<double>(e.historyVersion.load())));
@@ -866,7 +974,7 @@ napi_value GetStats(napi_env env, napi_callback_info /*info*/) {
                             makeBool(env, e.styleClipboard != nullptr));
     // M17d：文档图案数（「定义图案」菜单使能/图案列表刷新键）
     napi_set_named_property(env, data, "patternCount", makeDouble(env,
-                            static_cast<double>(e.doc.patterns.size())));
+                            static_cast<double>(e.doc().patterns.size())));
     return makeOk(env, data);
 }
 
@@ -1084,10 +1192,10 @@ napi_value AddAdjustmentLayer(napi_env env, napi_callback_info info) {
     double newId = 0;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "addAdjustmentLayer: no document");
         }
-        e.history.beginEdit(e.doc, "add adjustment", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "add adjustment", static_cast<uint64_t>(e.docRevision()));
         Layer layer;
         layer.id = e.nextLayerId();
         const char* kindNames[8] = {"Levels", "Curves", "亮度/对比度", "反相", "阈值",
@@ -1096,17 +1204,17 @@ napi_value AddAdjustmentLayer(napi_env env, napi_callback_info info) {
         auto adj = std::make_shared<LayerAdjustment>();
         adj->kind = static_cast<AdjustmentKind>(reqKind);
         layer.adjustment = std::move(adj);
-        size_t at = e.doc.layers.size();
-        for (size_t i = 0; i < e.doc.layers.size(); ++i) {
-            if (e.doc.layers[i].id == e.doc.activeId) {
+        size_t at = e.doc().layers.size();
+        for (size_t i = 0; i < e.doc().layers.size(); ++i) {
+            if (e.doc().layers[i].id == e.doc().activeId) {
                 at = i + 1;
                 break;
             }
         }
-        e.doc.layers.insert(e.doc.layers.begin() + static_cast<long>(at), std::move(layer));
-        e.doc.activeId = e.doc.layers[at].id;
-        newId = static_cast<double>(e.doc.layers[at].id);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.doc().layers.insert(e.doc().layers.begin() + static_cast<long>(at), std::move(layer));
+        e.doc().activeId = e.doc().layers[at].id;
+        newId = static_cast<double>(e.doc().layers[at].id);
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -1134,7 +1242,7 @@ napi_value SetAdjustmentParams(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
         if (l == nullptr || l->adjustment == nullptr) {
             return makeError(env, kErrBadParam, "setAdjustmentParams: adjustment layer not found");
         }
@@ -1143,14 +1251,14 @@ napi_value SetAdjustmentParams(napi_env env, napi_callback_info info) {
             l->adjustment->gamma == static_cast<float>(gamma)) {
             return makeOk(env, nullptr);
         }
-        e.history.beginEdit(e.doc, "adjust params", static_cast<uint64_t>(e.docRevision),
+        e.history().beginEdit(e.doc(), "adjust params", static_cast<uint64_t>(e.docRevision()),
                             "adj:" + std::to_string(static_cast<long long>(id)));
         auto adj = std::make_shared<LayerAdjustment>(*l->adjustment);  // COW
         adj->inBlack = static_cast<float>(std::min(0.98, std::max(0.0, inBlack)));
         adj->inWhite = static_cast<float>(std::min(1.0, std::max(0.02, inWhite)));
         adj->gamma = static_cast<float>(std::min(10.0, std::max(0.1, gamma)));
         l->adjustment = std::move(adj);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -1170,23 +1278,23 @@ napi_value AddLayer(napi_env env, napi_callback_info info) {
     double newId = 0;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "addLayer: no document");
         }
         Layer layer;
         layer.id = e.nextLayerId();
         layer.name = name[0] != '\0' ? std::string(name) : ("图层 " + std::to_string(layer.id));
         // 插到 active 之上（源 addLayer 语义：新图层出现在当前图层上方并激活）
-        size_t at = e.doc.layers.size();
-        for (size_t i = 0; i < e.doc.layers.size(); ++i) {
-            if (e.doc.layers[i].id == e.doc.activeId) {
+        size_t at = e.doc().layers.size();
+        for (size_t i = 0; i < e.doc().layers.size(); ++i) {
+            if (e.doc().layers[i].id == e.doc().activeId) {
                 at = i + 1;
                 break;
             }
         }
-        e.doc.layers.insert(e.doc.layers.begin() + static_cast<long>(at), std::move(layer));
-        e.doc.activeId = e.doc.layers[at].id;
-        newId = static_cast<double>(e.doc.layers[at].id);
+        e.doc().layers.insert(e.doc().layers.begin() + static_cast<long>(at), std::move(layer));
+        e.doc().activeId = e.doc().layers[at].id;
+        newId = static_cast<double>(e.doc().layers[at].id);
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -1210,27 +1318,27 @@ napi_value RemoveLayer(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        size_t at = e.doc.layers.size();
-        for (size_t i = 0; i < e.doc.layers.size(); ++i) {
-            if (e.doc.layers[i].id == static_cast<LayerId>(id)) {
+        size_t at = e.doc().layers.size();
+        for (size_t i = 0; i < e.doc().layers.size(); ++i) {
+            if (e.doc().layers[i].id == static_cast<LayerId>(id)) {
                 at = i;
                 break;
             }
         }
-        if (at == e.doc.layers.size()) {
+        if (at == e.doc().layers.size()) {
             return makeError(env, kErrBadParam, "removeLayer: layer not found");
         }
         // M14a：组级联删除（整棵子树）
-        if (e.doc.layers[at].isGroup) {
-            const int end = groupChildEnd(e.doc.layers, static_cast<int>(at));
-            e.doc.layers.erase(e.doc.layers.begin() + static_cast<long>(at),
-                               e.doc.layers.begin() + end);
+        if (e.doc().layers[at].isGroup) {
+            const int end = groupChildEnd(e.doc().layers, static_cast<int>(at));
+            e.doc().layers.erase(e.doc().layers.begin() + static_cast<long>(at),
+                               e.doc().layers.begin() + end);
         } else {
-            e.doc.layers.erase(e.doc.layers.begin() + static_cast<long>(at));
+            e.doc().layers.erase(e.doc().layers.begin() + static_cast<long>(at));
         }
-        if (e.doc.activeId == static_cast<LayerId>(id)) {
-            e.doc.activeId =
-                e.doc.layers.empty() ? 0 : e.doc.layers[std::min(at, e.doc.layers.size() - 1)].id;
+        if (e.doc().activeId == static_cast<LayerId>(id)) {
+            e.doc().activeId =
+                e.doc().layers.empty() ? 0 : e.doc().layers[std::min(at, e.doc().layers.size() - 1)].id;
         }
         e.bumpRevisionLocked();
         e.requestRender();
@@ -1252,10 +1360,10 @@ napi_value SelectLayer(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (findLayerLocked(e.doc, static_cast<LayerId>(id)) == nullptr) {
+        if (findLayerLocked(e.doc(), static_cast<LayerId>(id)) == nullptr) {
             return makeError(env, kErrBadParam, "selectLayer: layer not found");
         }
-        e.doc.activeId = static_cast<LayerId>(id);
+        e.doc().activeId = static_cast<LayerId>(id);
         e.bumpRevisionLocked();
     }
     return makeOk(env, nullptr);
@@ -1278,14 +1386,14 @@ napi_value SetLayerMaskEnabled(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
         if (l == nullptr || l->mask == nullptr) {
             return makeError(env, kErrBadParam, "setLayerMaskEnabled: layer/mask not found");
         }
         if (l->mask->enabled == v) {
             return makeOk(env, nullptr);
         }
-        e.history.beginEdit(e.doc, "mask enable", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "mask enable", static_cast<uint64_t>(e.docRevision()));
         auto m = std::make_shared<LayerMask>(*l->mask);  // COW：快照安全
         m->enabled = v;
         l->mask = std::move(m);
@@ -1295,7 +1403,7 @@ napi_value SetLayerMaskEnabled(napi_env env, napi_callback_info info) {
                 l->shape != nullptr ? l->shapeCache : l->pixels;
             l->render = (v && base != nullptr) ? composeMasked(base, *l->mask) : nullptr;
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -1319,16 +1427,16 @@ napi_value SetLayerClipping(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
         if (l == nullptr) {
             return makeError(env, kErrBadParam, "setLayerClipping: layer not found");
         }
         if (l->clipping == v) {
             return makeOk(env, nullptr);
         }
-        e.history.beginEdit(e.doc, "clipping", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "clipping", static_cast<uint64_t>(e.docRevision()));
         l->clipping = v;
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -1351,7 +1459,7 @@ napi_value SetLayerVisible(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
         if (l == nullptr) {
             return makeError(env, kErrBadParam, "setLayerVisible: layer not found");
         }
@@ -1378,7 +1486,7 @@ napi_value SetLayerOpacity(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
         if (l == nullptr) {
             return makeError(env, kErrBadParam, "setLayerOpacity: layer not found");
         }
@@ -1388,10 +1496,10 @@ napi_value SetLayerOpacity(napi_env env, napi_callback_info info) {
         }
         // H3：不透明度滑杆入历史（此前无事务不可撤销，PS「图层不透明度」语义）；
         // coalesce 键按层——整段拖动只落一条历史。
-        e.history.beginEdit(e.doc, "layer opacity", static_cast<uint64_t>(e.docRevision),
+        e.history().beginEdit(e.doc(), "layer opacity", static_cast<uint64_t>(e.docRevision()),
                             "op:" + std::to_string(static_cast<long long>(id)));
         l->opacity = nv;
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -1414,7 +1522,7 @@ napi_value SetLayerBlendMode(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
         if (l == nullptr) {
             return makeError(env, kErrBadParam, "setLayerBlendMode: layer not found");
         }
@@ -1441,20 +1549,20 @@ napi_value ReorderLayer(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        size_t at = e.doc.layers.size();
-        for (size_t i = 0; i < e.doc.layers.size(); ++i) {
-            if (e.doc.layers[i].id == static_cast<LayerId>(id)) {
+        size_t at = e.doc().layers.size();
+        for (size_t i = 0; i < e.doc().layers.size(); ++i) {
+            if (e.doc().layers[i].id == static_cast<LayerId>(id)) {
                 at = i;
                 break;
             }
         }
-        if (at == e.doc.layers.size()) {
+        if (at == e.doc().layers.size()) {
             return makeError(env, kErrBadParam, "reorderLayer: layer not found");
         }
         // M14a 组树不变式：平铺序必须是先序 DFS（组节点紧跟完整子树）。无检查的单节点
         // 搬移可把组段打散（子层逃逸组 blend/opacity 语义），坏顺序还会原样入存档——
         // 虚拟副本上移动 + contiguousOn 终检，破坏即拒绝（照 setLayerParent 范式）。
-        std::vector<Layer> tmp = e.doc.layers;
+        std::vector<Layer> tmp = e.doc().layers;
         Layer layer = tmp[at];
         tmp.erase(tmp.begin() + static_cast<long>(at));
         long dst = std::min(std::max(0L, static_cast<long>(toIndex)),
@@ -1463,7 +1571,7 @@ napi_value ReorderLayer(napi_env env, napi_callback_info info) {
         if (!contiguousOn(tmp)) {
             return makeError(env, kErrBadParam, "reorderLayer: move breaks group contiguity");
         }
-        e.doc.layers = std::move(tmp);
+        e.doc().layers = std::move(tmp);
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -1477,8 +1585,8 @@ napi_value GetLayerListSnapshot(napi_env env, napi_callback_info /*info*/) {
     uint32_t n = 0;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        for (const Layer& l : e.doc.layers) {
-            napi_set_element(env, arr, n++, makeLayerDto(env, l, l.id == e.doc.activeId));
+        for (const Layer& l : e.doc().layers) {
+            napi_set_element(env, arr, n++, makeLayerDto(env, l, l.id == e.doc().activeId));
         }
     }
     return makeOk(env, arr);
@@ -1518,7 +1626,7 @@ napi_value GetLayerThumbnail(napi_env env, napi_callback_info info) {
     {
         auto& e = Engine::get();
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, ctx->layerId);
+        Layer* l = findLayerLocked(e.doc(), ctx->layerId);
         if (l != nullptr) {
             ctx->pixels = l->effectivePixels();
         }
@@ -1699,23 +1807,23 @@ napi_value AddLayerMask(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
         if (l == nullptr) {
             return makeError(env, kErrBadParam, "addLayerMask: layer not found");
         }
         if (l->mask != nullptr) {
             return makeError(env, kErrBadParam, "addLayerMask: layer already has mask");
         }
-        e.history.beginEdit(e.doc, "add mask", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "add mask", static_cast<uint64_t>(e.docRevision()));
         auto m = std::make_shared<LayerMask>();
         // M10c：解除"蒙版需先有像素"前提——空图层蒙版网格取文档域（全 255 显示全部；
         // composeMasked 对 null 像素层输出 null，渲染路径不变）
         const uint32_t cols = l->pixels != nullptr
             ? l->pixels->cols
-            : (e.doc.width + kTileSize - 1u) / kTileSize;
+            : (e.doc().width + kTileSize - 1u) / kTileSize;
         const uint32_t rows = l->pixels != nullptr
             ? l->pixels->rows
-            : (e.doc.height + kTileSize - 1u) / kTileSize;
+            : (e.doc().height + kTileSize - 1u) / kTileSize;
         TileGridBuilder builder(cols, rows);
         for (uint32_t ty = 0; ty < rows; ++ty) {
             for (uint32_t tx = 0; tx < cols; ++tx) {
@@ -1742,7 +1850,7 @@ napi_value AddLayerMask(napi_env env, napi_callback_info info) {
                 l->shape != nullptr ? l->shapeCache : l->pixels;
             l->render = base != nullptr ? composeMasked(base, *l->mask) : nullptr;
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -1771,21 +1879,21 @@ napi_value SetRectSelection(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "setRectSelection: no document");
         }
         if (w <= 0 || h <= 0) {
             return makeError(env, kErrBadParam, "setRectSelection: empty rect");
         }
-        auto mask = tiles::rectMask(x, y, w, h, e.doc.width, e.doc.height);
+        auto mask = tiles::rectMask(x, y, w, h, e.doc().width, e.doc().height);
         if (mask == nullptr) {
             return makeError(env, kErrBadParam, "setRectSelection: rect outside document");
         }
-        auto merged = tiles::combineSelection(e.doc, std::move(mask),
+        auto merged = tiles::combineSelection(e.doc(), std::move(mask),
                                               static_cast<tiles::SelectionOp>(op));
-        e.history.beginEdit(e.doc, "rect select", static_cast<uint64_t>(e.docRevision));
-        e.doc.selection = std::move(merged);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "rect select", static_cast<uint64_t>(e.docRevision()));
+        e.doc().selection = std::move(merged);
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -1797,13 +1905,13 @@ napi_value ClearSelection(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.selection == nullptr) {
+        if (e.doc().selection == nullptr) {
             return makeOk(env, nullptr);
         }
-        e.history.beginEdit(e.doc, "deselect", static_cast<uint64_t>(e.docRevision));
-        e.lastSelection = e.doc.selection;
-        e.doc.selection = nullptr;
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "deselect", static_cast<uint64_t>(e.docRevision()));
+        e.active().lastSelection = e.doc().selection;
+        e.doc().selection = nullptr;
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -1820,23 +1928,23 @@ std::shared_ptr<const TileGrid> computeWandMaskLocked(Engine& e, int x, int y, i
     std::unique_ptr<tiles::WandSource> src;
     if (allLayers) {
         // 采样源 = 全部可见层合成（flatten 区域版全域；v1 登记整域一次性）
-        const io::FlattenJob job = io::BuildFlattenJob(e.doc, 0, 0, 0, 0);
+        const io::FlattenJob job = io::BuildFlattenJob(e.doc(), 0, 0, 0, 0);
         io::FlattenResult res = io::FlattenVisible(job, 0, 0, 0, 0);
         if (!res.ok) {
             err = "wand: flatten failed";
             return nullptr;
         }
         auto flat = std::make_shared<std::vector<uint8_t>>(std::move(res.rgba));
-        src = tiles::makeFlatSource(std::move(flat), e.doc.width, e.doc.height);
+        src = tiles::makeFlatSource(std::move(flat), e.doc().width, e.doc().height);
     } else {
-        Layer* l = findLayerLocked(e.doc, e.doc.activeId);
+        Layer* l = findLayerLocked(e.doc(), e.doc().activeId);
         if (l == nullptr || l->effectivePixels() == nullptr) {
             err = "wand: no pixels to sample";
             return nullptr;
         }
         src = tiles::makeTileSource(*l->effectivePixels());
     }
-    return tiles::wandMask(*src, e.doc.width, e.doc.height, x, y, tol, contiguous, sampleSize);
+    return tiles::wandMask(*src, e.doc().width, e.doc().height, x, y, tol, contiguous, sampleSize);
 }
 
 napi_value SetWandSelection(napi_env env, napi_callback_info info) {
@@ -1876,7 +1984,7 @@ napi_value SetWandSelection(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "setWandSelection: no document");
         }
         std::string maskErr;
@@ -1886,20 +1994,20 @@ napi_value SetWandSelection(napi_env env, napi_callback_info info) {
         if (mask == nullptr) {
             return makeError(env, kErrBadParam, "setWandSelection: " + maskErr);
         }
-        auto merged = tiles::combineSelection(e.doc, std::move(mask),
+        auto merged = tiles::combineSelection(e.doc(), std::move(mask),
                                               static_cast<tiles::SelectionOp>(op));
         if (merged == nullptr && op != 0) {
             // 减/交后清空或与现有相同：仍作为一次事务落盘（PS 允许减到无选区）
-            e.history.beginEdit(e.doc, "magic wand", static_cast<uint64_t>(e.docRevision));
-            e.doc.selection = nullptr;
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().beginEdit(e.doc(), "magic wand", static_cast<uint64_t>(e.docRevision()));
+            e.doc().selection = nullptr;
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             e.bumpRevisionLocked();
             e.requestRender();
             return makeOk(env, nullptr);
         }
-        e.history.beginEdit(e.doc, "magic wand", static_cast<uint64_t>(e.docRevision));
-        e.doc.selection = std::move(merged);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "magic wand", static_cast<uint64_t>(e.docRevision()));
+        e.doc().selection = std::move(merged);
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -1953,15 +2061,15 @@ napi_value SetPolygonSelection(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "setPolygonSelection: no document");
         }
-        auto mask = tiles::polygonMask(xy, e.doc.width, e.doc.height);
-        auto merged = tiles::combineSelection(e.doc, std::move(mask),
+        auto mask = tiles::polygonMask(xy, e.doc().width, e.doc().height);
+        auto merged = tiles::combineSelection(e.doc(), std::move(mask),
                                               static_cast<tiles::SelectionOp>(op));
-        e.history.beginEdit(e.doc, "polygon select", static_cast<uint64_t>(e.docRevision));
-        e.doc.selection = std::move(merged);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "polygon select", static_cast<uint64_t>(e.docRevision()));
+        e.doc().selection = std::move(merged);
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -1990,15 +2098,15 @@ napi_value SetEllipseSelection(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "setEllipseSelection: no document");
         }
-        auto mask = tiles::ellipseMask(x, y, w, h, e.doc.width, e.doc.height);
-        auto merged = tiles::combineSelection(e.doc, std::move(mask),
+        auto mask = tiles::ellipseMask(x, y, w, h, e.doc().width, e.doc().height);
+        auto merged = tiles::combineSelection(e.doc(), std::move(mask),
                                               static_cast<tiles::SelectionOp>(op));
-        e.history.beginEdit(e.doc, "ellipse select", static_cast<uint64_t>(e.docRevision));
-        e.doc.selection = std::move(merged);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "ellipse select", static_cast<uint64_t>(e.docRevision()));
+        e.doc().selection = std::move(merged);
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -2010,12 +2118,12 @@ napi_value SelectAll(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "selectAll: no document");
         }
-        e.history.beginEdit(e.doc, "select all", static_cast<uint64_t>(e.docRevision));
-        e.doc.selection = tiles::fullSelection(e.doc.width, e.doc.height);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "select all", static_cast<uint64_t>(e.docRevision()));
+        e.doc().selection = tiles::fullSelection(e.doc().width, e.doc().height);
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -2027,16 +2135,16 @@ napi_value InvertSelection(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "invertSelection: no document");
         }
-        auto inv = tiles::invertSelection(e.doc);
-        if (inv == nullptr && e.doc.selection == nullptr) {
+        auto inv = tiles::invertSelection(e.doc());
+        if (inv == nullptr && e.doc().selection == nullptr) {
             return makeError(env, kErrBadParam, "invertSelection: nothing to invert");
         }
-        e.history.beginEdit(e.doc, "invert selection", static_cast<uint64_t>(e.docRevision));
-        e.doc.selection = std::move(inv);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "invert selection", static_cast<uint64_t>(e.docRevision()));
+        e.doc().selection = std::move(inv);
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -2048,16 +2156,16 @@ napi_value ReselectSelection(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "reselectSelection: no document");
         }
-        if (e.lastSelection == nullptr) {
+        if (e.active().lastSelection == nullptr) {
             return makeError(env, kErrBadParam, "reselectSelection: no reselectable selection");
         }
-        e.history.beginEdit(e.doc, "reselect", static_cast<uint64_t>(e.docRevision));
-        e.doc.selection = e.lastSelection;
-        e.lastSelection = nullptr;
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "reselect", static_cast<uint64_t>(e.docRevision()));
+        e.doc().selection = e.active().lastSelection;
+        e.active().lastSelection = nullptr;
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -2071,19 +2179,19 @@ napi_value applySelectionKernel(napi_env env, const char* label,
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "selection op: no document");
         }
-        if (e.doc.selection == nullptr) {
+        if (e.doc().selection == nullptr) {
             return makeError(env, kErrBadParam, "selection op: no active selection");
         }
-        auto next = fn(e.doc, param);
+        auto next = fn(e.doc(), param);
         if (next == nullptr) {
             return makeError(env, kErrBadParam, "selection op: kernel produced empty result");
         }
-        e.history.beginEdit(e.doc, label, static_cast<uint64_t>(e.docRevision));
-        e.doc.selection = std::move(next);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), label, static_cast<uint64_t>(e.docRevision()));
+        e.doc().selection = std::move(next);
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -2146,19 +2254,19 @@ napi_value SmoothSelection(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "smoothSelection: no document");
         }
-        if (e.doc.selection == nullptr) {
+        if (e.doc().selection == nullptr) {
             return makeError(env, kErrBadParam, "smoothSelection: no active selection");
         }
-        auto next = tiles::smoothSelection(e.doc);
+        auto next = tiles::smoothSelection(e.doc());
         if (next == nullptr) {
             return makeError(env, kErrBadParam, "smoothSelection: empty result");
         }
-        e.history.beginEdit(e.doc, "smooth selection", static_cast<uint64_t>(e.docRevision));
-        e.doc.selection = std::move(next);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "smooth selection", static_cast<uint64_t>(e.docRevision()));
+        e.doc().selection = std::move(next);
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -2173,25 +2281,25 @@ napi_value ToggleQuickMask(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "toggleQuickMask: no document");
         }
-        const bool entering = e.doc.quickMask == nullptr;
-        e.history.beginEdit(e.doc, "quick mask toggle", static_cast<uint64_t>(e.docRevision));
+        const bool entering = e.doc().quickMask == nullptr;
+        e.history().beginEdit(e.doc(), "quick mask toggle", static_cast<uint64_t>(e.docRevision()));
         if (entering) {
-            tiles::enterQuickMask(e.doc);
+            tiles::enterQuickMask(e.doc());
         } else {
-            tiles::exitQuickMask(e.doc);
+            tiles::exitQuickMask(e.doc());
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
         OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "quick mask %{public}s",
                      entering ? "enter" : "exit");
         napi_value data = nullptr;
         napi_create_object(env, &data);
-        napi_set_named_property(env, data, "active", makeBool(env, e.doc.quickMask != nullptr));
-        napi_set_named_property(env, data, "hasSelection", makeBool(env, e.doc.selection != nullptr));
+        napi_set_named_property(env, data, "active", makeBool(env, e.doc().quickMask != nullptr));
+        napi_set_named_property(env, data, "hasSelection", makeBool(env, e.doc().selection != nullptr));
         return makeOk(env, data);
     }
 }
@@ -2221,7 +2329,7 @@ napi_value ApplyGradient(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "applyGradient: no document");
         }
         GradientSpec spec;
@@ -2233,15 +2341,15 @@ napi_value ApplyGradient(napi_env env, napi_callback_info info) {
         spec.y1 = y1;
         const auto gt = static_cast<GradientTarget>(static_cast<int32_t>(target));
         std::string err;
-        e.history.beginEdit(e.doc, "gradient", static_cast<uint64_t>(e.docRevision));
-        const bool ok = applyGradient(e.doc, static_cast<LayerId>(id), spec, gt,
+        e.history().beginEdit(e.doc(), "gradient", static_cast<uint64_t>(e.docRevision()));
+        const bool ok = applyGradient(e.doc(), static_cast<LayerId>(id), spec, gt,
                                       e.fgColor, e.bgColor, err);
         if (!ok) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, err);
         }
         restyleAllLocked(e);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -2260,21 +2368,21 @@ napi_value FillSelection(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "fillSelection: no document");
         }
         std::string err;
-        e.history.beginEdit(e.doc, "fill", static_cast<uint64_t>(e.docRevision));
-        const bool ok = fillWithColor(e.doc, e.doc.activeId,
+        e.history().beginEdit(e.doc(), "fill", static_cast<uint64_t>(e.docRevision()));
+        const bool ok = fillWithColor(e.doc(), e.doc().activeId,
                                       static_cast<FillSource>(static_cast<int32_t>(source)),
                                       e.fgColor[0], e.fgColor[1], e.fgColor[2],
                                       e.bgColor[0], e.bgColor[1], e.bgColor[2], err);
         if (!ok) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, err);
         }
         restyleAllLocked(e);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -2293,20 +2401,20 @@ napi_value StrokeSelection(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "strokeSelection: no document");
         }
         std::string err;
-        e.history.beginEdit(e.doc, "stroke", static_cast<uint64_t>(e.docRevision));
-        const bool ok = strokeSelectionBorder(e.doc, e.doc.activeId,
+        e.history().beginEdit(e.doc(), "stroke", static_cast<uint64_t>(e.docRevision()));
+        const bool ok = strokeSelectionBorder(e.doc(), e.doc().activeId,
                                               static_cast<int>(width),
                                               e.fgColor[0], e.fgColor[1], e.fgColor[2], err);
         if (!ok) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, err);
         }
         restyleAllLocked(e);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -2340,7 +2448,7 @@ napi_value BucketFill(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lg(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "bucketFill: no document");
         }
         std::string err;
@@ -2351,24 +2459,24 @@ napi_value BucketFill(napi_env env, napi_callback_info info) {
             return makeError(env, kErrBadParam, "bucketFill: " + err);
         }
         // 活动选区约束（有选区时油漆桶只填交集——PS 语义）
-        std::shared_ptr<const TileGrid> saved = e.doc.selection;
+        std::shared_ptr<const TileGrid> saved = e.doc().selection;
         if (saved != nullptr) {
-            mask = tiles::combineSelection(e.doc, mask, tiles::SelectionOp::Intersect);
+            mask = tiles::combineSelection(e.doc(), mask, tiles::SelectionOp::Intersect);
             if (mask == nullptr) {
                 return makeError(env, kErrBadParam, "bucketFill: empty intersection");
             }
         }
-        e.history.beginEdit(e.doc, "bucket fill", static_cast<uint64_t>(e.docRevision));
-        e.doc.selection = std::move(mask);
-        const bool ok = fillWithColor(e.doc, e.doc.activeId, FillSource::Foreground,
+        e.history().beginEdit(e.doc(), "bucket fill", static_cast<uint64_t>(e.docRevision()));
+        e.doc().selection = std::move(mask);
+        const bool ok = fillWithColor(e.doc(), e.doc().activeId, FillSource::Foreground,
                                       e.fgColor[0], e.fgColor[1], e.fgColor[2],
                                       e.bgColor[0], e.bgColor[1], e.bgColor[2], err);
-        e.doc.selection = saved;
+        e.doc().selection = saved;
         if (!ok) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, "bucketFill: " + err);
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -2394,7 +2502,7 @@ napi_value RasterizeShape(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "rasterizeShape: no document");
         }
         ShapeSpec spec;
@@ -2408,14 +2516,14 @@ napi_value RasterizeShape(napi_env env, napi_callback_info info) {
         spec.stroke = v[8] != 0;
         spec.strokeWidth = v[9];
         std::string err;
-        e.history.beginEdit(e.doc, "shape", static_cast<uint64_t>(e.docRevision));
-        const bool ok = rasterizeShape(e.doc, e.doc.activeId, spec, e.fgColor, e.bgColor, err);
+        e.history().beginEdit(e.doc(), "shape", static_cast<uint64_t>(e.docRevision()));
+        const bool ok = rasterizeShape(e.doc(), e.doc().activeId, spec, e.fgColor, e.bgColor, err);
         if (!ok) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, err);
         }
         restyleAllLocked(e);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -2444,10 +2552,10 @@ napi_value SetCloneSource(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "setCloneSource: no document");
         }
-        if (e.doc.activeId == 0) {
+        if (e.doc().activeId == 0) {
             return makeError(env, kErrBadParam, "setCloneSource: no active layer");
         }
         if (slot >= 0) {
@@ -2457,7 +2565,7 @@ napi_value SetCloneSource(napi_env env, napi_callback_info info) {
             e.cloneSlot = static_cast<int>(slot);
         }
         e.cs().active = true;
-        e.cs().layerId = e.doc.activeId;
+        e.cs().layerId = e.doc().activeId;
         e.cs().srcX = x;
         e.cs().srcY = y;
         e.cs().hasOffset = false;  // 新源点：对齐偏移重新锁定
@@ -2574,6 +2682,7 @@ struct CaOpCtx {
     napi_deferred deferred = nullptr;
     Document docSnap;
     uint64_t epoch = 0;
+    void* docSess = nullptr;  // D2：归属会话（发布段 docIfUnchanged 复核）
     int64_t revision = 0;
     int op = 0;  // 0=fill 1=move
     int dx = 0, dy = 0;
@@ -2611,15 +2720,16 @@ napi_value CaOpAsync(napi_env env, napi_callback_info info, int op) {
     }
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0) {
+        if (e.doc().width == 0) {
             delete ctx;
             return makeError(env, kErrNoDoc, op == 0 ? "contentAwareFill: no document"
                                                      : op == 2 ? "patchSelection: no document"
                                                                : "contentAwareMove: no document");
         }
-        ctx->docSnap = e.doc;
-        ctx->epoch = e.docEpoch;
-        ctx->revision = e.docRevision;
+        ctx->docSnap = e.doc();
+        ctx->epoch = e.docEpoch();
+        ctx->revision = e.docRevision();
+        ctx->docSess = &e.doc();
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -2642,14 +2752,19 @@ napi_value CaOpAsync(napi_env env, napi_callback_info info, int op) {
             }
             auto& eg = Engine::get();
             std::lock_guard<std::mutex> lk(eg.docMutex);
-            if (c->changed && eg.docEpoch == c->epoch && eg.docRevision == c->revision) {
-                eg.history.beginEdit(eg.doc,
+            // D2：归属会话复核（闩锁会话在池 + epoch/revision 未变）——发布落原会话，
+            // 不再要求仍是 active（切标签后完成的操作仍入账原文档，PS 语义）
+            auto sess = eg.docIfUnchanged(Engine::DocStamp{static_cast<DocSession*>(c->docSess),
+                                                           c->epoch,
+                                                           static_cast<uint32_t>(c->revision)});
+            if (c->changed && sess != nullptr) {
+                sess->history.beginEdit(sess->doc,
                                      c->op == 0 ? "content-aware fill"
                                                 : c->op == 2 ? "patch" : "content-aware move",
-                                     static_cast<uint64_t>(eg.docRevision));
-                eg.doc = std::move(work);
-                eg.history.endEdit(eg.doc, static_cast<uint64_t>(eg.docRevision));
-                eg.bumpRevisionLocked();
+                                     static_cast<uint64_t>(sess->revision));
+                sess->doc = std::move(work);
+                sess->history.endEdit(sess->doc, static_cast<uint64_t>(sess->revision));
+                eg.bumpRevisionLocked(sess.get());
                 eg.requestRender();
             } else {
                 c->changed = false;
@@ -2686,6 +2801,7 @@ struct LiquifyCtx {
     napi_deferred deferred = nullptr;
     Document docSnap;
     uint64_t epoch = 0;
+    void* docSess = nullptr;  // D2：归属会话（发布段 docIfUnchanged 复核）
     int64_t revision = 0;
     LayerId layerId = 0;
     std::vector<liquify::Stroke> strokes;
@@ -2799,17 +2915,18 @@ napi_value ApplyLiquify(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0) {
+        if (e.doc().width == 0) {
             delete ctx;
             return makeError(env, kErrNoDoc, "applyLiquify: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
+        if (e.active().textEditOpen || e.active().filterPreview.active || e.active().camPreview.open) {
             delete ctx;
             return makeError(env, kErrBadParam, "applyLiquify: edit/preview session open");
         }
-        ctx->docSnap = e.doc;
-        ctx->epoch = e.docEpoch;
-        ctx->revision = e.docRevision;
+        ctx->docSnap = e.doc();
+        ctx->epoch = e.docEpoch();
+        ctx->revision = e.docRevision();
+        ctx->docSess = &e.doc();
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -2881,11 +2998,14 @@ napi_value ApplyLiquify(napi_env env, napi_callback_info info) {
             restyleDocument(work);
             auto& eg = Engine::get();
             std::lock_guard<std::mutex> lk(eg.docMutex);
-            if (eg.docEpoch == c->epoch && eg.docRevision == c->revision) {
-                eg.history.beginEdit(eg.doc, "æ¶²å", static_cast<uint64_t>(eg.docRevision));  // 液化
-                eg.doc = std::move(work);
-                eg.history.endEdit(eg.doc, static_cast<uint64_t>(eg.docRevision));
-                eg.bumpRevisionLocked();
+            auto sess = eg.docIfUnchanged(Engine::DocStamp{static_cast<DocSession*>(c->docSess),
+                                                           c->epoch,
+                                                           static_cast<uint32_t>(c->revision)});
+            if (sess != nullptr) {
+                sess->history.beginEdit(sess->doc, "液化", static_cast<uint64_t>(sess->revision));
+                sess->doc = std::move(work);
+                sess->history.endEdit(sess->doc, static_cast<uint64_t>(sess->revision));
+                eg.bumpRevisionLocked(sess.get());
                 eg.requestRender();
             } else {
                 c->changed = false;
@@ -2922,6 +3042,7 @@ struct PuppetCtx {
     napi_deferred deferred = nullptr;
     Document docSnap;
     uint64_t epoch = 0;
+    void* docSess = nullptr;  // D2：归属会话（发布段 docIfUnchanged 复核）
     int64_t revision = 0;
     LayerId layerId = 0;
     puppet::Warp warp;
@@ -3004,17 +3125,18 @@ napi_value ApplyPuppet(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0) {
+        if (e.doc().width == 0) {
             delete ctx;
             return makeError(env, kErrNoDoc, "applyPuppet: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
+        if (e.active().textEditOpen || e.active().filterPreview.active || e.active().camPreview.open) {
             delete ctx;
             return makeError(env, kErrBadParam, "applyPuppet: edit/preview session open");
         }
-        ctx->docSnap = e.doc;
-        ctx->epoch = e.docEpoch;
-        ctx->revision = e.docRevision;
+        ctx->docSnap = e.doc();
+        ctx->epoch = e.docEpoch();
+        ctx->revision = e.docRevision();
+        ctx->docSess = &e.doc();
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -3067,12 +3189,15 @@ napi_value ApplyPuppet(napi_env env, napi_callback_info info) {
             restyleDocument(work);
             auto& eg = Engine::get();
             std::lock_guard<std::mutex> lk(eg.docMutex);
-            if (eg.docEpoch == c->epoch && eg.docRevision == c->revision) {
-                eg.history.beginEdit(eg.doc, "\xe6\x93\x8d\xe6\x8e\xa7\xe5\x8f\x98\xe5\xbd\xa2",
-                                     static_cast<uint64_t>(eg.docRevision));  // 操控变形
-                eg.doc = std::move(work);
-                eg.history.endEdit(eg.doc, static_cast<uint64_t>(eg.docRevision));
-                eg.bumpRevisionLocked();
+            auto sess = eg.docIfUnchanged(Engine::DocStamp{static_cast<DocSession*>(c->docSess),
+                                                           c->epoch,
+                                                           static_cast<uint32_t>(c->revision)});
+            if (sess != nullptr) {
+                sess->history.beginEdit(sess->doc, "\xe6\x93\x8d\xe6\x8e\xa7\xe5\x8f\x98\xe5\xbd\xa2",
+                                     static_cast<uint64_t>(sess->revision));
+                sess->doc = std::move(work);
+                sess->history.endEdit(sess->doc, static_cast<uint64_t>(sess->revision));
+                eg.bumpRevisionLocked(sess.get());
                 eg.requestRender();
             } else {
                 c->changed = false;
@@ -3110,6 +3235,7 @@ struct PerspectiveCtx {
     napi_deferred deferred = nullptr;
     Document docSnap;
     uint64_t epoch = 0;
+    void* docSess = nullptr;  // D2：归属会话（发布段 docIfUnchanged 复核）
     int64_t revision = 0;
     LayerId layerId = 0;
     perspective::Plane plane;
@@ -3162,17 +3288,18 @@ napi_value ApplyPerspective(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0) {
+        if (e.doc().width == 0) {
             delete ctx;
             return makeError(env, kErrNoDoc, "applyPerspective: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
+        if (e.active().textEditOpen || e.active().filterPreview.active || e.active().camPreview.open) {
             delete ctx;
             return makeError(env, kErrBadParam, "applyPerspective: edit/preview session open");
         }
-        ctx->docSnap = e.doc;
-        ctx->epoch = e.docEpoch;
-        ctx->revision = e.docRevision;
+        ctx->docSnap = e.doc();
+        ctx->epoch = e.docEpoch();
+        ctx->revision = e.docRevision();
+        ctx->docSess = &e.doc();
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -3321,12 +3448,15 @@ napi_value ApplyPerspective(napi_env env, napi_callback_info info) {
             restyleDocument(work);
             auto& eg = Engine::get();
             std::lock_guard<std::mutex> lk(eg.docMutex);
-            if (eg.docEpoch == c->epoch && eg.docRevision == c->revision) {
-                eg.history.beginEdit(eg.doc, "\xe9\x80\x8f\xe8\xa7\x86\xe5\x8f\x98\xe5\xbd\xa2",
-                                     static_cast<uint64_t>(eg.docRevision));  // 透视变形
-                eg.doc = std::move(work);
-                eg.history.endEdit(eg.doc, static_cast<uint64_t>(eg.docRevision));
-                eg.bumpRevisionLocked();
+            auto sess = eg.docIfUnchanged(Engine::DocStamp{static_cast<DocSession*>(c->docSess),
+                                                           c->epoch,
+                                                           static_cast<uint32_t>(c->revision)});
+            if (sess != nullptr) {
+                sess->history.beginEdit(sess->doc, "\xe9\x80\x8f\xe8\xa7\x86\xe5\x8f\x98\xe5\xbd\xa2",
+                                     static_cast<uint64_t>(sess->revision));
+                sess->doc = std::move(work);
+                sess->history.endEdit(sess->doc, static_cast<uint64_t>(sess->revision));
+                eg.bumpRevisionLocked(sess.get());
                 eg.requestRender();
             } else {
                 c->changed = false;
@@ -3364,6 +3494,7 @@ struct WideAngleCtx {
     napi_deferred deferred = nullptr;
     Document docSnap;
     uint64_t epoch = 0;
+    void* docSess = nullptr;  // D2：归属会话（发布段 docIfUnchanged 复核）
     int64_t revision = 0;
     LayerId layerId = 0;
     wideangle::Params params;
@@ -3425,17 +3556,18 @@ napi_value ApplyWideAngle(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0) {
+        if (e.doc().width == 0) {
             delete ctx;
             return makeError(env, kErrNoDoc, "applyWideAngle: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
+        if (e.active().textEditOpen || e.active().filterPreview.active || e.active().camPreview.open) {
             delete ctx;
             return makeError(env, kErrBadParam, "applyWideAngle: edit/preview session open");
         }
-        ctx->docSnap = e.doc;
-        ctx->epoch = e.docEpoch;
-        ctx->revision = e.docRevision;
+        ctx->docSnap = e.doc();
+        ctx->epoch = e.docEpoch();
+        ctx->revision = e.docRevision();
+        ctx->docSess = &e.doc();
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -3581,12 +3713,15 @@ napi_value ApplyWideAngle(napi_env env, napi_callback_info info) {
             restyleDocument(work);
             auto& eg = Engine::get();
             std::lock_guard<std::mutex> lk(eg.docMutex);
-            if (eg.docEpoch == c->epoch && eg.docRevision == c->revision) {
-                eg.history.beginEdit(eg.doc, "\xe8\x87\xaa\xe9\x80\x82\xe5\xba\x94\xe5\xb9\xbf\xe8\xa7\x92",
-                                     static_cast<uint64_t>(eg.docRevision));  // 自适应广角
-                eg.doc = std::move(work);
-                eg.history.endEdit(eg.doc, static_cast<uint64_t>(eg.docRevision));
-                eg.bumpRevisionLocked();
+            auto sess = eg.docIfUnchanged(Engine::DocStamp{static_cast<DocSession*>(c->docSess),
+                                                           c->epoch,
+                                                           static_cast<uint32_t>(c->revision)});
+            if (sess != nullptr) {
+                sess->history.beginEdit(sess->doc, "\xe8\x87\xaa\xe9\x80\x82\xe5\xba\x94\xe5\xb9\xbf\xe8\xa7\x92",
+                                     static_cast<uint64_t>(sess->revision));
+                sess->doc = std::move(work);
+                sess->history.endEdit(sess->doc, static_cast<uint64_t>(sess->revision));
+                eg.bumpRevisionLocked(sess.get());
                 eg.requestRender();
             } else {
                 c->changed = false;
@@ -3624,6 +3759,7 @@ struct VpCloneCtx {
     napi_deferred deferred = nullptr;
     Document docSnap;
     uint64_t epoch = 0;
+    void* docSess = nullptr;  // D2：归属会话（发布段 docIfUnchanged 复核）
     int64_t revision = 0;
     LayerId layerId = 0;
     vanishing::VpPlane plane;
@@ -3735,17 +3871,18 @@ napi_value ApplyVpClone(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0) {
+        if (e.doc().width == 0) {
             delete ctx;
             return makeError(env, kErrNoDoc, "applyVpClone: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
+        if (e.active().textEditOpen || e.active().filterPreview.active || e.active().camPreview.open) {
             delete ctx;
             return makeError(env, kErrBadParam, "applyVpClone: edit/preview session open");
         }
-        ctx->docSnap = e.doc;
-        ctx->epoch = e.docEpoch;
-        ctx->revision = e.docRevision;
+        ctx->docSnap = e.doc();
+        ctx->epoch = e.docEpoch();
+        ctx->revision = e.docRevision();
+        ctx->docSess = &e.doc();
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -3877,12 +4014,15 @@ napi_value ApplyVpClone(napi_env env, napi_callback_info info) {
             restyleDocument(work);
             auto& eg = Engine::get();
             std::lock_guard<std::mutex> lk(eg.docMutex);
-            if (eg.docEpoch == c->epoch && eg.docRevision == c->revision) {
-                eg.history.beginEdit(eg.doc, "\xe6\xb6\x88\xe5\xa4\xb1\xe7\x82\xb9\xe9\x80\x8f\xe8\xa7\x86\xe5\x85\x8b\xe9\x9a\x86",
-                                     static_cast<uint64_t>(eg.docRevision));  // 消失点透视克隆
-                eg.doc = std::move(work);
-                eg.history.endEdit(eg.doc, static_cast<uint64_t>(eg.docRevision));
-                eg.bumpRevisionLocked();
+            auto sess = eg.docIfUnchanged(Engine::DocStamp{static_cast<DocSession*>(c->docSess),
+                                                           c->epoch,
+                                                           static_cast<uint32_t>(c->revision)});
+            if (sess != nullptr) {
+                sess->history.beginEdit(sess->doc, "\xe6\xb6\x88\xe5\xa4\xb1\xe7\x82\xb9\xe9\x80\x8f\xe8\xa7\x86\xe5\x85\x8b\xe9\x9a\x86",
+                                     static_cast<uint64_t>(sess->revision));
+                sess->doc = std::move(work);
+                sess->history.endEdit(sess->doc, static_cast<uint64_t>(sess->revision));
+                eg.bumpRevisionLocked(sess.get());
                 eg.requestRender();
             } else {
                 c->changed = false;
@@ -3957,18 +4097,18 @@ napi_value StoreSelection(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "storeSelection: no document");
         }
-        if (e.doc.selection == nullptr) {
+        if (e.doc().selection == nullptr) {
             return makeError(env, kErrBadParam, "storeSelection: no active selection");
         }
-        e.history.beginEdit(e.doc, "store selection", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "store selection", static_cast<uint64_t>(e.docRevision()));
         AlphaChannel ch;
         ch.name = name;
-        ch.mask = e.doc.selection;
+        ch.mask = e.doc().selection;
         bool replaced = false;
-        for (AlphaChannel& c : e.doc.channels) {
+        for (AlphaChannel& c : e.doc().channels) {
             if (c.name == ch.name) {
                 c.mask = ch.mask;  // PS：同名覆盖
                 replaced = true;
@@ -3976,9 +4116,9 @@ napi_value StoreSelection(napi_env env, napi_callback_info info) {
             }
         }
         if (!replaced) {
-            e.doc.channels.push_back(std::move(ch));
+            e.doc().channels.push_back(std::move(ch));
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -4002,11 +4142,11 @@ napi_value LoadSelection(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "loadSelection: no document");
         }
         const TileGrid* mask = nullptr;
-        for (const AlphaChannel& c : e.doc.channels) {
+        for (const AlphaChannel& c : e.doc().channels) {
             if (c.name == name && c.mask != nullptr) {
                 mask = c.mask.get();
                 break;
@@ -4017,16 +4157,16 @@ napi_value LoadSelection(napi_env env, napi_callback_info info) {
         }
         // 通道掩码（shared_ptr 共享零拷贝）→ 布尔合并走既有 combineSelection
         std::shared_ptr<const TileGrid> next;
-        for (const AlphaChannel& c : e.doc.channels) {
+        for (const AlphaChannel& c : e.doc().channels) {
             if (c.name == name) {
                 next = c.mask;
                 break;
             }
         }
-        auto merged = tiles::combineSelection(e.doc, next, static_cast<tiles::SelectionOp>(op));
-        e.history.beginEdit(e.doc, "load selection", static_cast<uint64_t>(e.docRevision));
-        e.doc.selection = std::move(merged);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        auto merged = tiles::combineSelection(e.doc(), next, static_cast<tiles::SelectionOp>(op));
+        e.history().beginEdit(e.doc(), "load selection", static_cast<uint64_t>(e.docRevision()));
+        e.doc().selection = std::move(merged);
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -4046,16 +4186,16 @@ napi_value DeleteChannel(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        e.history.beginEdit(e.doc, "delete channel", static_cast<uint64_t>(e.docRevision));
-        const size_t before = e.doc.channels.size();
-        for (size_t i = 0; i < e.doc.channels.size(); ++i) {
-            if (e.doc.channels[i].name == name) {
-                e.doc.channels.erase(e.doc.channels.begin() + static_cast<long>(i));
+        e.history().beginEdit(e.doc(), "delete channel", static_cast<uint64_t>(e.docRevision()));
+        const size_t before = e.doc().channels.size();
+        for (size_t i = 0; i < e.doc().channels.size(); ++i) {
+            if (e.doc().channels[i].name == name) {
+                e.doc().channels.erase(e.doc().channels.begin() + static_cast<long>(i));
                 break;
             }
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
-        if (e.doc.channels.size() != before) {
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
+        if (e.doc().channels.size() != before) {
             e.bumpRevisionLocked();
             e.requestRender();
         }
@@ -4068,10 +4208,10 @@ napi_value GetChannelList(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
     std::lock_guard<std::mutex> lk(e.docMutex);
     napi_value arr = nullptr;
-    napi_create_array_with_length(env, e.doc.channels.size(), &arr);
-    for (size_t i = 0; i < e.doc.channels.size(); ++i) {
+    napi_create_array_with_length(env, e.doc().channels.size(), &arr);
+    for (size_t i = 0; i < e.doc().channels.size(); ++i) {
         napi_value s = nullptr;
-        napi_create_string_utf8(env, e.doc.channels[i].name.c_str(), NAPI_AUTO_LENGTH, &s);
+        napi_create_string_utf8(env, e.doc().channels[i].name.c_str(), NAPI_AUTO_LENGTH, &s);
         napi_set_element(env, arr, static_cast<uint32_t>(i), s);
     }
     return arr;
@@ -4088,13 +4228,13 @@ napi_value CopySelection(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "copySelection: no document");
         }
-        if (e.doc.selection == nullptr) {
+        if (e.doc().selection == nullptr) {
             return makeError(env, kErrBadParam, "copySelection: no active selection");
         }
-        if (!copySelectionToClipboard(e.doc, merged, e.clipboard)) {
+        if (!copySelectionToClipboard(e.doc(), merged, e.clipboard)) {
             return makeError(env, kErrBadParam, "copySelection: nothing to copy");
         }
         OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Clipboard",
@@ -4116,18 +4256,18 @@ napi_value CutSelection(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "cutSelection: no document");
         }
-        if (e.doc.selection == nullptr) {
+        if (e.doc().selection == nullptr) {
             return makeError(env, kErrBadParam, "cutSelection: no active selection");
         }
-        if (!copySelectionToClipboard(e.doc, merged, e.clipboard)) {
+        if (!copySelectionToClipboard(e.doc(), merged, e.clipboard)) {
             return makeError(env, kErrBadParam, "cutSelection: nothing to cut");
         }
-        e.history.beginEdit(e.doc, "cut", static_cast<uint64_t>(e.docRevision));
-        eraseSelectionPixels(e.doc);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "cut", static_cast<uint64_t>(e.docRevision()));
+        eraseSelectionPixels(e.doc());
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -4138,18 +4278,18 @@ napi_value DeleteSelectionPixels(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "deleteSelectionPixels: no document");
         }
-        if (e.doc.selection == nullptr) {
+        if (e.doc().selection == nullptr) {
             return makeError(env, kErrBadParam, "deleteSelectionPixels: no active selection");
         }
-        e.history.beginEdit(e.doc, "clear", static_cast<uint64_t>(e.docRevision));
-        const bool changed = eraseSelectionPixels(e.doc);
+        e.history().beginEdit(e.doc(), "clear", static_cast<uint64_t>(e.docRevision()));
+        const bool changed = eraseSelectionPixels(e.doc());
         if (changed) {
             restyleAllLocked(e);
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         if (changed) {
             e.bumpRevisionLocked();
             e.requestRender();
@@ -4162,17 +4302,17 @@ napi_value PasteClipboard(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "pasteClipboard: no document");
         }
         if (e.clipboard.width == 0) {
             return makeError(env, kErrBadParam, "pasteClipboard: clipboard empty");
         }
-        e.history.beginEdit(e.doc, "paste", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "paste", static_cast<uint64_t>(e.docRevision()));
         const LayerId newId = e.nextLayerId();
-        pasteClipboardAsLayer(e.doc, e.clipboard, newId);
+        pasteClipboardAsLayer(e.doc(), e.clipboard, newId);
         restyleAllLocked(e);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
         OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Clipboard",
@@ -4202,20 +4342,20 @@ napi_value BeginStroke(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0) {
+        if (e.doc().width == 0) {
             return makeError(env, kErrNoDoc, "beginStroke: no document");
         }
-        if (e.doc.activeId == 0) {
+        if (e.doc().activeId == 0) {
             return makeError(env, kErrNoDoc, "beginStroke: no active layer");
         }
         // M12（PS 语义）：在文本层上作画自动栅格化（一步事务），此后按普通层走
         {
-            Layer* al = findLayerLocked(e.doc, e.doc.activeId);
+            Layer* al = findLayerLocked(e.doc(), e.doc().activeId);
             if (al != nullptr && al->text != nullptr) {
-                e.history.beginEdit(e.doc, "rasterize text (paint)",
-                                    static_cast<uint64_t>(e.docRevision));
+                e.history().beginEdit(e.doc(), "rasterize text (paint)",
+                                    static_cast<uint64_t>(e.docRevision()));
                 rasterizeTextLayerToPixels(*al);
-                e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+                e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
                 e.bumpRevisionLocked();
                 OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Text",
                              "text layer auto rasterized (paint)");
@@ -4223,7 +4363,7 @@ napi_value BeginStroke(napi_env env, napi_callback_info info) {
         }
         OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Brush",
                      "begin stroke at (%{public}f, %{public}f) layer=%{public}llu d=%{public}f erasing=%{public}d",
-                     x, y, static_cast<unsigned long long>(e.doc.activeId),
+                     x, y, static_cast<unsigned long long>(e.doc().activeId),
                      static_cast<double>(e.brush.diameter), e.brush.erasing ? 1 : 0);
     }
     {
@@ -4282,10 +4422,10 @@ napi_value Undo(napi_env env, napi_callback_info /*info*/) {
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
         std::string label;
-        uint64_t rev = static_cast<uint64_t>(e.docRevision);
-        performed = e.history.undo(e.doc, rev, label);
+        uint64_t rev = static_cast<uint64_t>(e.docRevision());
+        performed = e.history().undo(e.doc(), rev, label);
         if (performed) {
-            e.docRevision = static_cast<int64_t>(rev);
+            e.docRevision() = static_cast<int64_t>(rev);
             e.fireRevisionLocked();  // 恢复快照版本只广播（bump 的自增会让值恰好不变、@Watch 不触发）
             e.requestRender();
         }
@@ -4305,10 +4445,10 @@ napi_value Redo(napi_env env, napi_callback_info /*info*/) {
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
         std::string label;
-        uint64_t rev = static_cast<uint64_t>(e.docRevision);
-        performed = e.history.redo(e.doc, rev, label);
+        uint64_t rev = static_cast<uint64_t>(e.docRevision());
+        performed = e.history().redo(e.doc(), rev, label);
         if (performed) {
-            e.docRevision = static_cast<int64_t>(rev);
+            e.docRevision() = static_cast<int64_t>(rev);
             e.fireRevisionLocked();  // 同 undo：恢复快照版本只广播
             e.requestRender();
         }
@@ -4427,18 +4567,18 @@ napi_value ResizeCanvas(napi_env env, napi_callback_info info) {
     bool changed = false;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "resizeCanvas: no document");
         }
-        e.history.beginEdit(e.doc, "canvas size", static_cast<uint64_t>(e.docRevision));
-        changed = resizeCanvas(e.doc, static_cast<int>(x), static_cast<int>(y),
+        e.history().beginEdit(e.doc(), "canvas size", static_cast<uint64_t>(e.docRevision()));
+        changed = resizeCanvas(e.doc(), static_cast<int>(x), static_cast<int>(y),
                                  static_cast<int>(w), static_cast<int>(h));
         if (changed) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             e.bumpRevisionLocked();
             e.requestRender();
         } else {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         }
     }
     napi_value data = nullptr;
@@ -4455,6 +4595,7 @@ struct DocGeomCtx {
     napi_deferred deferred = nullptr;
     Document docSnap;   // 锁内整档拷贝（shared_ptr 共享瓦片，O(层数)）
     uint64_t epoch = 0;
+    void* docSess = nullptr;  // D2：归属会话（发布段 docIfUnchanged 复核）
     int64_t revision = 0;
     int op = 0;         // 0=rot90 1=flip 2=trim 3=revealAll 4=resample 5=rotArb 6=caScale
     bool flag = true;   // clockwise / horizontal
@@ -4517,13 +4658,14 @@ napi_value DocGeomAsync(napi_env env, napi_callback_info info, int op) {
     }
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             delete ctx;
             return makeError(env, kErrNoDoc, "docGeom: no document");
         }
-        ctx->docSnap = e.doc;
-        ctx->epoch = e.docEpoch;
-        ctx->revision = e.docRevision;
+        ctx->docSnap = e.doc();
+        ctx->epoch = e.docEpoch();
+        ctx->revision = e.docRevision();
+        ctx->docSess = &e.doc();
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -4589,7 +4731,10 @@ napi_value DocGeomAsync(napi_env env, napi_callback_info info, int op) {
             // 发布段（持锁）：代次/版本失配 = 快照后有并发编辑/关档 → 整体作废
             auto& eg = Engine::get();
             std::lock_guard<std::mutex> lk(eg.docMutex);
-            if (c->changed && eg.docEpoch == c->epoch && eg.docRevision == c->revision) {
+            auto sess = eg.docIfUnchanged(Engine::DocStamp{static_cast<DocSession*>(c->docSess),
+                                                           c->epoch,
+                                                           static_cast<uint32_t>(c->revision)});
+            if (c->changed && sess != nullptr) {
                 const char* label = c->op == 0
                                         ? (c->flag ? "rotate 90 CW" : "rotate 90 CCW")
                                     : c->op == 1
@@ -4599,10 +4744,10 @@ napi_value DocGeomAsync(napi_env env, napi_callback_info info, int op) {
                                     : c->op == 4 ? "image size"
                                     : c->op == 6 ? "content-aware scale"
                                                  : "rotate arbitrary";
-                eg.history.beginEdit(eg.doc, label, static_cast<uint64_t>(eg.docRevision));
-                eg.doc = std::move(work);
-                eg.history.endEdit(eg.doc, static_cast<uint64_t>(eg.docRevision));
-                eg.bumpRevisionLocked();
+                sess->history.beginEdit(sess->doc, label, static_cast<uint64_t>(sess->revision));
+                sess->doc = std::move(work);
+                sess->history.endEdit(sess->doc, static_cast<uint64_t>(sess->revision));
+                eg.bumpRevisionLocked(sess.get());
                 eg.requestRender();
             } else {
                 c->changed = false;
@@ -4662,13 +4807,13 @@ napi_value TranslateLayer(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "translateLayer: no document");
         }
-        Layer* l = id > 0 ? findLayerLocked(e.doc, static_cast<LayerId>(id)) : nullptr;
+        Layer* l = id > 0 ? findLayerLocked(e.doc(), static_cast<LayerId>(id)) : nullptr;
         if (l == nullptr) {
-            for (Layer& li : e.doc.layers) {
-                if (li.id == e.doc.activeId) {
+            for (Layer& li : e.doc().layers) {
+                if (li.id == e.doc().activeId) {
                     l = &li;
                     break;
                 }
@@ -4678,21 +4823,21 @@ napi_value TranslateLayer(napi_env env, napi_callback_info info) {
             return makeError(env, kErrNoDoc, "translateLayer: no active layer");
         }
         // M14b 链接联动：拖拽目标 linkId 非零 → 同组全部层一起动（每组拖拽一次事务）
-        std::vector<LayerId> linked = collectLinkedIds(e.doc, l->id);
+        std::vector<LayerId> linked = collectLinkedIds(e.doc(), l->id);
         const int p = static_cast<int>(phase);
         if (p == 0) {
-            e.history.beginEdit(e.doc, linked.size() > 1 ? "move linked layers" : "move layer",
-                                static_cast<uint64_t>(e.docRevision));
+            e.history().beginEdit(e.doc(), linked.size() > 1 ? "move linked layers" : "move layer",
+                                static_cast<uint64_t>(e.docRevision()));
         }
         for (LayerId lid : linked) {
-            Layer* t = findLayerLocked(e.doc, lid);
+            Layer* t = findLayerLocked(e.doc(), lid);
             if (t == nullptr) {
                 continue;
             }
             shiftLayerOrigins(*t, dx, dy);  // M14c：styledOrigin 随层平移
         }
         if (p == 2) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             e.bumpRevisionLocked();
         }
         e.requestRender();
@@ -4716,17 +4861,17 @@ napi_value TranslateSelection(napi_env env, napi_callback_info info) {
     bool moved = false;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "translateSelection: no document");
         }
-        e.history.beginEdit(e.doc, "move selection", static_cast<uint64_t>(e.docRevision));
-        moved = translateSelection(e.doc, static_cast<int>(dx), static_cast<int>(dy));
+        e.history().beginEdit(e.doc(), "move selection", static_cast<uint64_t>(e.docRevision()));
+        moved = translateSelection(e.doc(), static_cast<int>(dx), static_cast<int>(dy));
         if (moved) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             e.bumpRevisionLocked();
             e.requestRender();
         } else {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         }
     }
     napi_value data = nullptr;
@@ -4755,7 +4900,7 @@ napi_value RenameLayer(napi_env env, napi_callback_info info) {
     bool ok = false;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
         if (l != nullptr) {
             l->name = std::string(buf, len);
             e.bumpRevisionLocked();
@@ -4806,11 +4951,11 @@ napi_value SamplePixel(napi_env env, napi_callback_info info) {
     ctx->sampleY = y;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             delete ctx;
             return makeError(env, kErrNoDoc, "samplePixel: no document");
         }
-        ctx->job = io::BuildFlattenJob(e.doc, 0, 0, 0, 0);
+        ctx->job = io::BuildFlattenJob(e.doc(), 0, 0, 0, 0);
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -4870,12 +5015,12 @@ napi_value ExportPng(napi_env env, napi_callback_info info) {
     ctx->fd = fd;  // 全路径接管：execute 关闭（成功/失败都关）
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             delete ctx;
             close(fd);
             return makeError(env, kErrNoDoc, "exportPng: no document");
         }
-        ctx->job = io::BuildFlattenJob(e.doc, 0, 0, 0, 0);
+        ctx->job = io::BuildFlattenJob(e.doc(), 0, 0, 0, 0);
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -4952,20 +5097,20 @@ napi_value BakeLayerTransform(napi_env env, napi_callback_info info) {
     bool ok = false;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "bakeLayerTransform: no document");
         }
-        e.history.beginEdit(e.doc, "free transform", static_cast<uint64_t>(e.docRevision));
-        ok = bakeLayerTransform(e.doc, static_cast<LayerId>(id), p[0], p[1], p[2], p[3], p[4], p[5]);
+        e.history().beginEdit(e.doc(), "free transform", static_cast<uint64_t>(e.docRevision()));
+        ok = bakeLayerTransform(e.doc(), static_cast<LayerId>(id), p[0], p[1], p[2], p[3], p[4], p[5]);
         if (ok) {
             restyleAllLocked(e);
         }
         if (ok) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             e.bumpRevisionLocked();
             e.requestRender();
         } else {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         }
     }
     napi_value data = nullptr;
@@ -4980,12 +5125,12 @@ napi_value BeginTransformOverlay(napi_env env, napi_callback_info /*info*/) {
     int bx = 0, by = 0, bw = 0, bh = 0;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "beginTransformOverlay: no document");
         }
         const Layer* active = nullptr;
-        for (const Layer& l : e.doc.layers) {
-            if (l.id == e.doc.activeId) {
+        for (const Layer& l : e.doc().layers) {
+            if (l.id == e.doc().activeId) {
                 active = &l;
                 break;
             }
@@ -4993,13 +5138,13 @@ napi_value BeginTransformOverlay(napi_env env, napi_callback_info /*info*/) {
         if (active == nullptr || active->effectivePixels() == nullptr) {
             return makeError(env, kErrBadParam, "beginTransformOverlay: empty active layer");
         }
-        if (!visibleContentBBox(e.doc, bx, by, bw, bh)) {
+        if (!visibleContentBBox(e.doc(), bx, by, bw, bh)) {
             return makeError(env, kErrBadParam, "beginTransformOverlay: no content");
         }
-        Engine::TransformPreview tp;
+        TransformPreview tp;
         tp.layerId = active->id;
         tp.active = true;  // 单位阵（无变换）
-        e.transformPreview = tp;
+        e.active().transformPreview = tp;
         e.requestRender();
     }
     napi_value data = nullptr;
@@ -5026,12 +5171,12 @@ napi_value SetTransformPreview(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        e.transformPreview.active = active;
+        e.active().transformPreview.active = active;
         if (active && argc >= 7) {
             for (int i = 0; i < 6; ++i) {
                 double v = 0;
                 if (napi_get_value_double(env, argv[i + 1], &v) == napi_ok) {
-                    e.transformPreview.m[i] = v;
+                    e.active().transformPreview.m[i] = v;
                 }
             }
         }
@@ -5051,6 +5196,7 @@ struct BakeCtx {
     // 发布护栏（审查修复）：快照到 worker 执行之间文档可能被并发编辑/关闭，
     // 代次+版本失配即作废，防旧 docSnap 整档覆盖丢编辑/复活已关档（照 developRaw 复核范式）
     uint64_t epoch = 0;
+    void* docSess = nullptr;  // D2：归属会话（发布段 docIfUnchanged 复核）
     int64_t revision = 0;
 };
 
@@ -5083,15 +5229,16 @@ napi_value BakeLayerMatrix(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             delete ctx;
             return makeError(env, kErrNoDoc, "bakeLayerMatrix: no document");
         }
-        ctx->docSnap = e.doc;
-        ctx->epoch = e.docEpoch;
-        ctx->revision = e.docRevision;
+        ctx->docSnap = e.doc();
+        ctx->epoch = e.docEpoch();
+        ctx->revision = e.docRevision();
+        ctx->docSess = &e.doc();
         // 预览态即清（渲染回到未变换；烘焙结果异步发布）
-        e.transformPreview.active = false;
+        e.active().transformPreview.active = false;
         e.requestRender();
     }
     napi_value promise = nullptr;
@@ -5104,20 +5251,27 @@ napi_value BakeLayerMatrix(napi_env env, napi_callback_info info) {
             auto* c = static_cast<BakeCtx*>(data);
             auto& e = Engine::get();
             // warp 在锁外跑（此前持 docMutex 整段烘焙，大图长阻塞所有命令）；
-            // 纯函数作用于快照副本，历史事务只在发布段挂 e.doc——作废路径零污染
+            // 纯函数作用于快照副本，历史事务只在发布段挂 e.doc()——作废路径零污染
             Document work = c->docSnap;
             const bool baked = bakeLayerMatrix(work, static_cast<LayerId>(c->id), c->m);
             std::lock_guard<std::mutex> lk(e.docMutex);
-            if (!baked || e.docEpoch != c->epoch || e.docRevision != c->revision) {
+            auto sess = e.docIfUnchanged(Engine::DocStamp{static_cast<DocSession*>(c->docSess),
+                                                          c->epoch,
+                                                          static_cast<uint32_t>(c->revision)});
+            if (!baked || sess == nullptr) {
                 c->ok = false;  // 烘焙失败或快照已过期 → 整体作废，不发布不进历史
                 return;
             }
-            e.history.beginEdit(e.doc, "free transform", static_cast<uint64_t>(e.docRevision));
-            e.doc = std::move(work);
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            sess->history.beginEdit(sess->doc, "free transform", static_cast<uint64_t>(sess->revision));
+            sess->doc = std::move(work);
+            sess->history.endEdit(sess->doc, static_cast<uint64_t>(sess->revision));
             c->ok = true;
-            restyleAllLocked(e);
-            e.bumpRevisionLocked();
+            if (&e.active() == sess.get()) {
+                restyleAllLocked(e);
+            } else {
+                restyleDocument(sess->doc);
+            }
+            e.bumpRevisionLocked(sess.get());
             e.requestRender();
         },
         [](napi_env env, napi_status status, void* data) {
@@ -5143,7 +5297,7 @@ napi_value CancelTransformOverlay(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        e.transformPreview.active = false;
+        e.active().transformPreview.active = false;
         e.requestRender();
     }
     return makeOk(env, nullptr);
@@ -5196,11 +5350,11 @@ napi_value SetCurvePoints(napi_env env, napi_callback_info info) {
     bool ok = false;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
         if (l == nullptr || l->adjustment == nullptr) {
             return makeError(env, kErrBadParam, "setCurvePoints: not an adjustment layer");
         }
-        e.history.beginEdit(e.doc, "curves points", static_cast<uint64_t>(e.docRevision),
+        e.history().beginEdit(e.doc(), "curves points", static_cast<uint64_t>(e.docRevision()),
                             "curve:" + std::to_string(static_cast<long long>(id)));
         // COW（照 setAdjustmentParams 范式）：History 快照浅拷贝 shared_ptr，原地改 pointee
         // 会同步污染撤销前快照 → undo 恢复不出旧曲线
@@ -5209,7 +5363,7 @@ napi_value SetCurvePoints(napi_env env, napi_callback_info info) {
         adj->curveX = xs;
         adj->curveY = ys;
         l->adjustment = std::move(adj);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
         ok = true;
@@ -5268,7 +5422,7 @@ napi_value SetAdjustmentKind(napi_env env, napi_callback_info info) {
     bool ok = false;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(v[0]));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(v[0]));
         if (l == nullptr || l->adjustment == nullptr) {
             return makeError(env, kErrBadParam, "setAdjustmentKind: not an adjustment layer");
         }
@@ -5276,7 +5430,7 @@ napi_value SetAdjustmentKind(napi_env env, napi_callback_info info) {
         if (kind < 0 || kind > 7) {
             return makeError(env, kErrBadParam, "setAdjustmentKind: bad kind");
         }
-        e.history.beginEdit(e.doc, "adjustment kind", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "adjustment kind", static_cast<uint64_t>(e.docRevision()));
         // COW：同 setCurvePoints——kind/参数原地改会污染 History 浅拷贝的撤销前快照
         auto adj = std::make_shared<LayerAdjustment>(*l->adjustment);
         adj->kind = static_cast<AdjustmentKind>(kind);
@@ -5285,7 +5439,7 @@ napi_value SetAdjustmentKind(napi_env env, napi_callback_info info) {
         adj->p2 = static_cast<float>(v[4]);
         adj->p3 = static_cast<float>(v[5]);
         l->adjustment = std::move(adj);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
         ok = true;
@@ -5313,11 +5467,11 @@ napi_value GetHistogram(napi_env env, napi_callback_info /*info*/) {
     auto* ctx = new HistogramCtx();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             delete ctx;
             return makeError(env, kErrNoDoc, "getHistogram: no document");
         }
-        ctx->job = io::BuildFlattenJob(e.doc, 0, 0, 0, 0);
+        ctx->job = io::BuildFlattenJob(e.doc(), 0, 0, 0, 0);
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -5407,25 +5561,25 @@ napi_value ExportPsd(napi_env env, napi_callback_info info) {
     ctx->fd = fd;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             delete ctx;
             close(fd);
             return makeError(env, kErrNoDoc, "exportPsd: no document");
         }
         io::PsdDocSnap snap;
-        snap.workPath = e.doc.workPath;  // M18d：路径资源导出
-        snap.paths = e.doc.paths;
-        snap.width = e.doc.width;
-        snap.height = e.doc.height;
-        snap.name = e.doc.name;
+        snap.workPath = e.doc().workPath;  // M18d：路径资源导出
+        snap.paths = e.doc().paths;
+        snap.width = e.doc().width;
+        snap.height = e.doc().height;
+        snap.name = e.doc().name;
         // M22：深色/多模式往返元数据（原 header/ICC/色板/全局块）
-        snap.psdSrcDepth = e.doc.psdSrcDepth;
-        snap.psdSrcMode = e.doc.psdSrcMode;
-        snap.psdSrcChannels = e.doc.psdSrcChannels;
-        snap.psdIccProfile = e.doc.psdIccProfile;
-        snap.psdColorModeData = e.doc.psdColorModeData;
-        snap.globalBlocks = e.doc.psdGlobalExtra;
-        for (const Layer& l : e.doc.layers) {
+        snap.psdSrcDepth = e.doc().psdSrcDepth;
+        snap.psdSrcMode = e.doc().psdSrcMode;
+        snap.psdSrcChannels = e.doc().psdSrcChannels;
+        snap.psdIccProfile = e.doc().psdIccProfile;
+        snap.psdColorModeData = e.doc().psdColorModeData;
+        snap.globalBlocks = e.doc().psdGlobalExtra;
+        for (const Layer& l : e.doc().layers) {
             io::PsdLayerSnap pl;
             pl.name = l.name;
             pl.visible = l.visible;
@@ -5509,7 +5663,7 @@ napi_value ExportPsd(napi_env env, napi_callback_info info) {
             snap.layers.push_back(std::move(pl));
         }
         ctx->psdSnap = std::move(snap);
-        ctx->job = io::BuildFlattenJob(e.doc, 0, 0, 0, 0);
+        ctx->job = io::BuildFlattenJob(e.doc(), 0, 0, 0, 0);
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -5569,11 +5723,11 @@ napi_value FlattenToPixelMap(napi_env env, napi_callback_info /*info*/) {
     auto* ctx = new ExportCtx();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             delete ctx;
             return makeError(env, kErrNoDoc, "flattenToPixelMap: no document");
         }
-        ctx->job = io::BuildFlattenJob(e.doc, 0, 0, 0, 0);
+        ctx->job = io::BuildFlattenJob(e.doc(), 0, 0, 0, 0);
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -5673,13 +5827,13 @@ napi_value CreateTextLayer(napi_env env, napi_callback_info info) {
     double newId = 0;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "createTextLayer: no document");
         }
-        if (e.textEditOpen) {
+        if (e.active().textEditOpen) {
             return makeError(env, kErrBadParam, "createTextLayer: text edit session open");
         }
-        e.history.beginEdit(e.doc, "add text", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "add text", static_cast<uint64_t>(e.docRevision()));
         Layer layer;
         layer.id = e.nextLayerId();
         layer.name = "文本";
@@ -5692,17 +5846,17 @@ napi_value CreateTextLayer(napi_env env, napi_callback_info info) {
         layer.text = std::move(t);
         layer.transform.originX = x;
         layer.transform.originY = y;
-        size_t at = e.doc.layers.size();
-        for (size_t i = 0; i < e.doc.layers.size(); ++i) {
-            if (e.doc.layers[i].id == e.doc.activeId) {
+        size_t at = e.doc().layers.size();
+        for (size_t i = 0; i < e.doc().layers.size(); ++i) {
+            if (e.doc().layers[i].id == e.doc().activeId) {
                 at = i + 1;
                 break;
             }
         }
-        e.doc.layers.insert(e.doc.layers.begin() + static_cast<long>(at), std::move(layer));
-        e.doc.activeId = e.doc.layers[at].id;
-        newId = static_cast<double>(e.doc.layers[at].id);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.doc().layers.insert(e.doc().layers.begin() + static_cast<long>(at), std::move(layer));
+        e.doc().activeId = e.doc().layers[at].id;
+        newId = static_cast<double>(e.doc().layers[at].id);
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -5738,7 +5892,7 @@ napi_value SetTextLayerContent(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
         if (l == nullptr || l->text == nullptr) {
             return makeError(env, kErrBadParam, "setTextLayerContent: text layer not found");
         }
@@ -5746,7 +5900,7 @@ napi_value SetTextLayerContent(napi_env env, napi_callback_info info) {
             return makeOk(env, nullptr);  // 无变化（debounce 抖动）
         }
         if (txn != 0) {
-            e.history.beginEdit(e.doc, "text edit", static_cast<uint64_t>(e.docRevision));
+            e.history().beginEdit(e.doc(), "text edit", static_cast<uint64_t>(e.docRevision()));
         }
         auto nt = std::make_shared<TextLayerState>(*l->text);  // COW
         nt->content = content;
@@ -5755,7 +5909,7 @@ napi_value SetTextLayerContent(napi_env env, napi_callback_info info) {
         relayoutTextLayer(*l, err);
         l->name = textLayerDisplayName(*l->text);
         if (txn != 0) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         }
         e.bumpRevisionLocked();
         e.requestRender();
@@ -5813,12 +5967,12 @@ napi_value SetTextLayerStyle(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
         if (l == nullptr || l->text == nullptr) {
             return makeError(env, kErrBadParam, "setTextLayerStyle: text layer not found");
         }
         if (txn != 0) {
-            e.history.beginEdit(e.doc, "text style", static_cast<uint64_t>(e.docRevision));
+            e.history().beginEdit(e.doc(), "text style", static_cast<uint64_t>(e.docRevision()));
         }
         auto nt = std::make_shared<TextLayerState>(*l->text);  // COW
         nt->fontFamily = family;
@@ -5838,7 +5992,7 @@ napi_value SetTextLayerStyle(napi_env env, napi_callback_info info) {
         std::string err;
         relayoutTextLayer(*l, err);
         if (txn != 0) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         }
         e.bumpRevisionLocked();
         e.requestRender();
@@ -5858,16 +6012,16 @@ napi_value RasterizeTextLayer(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
         if (l == nullptr || l->text == nullptr) {
             return makeError(env, kErrBadParam, "rasterizeTextLayer: text layer not found");
         }
-        if (e.textEditOpen && e.textEditLayerId == l->id) {
+        if (e.active().textEditOpen && e.active().textEditLayerId == l->id) {
             return makeError(env, kErrBadParam, "rasterizeTextLayer: edit session open");
         }
-        e.history.beginEdit(e.doc, "rasterize text", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "rasterize text", static_cast<uint64_t>(e.docRevision()));
         rasterizeTextLayerToPixels(*l);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -5887,16 +6041,16 @@ napi_value BeginTextSession(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
         if (l == nullptr || l->text == nullptr) {
             return makeError(env, kErrBadParam, "beginTextSession: text layer not found");
         }
-        if (e.textEditOpen) {
+        if (e.active().textEditOpen) {
             return makeError(env, kErrBadParam, "beginTextSession: already open");
         }
-        e.textEditOpen = true;
-        e.textEditLayerId = l->id;
-        e.history.beginEdit(e.doc, "text edit", static_cast<uint64_t>(e.docRevision));
+        e.active().textEditOpen = true;
+        e.active().textEditLayerId = l->id;
+        e.history().beginEdit(e.doc(), "text edit", static_cast<uint64_t>(e.docRevision()));
         e.requestRender();  // 编辑层从 GL 隐藏（渲染快照按 textEditOpen 跳过）
     }
     return makeOk(env, nullptr);
@@ -5906,10 +6060,10 @@ napi_value EndTextSession(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.textEditOpen) {
-            e.textEditOpen = false;
-            e.textEditLayerId = 0;
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        if (e.active().textEditOpen) {
+            e.active().textEditOpen = false;
+            e.active().textEditLayerId = 0;
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             e.historyVersion.fetch_add(1);
             e.requestRender();  // 编辑层回 GL 显示
         }
@@ -5963,7 +6117,7 @@ napi_value RegisterFontFile(napi_env env, napi_callback_info info) {
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
         std::string relayoutErr;
-        n = relayoutDocumentText(e.doc, relayoutErr);
+        n = relayoutDocumentText(e.doc(), relayoutErr);
         if (n > 0) {
             e.bumpRevisionLocked();
             e.requestRender();
@@ -6325,19 +6479,19 @@ napi_value ApplyFilter(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0) {
+        if (e.doc().width == 0) {
             return makeError(env, kErrNoDoc, "applyFilter: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
+        if (e.active().textEditOpen || e.active().filterPreview.active || e.active().camPreview.open) {
             return makeError(env, kErrBadParam, "applyFilter: edit/preview session open");
         }
-        e.history.beginEdit(e.doc, "filter", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "filter", static_cast<uint64_t>(e.docRevision()));
         std::string err;
-        if (!applyFilterToLayer(e.doc, static_cast<LayerId>(id), p, err)) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));  // before==after 丢弃
+        if (!applyFilterToLayer(e.doc(), static_cast<LayerId>(id), p, err)) {
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));  // before==after 丢弃
             return makeError(env, kErrBadParam, "applyFilter: " + err);
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -6356,10 +6510,10 @@ napi_value BeginFilterPreview(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0) {
+        if (e.doc().width == 0) {
             return makeError(env, kErrNoDoc, "beginFilterPreview: no document");
         }
-        Layer* layer = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        Layer* layer = findLayerLocked(e.doc(), static_cast<LayerId>(id));
         if (layer == nullptr) {
             return makeError(env, kErrBadParam, "beginFilterPreview: layer not found");
         }
@@ -6370,7 +6524,7 @@ napi_value BeginFilterPreview(napi_env env, napi_callback_info info) {
         if (srcGrid == nullptr) {
             return makeError(env, kErrBadParam, "beginFilterPreview: empty layer");
         }
-        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
+        if (e.active().textEditOpen || e.active().filterPreview.active || e.active().camPreview.open) {
             return makeError(env, kErrBadParam, "beginFilterPreview: session open");
         }
         uint32_t gx = 0, gy = 0, w = 0, h = 0;
@@ -6379,8 +6533,8 @@ napi_value BeginFilterPreview(napi_env env, napi_callback_info info) {
         }
         std::vector<uint8_t> strip;
         filterGridToStrip(*srcGrid, gx, gy, w, h, strip);
-        auto& fp = e.filterPreview;
-        fp = Engine::FilterPreview{};
+        auto& fp = e.active().filterPreview;
+        fp = FilterPreview{};
         fp.active = true;
         fp.layerId = static_cast<LayerId>(id);
         fp.fullW = w;
@@ -6434,7 +6588,7 @@ napi_value SetFilterPreview(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Engine::FilterPreview& fp = e.filterPreview;
+        FilterPreview& fp = e.active().filterPreview;
         if (!fp.active || fp.srcStrip.empty()) {
             return makeError(env, kErrBadParam, "setFilterPreview: no preview session");
         }
@@ -6485,9 +6639,9 @@ napi_value EndFilterPreview(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Engine::FilterPreview& fp = e.filterPreview;
+        FilterPreview& fp = e.active().filterPreview;
         if (fp.active) {
-            Layer* fl = findLayerLocked(e.doc, fp.layerId);
+            Layer* fl = findLayerLocked(e.doc(), fp.layerId);
             const bool isSmartLayer = fl != nullptr && fl->smart != nullptr;
             if (commit != 0 && !isSmartLayer) {
                 // M21：SO 层提交走 addSmartFilter（整链重渲），此处只清代理。
@@ -6499,20 +6653,20 @@ napi_value EndFilterPreview(napi_env env, napi_callback_info info) {
                     p.colorBg[0] = e.bgColor[0];
                     p.colorBg[1] = e.bgColor[1];
                     p.colorBg[2] = e.bgColor[2];
-                    e.history.beginEdit(e.doc, histLabel, static_cast<uint64_t>(e.docRevision));
+                    e.history().beginEdit(e.doc(), histLabel, static_cast<uint64_t>(e.docRevision()));
                     std::string err;
-                    if (applyFilterToLayer(e.doc, fp.layerId, p, err)) {
+                    if (applyFilterToLayer(e.doc(), fp.layerId, p, err)) {
                         restyleAllLocked(e);
-                        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+                        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
                         e.bumpRevisionLocked();
                     } else {
-                        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+                        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
                         OH_LOG_Print(LOG_APP, LOG_WARN, 0x4D30, "Montage.Filter",
                                      "commit failed: %{public}s", err.c_str());
                     }
                 }
             }
-            fp = Engine::FilterPreview{};
+            fp = FilterPreview{};
             e.requestRender();
         }
     }
@@ -6576,14 +6730,14 @@ static void camOpComplete(napi_env env, napi_status status, void* data) {
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
         Layer* l = nullptr;
-        for (Layer& cand : e.doc.layers) {
+        for (Layer& cand : e.doc().layers) {
             if (cand.id == c->layerId) { l = &cand; break; }
         }
         if (l != nullptr && status == napi_ok && c->ok) {
             if (c->mode == 1) {
                 // 预览：会话仍开且代次最新才发布；无事务（pending 已在首预览挂上）。
-                if (e.camPreview.open && e.camPreview.layerId == c->layerId &&
-                    e.camPreview.seq == c->seq) {
+                if (e.active().camPreview.open && e.active().camPreview.layerId == c->layerId &&
+                    e.active().camPreview.seq == c->seq) {
                     if (c->grid) l->pixels = c->grid;
                     restyleAllLocked(e);
                     e.bumpRevisionLocked();
@@ -6592,32 +6746,32 @@ static void camOpComplete(napi_env env, napi_status status, void* data) {
                     applied = true;  // 陈旧任务：静默丢弃（不算失败）
                 }
             } else if (c->mode == 0) {
-                e.history.beginEdit(e.doc, c->fromRaw ? "RAW 显影" : "Camera Raw 滤镜",
-                                    static_cast<uint64_t>(e.docRevision));
+                e.history().beginEdit(e.doc(), c->fromRaw ? "RAW 显影" : "Camera Raw 滤镜",
+                                    static_cast<uint64_t>(e.docRevision()));
                 if (c->grid) l->pixels = c->grid;
                 restyleAllLocked(e);
-                e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+                e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
                 e.bumpRevisionLocked();
-                if (c->fromRaw) e.rawDevelop.last = c->params;
+                if (c->fromRaw) e.active().rawDevelop.last = c->params;
                 applied = true;
             } else if (c->mode == 2) {
                 // 终提交：会话仍开且代次最新才收口；否则退回单步事务路径。
-                if (e.camPreview.open && e.camPreview.layerId == c->layerId &&
-                    e.camPreview.seq == c->seq) {
+                if (e.active().camPreview.open && e.active().camPreview.layerId == c->layerId &&
+                    e.active().camPreview.seq == c->seq) {
                     if (c->grid) l->pixels = c->grid;
                     restyleAllLocked(e);
-                    e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+                    e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
                     e.bumpRevisionLocked();
-                    if (c->fromRaw) e.rawDevelop.last = c->params;
-                    e.camPreview.open = false;
+                    if (c->fromRaw) e.active().rawDevelop.last = c->params;
+                    e.active().camPreview.open = false;
                 } else {
-                    e.history.beginEdit(e.doc, c->fromRaw ? "RAW 显影" : "Camera Raw 滤镜",
-                                        static_cast<uint64_t>(e.docRevision));
+                    e.history().beginEdit(e.doc(), c->fromRaw ? "RAW 显影" : "Camera Raw 滤镜",
+                                        static_cast<uint64_t>(e.docRevision()));
                     if (c->grid) l->pixels = c->grid;
                     restyleAllLocked(e);
-                    e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+                    e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
                     e.bumpRevisionLocked();
-                    if (c->fromRaw) e.rawDevelop.last = c->params;
+                    if (c->fromRaw) e.active().rawDevelop.last = c->params;
                 }
                 e.historyVersion.fetch_add(1);
                 applied = true;
@@ -6688,15 +6842,15 @@ napi_value DevelopRaw(napi_env env, napi_callback_info info) {
     if (mode == 3) {
         // 取消：同步还原（不排队异步）。
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (!e.camPreview.open || !e.camPreview.fromRaw) {
+        if (!e.active().camPreview.open || !e.active().camPreview.fromRaw) {
             return makeError(env, kErrBadParam, "developRaw: no preview session");
         }
-        const LayerId id = e.camPreview.layerId;
-        auto snap = e.camPreview.snap;
-        e.camPreview = Engine::CameraPreviewSession{};
+        const LayerId id = e.active().camPreview.layerId;
+        auto snap = e.active().camPreview.snap;
+        e.active().camPreview = CameraPreviewSession{};
         Document before;
-        e.history.takePending(before);
-        for (Layer& l : e.doc.layers) {
+        e.history().takePending(before);
+        for (Layer& l : e.doc().layers) {
             if (l.id == id) {
                 l.pixels = snap;
                 restyleAllLocked(e);
@@ -6717,43 +6871,43 @@ napi_value DevelopRaw(napi_env env, napi_callback_info info) {
     ctx->params.cameraJson = std::move(cameraJson);
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (!e.rawDevelop.valid || e.rawDevelop.bytes.empty()) {
+        if (!e.active().rawDevelop.valid || e.active().rawDevelop.bytes.empty()) {
             delete ctx;
             return makeError(env, kErrNoDoc, "developRaw: no RAW session (import a DNG first)");
         }
-        if (e.textEditOpen || e.filterPreview.active) {
+        if (e.active().textEditOpen || e.active().filterPreview.active) {
             delete ctx;
             return makeError(env, kErrBadParam, "developRaw: session open");
         }
-        if (e.camPreview.open && !e.camPreview.fromRaw) {
+        if (e.active().camPreview.open && !e.active().camPreview.fromRaw) {
             delete ctx;
             return makeError(env, kErrBadParam, "developRaw: camera raw filter session open");
         }
-        ctx->layerId = e.rawDevelop.layerId;
+        ctx->layerId = e.active().rawDevelop.layerId;
         if (mode == 1 || mode == 2) {
-            if (!e.camPreview.open) {
+            if (!e.active().camPreview.open) {
                 Layer* l = nullptr;
-                for (Layer& cand : e.doc.layers) {
+                for (Layer& cand : e.doc().layers) {
                     if (cand.id == ctx->layerId) { l = &cand; break; }
                 }
                 if (l == nullptr) {
                     delete ctx;
                     return makeError(env, kErrBadParam, "developRaw: RAW layer no longer exists");
                 }
-                e.camPreview.open = true;
-                e.camPreview.fromRaw = true;
-                e.camPreview.layerId = ctx->layerId;
-                e.camPreview.snap = l->pixels;
-                e.history.beginEdit(e.doc, "Camera Raw 显影",
-                                    static_cast<uint64_t>(e.docRevision));
-            } else if (e.camPreview.layerId != ctx->layerId) {
+                e.active().camPreview.open = true;
+                e.active().camPreview.fromRaw = true;
+                e.active().camPreview.layerId = ctx->layerId;
+                e.active().camPreview.snap = l->pixels;
+                e.history().beginEdit(e.doc(), "Camera Raw 显影",
+                                    static_cast<uint64_t>(e.docRevision()));
+            } else if (e.active().camPreview.layerId != ctx->layerId) {
                 delete ctx;
                 return makeError(env, kErrBadParam, "developRaw: preview session mismatch");
             }
-            ++e.camPreview.seq;
-            ctx->seq = e.camPreview.seq;
+            ++e.active().camPreview.seq;
+            ctx->seq = e.active().camPreview.seq;
         }
-        ctx->rawBytes = e.rawDevelop.bytes;
+        ctx->rawBytes = e.active().rawDevelop.bytes;
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -6804,15 +6958,15 @@ napi_value CameraRawFilter(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     if (mode == 3) {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (!e.camPreview.open || e.camPreview.fromRaw) {
+        if (!e.active().camPreview.open || e.active().camPreview.fromRaw) {
             return makeError(env, kErrBadParam, "cameraRawFilter: no preview session");
         }
-        const LayerId lid = e.camPreview.layerId;
-        auto snap = e.camPreview.snap;
-        e.camPreview = Engine::CameraPreviewSession{};
+        const LayerId lid = e.active().camPreview.layerId;
+        auto snap = e.active().camPreview.snap;
+        e.active().camPreview = CameraPreviewSession{};
         Document before;
-        e.history.takePending(before);
-        for (Layer& l : e.doc.layers) {
+        e.history().takePending(before);
+        for (Layer& l : e.doc().layers) {
             if (l.id == lid) {
                 l.pixels = snap;
                 restyleAllLocked(e);
@@ -6830,38 +6984,38 @@ napi_value CameraRawFilter(napi_env env, napi_callback_info info) {
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
         Layer* l = nullptr;
-        for (Layer& cand : e.doc.layers) {
+        for (Layer& cand : e.doc().layers) {
             if (cand.id == static_cast<LayerId>(id)) { l = &cand; break; }
         }
         if (l == nullptr || l->pixels == nullptr) {
             delete ctx;
             return makeError(env, kErrBadParam, "cameraRawFilter: layer has no pixels");
         }
-        if (e.textEditOpen || e.filterPreview.active) {
+        if (e.active().textEditOpen || e.active().filterPreview.active) {
             delete ctx;
             return makeError(env, kErrBadParam, "cameraRawFilter: session open");
         }
-        if (e.camPreview.open && e.camPreview.fromRaw) {
+        if (e.active().camPreview.open && e.active().camPreview.fromRaw) {
             delete ctx;
             return makeError(env, kErrBadParam, "cameraRawFilter: RAW preview session open");
         }
         ctx->layerId = l->id;
         const TileGrid* srcGrid = nullptr;
         if (mode == 1 || mode == 2) {
-            if (!e.camPreview.open) {
-                e.camPreview.open = true;
-                e.camPreview.fromRaw = false;
-                e.camPreview.layerId = l->id;
-                e.camPreview.snap = l->pixels;
-                e.history.beginEdit(e.doc, "Camera Raw 滤镜",
-                                    static_cast<uint64_t>(e.docRevision));
-            } else if (e.camPreview.layerId != l->id) {
+            if (!e.active().camPreview.open) {
+                e.active().camPreview.open = true;
+                e.active().camPreview.fromRaw = false;
+                e.active().camPreview.layerId = l->id;
+                e.active().camPreview.snap = l->pixels;
+                e.history().beginEdit(e.doc(), "Camera Raw 滤镜",
+                                    static_cast<uint64_t>(e.docRevision()));
+            } else if (e.active().camPreview.layerId != l->id) {
                 delete ctx;
                 return makeError(env, kErrBadParam, "cameraRawFilter: preview session mismatch");
             }
-            ++e.camPreview.seq;
-            ctx->seq = e.camPreview.seq;
-            srcGrid = e.camPreview.snap.get();
+            ++e.active().camPreview.seq;
+            ctx->seq = e.active().camPreview.seq;
+            srcGrid = e.active().camPreview.snap.get();
         } else {
             srcGrid = l->pixels.get();
         }
@@ -6898,20 +7052,20 @@ napi_value AddGroup(napi_env env, napi_callback_info info) {
     double newId = 0;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0) {
+        if (e.doc().width == 0) {
             return makeError(env, kErrNoDoc, "addGroup: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
+        if (e.active().textEditOpen || e.active().filterPreview.active || e.active().camPreview.open) {
             return makeError(env, kErrBadParam, "addGroup: session open");
         }
-        e.history.beginEdit(e.doc, "new group", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "new group", static_cast<uint64_t>(e.docRevision()));
         std::string err;
-        const LayerId id = createGroup(e.doc, e.nextLayerId(), "", err);
+        const LayerId id = createGroup(e.doc(), e.nextLayerId(), "", err);
         if (id == 0) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, "addGroup: " + err);
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         newId = static_cast<double>(id);
         e.bumpRevisionLocked();
         e.requestRender();
@@ -6935,14 +7089,14 @@ napi_value GroupLayer(napi_env env, napi_callback_info info) {
     double newId = 0;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        e.history.beginEdit(e.doc, "group layer", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "group layer", static_cast<uint64_t>(e.docRevision()));
         std::string err;
-        const LayerId gid = groupLayer(e.doc, e.nextLayerId(), static_cast<LayerId>(id), err);
+        const LayerId gid = groupLayer(e.doc(), e.nextLayerId(), static_cast<LayerId>(id), err);
         if (gid == 0) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, "groupLayer: " + err);
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         newId = static_cast<double>(gid);
         e.bumpRevisionLocked();
         e.requestRender();
@@ -6965,13 +7119,13 @@ napi_value UngroupLayer(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        e.history.beginEdit(e.doc, "ungroup", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "ungroup", static_cast<uint64_t>(e.docRevision()));
         std::string err;
-        if (!ungroupLayer(e.doc, static_cast<LayerId>(id), err)) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        if (!ungroupLayer(e.doc(), static_cast<LayerId>(id), err)) {
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, "ungroupLayer: " + err);
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -6992,14 +7146,14 @@ napi_value SetLayerParent(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        e.history.beginEdit(e.doc, "reorder layer", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "reorder layer", static_cast<uint64_t>(e.docRevision()));
         std::string err;
-        if (!setLayerParent(e.doc, static_cast<LayerId>(id), static_cast<LayerId>(parent),
+        if (!setLayerParent(e.doc(), static_cast<LayerId>(id), static_cast<LayerId>(parent),
                             static_cast<int>(index), err)) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, "setLayerParent: " + err);
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -7021,7 +7175,7 @@ napi_value SetGroupCollapsed(napi_env env, napi_callback_info info) {
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
         std::string err;
-        if (!setGroupCollapsed(e.doc, static_cast<LayerId>(id), collapsed != 0, err)) {
+        if (!setGroupCollapsed(e.doc(), static_cast<LayerId>(id), collapsed != 0, err)) {
             return makeError(env, kErrBadParam, "setGroupCollapsed: " + err);
         }
         e.bumpRevisionLocked();
@@ -7073,19 +7227,19 @@ napi_value runLayerMergeCommand(napi_env env, const char* what,
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, std::string(what) + ": no document");
         }
-        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
+        if (e.active().textEditOpen || e.active().filterPreview.active || e.active().camPreview.open) {
             return makeError(env, kErrBadParam, std::string(what) + ": session open");
         }
-        e.history.beginEdit(e.doc, what, static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), what, static_cast<uint64_t>(e.docRevision()));
         std::string err;
-        if (!fn(e.doc, err)) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        if (!fn(e.doc(), err)) {
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, std::string(what) + ": " + err);
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -7104,19 +7258,19 @@ napi_value FlattenImage(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "flattenImage: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
+        if (e.active().textEditOpen || e.active().filterPreview.active || e.active().camPreview.open) {
             return makeError(env, kErrBadParam, "flattenImage: session open");
         }
-        e.history.beginEdit(e.doc, "flatten image", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "flatten image", static_cast<uint64_t>(e.docRevision()));
         std::string err;
-        if (!flattenImage(e.doc, e.nextLayerId(), err)) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        if (!flattenImage(e.doc(), e.nextLayerId(), err)) {
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, "flattenImage: " + err);
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -7128,22 +7282,22 @@ napi_value StampVisible(napi_env env, napi_callback_info /*info*/) {
     double newId = 0;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "stampVisible: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
+        if (e.active().textEditOpen || e.active().filterPreview.active || e.active().camPreview.open) {
             return makeError(env, kErrBadParam, "stampVisible: session open");
         }
-        e.history.beginEdit(e.doc, "stamp visible", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "stamp visible", static_cast<uint64_t>(e.docRevision()));
         std::string err;
         const LayerId id = e.nextLayerId();
         const std::string name = "图层 " + std::to_string(id);
-        const LayerId got = stampVisible(e.doc, id, name, err);
+        const LayerId got = stampVisible(e.doc(), id, name, err);
         if (got == 0) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, "stampVisible: " + err);
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         newId = static_cast<double>(got);
         e.bumpRevisionLocked();
         e.requestRender();
@@ -7166,25 +7320,25 @@ napi_value DuplicateLayer(napi_env env, napi_callback_info info) {
     double newId = 0;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "duplicateLayer: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
+        if (e.active().textEditOpen || e.active().filterPreview.active || e.active().camPreview.open) {
             return makeError(env, kErrBadParam, "duplicateLayer: session open");
         }
         LayerId src = static_cast<LayerId>(id);
         if (src == 0) {
-            src = e.doc.activeId;
+            src = e.doc().activeId;
         }
-        e.history.beginEdit(e.doc, "duplicate layer", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "duplicate layer", static_cast<uint64_t>(e.docRevision()));
         std::string err;
-        const LayerId got = duplicateLayer(e.doc, src, e.nextLayerId(),
+        const LayerId got = duplicateLayer(e.doc(), src, e.nextLayerId(),
                                            [&e] { return e.nextLayerId(); }, err);
         if (got == 0) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, "duplicateLayer: " + err);
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         newId = static_cast<double>(got);
         e.bumpRevisionLocked();
         e.requestRender();
@@ -7210,17 +7364,17 @@ napi_value SetLayerLink(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "setLayerLink: no document");
         }
-        e.history.beginEdit(e.doc, link ? "link layers" : "unlink layers",
-                            static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), link ? "link layers" : "unlink layers",
+                            static_cast<uint64_t>(e.docRevision()));
         std::string err;
-        if (!setLayerLink(e.doc, ids, link != 0, err)) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        if (!setLayerLink(e.doc(), ids, link != 0, err)) {
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, "setLayerLink: " + err);
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -7242,16 +7396,16 @@ napi_value AlignLayers(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "alignLayers: no document");
         }
-        e.history.beginEdit(e.doc, "align layers", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "align layers", static_cast<uint64_t>(e.docRevision()));
         std::string err;
-        if (!alignLayers(e.doc, ids, mode, err)) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        if (!alignLayers(e.doc(), ids, mode, err)) {
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, "alignLayers: " + err);
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -7273,16 +7427,16 @@ napi_value DistributeLayers(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "distributeLayers: no document");
         }
-        e.history.beginEdit(e.doc, "distribute layers", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "distribute layers", static_cast<uint64_t>(e.docRevision()));
         std::string err;
-        if (!distributeLayers(e.doc, ids, mode, err)) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        if (!distributeLayers(e.doc(), ids, mode, err)) {
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, "distributeLayers: " + err);
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -7297,16 +7451,16 @@ napi_value runStyleCommand(napi_env env, const char* what, LayerId id,
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, std::string(what) + ": no document");
         }
-        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
+        if (e.active().textEditOpen || e.active().filterPreview.active || e.active().camPreview.open) {
             return makeError(env, kErrBadParam, std::string(what) + ": session open");
         }
-        Layer* l = id > 0 ? findLayerLocked(e.doc, id) : nullptr;
+        Layer* l = id > 0 ? findLayerLocked(e.doc(), id) : nullptr;
         if (l == nullptr) {
-            for (Layer& li : e.doc.layers) {
-                if (li.id == e.doc.activeId) {
+            for (Layer& li : e.doc().layers) {
+                if (li.id == e.doc().activeId) {
                     l = &li;
                     break;
                 }
@@ -7321,17 +7475,17 @@ napi_value runStyleCommand(napi_env env, const char* what, LayerId id,
         // H3 coalesce：键 = style:<实际层id>:<what>（what 已含效果名，跨效果不串账；
         // 定位后再取 id，0=活动层的键不会跨层合并）
         const std::string ck = "style:" + std::to_string(static_cast<long long>(l->id)) + ":" + what;
-        e.history.beginEdit(e.doc, what, static_cast<uint64_t>(e.docRevision), ck);
+        e.history().beginEdit(e.doc(), what, static_cast<uint64_t>(e.docRevision()), ck);
         std::string err;
-        if (!apply(e.doc, *l, err)) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        if (!apply(e.doc(), *l, err)) {
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, std::string(what) + ": " + err);
         }
-        if (!restyleLayer(e.doc, *l, nextGridRevision(), err)) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        if (!restyleLayer(e.doc(), *l, nextGridRevision(), err)) {
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, std::string(what) + ": " + err);
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -7730,14 +7884,14 @@ napi_value SetGlobalLight(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0) {
+        if (e.doc().width == 0) {
             return makeError(env, kErrNoDoc, "setGlobalLight: no document");
         }
-        e.doc.globalLightAngle = std::clamp(angle, 0.0, 360.0);
+        e.doc().globalLightAngle = std::clamp(angle, 0.0, 360.0);
         std::string err;
-        for (Layer& l : e.doc.layers) {
+        for (Layer& l : e.doc().layers) {
             if (l.style != nullptr || l.fill != nullptr) {
-                restyleLayer(e.doc, l, nextGridRevision(), err);
+                restyleLayer(e.doc(), l, nextGridRevision(), err);
             }
         }
         e.bumpRevisionLocked();
@@ -7758,12 +7912,12 @@ napi_value CopyLayerStyle(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0) {
+        if (e.doc().width == 0) {
             return makeError(env, kErrNoDoc, "copyLayerStyle: no document");
         }
         Layer* l = nullptr;
-        for (Layer& li : e.doc.layers) {
-            if (li.id == (id > 0 ? static_cast<LayerId>(id) : e.doc.activeId)) {
+        for (Layer& li : e.doc().layers) {
+            if (li.id == (id > 0 ? static_cast<LayerId>(id) : e.doc().activeId)) {
                 l = &li;
                 break;
             }
@@ -7847,13 +8001,13 @@ napi_value AddFillLayer(napi_env env, napi_callback_info info) {
     double newId = 0;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "addFillLayer: no document");
         }
-        if (e.textEditOpen || e.filterPreview.active || e.camPreview.open) {
+        if (e.active().textEditOpen || e.active().filterPreview.active || e.active().camPreview.open) {
             return makeError(env, kErrBadParam, "addFillLayer: session open");
         }
-        e.history.beginEdit(e.doc, "new fill layer", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "new fill layer", static_cast<uint64_t>(e.docRevision()));
         Layer layer;
         layer.id = e.nextLayerId();
         const int kind = static_cast<int>(v[0]);
@@ -7869,22 +8023,22 @@ napi_value AddFillLayer(napi_env env, napi_callback_info info) {
         layer.transform.originX = 0.0;
         layer.transform.originY = 0.0;
         std::string err;
-        if (!restyleLayer(e.doc, layer, nextGridRevision(), err)) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        if (!restyleLayer(e.doc(), layer, nextGridRevision(), err)) {
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, "addFillLayer: " + err);
         }
         // 插到活动层上方（addLayer 同语义）
-        size_t at = e.doc.layers.size();
-        for (size_t i = 0; i < e.doc.layers.size(); ++i) {
-            if (e.doc.layers[i].id == e.doc.activeId) {
+        size_t at = e.doc().layers.size();
+        for (size_t i = 0; i < e.doc().layers.size(); ++i) {
+            if (e.doc().layers[i].id == e.doc().activeId) {
                 at = i + 1;
                 break;
             }
         }
-        e.doc.layers.insert(e.doc.layers.begin() + static_cast<long>(at), std::move(layer));
-        e.doc.activeId = e.doc.layers[at].id;
-        newId = static_cast<double>(e.doc.layers[at].id);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.doc().layers.insert(e.doc().layers.begin() + static_cast<long>(at), std::move(layer));
+        e.doc().activeId = e.doc().layers[at].id;
+        newId = static_cast<double>(e.doc().layers[at].id);
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -7915,13 +8069,13 @@ napi_value SetFillLayerParams(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "setFillLayerParams: no document");
         }
-        Layer* l = id > 0 ? findLayerLocked(e.doc, id) : nullptr;
+        Layer* l = id > 0 ? findLayerLocked(e.doc(), id) : nullptr;
         if (l == nullptr) {
-            for (Layer& li : e.doc.layers) {
-                if (li.id == e.doc.activeId) {
+            for (Layer& li : e.doc().layers) {
+                if (li.id == e.doc().activeId) {
                     l = &li;
                     break;
                 }
@@ -7930,7 +8084,7 @@ napi_value SetFillLayerParams(napi_env env, napi_callback_info info) {
         if (l == nullptr || l->fill == nullptr) {
             return makeError(env, kErrBadParam, "setFillLayerParams: not a fill layer");
         }
-        e.history.beginEdit(e.doc, "fill layer params", static_cast<uint64_t>(e.docRevision),
+        e.history().beginEdit(e.doc(), "fill layer params", static_cast<uint64_t>(e.docRevision()),
                             "fill:" + std::to_string(static_cast<long long>(l->id)));
         // COW：fill 为 shared_ptr 且 History 浅拷贝，原地改会污染撤销前快照（同 adjustment）
         auto fill = std::make_shared<FillLayerState>(*l->fill);
@@ -7942,11 +8096,11 @@ napi_value SetFillLayerParams(napi_env env, napi_callback_info info) {
         fill->angleDeg = v[5];
         l->fill = std::move(fill);
         std::string err;
-        if (!restyleLayer(e.doc, *l, nextGridRevision(), err)) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        if (!restyleLayer(e.doc(), *l, nextGridRevision(), err)) {
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, "setFillLayerParams: " + err);
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -7970,7 +8124,7 @@ napi_value AddGuide(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     std::lock_guard<std::mutex> lk(e.docMutex);
     std::string err;
-    if (!addGuide(e.doc, orient, pos, err)) {
+    if (!addGuide(e.doc(), orient, pos, err)) {
         return makeError(env, kErrBadParam, "addGuide: " + err);
     }
     return makeOk(env, nullptr);
@@ -7991,7 +8145,7 @@ napi_value MoveGuide(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     std::lock_guard<std::mutex> lk(e.docMutex);
     std::string err;
-    if (!moveGuide(e.doc, orient, index, pos, err)) {
+    if (!moveGuide(e.doc(), orient, index, pos, err)) {
         return makeError(env, kErrBadParam, "moveGuide: " + err);
     }
     return makeOk(env, nullptr);
@@ -8010,7 +8164,7 @@ napi_value RemoveGuide(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     std::lock_guard<std::mutex> lk(e.docMutex);
     std::string err;
-    if (!removeGuide(e.doc, orient, index, err)) {
+    if (!removeGuide(e.doc(), orient, index, err)) {
         return makeError(env, kErrBadParam, "removeGuide: " + err);
     }
     return makeOk(env, nullptr);
@@ -8020,7 +8174,7 @@ napi_value RemoveGuide(napi_env env, napi_callback_info info) {
 napi_value ClearGuides(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     std::lock_guard<std::mutex> lk(e.docMutex);
-    clearGuides(e.doc);
+    clearGuides(e.doc());
     return makeOk(env, nullptr);
 }
 
@@ -8035,7 +8189,7 @@ napi_value SetGuidesLocked(napi_env env, napi_callback_info info) {
     }
     auto& e = Engine::get();
     std::lock_guard<std::mutex> lk(e.docMutex);
-    setGuidesLocked(e.doc, locked != 0);
+    setGuidesLocked(e.doc(), locked != 0);
     return makeOk(env, nullptr);
 }
 
@@ -8050,7 +8204,7 @@ napi_value SetGuidesVisible(napi_env env, napi_callback_info info) {
     }
     auto& e = Engine::get();
     std::lock_guard<std::mutex> lk(e.docMutex);
-    setGuidesVisible(e.doc, visible != 0);
+    setGuidesVisible(e.doc(), visible != 0);
     return makeOk(env, nullptr);
 }
 
@@ -8069,10 +8223,10 @@ napi_value GetGuides(napi_env env, napi_callback_info info) {
         }
         napi_set_named_property(env2, obj, key, arr);
     };
-    pushArr(env, data, "h", e.doc.guidesH);
-    pushArr(env, data, "v", e.doc.guidesV);
-    napi_set_named_property(env, data, "locked", makeBool(env, e.doc.guidesLocked));
-    napi_set_named_property(env, data, "visible", makeBool(env, e.doc.guidesVisible));
+    pushArr(env, data, "h", e.doc().guidesH);
+    pushArr(env, data, "v", e.doc().guidesV);
+    napi_set_named_property(env, data, "locked", makeBool(env, e.doc().guidesLocked));
+    napi_set_named_property(env, data, "visible", makeBool(env, e.doc().guidesVisible));
     return makeOk(env, data);
 }
 
@@ -8089,13 +8243,13 @@ napi_value GetLayerBounds(napi_env env, napi_callback_info info) {
     std::lock_guard<std::mutex> lk(e.docMutex);
     LayerId lid = static_cast<LayerId>(id);
     if (lid == 0) {
-        lid = e.doc.activeId;
+        lid = e.doc().activeId;
     }
     napi_value data = nullptr;
     napi_create_object(env, &data);
     double x = 0, y = 0, w = 0, h = 0;
     std::string err;
-    const bool ok = layerContentBBox(e.doc, lid, x, y, w, h, err);
+    const bool ok = layerContentBBox(e.doc(), lid, x, y, w, h, err);
     napi_set_named_property(env, data, "ok", makeBool(env, ok));
     napi_set_named_property(env, data, "x", makeDouble(env, x));
     napi_set_named_property(env, data, "y", makeDouble(env, y));
@@ -8111,7 +8265,7 @@ napi_value GetLayerBounds(napi_env env, napi_callback_info info) {
 napi_value GetHistoryList(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     std::lock_guard<std::mutex> lk(e.docMutex);
-    const History::Info hist = e.history.getInfo();
+    const History::Info hist = e.history().getInfo();
     napi_value data = nullptr;
     napi_create_object(env, &data);
     napi_value arr = nullptr;
@@ -8137,11 +8291,11 @@ napi_value SetHistoryState(napi_env env, napi_callback_info info) {
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
         std::string label;
-        uint64_t rev = static_cast<uint64_t>(e.docRevision);
-        if (!e.history.jumpTo(e.doc, rev, static_cast<size_t>(idx), label)) {
+        uint64_t rev = static_cast<uint64_t>(e.docRevision());
+        if (!e.history().jumpTo(e.doc(), rev, static_cast<size_t>(idx), label)) {
             return makeError(env, kErrBadParam, "setHistoryState: index out of range");
         }
-        e.docRevision = static_cast<int64_t>(rev);
+        e.docRevision() = static_cast<int64_t>(rev);
         e.fireRevisionLocked();  // 广播版本（不递增——撤销族同语义）
         e.requestRender();
     }
@@ -8322,15 +8476,15 @@ napi_value DefinePattern(napi_env env, napi_callback_info /*info*/) {
     napi_value data = nullptr;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "definePattern: no document");
         }
-        if (e.doc.selection == nullptr) {
+        if (e.doc().selection == nullptr) {
             return makeError(env, kErrBadParam, "definePattern: no active selection");
         }
         Layer* l = nullptr;
-        for (Layer& li : e.doc.layers) {
-            if (li.id == e.doc.activeId) {
+        for (Layer& li : e.doc().layers) {
+            if (li.id == e.doc().activeId) {
                 l = &li;
                 break;
             }
@@ -8339,7 +8493,7 @@ napi_value DefinePattern(napi_env env, napi_callback_info /*info*/) {
             return makeError(env, kErrBadParam, "definePattern: no active layer pixels");
         }
         double bx = 0, by = 0, bw = 0, bh = 0;
-        if (!selectionBBox(e.doc, bx, by, bw, bh) || bw < 1 || bh < 1) {
+        if (!selectionBBox(e.doc(), bx, by, bw, bh) || bw < 1 || bh < 1) {
             return makeError(env, kErrBadParam, "definePattern: empty selection");
         }
         if (bw > 4096 || bh > 4096) {
@@ -8380,7 +8534,7 @@ napi_value DefinePattern(napi_env env, napi_callback_info /*info*/) {
                     ps + static_cast<size_t>(static_cast<uint32_t>(gy) % kTileSize) *
                              it->second->pixels->rowBytes() +
                          static_cast<size_t>(static_cast<uint32_t>(gx) % kTileSize) * 4;
-                const uint8_t sg = selectionGrayAt(*e.doc.selection, docX, docY);
+                const uint8_t sg = selectionGrayAt(*e.doc().selection, docX, docY);
                 const uint32_t a = static_cast<uint32_t>(sp[3]) * sg / 255u;
                 if (a == 0 && sp[0] == 0 && sp[1] == 0 && sp[2] == 0) {
                     continue;
@@ -8408,20 +8562,20 @@ napi_value DefinePattern(napi_env env, napi_callback_info /*info*/) {
         p.w = w;
         p.h = h;
         p.pixels = builder.publish(nextGridRevision());
-        e.doc.patterns.push_back(std::move(p));
+        e.doc().patterns.push_back(std::move(p));
         e.bumpRevisionLocked();  // 图案列表刷新（docVersion 事件；不入 History）
         napi_create_object(env, &data);
         napi_value sid = nullptr;
-        napi_create_string_utf8(env, e.doc.patterns.back().id.c_str(), NAPI_AUTO_LENGTH, &sid);
+        napi_create_string_utf8(env, e.doc().patterns.back().id.c_str(), NAPI_AUTO_LENGTH, &sid);
         napi_set_named_property(env, data, "id", sid);
         napi_value sname = nullptr;
-        napi_create_string_utf8(env, e.doc.patterns.back().name.c_str(), NAPI_AUTO_LENGTH,
+        napi_create_string_utf8(env, e.doc().patterns.back().name.c_str(), NAPI_AUTO_LENGTH,
                                 &sname);
         napi_set_named_property(env, data, "name", sname);
         napi_set_named_property(env, data, "w", makeDouble(env, w));
         napi_set_named_property(env, data, "h", makeDouble(env, h));
         OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Pattern",
-                     "define %{public}s %{public}ux%{public}u", e.doc.patterns.back().id.c_str(),
+                     "define %{public}s %{public}ux%{public}u", e.doc().patterns.back().id.c_str(),
                      w, h);
     }
     e.requestRender();
@@ -8433,9 +8587,9 @@ napi_value GetPatterns(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
     std::lock_guard<std::mutex> lk(e.docMutex);
     napi_value arr = nullptr;
-    napi_create_array_with_length(env, e.doc.patterns.size(), &arr);
-    for (size_t i = 0; i < e.doc.patterns.size(); ++i) {
-        const DocumentPattern& p = e.doc.patterns[i];
+    napi_create_array_with_length(env, e.doc().patterns.size(), &arr);
+    for (size_t i = 0; i < e.doc().patterns.size(); ++i) {
+        const DocumentPattern& p = e.doc().patterns[i];
         napi_value obj = nullptr;
         napi_create_object(env, &obj);
         napi_value sid = nullptr;
@@ -8458,7 +8612,7 @@ napi_value GetSelectionBounds(napi_env env, napi_callback_info info) {
     napi_value data = nullptr;
     napi_create_object(env, &data);
     double x = 0, y = 0, w = 0, h = 0;
-    const bool ok = selectionBBox(e.doc, x, y, w, h);
+    const bool ok = selectionBBox(e.doc(), x, y, w, h);
     napi_set_named_property(env, data, "ok", makeBool(env, ok));
     napi_set_named_property(env, data, "x", makeDouble(env, x));
     napi_set_named_property(env, data, "y", makeDouble(env, y));
@@ -8582,7 +8736,7 @@ napi_value GetShapePath(napi_env env, napi_callback_info info) {
     }
     auto& e = Engine::get();
     std::lock_guard<std::mutex> lk(e.docMutex);
-    const Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+    const Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
     VectorPath out;
     if (l != nullptr && l->shape != nullptr) {
         out = l->shape->live.kind == ShapeLiveKind::None ? l->shape->path
@@ -8609,7 +8763,7 @@ napi_value CreateShapeLayer(napi_env env, napi_callback_info info) {
     double newId = 0;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "createShapeLayer: no document");
         }
         auto state = std::make_shared<ShapeLayerState>();
@@ -8681,22 +8835,22 @@ napi_value CreateShapeLayer(napi_env env, napi_callback_info info) {
         layer.id = e.nextLayerId();
         layer.name = shapeLayerDisplayName(*state);
         layer.shape = std::move(state);
-        size_t at = e.doc.layers.size();
-        for (size_t i = 0; i < e.doc.layers.size(); ++i) {
-            if (e.doc.layers[i].id == e.doc.activeId) {
+        size_t at = e.doc().layers.size();
+        for (size_t i = 0; i < e.doc().layers.size(); ++i) {
+            if (e.doc().layers[i].id == e.doc().activeId) {
                 at = i + 1;
                 break;
             }
         }
-        e.history.beginEdit(e.doc, layer.name, static_cast<uint64_t>(e.docRevision));
-        e.doc.layers.insert(e.doc.layers.begin() + static_cast<long>(at), std::move(layer));
-        Layer& inserted = e.doc.layers[at];
-        e.doc.activeId = inserted.id;
-        if (!shapeRenderLayer(e.doc, inserted, err)) {
-            { uint64_t rv = 0; std::string lb; e.history.undo(e.doc, rv, lb); (void)rv; (void)lb; }  // 渲染失败回滚（预算拒绝等）
+        e.history().beginEdit(e.doc(), layer.name, static_cast<uint64_t>(e.docRevision()));
+        e.doc().layers.insert(e.doc().layers.begin() + static_cast<long>(at), std::move(layer));
+        Layer& inserted = e.doc().layers[at];
+        e.doc().activeId = inserted.id;
+        if (!shapeRenderLayer(e.doc(), inserted, err)) {
+            { uint64_t rv = 0; std::string lb; e.history().undo(e.doc(), rv, lb); (void)rv; (void)lb; }  // 渲染失败回滚（预算拒绝等）
             return makeError(env, kErrBadParam, ("createShapeLayer: " + err).c_str());
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         newId = static_cast<double>(inserted.id);
         e.bumpRevisionLocked();
         e.requestRender();
@@ -8724,7 +8878,7 @@ napi_value SetShapeLive(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(a[0]));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(a[0]));
         if (l == nullptr || l->shape == nullptr) {
             return makeError(env, kErrBadParam, "setShapeLive: shape layer not found");
         }
@@ -8772,10 +8926,10 @@ napi_value SetShapeLive(napi_env env, napi_callback_info info) {
         if (!validateShape(next->path, next->hasStroke ? &next->stroke : nullptr, err)) {
             return makeError(env, kErrBadParam, ("setShapeLive: " + err).c_str());
         }
-        e.history.beginEdit(e.doc, "编辑形状", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "编辑形状", static_cast<uint64_t>(e.docRevision()));
         l->shape = std::move(next);
-        shapeRenderLayer(e.doc, *l, err);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        shapeRenderLayer(e.doc(), *l, err);
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -8799,7 +8953,7 @@ napi_value SetShapeFill(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(a[0]));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(a[0]));
         if (l == nullptr || l->shape == nullptr) {
             return makeError(env, kErrBadParam, "setShapeFill: shape layer not found");
         }
@@ -8809,11 +8963,11 @@ napi_value SetShapeFill(napi_env env, napi_callback_info info) {
         next->fillColor[1] = static_cast<float>(a[3]);
         next->fillColor[2] = static_cast<float>(a[4]);
         next->fillColor[3] = static_cast<float>(a[5]);
-        e.history.beginEdit(e.doc, "形状填充", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "形状填充", static_cast<uint64_t>(e.docRevision()));
         l->shape = std::move(next);
         std::string err;
-        shapeRenderLayer(e.doc, *l, err);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        shapeRenderLayer(e.doc(), *l, err);
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -8837,7 +8991,7 @@ napi_value SetShapeStroke(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(a[0]));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(a[0]));
         if (l == nullptr || l->shape == nullptr) {
             return makeError(env, kErrBadParam, "setShapeStroke: shape layer not found");
         }
@@ -8864,10 +9018,10 @@ napi_value SetShapeStroke(napi_env env, napi_callback_info info) {
         if (next->hasStroke && !validateShape(next->path, &next->stroke, err)) {
             return makeError(env, kErrBadParam, ("setShapeStroke: " + err).c_str());
         }
-        e.history.beginEdit(e.doc, "形状描边", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "形状描边", static_cast<uint64_t>(e.docRevision()));
         l->shape = std::move(next);
-        shapeRenderLayer(e.doc, *l, err);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        shapeRenderLayer(e.doc(), *l, err);
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -8888,13 +9042,13 @@ napi_value RasterizeShapeLayer(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
         if (l == nullptr || l->shape == nullptr) {
             return makeError(env, kErrBadParam, "rasterizeShapeLayer: shape layer not found");
         }
-        e.history.beginEdit(e.doc, "栅格化形状", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "栅格化形状", static_cast<uint64_t>(e.docRevision()));
         rasterizeShapeLayerToPixels(*l);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -8920,7 +9074,7 @@ napi_value SetShapePath(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
         if (l == nullptr || l->shape == nullptr) {
             return makeError(env, kErrBadParam, "setShapePath: shape layer not found");
         }
@@ -8931,10 +9085,10 @@ napi_value SetShapePath(napi_env env, napi_callback_info info) {
         }
         next->path = std::move(path);
         next->live = LiveShape{};  // 路径编辑后不再是参数形状
-        e.history.beginEdit(e.doc, "编辑路径", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "编辑路径", static_cast<uint64_t>(e.docRevision()));
         l->shape = std::move(next);
-        shapeRenderLayer(e.doc, *l, err);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        shapeRenderLayer(e.doc(), *l, err);
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -8960,7 +9114,7 @@ napi_value SetWorkPath(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        e.doc.workPath = std::move(path);
+        e.doc().workPath = std::move(path);
         e.bumpRevisionLocked();
     }
     return makeOk(env, nullptr);
@@ -8969,7 +9123,7 @@ napi_value SetWorkPath(napi_env env, napi_callback_info info) {
 napi_value GetWorkPath(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
     std::lock_guard<std::mutex> lk(e.docMutex);
-    return makeOk(env, pathToFlatArray(env, e.doc.workPath));
+    return makeOk(env, pathToFlatArray(env, e.doc().workPath));
 }
 
 napi_value CommitWorkPathAsShape(napi_env env, napi_callback_info info) {
@@ -8990,14 +9144,14 @@ napi_value CommitWorkPathAsShape(napi_env env, napi_callback_info info) {
     double newId = 0;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "commitWorkPathAsShape: no document");
         }
-        if (e.doc.workPath.empty()) {
+        if (e.doc().workPath.empty()) {
             return makeError(env, kErrBadParam, "commitWorkPathAsShape: no work path");
         }
         auto state = std::make_shared<ShapeLayerState>();
-        state->path = e.doc.workPath;
+        state->path = e.doc().workPath;
         state->fillKind = static_cast<int32_t>(a[0]);
         state->fillColor[0] = static_cast<float>(a[1]);
         state->fillColor[1] = static_cast<float>(a[2]);
@@ -9019,23 +9173,23 @@ napi_value CommitWorkPathAsShape(napi_env env, napi_callback_info info) {
         layer.id = e.nextLayerId();
         layer.name = shapeLayerDisplayName(*state);
         layer.shape = std::move(state);
-        size_t at = e.doc.layers.size();
-        for (size_t i = 0; i < e.doc.layers.size(); ++i) {
-            if (e.doc.layers[i].id == e.doc.activeId) {
+        size_t at = e.doc().layers.size();
+        for (size_t i = 0; i < e.doc().layers.size(); ++i) {
+            if (e.doc().layers[i].id == e.doc().activeId) {
                 at = i + 1;
                 break;
             }
         }
-        e.history.beginEdit(e.doc, layer.name, static_cast<uint64_t>(e.docRevision));
-        e.doc.layers.insert(e.doc.layers.begin() + static_cast<long>(at), std::move(layer));
-        Layer& inserted = e.doc.layers[at];
-        e.doc.activeId = inserted.id;
-        if (!shapeRenderLayer(e.doc, inserted, err)) {
-            { uint64_t rv = 0; std::string lb; e.history.undo(e.doc, rv, lb); (void)rv; (void)lb; }
+        e.history().beginEdit(e.doc(), layer.name, static_cast<uint64_t>(e.docRevision()));
+        e.doc().layers.insert(e.doc().layers.begin() + static_cast<long>(at), std::move(layer));
+        Layer& inserted = e.doc().layers[at];
+        e.doc().activeId = inserted.id;
+        if (!shapeRenderLayer(e.doc(), inserted, err)) {
+            { uint64_t rv = 0; std::string lb; e.history().undo(e.doc(), rv, lb); (void)rv; (void)lb; }
             return makeError(env, kErrBadParam, ("commitWorkPathAsShape: " + err).c_str());
         }
-        e.doc.workPath = VectorPath{};  // PS 语义：成形状层后工作路径清空
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.doc().workPath = VectorPath{};  // PS 语义：成形状层后工作路径清空
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         newId = static_cast<double>(inserted.id);
         e.bumpRevisionLocked();
         e.requestRender();
@@ -9058,12 +9212,12 @@ napi_value PathToSelection(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "pathToSelection: no document");
         }
-        VectorPath source = e.doc.workPath;
+        VectorPath source = e.doc().workPath;
         if (source.empty()) {
-            Layer* l = findLayerLocked(e.doc, e.doc.activeId);
+            Layer* l = findLayerLocked(e.doc(), e.doc().activeId);
             if (l != nullptr && l->shape != nullptr) {
                 source = l->shape->live.kind == ShapeLiveKind::None
                              ? l->shape->path
@@ -9073,15 +9227,15 @@ napi_value PathToSelection(napi_env env, napi_callback_info info) {
         if (source.empty()) {
             return makeError(env, kErrBadParam, "pathToSelection: no path");
         }
-        auto mask = pathToSelectionMask(source, e.doc.width, e.doc.height);
+        auto mask = pathToSelectionMask(source, e.doc().width, e.doc().height);
         if (mask == nullptr) {
             return makeError(env, kErrBadParam, "pathToSelection: empty result");
         }
-        auto merged = tiles::combineSelection(e.doc, std::move(mask),
+        auto merged = tiles::combineSelection(e.doc(), std::move(mask),
                                               static_cast<tiles::SelectionOp>(op));
-        e.history.beginEdit(e.doc, "路径转选区", static_cast<uint64_t>(e.docRevision));
-        e.doc.selection = std::move(merged);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "路径转选区", static_cast<uint64_t>(e.docRevision()));
+        e.doc().selection = std::move(merged);
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -9106,44 +9260,44 @@ napi_value FillPath(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "fillPath: no document");
         }
-        Layer* l = findLayerLocked(e.doc, e.doc.activeId);
+        Layer* l = findLayerLocked(e.doc(), e.doc().activeId);
         if (l == nullptr || l->shape != nullptr || l->fill != nullptr) {
             return makeError(env, kErrBadParam, "fillPath: active layer must be a pixel layer");
         }
-        if (e.doc.workPath.empty()) {
+        if (e.doc().workPath.empty()) {
             return makeError(env, kErrBadParam, "fillPath: no work path");
         }
-        auto mask = pathToSelectionMask(e.doc.workPath, e.doc.width, e.doc.height);
+        auto mask = pathToSelectionMask(e.doc().workPath, e.doc().width, e.doc().height);
         if (mask == nullptr) {
             return makeError(env, kErrBadParam, "fillPath: empty result");
         }
-        std::shared_ptr<const TileGrid> saved = e.doc.selection;
+        std::shared_ptr<const TileGrid> saved = e.doc().selection;
         if (saved != nullptr) {
-            e.doc.selection = mask;
-            mask = tiles::combineSelection(e.doc, saved, tiles::SelectionOp::Intersect);
+            e.doc().selection = mask;
+            mask = tiles::combineSelection(e.doc(), saved, tiles::SelectionOp::Intersect);
             if (mask == nullptr) {
-                e.doc.selection = saved;
+                e.doc().selection = saved;
                 return makeOk(env, nullptr);  // 不相交 = 无事发生
             }
         }
-        e.history.beginEdit(e.doc, "填充路径", static_cast<uint64_t>(e.docRevision));
-        std::shared_ptr<const TileGrid> savedNow = e.doc.selection;
-        e.doc.selection = mask;
+        e.history().beginEdit(e.doc(), "填充路径", static_cast<uint64_t>(e.docRevision()));
+        std::shared_ptr<const TileGrid> savedNow = e.doc().selection;
+        e.doc().selection = mask;
         std::string err;
-        const bool ok = fillWithColor(e.doc, l->id, FillSource::Foreground,
+        const bool ok = fillWithColor(e.doc(), l->id, FillSource::Foreground,
                                       static_cast<float>(c[0]), static_cast<float>(c[1]),
                                       static_cast<float>(c[2]), 0, 0, 0, err);
-        e.doc.selection = savedNow;
+        e.doc().selection = savedNow;
         if (!ok) {
-            { uint64_t rv = 0; std::string lb; e.history.undo(e.doc, rv, lb); (void)rv; (void)lb; }
-            e.doc.selection = saved;
+            { uint64_t rv = 0; std::string lb; e.history().undo(e.doc(), rv, lb); (void)rv; (void)lb; }
+            e.doc().selection = saved;
             return makeError(env, kErrBadParam, ("fillPath: " + err).c_str());
         }
-        e.doc.selection = saved;
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.doc().selection = saved;
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -9168,18 +9322,18 @@ napi_value StrokePath(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "strokePath: no document");
         }
-        Layer* l = findLayerLocked(e.doc, e.doc.activeId);
+        Layer* l = findLayerLocked(e.doc(), e.doc().activeId);
         if (l == nullptr || l->shape != nullptr || l->fill != nullptr) {
             return makeError(env, kErrBadParam, "strokePath: active layer must be a pixel layer");
         }
-        if (e.doc.workPath.empty()) {
+        if (e.doc().workPath.empty()) {
             return makeError(env, kErrBadParam, "strokePath: no work path");
         }
         const double width = std::min(std::max(1.0, c[4]), 250.0);
-        VectorRasterizer r = strokeRasterizer(e.doc.workPath, width, LineCap::Butt, LineJoin::Miter,
+        VectorRasterizer r = strokeRasterizer(e.doc().workPath, width, LineCap::Butt, LineJoin::Miter,
                                               4.0, {}, 0.0, kVectorTolerance);
         int32_t bx0, by0, bx1, by1;
         if (!r.pixelBounds(bx0, by0, bx1, by1)) {
@@ -9187,40 +9341,40 @@ napi_value StrokePath(napi_env env, napi_callback_info info) {
         }
         int32_t x0 = std::max(0, bx0);
         int32_t y0 = std::max(0, by0);
-        int32_t x1 = std::min(static_cast<int32_t>(e.doc.width), bx1);
-        int32_t y1 = std::min(static_cast<int32_t>(e.doc.height), by1);
+        int32_t x1 = std::min(static_cast<int32_t>(e.doc().width), bx1);
+        int32_t y1 = std::min(static_cast<int32_t>(e.doc().height), by1);
         if (x0 >= x1 || y0 >= y1) {
             return makeOk(env, nullptr);
         }
         auto cov = r.render(x0, y0, x1, y1);
-        auto band = coverageToMaskGrid(cov, x0, y0, x1 - x0, y1 - y0, e.doc.width, e.doc.height);
+        auto band = coverageToMaskGrid(cov, x0, y0, x1 - x0, y1 - y0, e.doc().width, e.doc().height);
         if (band == nullptr) {
             return makeError(env, kErrBadParam, "strokePath: empty band");
         }
-        std::shared_ptr<const TileGrid> saved = e.doc.selection;
+        std::shared_ptr<const TileGrid> saved = e.doc().selection;
         if (saved != nullptr) {
-            e.doc.selection = band;
-            band = tiles::combineSelection(e.doc, saved, tiles::SelectionOp::Intersect);
+            e.doc().selection = band;
+            band = tiles::combineSelection(e.doc(), saved, tiles::SelectionOp::Intersect);
             if (band == nullptr) {
-                e.doc.selection = saved;
+                e.doc().selection = saved;
                 return makeOk(env, nullptr);
             }
         }
-        e.history.beginEdit(e.doc, "描边路径", static_cast<uint64_t>(e.docRevision));
-        std::shared_ptr<const TileGrid> savedNow = e.doc.selection;
-        e.doc.selection = band;
+        e.history().beginEdit(e.doc(), "描边路径", static_cast<uint64_t>(e.docRevision()));
+        std::shared_ptr<const TileGrid> savedNow = e.doc().selection;
+        e.doc().selection = band;
         std::string err;
-        const bool ok = fillWithColor(e.doc, l->id, FillSource::Foreground,
+        const bool ok = fillWithColor(e.doc(), l->id, FillSource::Foreground,
                                       static_cast<float>(c[0]), static_cast<float>(c[1]),
                                       static_cast<float>(c[2]), 0, 0, 0, err);
-        e.doc.selection = savedNow;
+        e.doc().selection = savedNow;
         if (!ok) {
-            { uint64_t rv = 0; std::string lb; e.history.undo(e.doc, rv, lb); (void)rv; (void)lb; }
-            e.doc.selection = saved;
+            { uint64_t rv = 0; std::string lb; e.history().undo(e.doc(), rv, lb); (void)rv; (void)lb; }
+            e.doc().selection = saved;
             return makeError(env, kErrBadParam, ("strokePath: " + err).c_str());
         }
-        e.doc.selection = saved;
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.doc().selection = saved;
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -9240,15 +9394,15 @@ napi_value SaveWorkPath(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.workPath.empty()) {
+        if (e.doc().workPath.empty()) {
             return makeError(env, kErrBadParam, "saveWorkPath: no work path");
         }
         std::string nm =
-            name[0] != '\0' ? std::string(name) : ("路径 " + std::to_string(e.doc.paths.size() + 1));
+            name[0] != '\0' ? std::string(name) : ("路径 " + std::to_string(e.doc().paths.size() + 1));
         bool replaced = false;
-        for (NamedPathEntry& p : e.doc.paths) {
+        for (NamedPathEntry& p : e.doc().paths) {
             if (p.name == nm) {
-                p.path = e.doc.workPath;
+                p.path = e.doc().workPath;
                 replaced = true;
                 break;
             }
@@ -9256,10 +9410,10 @@ napi_value SaveWorkPath(napi_env env, napi_callback_info info) {
         if (!replaced) {
             NamedPathEntry entry;
             entry.name = nm;
-            entry.path = e.doc.workPath;
-            e.doc.paths.push_back(std::move(entry));
+            entry.path = e.doc().workPath;
+            e.doc().paths.push_back(std::move(entry));
         }
-        e.doc.workPath = VectorPath{};
+        e.doc().workPath = VectorPath{};
         e.bumpRevisionLocked();
     }
     return makeOk(env, nullptr);
@@ -9276,10 +9430,10 @@ napi_value DeleteSavedPath(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (idx < 0 || static_cast<size_t>(idx) >= e.doc.paths.size()) {
+        if (idx < 0 || static_cast<size_t>(idx) >= e.doc().paths.size()) {
             return makeError(env, kErrBadParam, "deleteSavedPath: bad index");
         }
-        e.doc.paths.erase(e.doc.paths.begin() + static_cast<long>(idx));
+        e.doc().paths.erase(e.doc().paths.begin() + static_cast<long>(idx));
         e.bumpRevisionLocked();
     }
     return makeOk(env, nullptr);
@@ -9290,11 +9444,11 @@ napi_value GetSavedPaths(napi_env env, napi_callback_info /*info*/) {
     std::lock_guard<std::mutex> lk(e.docMutex);
     napi_value arr = nullptr;
     napi_create_array(env, &arr);
-    for (size_t i = 0; i < e.doc.paths.size(); i++) {
+    for (size_t i = 0; i < e.doc().paths.size(); i++) {
         napi_value obj = nullptr;
         napi_create_object(env, &obj);
-        napi_set_named_property(env, obj, "name", makeString(env, e.doc.paths[i].name));
-        napi_set_named_property(env, obj, "flat", pathToFlatArray(env, e.doc.paths[i].path));
+        napi_set_named_property(env, obj, "name", makeString(env, e.doc().paths[i].name));
+        napi_set_named_property(env, obj, "flat", pathToFlatArray(env, e.doc().paths[i].path));
         napi_set_element(env, arr, static_cast<uint32_t>(i), obj);
     }
     return makeOk(env, arr);
@@ -9312,10 +9466,10 @@ napi_value LoadSavedPath(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (idx < 0 || static_cast<size_t>(idx) >= e.doc.paths.size()) {
+        if (idx < 0 || static_cast<size_t>(idx) >= e.doc().paths.size()) {
             return makeError(env, kErrBadParam, "loadSavedPath: bad index");
         }
-        e.doc.workPath = e.doc.paths[static_cast<size_t>(idx)].path;
+        e.doc().workPath = e.doc().paths[static_cast<size_t>(idx)].path;
         e.bumpRevisionLocked();
     }
     return makeOk(env, nullptr);
@@ -9325,14 +9479,14 @@ napi_value SelectionToWorkPath(napi_env env, napi_callback_info /*info*/) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.selection == nullptr) {
+        if (e.doc().selection == nullptr) {
             return makeError(env, kErrBadParam, "selectionToWorkPath: no selection");
         }
         VectorPath traced;
-        if (!traceSelectionToPath(*e.doc.selection, traced, 1024)) {
+        if (!traceSelectionToPath(*e.doc().selection, traced, 1024)) {
             return makeError(env, kErrBadParam, "selectionToWorkPath: empty trace");
         }
-        e.doc.workPath = std::move(traced);
+        e.doc().workPath = std::move(traced);
         e.bumpRevisionLocked();
     }
     return makeOk(env, nullptr);
@@ -9351,9 +9505,9 @@ napi_value DefineCustomShape(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        VectorPath source = e.doc.workPath;
+        VectorPath source = e.doc().workPath;
         if (source.empty()) {
-            Layer* l = findLayerLocked(e.doc, e.doc.activeId);
+            Layer* l = findLayerLocked(e.doc(), e.doc().activeId);
             if (l != nullptr && l->shape != nullptr) {
                 source = l->shape->live.kind == ShapeLiveKind::None
                              ? l->shape->path
@@ -9381,12 +9535,12 @@ napi_value DefineCustomShape(napi_env env, napi_callback_info info) {
             }
         }
         CustomShapeEntry entry;
-        e.doc.customShapeSeq++;
-        entry.id = "csh_" + std::to_string(e.doc.customShapeSeq);
+        e.doc().customShapeSeq++;
+        entry.id = "csh_" + std::to_string(e.doc().customShapeSeq);
         entry.name =
-            name[0] != '\0' ? std::string(name) : ("自定形状 " + std::to_string(e.doc.customShapeSeq));
+            name[0] != '\0' ? std::string(name) : ("自定形状 " + std::to_string(e.doc().customShapeSeq));
         entry.path = std::move(source);
-        e.doc.customShapes.push_back(std::move(entry));
+        e.doc().customShapes.push_back(std::move(entry));
         e.bumpRevisionLocked();
     }
     return makeOk(env, nullptr);
@@ -9397,8 +9551,8 @@ napi_value GetCustomShapes(napi_env env, napi_callback_info /*info*/) {
     std::lock_guard<std::mutex> lk(e.docMutex);
     napi_value arr = nullptr;
     napi_create_array(env, &arr);
-    for (size_t i = 0; i < e.doc.customShapes.size(); i++) {
-        const CustomShapeEntry& c = e.doc.customShapes[i];
+    for (size_t i = 0; i < e.doc().customShapes.size(); i++) {
+        const CustomShapeEntry& c = e.doc().customShapes[i];
         napi_value obj = nullptr;
         napi_create_object(env, &obj);
         napi_set_named_property(env, obj, "id", makeString(env, c.id));
@@ -9421,9 +9575,9 @@ napi_value DeleteCustomShape(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        for (size_t i = 0; i < e.doc.customShapes.size(); i++) {
-            if (e.doc.customShapes[i].id == id) {
-                e.doc.customShapes.erase(e.doc.customShapes.begin() + static_cast<long>(i));
+        for (size_t i = 0; i < e.doc().customShapes.size(); i++) {
+            if (e.doc().customShapes[i].id == id) {
+                e.doc().customShapes.erase(e.doc().customShapes.begin() + static_cast<long>(i));
                 e.bumpRevisionLocked();
                 return makeOk(env, nullptr);
             }
@@ -9454,11 +9608,11 @@ napi_value PlaceCustomShape(napi_env env, napi_callback_info info) {
     double newId = 0;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "placeCustomShape: no document");
         }
         const CustomShapeEntry* found = nullptr;
-        for (const CustomShapeEntry& c : e.doc.customShapes) {
+        for (const CustomShapeEntry& c : e.doc().customShapes) {
             if (c.id == id) {
                 found = &c;
                 break;
@@ -9493,22 +9647,22 @@ napi_value PlaceCustomShape(napi_env env, napi_callback_info info) {
         layer.id = e.nextLayerId();
         layer.name = found->name;
         layer.shape = std::move(state);
-        size_t at = e.doc.layers.size();
-        for (size_t i = 0; i < e.doc.layers.size(); ++i) {
-            if (e.doc.layers[i].id == e.doc.activeId) {
+        size_t at = e.doc().layers.size();
+        for (size_t i = 0; i < e.doc().layers.size(); ++i) {
+            if (e.doc().layers[i].id == e.doc().activeId) {
                 at = i + 1;
                 break;
             }
         }
-        e.history.beginEdit(e.doc, layer.name, static_cast<uint64_t>(e.docRevision));
-        e.doc.layers.insert(e.doc.layers.begin() + static_cast<long>(at), std::move(layer));
-        Layer& inserted = e.doc.layers[at];
-        e.doc.activeId = inserted.id;
-        if (!shapeRenderLayer(e.doc, inserted, err)) {
-            { uint64_t rv = 0; std::string lb; e.history.undo(e.doc, rv, lb); (void)rv; (void)lb; }
+        e.history().beginEdit(e.doc(), layer.name, static_cast<uint64_t>(e.docRevision()));
+        e.doc().layers.insert(e.doc().layers.begin() + static_cast<long>(at), std::move(layer));
+        Layer& inserted = e.doc().layers[at];
+        e.doc().activeId = inserted.id;
+        if (!shapeRenderLayer(e.doc(), inserted, err)) {
+            { uint64_t rv = 0; std::string lb; e.history().undo(e.doc(), rv, lb); (void)rv; (void)lb; }
             return makeError(env, kErrBadParam, ("placeCustomShape: " + err).c_str());
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         newId = static_cast<double>(inserted.id);
         e.bumpRevisionLocked();
         e.requestRender();
@@ -9538,11 +9692,11 @@ napi_value SetLayerVectorMask(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
         if (l == nullptr) {
             return makeError(env, kErrBadParam, "setLayerVectorMask: layer not found");
         }
-        e.history.beginEdit(e.doc, "矢量蒙版", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "矢量蒙版", static_cast<uint64_t>(e.docRevision()));
         if (path.empty() && !path.inverted) {
             l->vectorMask = nullptr;
         } else {
@@ -9550,8 +9704,8 @@ napi_value SetLayerVectorMask(napi_env env, napi_callback_info info) {
             m->path = std::move(path);
             l->vectorMask = std::move(m);
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
-        restyleDocument(e.doc);  // M18d：矢量蒙版设置后立即重派生
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
+        restyleDocument(e.doc());  // M18d：矢量蒙版设置后立即重派生
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -9574,16 +9728,16 @@ napi_value SetVectorMaskEnabled(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
         if (l == nullptr || l->vectorMask == nullptr) {
             return makeError(env, kErrBadParam, "setVectorMaskEnabled: no vector mask");
         }
         auto m = std::make_shared<VectorMaskData>(*l->vectorMask);
         m->enabled = v;
-        e.history.beginEdit(e.doc, "矢量蒙版开关", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "矢量蒙版开关", static_cast<uint64_t>(e.docRevision()));
         l->vectorMask = std::move(m);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
-        restyleDocument(e.doc);  // M18d：矢量蒙版变更立即重派生
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
+        restyleDocument(e.doc());  // M18d：矢量蒙版变更立即重派生
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -9667,6 +9821,7 @@ struct SmartOpCtx {
     napi_deferred deferred = nullptr;
     Document docSnap;
     uint64_t epoch = 0;
+    void* docSess = nullptr;  // D2：归属会话（发布段 docIfUnchanged 复核）
     int64_t revision = 0;
     int op = 0;
     std::vector<LayerId> ids;
@@ -9862,13 +10017,14 @@ napi_value SmartOpAsync(napi_env env, napi_callback_info info, int op) {
 
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0) {
+        if (e.doc().width == 0) {
             delete ctx;
             return makeError(env, kErrNoDoc, "smart op: no document");
         }
-        ctx->docSnap = e.doc;
-        ctx->epoch = e.docEpoch;
-        ctx->revision = e.docRevision;
+        ctx->docSnap = e.doc();
+        ctx->epoch = e.docEpoch();
+        ctx->revision = e.docRevision();
+        ctx->docSess = &e.doc();
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -10181,12 +10337,15 @@ napi_value SmartOpAsync(napi_env env, napi_callback_info info, int op) {
             }
             auto& eg = Engine::get();
             std::lock_guard<std::mutex> lk(eg.docMutex);
-            if (c->changed && eg.docEpoch == c->epoch && eg.docRevision == c->revision) {
-                eg.history.beginEdit(eg.doc, smartOpLabel(c->op, c->name),
-                                     static_cast<uint64_t>(eg.docRevision));
-                eg.doc = std::move(work);
-                eg.history.endEdit(eg.doc, static_cast<uint64_t>(eg.docRevision));
-                eg.bumpRevisionLocked();
+            auto sess = eg.docIfUnchanged(Engine::DocStamp{static_cast<DocSession*>(c->docSess),
+                                                           c->epoch,
+                                                           static_cast<uint32_t>(c->revision)});
+            if (c->changed && sess != nullptr) {
+                sess->history.beginEdit(sess->doc, smartOpLabel(c->op, c->name),
+                                     static_cast<uint64_t>(sess->revision));
+                sess->doc = std::move(work);
+                sess->history.endEdit(sess->doc, static_cast<uint64_t>(sess->revision));
+                eg.bumpRevisionLocked(sess.get());
                 eg.requestRender();
             } else if (c->changed) {
                 c->changed = false;
@@ -10297,14 +10456,14 @@ napi_value RasterizeSmartObject(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
         if (l == nullptr || l->smart == nullptr) {
             return makeError(env, kErrBadParam, "rasterizeSmartObject: layer is not a smart object");
         }
         if (l->effectivePixels() == nullptr) {
             return makeError(env, kErrBadParam, "rasterizeSmartObject: no rendered pixels");
         }
-        e.history.beginEdit(e.doc, "栅格化图层", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "栅格化图层", static_cast<uint64_t>(e.docRevision()));
         l->pixels = l->effectivePixels();
         l->transform.originX = l->effectiveOriginX();
         l->transform.originY = l->effectiveOriginY();
@@ -10314,7 +10473,7 @@ napi_value RasterizeSmartObject(napi_env env, napi_callback_info info) {
         l->mask = nullptr;
         l->render = nullptr;
         l->style = nullptr;
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -10337,14 +10496,14 @@ napi_value NewSmartObjectViaCopy(napi_env env, napi_callback_info info) {
     napi_value result = nullptr;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
         if (l == nullptr || l->smart == nullptr) {
             return makeError(env, kErrBadParam, "newSmartObjectViaCopy: layer is not a smart object");
         }
-        e.history.beginEdit(e.doc, "通过拷贝新建智能对象", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "通过拷贝新建智能对象", static_cast<uint64_t>(e.docRevision()));
         Layer copy = *l;
         copy.id = e.nextLayerId();
-        copy.name = e.doc.name.empty() ? l->name : l->name;  // 命名 v1 = 同名（PS 副本后缀挂 UI）
+        copy.name = e.doc().name.empty() ? l->name : l->name;  // 命名 v1 = 同名（PS 副本后缀挂 UI）
         auto sm = std::make_shared<SmartLayerState>(*l->smart);
         sm->contentsId = smart::nextContentsId();  // 独立内容
         sm->psdRaw.clear();
@@ -10353,15 +10512,15 @@ napi_value NewSmartObjectViaCopy(napi_env env, napi_callback_info info) {
         copy.smart = std::move(sm);
         copy.smartCacheHash = l->smartCacheHash;
         const size_t at = static_cast<size_t>(
-            std::distance(e.doc.layers.data(), l));
-        e.doc.layers.insert(e.doc.layers.begin() + static_cast<long>(at) + 1, std::move(copy));
-        e.doc.activeId = e.doc.layers[static_cast<size_t>(at) + 1].id;
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            std::distance(e.doc().layers.data(), l));
+        e.doc().layers.insert(e.doc().layers.begin() + static_cast<long>(at) + 1, std::move(copy));
+        e.doc().activeId = e.doc().layers[static_cast<size_t>(at) + 1].id;
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
         napi_value obj = nullptr;
         napi_create_object(env, &obj);
-        napi_value idv = makeDouble(env, static_cast<double>(e.doc.activeId));
+        napi_value idv = makeDouble(env, static_cast<double>(e.doc().activeId));
         napi_set_named_property(env, obj, "layer", idv);
         result = obj;
     }
@@ -10384,7 +10543,7 @@ napi_value GetSmartInfo(napi_env env, napi_callback_info info) {
     napi_value obj = nullptr;
     napi_create_object(env, &obj);
     std::lock_guard<std::mutex> lk(e.docMutex);
-    Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+    Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
     if (l == nullptr || l->smart == nullptr) {
         napi_value isSmart = nullptr;
         napi_get_boolean(env, false, &isSmart);
@@ -10469,7 +10628,7 @@ napi_value ExportSmartContents(napi_env env, napi_callback_info info) {
     std::vector<uint8_t> bytes;
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(id));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(id));
         if (l == nullptr || l->smart == nullptr) {
             close(fd);
             return makeError(env, kErrBadParam, "exportSmartContents: layer is not a smart object");
@@ -10931,7 +11090,7 @@ napi_value LibraryPatternToDoc(napi_env env, napi_callback_info info) {
     if (p == nullptr || p->pixels == nullptr) {
         return makeError(env, kErrBadParam, "libraryPatternToDoc: pattern not found");
     }
-    if (e.doc.width == 0 || e.doc.height == 0) {
+    if (e.doc().width == 0 || e.doc().height == 0) {
         return makeError(env, kErrNoDoc, "libraryPatternToDoc: no document");
     }
     DocumentPattern dp;
@@ -10942,7 +11101,7 @@ napi_value LibraryPatternToDoc(napi_env env, napi_callback_info info) {
     dp.pixels = p->pixels;
     const std::string docId = dp.id;
     const std::string name = dp.name;
-    e.doc.patterns.push_back(std::move(dp));
+    e.doc().patterns.push_back(std::move(dp));
     e.bumpRevisionLocked();
     napi_value data;
     napi_create_object(env, &data);
@@ -10982,7 +11141,7 @@ napi_value ApplyGradientStops(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "applyGradientStops: no document");
         }
         GradientSpec spec;
@@ -10993,14 +11152,14 @@ napi_value ApplyGradientStops(napi_env env, napi_callback_info info) {
         spec.y1 = a[5];
         const auto gt = static_cast<GradientTarget>(static_cast<int32_t>(a[6]));
         std::string err;
-        e.history.beginEdit(e.doc, "gradient", static_cast<uint64_t>(e.docRevision));
-        const bool ok = applyGradientStops(e.doc, static_cast<LayerId>(a[0]), spec, gt, stops, err);
+        e.history().beginEdit(e.doc(), "gradient", static_cast<uint64_t>(e.docRevision()));
+        const bool ok = applyGradientStops(e.doc(), static_cast<LayerId>(a[0]), spec, gt, stops, err);
         if (!ok) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, err);
         }
         restyleAllLocked(e);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -11053,7 +11212,7 @@ napi_value BucketFillPattern(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lg(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "bucketFillPattern: no document");
         }
         std::string err;
@@ -11063,22 +11222,22 @@ napi_value BucketFillPattern(napi_env env, napi_callback_info info) {
         if (mask == nullptr) {
             return makeError(env, kErrBadParam, "bucketFillPattern: " + err);
         }
-        std::shared_ptr<const TileGrid> saved = e.doc.selection;
+        std::shared_ptr<const TileGrid> saved = e.doc().selection;
         if (saved != nullptr) {
-            mask = tiles::combineSelection(e.doc, mask, tiles::SelectionOp::Intersect);
+            mask = tiles::combineSelection(e.doc(), mask, tiles::SelectionOp::Intersect);
             if (mask == nullptr) {
                 return makeError(env, kErrBadParam, "bucketFillPattern: empty intersection");
             }
         }
-        e.history.beginEdit(e.doc, "pattern fill", static_cast<uint64_t>(e.docRevision));
-        e.doc.selection = std::move(mask);
-        const bool ok = fillWithPattern(e.doc, e.doc.activeId, *patGrid, pw, ph, scale, err);
-        e.doc.selection = saved;
+        e.history().beginEdit(e.doc(), "pattern fill", static_cast<uint64_t>(e.docRevision()));
+        e.doc().selection = std::move(mask);
+        const bool ok = fillWithPattern(e.doc(), e.doc().activeId, *patGrid, pw, ph, scale, err);
+        e.doc().selection = saved;
         if (!ok) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, err);
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -11114,17 +11273,17 @@ napi_value FillWithPatternCmd(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lg(e.docMutex);
-        if (e.doc.width == 0 || e.doc.height == 0) {
+        if (e.doc().width == 0 || e.doc().height == 0) {
             return makeError(env, kErrNoDoc, "fillWithPattern: no document");
         }
         std::string err;
-        e.history.beginEdit(e.doc, "pattern fill", static_cast<uint64_t>(e.docRevision));
-        const bool ok = fillWithPattern(e.doc, e.doc.activeId, *patGrid, pw, ph, scale, err);
+        e.history().beginEdit(e.doc(), "pattern fill", static_cast<uint64_t>(e.docRevision()));
+        const bool ok = fillWithPattern(e.doc(), e.doc().activeId, *patGrid, pw, ph, scale, err);
         if (!ok) {
-            e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+            e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
             return makeError(env, kErrBadParam, err);
         }
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -11198,7 +11357,7 @@ napi_value SetLayerTexture(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(a[0]));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(a[0]));
         if (l == nullptr) {
             return makeError(env, kErrBadParam, "setLayerTexture: layer not found");
         }
@@ -11210,11 +11369,11 @@ napi_value SetLayerTexture(napi_env env, napi_callback_info info) {
         next->texDepth = std::clamp(a[4], 0.0, 1.0);
         next->bevelTexOn = a[5] != 0;
         next->satinTexOn = a[6] != 0;
-        e.history.beginEdit(e.doc, "layer texture", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "layer texture", static_cast<uint64_t>(e.docRevision()));
         l->style = std::move(next);
         std::string err;
-        restyleLayer(e.doc, *l, nextGridRevision(), err);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        restyleLayer(e.doc(), *l, nextGridRevision(), err);
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -11262,7 +11421,7 @@ napi_value SetShapeFillEx(napi_env env, napi_callback_info info) {
     auto& e = Engine::get();
     {
         std::lock_guard<std::mutex> lk(e.docMutex);
-        Layer* l = findLayerLocked(e.doc, static_cast<LayerId>(a[0]));
+        Layer* l = findLayerLocked(e.doc(), static_cast<LayerId>(a[0]));
         if (l == nullptr || l->shape == nullptr) {
             return makeError(env, kErrBadParam, "setShapeFillEx: shape layer not found");
         }
@@ -11276,11 +11435,11 @@ napi_value SetShapeFillEx(napi_env env, napi_callback_info info) {
         next->fillAngleDeg = std::clamp(angleDeg, -3600.0, 3600.0);
         next->fillPatternId = patternId;
         next->fillPatScale = std::clamp(patScale, 0.01, 10.0);
-        e.history.beginEdit(e.doc, "形状填充", static_cast<uint64_t>(e.docRevision));
+        e.history().beginEdit(e.doc(), "形状填充", static_cast<uint64_t>(e.docRevision()));
         l->shape = std::move(next);
         std::string err;
-        shapeRenderLayer(e.doc, *l, err);
-        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
+        shapeRenderLayer(e.doc(), *l, err);
+        e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));
         e.bumpRevisionLocked();
         e.requestRender();
     }

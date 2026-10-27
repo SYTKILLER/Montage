@@ -4,9 +4,11 @@
  *   loopback only + token 认证（32B hex，hilog tag Montage.Control 透出）；
  * - 帧协议 = JSON 行：request {id, method, params} → reply {id, ok, ...}（V-15 无半关闭 →
  *   on('message') 行缓冲累积；JSON.stringify 无内嵌换行保证行帧完整）；
- * - 方法：auth / engine.execute（Automation.execute 白名单 = 注册表 + actions.*）/ state.inspect /
- *   ui.screenshot（flatten→exportPng 写 cacheDir）/ ui.shotRead / fs.mkdir|read|write（限 cacheDir，
- *   拒 '..'）/ app.batch / app.imageProcessor（Automate 驱动）；
+ * - 方法：auth / engine.execute（Automation.execute 白名单 = 注册表 + actions.*；P4 job 化：
+ *   params.wait=false 立返 jobId，jobs.list 轮询，jobs.cancel 取消批处理族）/ jobs.list /
+ *   jobs.cancel / state.inspect / ui.screenshot（flatten→exportPng 写 cacheDir）/ ui.shotRead /
+ *   ui.stroke（P4 无头笔画驱动——动作录制/回放 E2E 通路）/ fs.mkdir|read|write（限 cacheDir，
+ *   拒 '..'）/ app.batch / app.imageProcessor（Automate 驱动，wait=false 起后台 job 可取消）；
  * - 大载荷分块：shotRead/fs.read 按调用方给的 offset/length 回 base64（≤48KB/块建议）。
  */
 import { socket } from '@kit.NetworkKit';
@@ -46,6 +48,26 @@ function toRecord(v: Object): Record<string, Object> {
   return v as Record<string, Object>;
 }
 
+/** P4 后台 job（photocraft #210 同义）：长命令立返 jobId，poll/list 查态，批处理族可取消。 */
+class CtrlJob {
+  id: number;
+  method: string;
+  state: string = 'running';  // running | done | failed | cancelled
+  value: Object | undefined = undefined;
+  error: string = '';
+  started: number = 0;
+  doneAt: number = 0;
+  cancelFlag: (() => boolean) | null = null;  // jobs.cancel 置位（Automate 每文件检查）
+  cancelFn: (() => void) | null = null;       // 支持取消的任务挂接（批处理族）
+  cancelled: boolean = false;
+
+  constructor(id: number, method: string) {
+    this.id = id;
+    this.method = method;
+    this.started = Date.now();
+  }
+}
+
 export class ControlServer {
   private engine: CompositorEngine | null = null;
   private server: socket.TCPSocketServer | null = null;
@@ -56,6 +78,10 @@ export class ControlServer {
   private shotSeq: number = 0;
   // P3-H1：菜单状态快照提供者（Index 注入 —— commands.list 使能/勾选现状求值用）
   private stateFn: (() => MenuState) | null = null;
+  // P4：无头笔画驱动（Index 注入——ui.stroke 走 strokeTouch 同管线，录制/回放 E2E 通路）
+  private strokeFn: ((x0: number, y0: number, x1: number, y1: number) => void) | null = null;
+  private jobs: CtrlJob[] = [];
+  private jobSeq: number = 0;
 
   setEngine(e: CompositorEngine): void {
     this.engine = e;
@@ -63,6 +89,36 @@ export class ControlServer {
 
   setStateProvider(fn: (() => MenuState) | null): void {
     this.stateFn = fn;
+  }
+
+  setStrokeHandler(fn: ((x0: number, y0: number, x1: number, y1: number) => void) | null): void {
+    this.strokeFn = fn;
+  }
+
+  /** 后台 job 启动：立返 jobId；promise 结算入 job（done/failed；cancelled 由 cancel 路径收尾）。 */
+  private startJob(method: string, run: () => Promise<Object>): CtrlJob {
+    this.jobSeq++;
+    const job = new CtrlJob(this.jobSeq, method);
+    this.jobs.push(job);
+    if (this.jobs.length > 32) {
+      this.jobs.splice(0, this.jobs.length - 32);  // 滚动保留最近 32 个
+    }
+    run().then((value: Object): void => {
+      if (job.cancelled) {
+        return;  // 已取消：结算丢弃
+      }
+      job.state = 'done';
+      job.value = value;
+      job.doneAt = Date.now();
+    }).catch((e: Error): void => {
+      if (job.cancelled) {
+        return;
+      }
+      job.state = 'failed';
+      job.error = e.message;
+      job.doneAt = Date.now();
+    });
+    return job;
   }
 
   isRunning(): boolean {
@@ -206,33 +262,85 @@ export class ControlServer {
   }
 
   private handle(c: CtrlConn, id: string, method: string, params: Record<string, Object>): void {
+    // P4 job 化：wait=false 抽取（不透传给命令层——Record 复制排除键）
+    const waitRaw: Object = params['wait'];
+    const noWait = waitRaw !== undefined && waitRaw !== null && typeof waitRaw === 'boolean' &&
+      !(waitRaw as boolean);
+    const cmdParams: Record<string, Object> = {} as Record<string, Object>;
+    for (const k of Object.keys(params)) {
+      if (k !== 'wait') {
+        cmdParams[k] = params[k];
+      }
+    }
+    if (method === 'jobs.list' || method === 'jobs.cancel') {
+      this.handleJobs(c, id, method, cmdParams);
+      return;
+    }
+    if (method === 'ui.stroke') {
+      // P4 无头笔画驱动（录制窗内自动入动作——与 UI strokeTouch 同管线）
+      if (this.strokeFn === null) {
+        this.reply(c, id, false, { 'error': 'no stroke handler' });
+        return;
+      }
+      const x0 = typeof cmdParams['x0'] === 'number' ? cmdParams['x0'] as number : 0;
+      const y0 = typeof cmdParams['y0'] === 'number' ? cmdParams['y0'] as number : 0;
+      const x1 = typeof cmdParams['x1'] === 'number' ? cmdParams['x1'] as number : x0 + 100;
+      const y1 = typeof cmdParams['y1'] === 'number' ? cmdParams['y1'] as number : y0;
+      this.strokeFn(x0, y0, x1, y1);
+      this.reply(c, id, true, { 'strokes': 1 });
+      return;
+    }
     if (method.startsWith('actions.')) {
       // 动作管理命令直达（engine.execute {command} 的顶层便捷路由）
-      automation.execute(method, params).then((r: AutoResult): void => {
-        const payload: Record<string, Object> = {};
-        if (r.value !== undefined) {
-          payload['value'] = r.value;
-        }
-        this.reply(c, id, r.ok, r.ok ? payload : { 'error': r.error });
+      const run = (): Promise<Object> =>
+        automation.execute(method, cmdParams).then((r: AutoResult): Object => {
+          if (!r.ok) {
+            throw new Error(r.error);
+          }
+          if (r.value !== undefined) {
+            return r.value;
+          }
+          const empty: Record<string, Object> = {};
+          return empty;
+        });
+      if (noWait) {
+        const job = this.startJob(method, run);
+        this.reply(c, id, true, { 'job': job.id, 'state': 'running' });
+        return;
+      }
+      run().then((value: Object): void => {
+        this.reply(c, id, true, { 'value': value });
       }).catch((e: Error): void => {
         this.reply(c, id, false, { 'error': `actions error: ${e.message}` });
       });
       return;
     }
     if (method === 'engine.execute') {
-      const cmd = typeof params['command'] === 'string' ? params['command'] as string : '';
-      const execParams: Record<string, Object> = params['params'] !== undefined &&
-        params['params'] !== null ? toRecord(params['params']) : {} as Record<string, Object>;
+      const cmd = typeof cmdParams['command'] === 'string' ? cmdParams['command'] as string : '';
+      const execParams: Record<string, Object> = cmdParams['params'] !== undefined &&
+        cmdParams['params'] !== null ? toRecord(cmdParams['params']) : {} as Record<string, Object>;
       if (cmd.length === 0) {
         this.reply(c, id, false, { 'error': 'missing "command"' });
         return;
       }
-      automation.execute(cmd, execParams).then((r: AutoResult): void => {
-        const payload: Record<string, Object> = {};
-        if (r.value !== undefined) {
-          payload['value'] = r.value;
-        }
-        this.reply(c, id, r.ok, r.ok ? payload : { 'error': r.error });
+      const run = (): Promise<Object> =>
+        automation.execute(cmd, execParams).then((r: AutoResult): Object => {
+          if (!r.ok) {
+            throw new Error(r.error);
+          }
+          if (r.value !== undefined) {
+            return r.value;
+          }
+          const empty: Record<string, Object> = {};
+          return empty;
+        });
+      if (noWait) {
+        const job = this.startJob(`engine.execute:${cmd}`, run);
+        this.reply(c, id, true, { 'job': job.id, 'state': 'running' });
+        return;
+      }
+      run().then((value: Object): void => {
+        this.reply(c, id, true, { 'value': value });
       }).catch((e: Error): void => {
         this.reply(c, id, false, { 'error': `execute error: ${e.message}` });
       });
@@ -308,6 +416,35 @@ export class ControlServer {
       pl['keys'] = keys.length;
       pl['langs'] = langs as Object;
       this.reply(c, id, !fail, pl);
+      return;
+    }
+    // P4 D2：多文档池驱动（E2E 通道；会话原语不入 automation 注册表——不可重放）
+    if (method === 'docs.list' || method === 'docs.switch' || method === 'docs.close' ||
+        method === 'docs.new') {
+      if (this.engine === null) {
+        this.reply(c, id, false, { 'error': 'no engine' });
+        return;
+      }
+      if (method === 'docs.list') {
+        this.reply(c, id, true, { 'docs': this.engine.docsList() as Object });
+      } else if (method === 'docs.switch' || method === 'docs.close') {
+        const idV: Object = cmdParams['id'];
+        if (typeof idV !== 'number') {
+          this.reply(c, id, false, { 'error': 'missing numeric "id"' });
+          return;
+        }
+        const did = idV as number;
+        const ok = method === 'docs.switch' ? this.engine.docSwitch(did) : this.engine.docClose(did);
+        this.reply(c, id, ok, ok ? {} : { 'error': `doc ${did} not found` });
+      } else {
+        const dn = this.engine.docNew();
+        if (dn === null) {
+          this.reply(c, id, false, { 'error': 'docNew failed' });
+        } else {
+          // 回包键勿用 'id'——reply() 的帧 id 会被 payload 同名键覆盖（docs.new 探针实证）
+          this.reply(c, id, true, { 'docId': dn.id });
+        }
+      }
       return;
     }
     if (method === 'ui.screenshot') {
@@ -434,6 +571,10 @@ export class ControlServer {
         this.reply(c, id, false, { 'error': 'missing "output"' });
         return;
       }
+      // P4：wait=false → 后台可取消 job（批处理族独享 cancelFn；Automate 每文件查旗标）
+      let cancelReq = false;
+      const am = new Automate(this.engine, (): boolean => cancelReq,
+        `${this.cacheDir}ctrl_restore.montage`);
       if (method === 'app.batch') {
         const preErr = Automate.checkSteps(actionName, steps);
         if (preErr.length > 0) {
@@ -444,26 +585,49 @@ export class ControlServer {
           inputDir: inputDir, files: files, output: output, actionName: actionName,
           steps: steps, format: format, quality: quality,
         };
-        new Automate(this.engine, (): boolean => false, `${this.cacheDir}ctrl_restore.montage`)
-          .runBatch(opts, (_d: number, _t: number, _n: string): void => {
-          }).then((r: BatchResult): void => {
-          this.reply(c, id, true, this.batchPayload(r));
+        const run = (): Promise<Object> => am.runBatch(opts,
+          (_d: number, _t: number, _n: string): void => {
+          }).then((r: BatchResult): Object => {
+          if (cancelReq) {
+            throw new Error('cancelled');
+          }
+          return this.batchPayload(r) as Object;
+        });
+        if (noWait) {
+          const job = this.startJob('app.batch', run);
+          job.cancelFn = (): void => {
+            cancelReq = true;
+          };
+          this.reply(c, id, true, { 'job': job.id, 'state': 'running' });
+          return;
+        }
+        run().then((value: Object): void => {
+          this.reply(c, id, true, value as Record<string, Object>);
         }).catch((e: Error): void => {
           this.reply(c, id, false, { 'error': `batch: ${e.message}` });
         });
       } else {
         const opts: ProcessorOptions = {
           inputDir: inputDir, files: files, output: output, format: format,
-          width: typeof params['width'] === 'number' ? params['width'] as number : 0,
-          height: typeof params['height'] === 'number' ? params['height'] as number : 0,
+          width: typeof cmdParams['width'] === 'number' ? cmdParams['width'] as number : 0,
+          height: typeof cmdParams['height'] === 'number' ? cmdParams['height'] as number : 0,
           dontEnlarge: true, quality: quality,
-          convertToSrgb: typeof params['convertToSrgb'] === 'boolean'
-            ? params['convertToSrgb'] as boolean : false,
+          convertToSrgb: typeof cmdParams['convertToSrgb'] === 'boolean'
+            ? cmdParams['convertToSrgb'] as boolean : false,
         };
-        new Automate(this.engine, (): boolean => false, `${this.cacheDir}ctrl_restore.montage`)
-          .runProcessor(opts, (_d: number, _t: number, _n: string): void => {
-          }).then((r: BatchResult): void => {
-          this.reply(c, id, true, this.batchPayload(r));
+        const run = (): Promise<Object> => am.runProcessor(opts,
+          (_d: number, _t: number, _n: string): void => {
+          }).then((r: BatchResult): Object => this.batchPayload(r) as Object);
+        if (noWait) {
+          const job = this.startJob('app.imageProcessor', run);
+          job.cancelFn = (): void => {
+            cancelReq = true;
+          };
+          this.reply(c, id, true, { 'job': job.id, 'state': 'running' });
+          return;
+        }
+        run().then((value: Object): void => {
+          this.reply(c, id, true, value as Record<string, Object>);
         }).catch((e: Error): void => {
           this.reply(c, id, false, { 'error': `processor: ${e.message}` });
         });
@@ -471,6 +635,59 @@ export class ControlServer {
       return;
     }
     this.reply(c, id, false, { 'error': `unknown method ${method}` });
+  }
+
+  /** P4：jobs.list / jobs.cancel（photocraft #210 语义子集）。 */
+  private handleJobs(c: CtrlConn, id: string, method: string, params: Record<string, Object>): void {
+    if (method === 'jobs.list') {
+      const rows: Record<string, Object>[] = [];
+      const jobFilter: Object = params['job'];
+      const filter = typeof jobFilter === 'number' ? jobFilter as number : 0;
+      for (const j of this.jobs) {
+        if (filter !== 0 && j.id !== filter) {
+          continue;
+        }
+        const row: Record<string, Object> = {
+          'id': j.id, 'method': j.method, 'state': j.state,
+          'ms': j.doneAt > 0 ? j.doneAt - j.started : Date.now() - j.started,
+        };
+        if (j.value !== undefined) {
+          row['value'] = j.value;
+        }
+        if (j.error.length > 0) {
+          row['error'] = j.error;
+        }
+        rows.push(row);
+      }
+      this.reply(c, id, true, { 'jobs': rows as Object });
+      return;
+    }
+    // jobs.cancel {job}
+    const jobV: Object = params['job'];
+    if (typeof jobV !== 'number') {
+      this.reply(c, id, false, { 'error': 'jobs.cancel needs numeric "job"' });
+      return;
+    }
+    for (const j of this.jobs) {
+      if (j.id !== (jobV as number)) {
+        continue;
+      }
+      if (j.state !== 'running') {
+        this.reply(c, id, false, { 'error': `job ${j.id} already ${j.state}` });
+        return;
+      }
+      if (j.cancelFn === null) {
+        this.reply(c, id, false, { 'error': `job ${j.id} does not support cancel` });
+        return;
+      }
+      j.cancelled = true;
+      j.cancelFn();
+      j.state = 'cancelled';  // 批处理循环随后以「已取消」错误收尾（结算被 cancelled 屏蔽）
+      j.doneAt = Date.now();
+      this.reply(c, id, true, { 'job': j.id, 'state': 'cancelled' });
+      return;
+    }
+    this.reply(c, id, false, { 'error': 'no such job' });
   }
 
   private batchPayload(r: BatchResult): Record<string, Object> {

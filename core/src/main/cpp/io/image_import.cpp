@@ -253,6 +253,16 @@ ImportCompletion* runImport(int fd, const std::string& fileName) {
     FdGuard fdGuard(fd);
     auto& engine = Engine::get();
 
+    // D2 归属锁存：导入是「追加图层到发起时的会话」——完成时 active 可能已切走，
+    // 发布一律落归属会话（docIfEpoch 池内复核：允许期间正常编辑，防跨整档重置）
+    DocSession* owner = nullptr;
+    uint64_t ownerEpoch = 0;
+    {
+        std::lock_guard<std::mutex> lk(engine.docMutex);
+        owner = &engine.active();
+        ownerEpoch = engine.active().epoch;
+    }
+
     // 全量读入一次（DNG/M25 嗅探共用；512MB 上限）
     std::vector<uint8_t> fileBytes;
     {
@@ -293,33 +303,40 @@ ImportCompletion* runImport(int fd, const std::string& fileName) {
                     layer.transform.width = w;
                     layer.transform.height = h;
                     layer.pixels = grid;
+                    LayerId devActiveId = 0;
                     {
                         std::lock_guard<std::mutex> lk(engine.docMutex);
-                        if (engine.doc.width == 0) {
-                            engine.doc.width = w;
-                            engine.doc.height = h;
+                        auto ownerSess = engine.docIfEpoch(owner, ownerEpoch);
+                        if (ownerSess == nullptr) {
+                            return makePayload(false, 0, 0, 0, "document closed during import");
                         }
-                        if (engine.doc.layers.empty()) {
-                            engine.doc.layers.push_back(std::move(layer));
-                            engine.doc.activeId = engine.doc.layers.back().id;
+                        Document& doc = ownerSess->doc;
+                        if (doc.width == 0) {
+                            doc.width = w;
+                            doc.height = h;
+                        }
+                        if (doc.layers.empty()) {
+                            doc.layers.push_back(std::move(layer));
+                            doc.activeId = doc.layers.back().id;
                         } else {
                             const LayerId nid = layer.id;
-                            engine.doc.layers.push_back(std::move(layer));
-                            engine.doc.activeId = nid;
+                            doc.layers.push_back(std::move(layer));
+                            doc.activeId = nid;
                         }
+                        devActiveId = doc.activeId;
                         // M15e：会话 RAW 缓存（显影参数面板数据源；resetDocument 随文档清）
-                        engine.rawDevelop.bytes = bytes;
-                        engine.rawDevelop.layerId = engine.doc.activeId;
-                        engine.rawDevelop.w = w;
-                        engine.rawDevelop.h = h;
-                        engine.rawDevelop.last = io::DevelopParams{};
-                        engine.rawDevelop.valid = true;
-                        engine.bumpRevisionLocked();
+                        ownerSess->rawDevelop.bytes = bytes;
+                        ownerSess->rawDevelop.layerId = doc.activeId;
+                        ownerSess->rawDevelop.w = w;
+                        ownerSess->rawDevelop.h = h;
+                        ownerSess->rawDevelop.last = io::DevelopParams{};
+                        ownerSess->rawDevelop.valid = true;
+                        engine.bumpRevisionLocked(ownerSess.get());
                     }
                     engine.requestRender();
                     OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Dng",
                                  "imported developed raw %ux%u", w, h);
-                    return makePayload(true, w, h, engine.doc.activeId, "");
+                    return makePayload(true, w, h, devActiveId, "");
                 }
                 OH_LOG_Print(LOG_APP, LOG_WARN, 0x4D30, "Montage.Dng",
                              "raw develop failed: %{public}s", derr.c_str());
@@ -346,13 +363,18 @@ ImportCompletion* runImport(int fd, const std::string& fileName) {
                             LayerId nid = layer.id;
                             {
                                 std::lock_guard<std::mutex> lk(engine.docMutex);
-                                if (engine.doc.width == 0) {
-                                    engine.doc.width = pw;
-                                    engine.doc.height = ph;
+                                auto ownerSess = engine.docIfEpoch(owner, ownerEpoch);
+                                if (ownerSess == nullptr) {
+                                    return makePayload(false, 0, 0, 0, "document closed during import");
                                 }
-                                engine.doc.layers.push_back(std::move(layer));
-                                engine.doc.activeId = nid;
-                                engine.bumpRevisionLocked();
+                                Document& doc = ownerSess->doc;
+                                if (doc.width == 0) {
+                                    doc.width = pw;
+                                    doc.height = ph;
+                                }
+                                doc.layers.push_back(std::move(layer));
+                                doc.activeId = nid;
+                                engine.bumpRevisionLocked(ownerSess.get());
                             }
                             engine.requestRender();
                             OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Dng",
@@ -401,16 +423,21 @@ ImportCompletion* runImport(int fd, const std::string& fileName) {
             Transform ct;
             {
                 std::lock_guard<std::mutex> lk(engine.docMutex);
-                const bool createsDoc = (engine.doc.width == 0 || engine.doc.height == 0);
+                auto ownerSess = engine.docIfEpoch(owner, ownerEpoch);
+                if (ownerSess == nullptr) {
+                    return makePayload(false, 0, 0, 0, "document closed during import");
+                }
+                Document& doc = ownerSess->doc;
+                const bool createsDoc = (doc.width == 0 || doc.height == 0);
                 if (createsDoc) {
-                    engine.doc.width = img.w;
-                    engine.doc.height = img.h;
-                    engine.doc.name = "Untitled";
+                    doc.width = img.w;
+                    doc.height = img.h;
+                    doc.name = "Untitled";
                     ct.originX = 0.0;
                     ct.originY = 0.0;
                 } else {
-                    ct.originX = std::max(0.0, (static_cast<double>(engine.doc.width) - img.w) / 2.0);
-                    ct.originY = std::max(0.0, (static_cast<double>(engine.doc.height) - img.h) / 2.0);
+                    ct.originX = std::max(0.0, (static_cast<double>(doc.width) - img.w) / 2.0);
+                    ct.originY = std::max(0.0, (static_cast<double>(doc.height) - img.h) / 2.0);
                 }
                 ct.width = img.w;
                 ct.height = img.h;
@@ -419,9 +446,9 @@ ImportCompletion* runImport(int fd, const std::string& fileName) {
                 layer.name = "图片 " + std::to_string(codecLayerId);
                 layer.transform = ct;
                 layer.pixels = codecGrid;
-                engine.doc.layers.push_back(std::move(layer));
-                engine.doc.activeId = codecLayerId;
-                engine.bumpRevisionLocked();
+                doc.layers.push_back(std::move(layer));
+                doc.activeId = codecLayerId;
+                engine.bumpRevisionLocked(ownerSess.get());
                 engine.requestRender();
             }
             notifyProgress(1.0);
@@ -504,13 +531,18 @@ ImportCompletion* runImport(int fd, const std::string& fileName) {
     Transform transform;
     {
         std::lock_guard<std::mutex> lk(engine.docMutex);
-        createsDoc = (engine.doc.width == 0 || engine.doc.height == 0);
+        auto ownerSess = engine.docIfEpoch(owner, ownerEpoch);
+        if (ownerSess == nullptr) {
+            return makePayload(false, imgW, imgH, 0, "document closed during import");
+        }
+        const Document& doc = ownerSess->doc;
+        createsDoc = (doc.width == 0 || doc.height == 0);
         if (createsDoc) {
             transform.originX = 0.0;
             transform.originY = 0.0;
         } else {
-            transform.originX = std::max(0.0, (static_cast<double>(engine.doc.width) - imgW) / 2.0);
-            transform.originY = std::max(0.0, (static_cast<double>(engine.doc.height) - imgH) / 2.0);
+            transform.originX = std::max(0.0, (static_cast<double>(doc.width) - imgW) / 2.0);
+            transform.originY = std::max(0.0, (static_cast<double>(doc.height) - imgH) / 2.0);
         }
         transform.width = imgW;
         transform.height = imgH;
@@ -525,10 +557,15 @@ ImportCompletion* runImport(int fd, const std::string& fileName) {
     bool layerAppended = false;
     auto publishGrid = [&](std::shared_ptr<const TileGrid> grid) {
         std::lock_guard<std::mutex> lk(engine.docMutex);
+        auto ownerSess = engine.docIfEpoch(owner, ownerEpoch);
+        if (ownerSess == nullptr) {
+            return;  // 归属会话已关闭：本带丢弃（importDone 回调报错）
+        }
+        Document& doc = ownerSess->doc;
         if (createsDoc) {
-            engine.doc.width = imgW;
-            engine.doc.height = imgH;
-            engine.doc.name = "Untitled";
+            doc.width = imgW;
+            doc.height = imgH;
+            doc.name = "Untitled";
         }
         if (!layerAppended) {
             Layer layer;
@@ -536,11 +573,11 @@ ImportCompletion* runImport(int fd, const std::string& fileName) {
             layer.name = "图片 " + std::to_string(layerId);
             layer.transform = transform;
             layer.pixels = grid;
-            engine.doc.layers.push_back(std::move(layer));
-            engine.doc.activeId = layerId;
+            doc.layers.push_back(std::move(layer));
+            doc.activeId = layerId;
             layerAppended = true;
         } else {
-            for (Layer& l : engine.doc.layers) {
+            for (Layer& l : doc.layers) {
                 if (l.id == layerId) {
                     l.pixels = grid;
                     break;
@@ -593,7 +630,10 @@ ImportCompletion* runImport(int fd, const std::string& fileName) {
 
     {
         std::lock_guard<std::mutex> lk(engine.docMutex);
-        engine.bumpRevisionLocked();
+        auto ownerSess = engine.docIfEpoch(owner, ownerEpoch);
+        if (ownerSess != nullptr) {
+            engine.bumpRevisionLocked(ownerSess.get());
+        }
     }
     {
         std::lock_guard<std::mutex> lk(engine.import.mtx);

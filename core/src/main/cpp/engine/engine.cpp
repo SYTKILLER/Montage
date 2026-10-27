@@ -42,20 +42,31 @@ void Engine::requestRender() {
     render.wake();
 }
 
-void Engine::bumpRevisionLocked() {
-    // 须持有 docMutex；版本经 TSFN 送 JS 线程（AppStorage docVersion，01 §6 事件面）
-    docRevision++;
-    fireRevisionLocked();
-}
-
-void Engine::fireRevisionLocked() {
-    // 撤销/重做：docRevision 被恢复为快照版本（非自增），只广播不递增。
-    // 此前 undo 复用 bump 的自增会让 AppStorage 值恰好不变 → @Watch 不触发 →
-    // 图层面板/缩略图在撤销后不刷新（M7.5 模拟器实证修复）。
+void Engine::bumpRevisionLocked(DocSession* target) {
+    // 须持有 docMutex；版本经 TSFN 送 JS 线程（AppStorage docVersion，01 §6 事件面）。
+    // D2：载荷 = 全局 revisionSeq（单调——@Watch 需每次值变；target 缺省 = active）
+    DocSession& s = target != nullptr ? *target : active();
+    s.revision++;
+    revisionSeq++;
     if (revisionTsfn == nullptr) {
         return;
     }
-    void* payload = reinterpret_cast<void*>(static_cast<intptr_t>(docRevision));
+    void* payload = reinterpret_cast<void*>(static_cast<intptr_t>(revisionSeq));
+    if (napi_call_threadsafe_function(revisionTsfn, payload, napi_tsfn_nonblocking) != napi_ok) {
+        OH_LOG_Print(LOG_APP, LOG_WARN, kDomain, kTag, "revision tsfn call failed");
+    }
+}
+
+void Engine::fireRevisionLocked() {
+    // 撤销/重做：会话 revision 被恢复为快照版本（非自增），只广播不递增；
+    // 此前 undo 复用 bump 的自增会让 AppStorage 值恰好不变 → @Watch 不触发 →
+    // 图层面板/缩略图在撤销后不刷新（M7.5 模拟器实证修复）。
+    // D2：切档/恢复同样需要「值必变」→ revisionSeq 自增后广播。
+    revisionSeq++;
+    if (revisionTsfn == nullptr) {
+        return;
+    }
+    void* payload = reinterpret_cast<void*>(static_cast<intptr_t>(revisionSeq));
     if (napi_call_threadsafe_function(revisionTsfn, payload, napi_tsfn_nonblocking) != napi_ok) {
         OH_LOG_Print(LOG_APP, LOG_WARN, kDomain, kTag, "revision tsfn call failed");
     }
@@ -64,6 +75,174 @@ void Engine::fireRevisionLocked() {
 LayerId Engine::nextLayerId() {
     static std::atomic<LayerId> counter{1};
     return counter.fetch_add(1);
+}
+
+// ---------- D2 多文档池命令面（锁外调用，内部自取锁） ----------
+
+uint64_t Engine::newSession(bool activate) {
+    auto s = std::make_shared<DocSession>();
+    s->id = ++sessionSeq;
+    const uint64_t id = s->id;
+    {
+        std::lock_guard<std::mutex> lk(docMutex);
+        docs.push_back(s);
+        if (activate) {
+            activeIdx = docs.size() - 1;
+        }
+    }
+    return id;
+}
+
+size_t Engine::prepareOpenSlot() {
+    // 整档替换类打开（工程/PSD/分层 TIFF/文件打开流）前的落位：active 是空档
+    //（无内容且无历史）→ 复用（旧单文档语义）；否则新建会话并激活（PS 多标签）。
+    // 后续 resetDocument 作用于新 active，旧文档会话与历史原样保留。
+    {
+        std::lock_guard<std::mutex> lk(docMutex);
+        const DocSession& s = active();
+        if (s.doc.width == 0 && !s.history.canUndo() && !s.history.canRedo()) {
+            return activeIdx;
+        }
+    }
+    newSession(true);
+    std::lock_guard<std::mutex> lk(docMutex);
+    return activeIdx;
+}
+
+bool Engine::switchDoc(size_t idx) {
+    // 1) 丢弃队列中未处理点（属旧 active——落新档=串档）
+    {
+        std::lock_guard<std::mutex> lk(strokeMtx);
+        strokeQueue.clear();
+        strokeSuspend_ = true;  // 窗口期 begin 标记丢弃（防切换临界区新笔画）
+    }
+    {
+        // 2) 与笔画线程 batch 处理段互斥；在途 draft 原地收尾（账目落原会话）再切换
+        std::unique_lock<std::mutex> cycle(strokeCycleMtx);
+        std::unique_lock<std::mutex> lk(docMutex);
+        if (idx >= docs.size() || idx == activeIdx) {
+            lk.unlock();
+            cycle.unlock();
+            std::lock_guard<std::mutex> sm(strokeMtx);
+            strokeSuspend_ = false;
+            return idx == activeIdx;  // 同位切换 = 成功（幂等）
+        }
+        if (draft != nullptr) {
+            commitDraftLocked(lk, cycle, false);
+        }
+        activeIdx = idx;
+        fireRevisionLocked();   // UI 镜像/标签条刷新（onDocVersion 全家桶）
+        historyVersion.fetch_add(1);  // 历史面板随会话切换
+        needsRender.store(true);
+    }
+    render.wake();
+    {
+        std::lock_guard<std::mutex> sm(strokeMtx);
+        strokeSuspend_ = false;
+    }
+    return true;
+}
+
+bool Engine::switchDocById(uint64_t id) {
+    std::unique_lock<std::mutex> lk(docMutex);
+    for (size_t i = 0; i < docs.size(); ++i) {
+        if (docs[i]->id == id) {
+            lk.unlock();
+            return switchDoc(i);
+        }
+    }
+    return false;
+}
+
+bool Engine::closeDocAt(size_t idx) {
+    // 关闭指定会话：唯一会话 → 退化为 resetDocument（旧 closeDocument 语义）；
+    // 池空补一个空会话（「无文档」UI 态保持）；关 active → 原位邻档接管（越界回退末位）。
+    {
+        std::unique_lock<std::mutex> lk(docMutex);
+        if (idx >= docs.size()) {
+            return false;
+        }
+        if (docs.size() <= 1) {
+            lk.unlock();
+            resetDocument();
+            return true;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(strokeMtx);
+        strokeQueue.clear();
+        strokeSuspend_ = true;
+    }
+    {
+        std::unique_lock<std::mutex> cycle(strokeCycleMtx);
+        std::unique_lock<std::mutex> lk(docMutex);
+        if (idx >= docs.size()) {
+            lk.unlock();
+            cycle.unlock();
+            std::lock_guard<std::mutex> sm(strokeMtx);
+            strokeSuspend_ = false;
+            return false;
+        }
+        // active 上的在途 draft 原地收尾（历史账目入会话——随会话一起销毁亦可，
+        // 但 draft 提交路径还引用全局去重状态，先提交再移除最稳）
+        if (idx == activeIdx && draft != nullptr) {
+            commitDraftLocked(lk, cycle, false);
+        }
+        docs.erase(docs.begin() + static_cast<long>(idx));
+        if (docs.empty()) {
+            auto s = std::make_shared<DocSession>();
+            s->id = ++sessionSeq;
+            docs.push_back(s);
+            activeIdx = 0;
+        } else if (activeIdx >= docs.size()) {
+            activeIdx = docs.size() - 1;
+        } else if (idx < activeIdx) {
+            activeIdx--;
+        }
+        fireRevisionLocked();  // 标签条/面板镜像刷新（无论关的是否 active）
+        historyVersion.fetch_add(1);
+        needsRender.store(true);
+    }
+    render.wake();
+    {
+        std::lock_guard<std::mutex> sm(strokeMtx);
+        strokeSuspend_ = false;
+    }
+    return true;
+}
+
+bool Engine::closeDocById(uint64_t id) {
+    std::unique_lock<std::mutex> lk(docMutex);
+    for (size_t i = 0; i < docs.size(); ++i) {
+        if (docs[i]->id == id) {
+            lk.unlock();
+            return closeDocAt(i);
+        }
+    }
+    return false;
+}
+
+std::shared_ptr<DocSession> Engine::docIfUnchanged(const DocStamp& s) {
+    // 须持 docMutex：同指针仍在池 + epoch/revision 未变 → 会话活且内容未被并发改
+    for (auto& p : docs) {
+        if (p.get() == s.session) {
+            if (p->epoch == s.epoch && p->revision == s.revision) {
+                return p;
+            }
+            return nullptr;
+        }
+    }
+    return nullptr;
+}
+
+std::shared_ptr<DocSession> Engine::docIfEpoch(DocSession* ptr, uint64_t epoch) {
+    // 须持 docMutex：导入归属复核——会话仍在池且未整档重置（允许期间正常编辑）
+    for (auto& p : docs) {
+        if (p.get() == ptr) {
+            return p->epoch == epoch ? p : nullptr;
+        }
+    }
+    return nullptr;
 }
 
 void Engine::ensureStrokeThreadLocked() {
@@ -105,9 +284,12 @@ void Engine::strokeThreadMain() {
                     if (draft != nullptr) {
                         continue;  // 上一笔未提交（异常序列）：丢弃新 begin 防串笔
                     }
+                    if (strokeSuspend_) {
+                        continue;  // D2：切换/关闭文档窗口期笔画不落错档
+                    }
                     // M10d：快速蒙版模式（doc.quickMask 非 null）= 落笔目标即通道，
                     // 由文档状态推导（撤销跨 Q 边界回退时自动跟随，无独立标志位失同步）
-                    const bool qm = doc.quickMask != nullptr;
+                    const bool qm = doc().quickMask != nullptr;
                     // M19a：修复族落笔语义（QM/蒙版目标不可修复——降级普通笔）
                     HealKind healKind = HealKind::None;
                     if (!qm && !brushOnMask && brushHealKind > 0) {
@@ -122,7 +304,7 @@ void Engine::strokeThreadMain() {
                     // 复用克隆管线；克隆工具优先——两者互斥由 UI 切换保证）
                     bool useHistoryBrush = false;
                     if (!qm && !useClone && historyBrushSteps > 0) {
-                        auto snap = history.layerPixelsStepsBack(historyBrushSteps, doc.activeId);
+                        auto snap = history().layerPixelsStepsBack(historyBrushSteps, doc().activeId);
                         if (snap != nullptr) {
                             cloneParams.srcGrid = snap.get();
                             cloneParams.srcOriginX = 0;
@@ -154,7 +336,7 @@ void Engine::strokeThreadMain() {
                     const bool healNeedsSrc = healKind == HealKind::Heal;
                     if (useClone || healNeedsSrc) {
                         const Layer* srcLayer = nullptr;
-                        for (const Layer& l : doc.layers) {
+                        for (const Layer& l : doc().layers) {
                             if (l.id == cs().layerId) {
                                 srcLayer = &l;
                                 break;
@@ -190,7 +372,7 @@ void Engine::strokeThreadMain() {
                             }
                         }
                     }
-                    history.beginEdit(doc, healKind == HealKind::Heal ? "healing brush"
+                    history().beginEdit(doc(), healKind == HealKind::Heal ? "healing brush"
                                         : healKind != HealKind::None ? "spot healing"
                                         : useHistoryBrush ? "history brush"
                                         : useClone ? "clone stamp"
@@ -198,17 +380,17 @@ void Engine::strokeThreadMain() {
                                         : qm ? "quick mask"
                                         : (brushOnMask ? "mask brush"
                                           : (brush.erasing ? "eraser" : "brush")),
-                                      static_cast<uint64_t>(docRevision));
+                                      static_cast<uint64_t>(docRevision()));
                     draft = std::make_unique<StrokeDraft>();
                     ++draftGen_;  // 渲染快照去重状态换代（copyStrokeSnapshotLocked 侦测）
                     std::string err;
-                    if (!draft->begin(doc, doc.activeId, brush, !qm && brushOnMask, qm,
+                    if (!draft->begin(doc(), doc().activeId, brush, !qm && brushOnMask, qm,
                                       (useClone || useHistoryBrush ||
                                        healKind == HealKind::Heal) ? &cloneParams : nullptr,
                                       err, qm ? BrushEffect::None : brushEffect, healKind)) {
                         OH_LOG_Print(LOG_APP, LOG_WARN, 0x4D30, "Montage.Brush",
                                      "draft begin failed: %{public}s", err.c_str());
-                        history.endEdit(doc, static_cast<uint64_t>(docRevision));
+                        history().endEdit(doc(), static_cast<uint64_t>(docRevision()));
                         draft.reset();
                         continue;
                     }
@@ -217,81 +399,7 @@ void Engine::strokeThreadMain() {
                     if (draft == nullptr) {
                         continue;  // 陈旧 end 标记（背靠背笔画残留）
                     }
-                    draft->end();
-                    if (draft->qmTarget()) {
-                        // M10d：提交到快速蒙版通道（COW 换网格）。必须以原网格为合并基底
-                        //（nullptr 会丢未触碰瓦片——M5b-1 实证教训）
-                        auto merged = draft->commitGrid(doc.quickMask.get());
-                        if (merged != nullptr) {
-                            doc.quickMask = std::move(merged);
-                        }
-                    } else if (draft->maskTarget()) {
-                        // M5b：提交到蒙版 patch 网格（COW 换 LayerMask）+ 重合成
-                        // 必须以原 patch 网格为合并基底（nullptr 会丢未触碰瓦片 → patch 缺行）
-                        const LayerId lid = draft->layerId();
-                        for (Layer& l : doc.layers) {
-                            if (l.id == lid && l.mask != nullptr && l.mask->pixels != nullptr) {
-                                auto merged = draft->commitGrid(l.mask->pixels.get());
-                                if (merged != nullptr) {
-                                    auto m = std::make_shared<LayerMask>(*l.mask);
-                                    m->pixels = merged;
-                                    l.mask = std::move(m);
-                                    l.render = (l.mask->enabled && l.pixels != nullptr)
-                                                   ? composeMasked(l.pixels, *l.mask)
-                                                   : nullptr;
-                                }
-                                break;
-                            }
-                        }
-                    } else {
-                        // 提交（对拍 commit：工作瓦片合并入图层 grid）。
-                        // P2-1：原实现先 commitGrid(nullptr) 判空再真合并——两次全量
-                        // 构建（paintTile + 逐瓦片拷贝），第一次结果整体丢弃
-                        const LayerId lid = draft->layerId();
-                        for (Layer& l : doc.layers) {
-                            if (l.id == lid) {
-                                l.pixels = draft->commitGrid(l.pixels.get());
-                                // M5a：蒙版启用图层提交后重合成派生网格
-                                if (l.mask != nullptr && l.mask->enabled) {
-                                    l.render = composeMasked(l.pixels, *l.mask);
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    // M14c：提交像素变更后重算带样式/填充层派生渲染（样式实时跟随笔画）。
-                    // 修复②：样式重算是秒级 CPU（模糊/膨胀全域）——持 docMutex 会把渲染
-                    // 线程冻在 doFrame 等锁处，样式层每笔收尾一次（8 连笔 10fps 实测主因）。
-                    // 有样式层时改走「CoW 快照 → 放锁重算 → 重取锁身份护栏发布」；endEdit
-                    // 移到发布后，undo/redo 快照仍自带最终 styledRender（与原时序一致）。
-                    // 放锁窗口内 resetDocument/其他事务可能插入：发布护栏 + endEdit 的
-                    // pendingFlag_ 守卫保证不落错账（窗口内他端 beginEdit 会并入本条目，
-                    // 与既有嵌套语义同类）。
-                    bool needRestyle = false;
-                    for (const Layer& l : doc.layers) {
-                        if (l.style != nullptr || l.fill != nullptr) {
-                            needRestyle = true;
-                            break;
-                        }
-                    }
-                    if (needRestyle) {
-                        Document work = doc;  // CoW：瓦片 shared_ptr 共享，O(层+瓦)指针拷贝
-                        draft.reset();
-                        lk.unlock();
-                        cycle.unlock();
-                        restyleDocument(work);
-                        cycle.lock();
-                        lk.lock();
-                        publishStyledLocked(work);
-                        history.endEdit(doc, static_cast<uint64_t>(docRevision + 1));
-                        bumpRevisionLocked();
-                    } else {
-                        restyleDocument(doc);  // 无样式/填充层：空转遍历，保持锁内原路径
-                        history.endEdit(doc, static_cast<uint64_t>(docRevision + 1));
-                        bumpRevisionLocked();
-                        draft.reset();
-                    }
-                    historyVersion.fetch_add(1);
+                    commitDraftLocked(lk, cycle, true);
                 } else if (draft != nullptr) {
                     draft->append(p.x, p.y, p.pressure);
                 }
@@ -299,6 +407,103 @@ void Engine::strokeThreadMain() {
             requestRender();
         }
     }
+}
+
+// 在途 draft 提交（end 分支与 switchDoc/closeDocAt 强制收尾共用）。须持 cycle+doc 锁。
+// 持 shared_ptr 引用：allowUnlock 放锁窗口内会话可能被切换/关闭——引用保证内存活，
+// 复核 &active() != sess.get() 时丢弃发布（账目只写死会话的 history，无副作用）。
+void Engine::commitDraftLocked(std::unique_lock<std::mutex>& lk,
+                               std::unique_lock<std::mutex>& cycle, bool allowUnlock) {
+    std::shared_ptr<DocSession> sess = docs[activeIdx];  // 收尾时 active 尚未切换（调用方保证）
+    DocSession& s = *sess;
+    draft->end();
+    if (draft->qmTarget()) {
+        // M10d：提交到快速蒙版通道（COW 换网格）。必须以原网格为合并基底
+        //（nullptr 会丢未触碰瓦片——M5b-1 实证教训）
+        auto merged = draft->commitGrid(s.doc.quickMask.get());
+        if (merged != nullptr) {
+            s.doc.quickMask = std::move(merged);
+        }
+    } else if (draft->maskTarget()) {
+        // M5b：提交到蒙版 patch 网格（COW 换 LayerMask）+ 重合成
+        // 必须以原 patch 网格为合并基底（nullptr 会丢未触碰瓦片 → patch 缺行）
+        const LayerId lid = draft->layerId();
+        for (Layer& l : s.doc.layers) {
+            if (l.id == lid && l.mask != nullptr && l.mask->pixels != nullptr) {
+                auto merged = draft->commitGrid(l.mask->pixels.get());
+                if (merged != nullptr) {
+                    auto m = std::make_shared<LayerMask>(*l.mask);
+                    m->pixels = merged;
+                    l.mask = std::move(m);
+                    l.render = (l.mask->enabled && l.pixels != nullptr)
+                                   ? composeMasked(l.pixels, *l.mask)
+                                   : nullptr;
+                }
+                break;
+            }
+        }
+    } else {
+        // 提交（对拍 commit：工作瓦片合并入图层 grid）。
+        // P2-1：原实现先 commitGrid(nullptr) 判空再真合并——两次全量
+        // 构建（paintTile + 逐瓦片拷贝），第一次结果整体丢弃
+        const LayerId lid = draft->layerId();
+        for (Layer& l : s.doc.layers) {
+            if (l.id == lid) {
+                l.pixels = draft->commitGrid(l.pixels.get());
+                // M5a：蒙版启用图层提交后重合成派生网格
+                if (l.mask != nullptr && l.mask->enabled) {
+                    l.render = composeMasked(l.pixels, *l.mask);
+                }
+                break;
+            }
+        }
+    }
+    // M14c：提交像素变更后重算带样式/填充层派生渲染（样式实时跟随笔画）。
+    // 修复②：样式重算是秒级 CPU（模糊/膨胀全域）——持 docMutex 会把渲染
+    // 线程冻在 doFrame 等锁处，样式层每笔收尾一次（8 连笔 10fps 实测主因）。
+    // 有样式层时改走「CoW 快照 → 放锁重算 → 重取锁身份护栏发布」；endEdit
+    // 移到发布后，undo/redo 快照仍自带最终 styledRender（与原时序一致）。
+    // 放锁窗口内 resetDocument/其他事务可能插入：发布护栏 + endEdit 的
+    // pendingFlag_ 守卫保证不落错账（窗口内他端 beginEdit 会并入本条目，
+    // 与既有嵌套语义同类）。
+    bool needRestyle = false;
+    for (const Layer& l : s.doc.layers) {
+        if (l.style != nullptr || l.fill != nullptr) {
+            needRestyle = true;
+            break;
+        }
+    }
+    if (needRestyle) {
+        Document work = s.doc;  // CoW：瓦片 shared_ptr 共享，O(层+瓦)指针拷贝
+        draft.reset();
+        if (allowUnlock) {
+            lk.unlock();
+            cycle.unlock();
+            restyleDocument(work);
+            cycle.lock();
+            lk.lock();
+            // 放锁窗口内 active 可能被切换/重置：按代次护栏丢弃（不落错档）
+            if (docs.empty() || &active() != sess.get()) {
+                return;
+            }
+            publishStyledLocked(work);
+            // 窗口内他端事务可能已并账：直接 endEdit 会撞他的 pending——由
+            // history.endEdit 的 pendingFlag_ 守卫吸收（合并/丢弃同旧语义）
+            s.history.endEdit(s.doc, static_cast<uint64_t>(s.revision + 1));
+            bumpRevisionLocked(&s);
+        } else {
+            restyleDocument(s.doc);
+            s.history.endEdit(s.doc, static_cast<uint64_t>(s.revision + 1));
+            bumpRevisionLocked(&s);
+            draft.reset();
+        }
+    } else {
+        restyleDocument(s.doc);  // 无样式/填充层：空转遍历，保持锁内原路径
+        s.history.endEdit(s.doc, static_cast<uint64_t>(s.revision + 1));
+        bumpRevisionLocked(&s);
+        draft.reset();
+    }
+    historyVersion.fetch_add(1);
 }
 
 Engine::StrokeSnapshot Engine::copyStrokeSnapshotLocked() {
@@ -343,7 +548,7 @@ Engine::StrokeSnapshot Engine::copyStrokeSnapshotLocked() {
     snap.layerId = draft->layerId();
     snap.active = true;
     const Layer* layer = nullptr;
-    for (const Layer& l : doc.layers) {
+    for (const Layer& l : doc().layers) {
         if (l.id == snap.layerId) {
             layer = &l;
             break;
@@ -394,7 +599,7 @@ Engine::StrokeSnapshot Engine::copyStrokeSnapshotLocked() {
                         for (uint32_t c = 0; c < kTile; ++c) {
                             const int gx = static_cast<int>(ltx * kTile) + static_cast<int>(c);
                             // patch 域坐标 → work 瓦片内坐标；内容矩形外走旧蒙版语义
-                            // （256 对齐瓦片在 content 外的样本是 0，直采会误隐 outside 区）
+                            //（256 对齐瓦片在 content 外的样本是 0，直采会误隐 outside 区）
                             const int pxg = gx - layer->mask->offsetX;
                             const int pyg = gy - layer->mask->offsetY;
                             const int mx = pxg - static_cast<int>(ptx * kTile);
@@ -457,14 +662,14 @@ Engine::StrokeSnapshot Engine::copyStrokeSnapshotLocked() {
 }
 
 // 修复②：锁外重算结果的发布（须持 docMutex）。身份护栏：锁外窗口内层被撤销/像素重换
-// （pixels 身份变化）、蒙版变更、样式/填充替换任一发生 → 本次结果不发布（撤销恢复的
+//（pixels 身份变化）、蒙版变更、样式/填充替换任一发生 → 本次结果不发布（撤销恢复的
 // 快照自带与像素配套的 styledRender；其余情形由下一次样式触发点重算覆盖）。
 void Engine::publishStyledLocked(const Document& work) {
     for (const Layer& wl : work.layers) {
         if (wl.style == nullptr && wl.fill == nullptr) {
             continue;
         }
-        for (Layer& l : doc.layers) {
+        for (Layer& l : doc().layers) {
             if (l.id != wl.id) {
                 continue;
             }
@@ -479,7 +684,8 @@ void Engine::publishStyledLocked(const Document& work) {
     }
 }
 
-// 关闭/新建/整档替换（打开工程/PSD）统一入口。调用方不得持 docMutex 进入。
+// 重置 active 会话（关/新/整档替换统一入口——io 三路径在 prepareOpenSlot 落位后
+// 调这里清「该会话」；其他会话与历史原样保留）。调用方不得持 docMutex 进入。
 // 审查修复（P0-1/P0-3/P1-3）：此前仅 project_open/psd_import 清 history，新建/关闭/
 // 导入图片三条路径都不清——Ctrl+Z 会把上一文档整档恢复（撤销跨文档）；且在途笔画
 // 残留会用旧档 before + 新档 after 造出跨文档撤销条目，必须连同队列与 draft 一并作废。
@@ -489,6 +695,7 @@ void Engine::resetDocument() {
         std::lock_guard<std::mutex> lk(strokeMtx);
         strokeQuit = true;
         strokeQueue.clear();  // 在途点/end 标记作废（跨文档笔画不落新档）
+        strokeSuspend_ = true;
         strokeCv.notify_all();
     }
     {
@@ -501,9 +708,21 @@ void Engine::resetDocument() {
         std::lock_guard<std::mutex> cycle(strokeCycleMtx);
         std::lock_guard<std::mutex> lk(docMutex);
         draft.reset();
-        doc = Document{};
-        viewport = Viewport{};
-        history.clear();  // 撤销不许跨文档回退（连带复位 pendingFlag_，堵跨文档事务）
+        DocSession& s = active();
+        s.doc = Document{};
+        s.viewport = Viewport{};
+        s.history.clear();  // 撤销不许跨会话回退（连带复位 pendingFlag_，堵跨会话事务）
+        s.revision = 0;
+        s.epoch++;  // 该会话代次递增：在途异步发布（bake 等）凭旧代次作废
+        s.savedRevision = 0;
+        s.filePath.clear();
+        s.textEditOpen = false;  // M12：编辑会话随文档清空
+        s.textEditLayerId = 0;
+        s.filterPreview = FilterPreview{};  // M13：预览会话随文档清空
+        s.lastSelection.reset();  // M10a：重新选择来源不跨文档
+        s.transformPreview = TransformPreview{};
+        s.rawDevelop = RawDevelopSession{};  // M15e：RAW 显影会话随文档清空
+        s.camPreview = CameraPreviewSession{};  // M23c：Camera Raw 预览会话随文档清空
         // 落笔目标标志随文档清空（否则新文档上蒙版目标笔画静默拒绝）
         brushOnMask = false;
         brushIsClone = false;
@@ -511,18 +730,14 @@ void Engine::resetDocument() {
         historyBrushSteps = 0;
         brushIsPattern = false;  // P1：图案图章随文档清（图案库进程级保留）
         patternStampGrid.reset();
-        for (CloneSource& s : cloneSlots) { s = CloneSource{}; }
-        textEditOpen = false;  // M12：编辑会话随文档清空
-        textEditLayerId = 0;
-        filterPreview = FilterPreview{};  // M13：预览会话随文档清空
-        lastSelection.reset();  // M10a：重新选择来源不跨文档
-        transformPreview = TransformPreview{};
-        rawDevelop = RawDevelopSession{};  // M15e：RAW 显影会话随文档清空
-        camPreview = CameraPreviewSession{};  // M23c：Camera Raw 预览会话随文档清空
-        smart::clearSessionCaches();  // M21：智能对象源解码/placed 缓存随文档清空（独立互斥）
+        for (CloneSource& s2 : cloneSlots) { s2 = CloneSource{}; }
+        smart::clearSessionCaches();  // M21：智能对象源解码/placed 缓存随会话清（v1 全局清，登记精细化）
         historyVersion.fetch_add(1);  // 历史面板随清空刷新（M15b）
-        ++docEpoch;  // 文档代次递增：在途异步发布（bake 等）凭旧代次作废，不复活已关档
         needsRender.store(true);
+    }
+    {
+        std::lock_guard<std::mutex> sm(strokeMtx);
+        strokeSuspend_ = false;
     }
     render.wake();
 }

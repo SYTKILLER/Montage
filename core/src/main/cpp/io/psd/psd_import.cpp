@@ -475,29 +475,31 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
         return false;
     }
 
-    // 整档替换：统一走 resetDocument（清撤销/会话态，撤销不跨文档；未持锁调用）
+    // 整档替换：统一走 resetDocument（清撤销/会话态，撤销不跨文档；未持锁调用）。
+    // D2 落位：非空档新开会话（旧档与历史保留），resetDocument 作用于落位后的 active
+    engine.prepareOpenSlot();
     engine.resetDocument();
     {
         std::lock_guard<std::mutex> lk(engine.docMutex);
-        engine.doc.width = doc.width;
-        engine.doc.height = doc.height;
-        engine.doc.name = "PSD";
-        engine.doc.layers = std::move(layers);
-        engine.doc.activeId = engine.doc.layers.empty()
+        engine.doc().width = doc.width;
+        engine.doc().height = doc.height;
+        engine.doc().name = "PSD";
+        engine.doc().layers = std::move(layers);
+        engine.doc().activeId = engine.doc().layers.empty()
                                   ? 0
-                                  : engine.doc.layers[engine.doc.layers.size() - 1].id;
+                                  : engine.doc().layers[engine.doc().layers.size() - 1].id;
         // M17c：带 lrFX 样式的层重建派生网格（openProject 同款收尾）
         // M18d：PSD 路径资源 → 路径面板（保存路径 + 工作路径；不入 History）
-        engine.doc.paths = doc.paths;
-        engine.doc.workPath = doc.workPath;
+        engine.doc().paths = doc.paths;
+        engine.doc().workPath = doc.workPath;
         // M22：深色/多模式往返元数据（渲染仍 8-bit；导出回写原深/模式）
-        engine.doc.psdSrcDepth = doc.srcDepth;
-        engine.doc.psdSrcMode = doc.srcMode;
-        engine.doc.psdSrcChannels = doc.srcChannels;
-        engine.doc.psdIccProfile = doc.iccProfile;
-        engine.doc.psdColorModeData = doc.colorModeData;
-        engine.doc.psdGlobalExtra = doc.globalExtra;
-        restyleDocument(engine.doc);
+        engine.doc().psdSrcDepth = doc.srcDepth;
+        engine.doc().psdSrcMode = doc.srcMode;
+        engine.doc().psdSrcChannels = doc.srcChannels;
+        engine.doc().psdIccProfile = doc.iccProfile;
+        engine.doc().psdColorModeData = doc.colorModeData;
+        engine.doc().psdGlobalExtra = doc.globalExtra;
+        restyleDocument(engine.doc());
         engine.bumpRevisionLocked();
         engine.requestRender();
     }

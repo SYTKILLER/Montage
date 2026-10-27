@@ -353,6 +353,13 @@ function buildTable(): CmdSpec[] {
   v.push(c('window.toggleInfo', '信息面板', 'Info Panel', 'window', { chk: 'panelInfo' }));
   v.push(c('window.toggleActions', '动作面板', 'Actions Panel', 'window', { chk: 'panelActions' }));
   v.push(c('window.togglePresets', '预设库', 'Preset Library', 'window', { chk: 'panelPresets' }));
+  // D2 多文档（P4）：文档动态子树 + 循环切换 + 关闭全部
+  v.push(c('window.docsSub', '文档', 'Documents', 'window', { isSub: true, when: 'docs1' }));
+  v.push(c('window.nextDoc', '下一文档', 'Next Document', 'window',
+    { shortcut: 'Ctrl+Tab', when: 'docs2' }));
+  v.push(c('window.prevDoc', '上一文档', 'Previous Document', 'window',
+    { shortcut: 'Ctrl+Shift+Tab', when: 'docs2' }));
+  v.push(c('window.closeAll', '关闭全部文档', 'Close All Documents', 'window', { when: 'docs1' }));
   // ----- 帮助 -----
   v.push(c('help.themeSub', '主题', 'Theme', 'help', { isSub: true }));
   v.push(c('theme.system', '跟随系统', 'Follow System', 'help', { parent: 'help.themeSub',
@@ -472,6 +479,15 @@ export interface MenuState {
   themeMode: string;
   lang: string;
   controlRunning: boolean;
+  docs: MenuDoc[];  // D2 多文档：标签条/窗口菜单动态子树数据源
+}
+
+/** D2 多文档：菜单态文档条目。 */
+export interface MenuDoc {
+  id: number;
+  name: string;
+  modified: boolean;
+  active: boolean;
 }
 
 type Pred = (s: MenuState) => boolean;
@@ -553,6 +569,8 @@ const PRED: Record<string, Pred> = {
   'themeDark': (s: MenuState): boolean => s.themeMode === 'dark',
   'langZh': (s: MenuState): boolean => s.lang === 'zh',
   'langEn': (s: MenuState): boolean => s.lang === 'en',
+  'docs1': (s: MenuState): boolean => s.docs.length > 0,
+  'docs2': (s: MenuState): boolean => s.docs.length > 1,
 };
 
 function evalPred(key: string, s: MenuState): boolean {
@@ -607,6 +625,11 @@ export function buildMenuVM(s: MenuState): MenuGroupVM[] {
         if (spec.id === 'edit.placeCustomSub') {
           for (const shapeId of s.customShapeIds) {
             kids.push(leafItem(`edit.placeCustom:${shapeId}`, shapeId, '', s.docOpen));
+          }
+        } else if (spec.id === 'window.docsSub') {
+          for (const d of s.docs) {
+            kids.push(leafItem(`doc.switch:${d.id}`, d.name + (d.modified ? ' *' : ''), '',
+              true, d.active));
           }
         } else {
           for (const sub of COMMAND_TABLE) {

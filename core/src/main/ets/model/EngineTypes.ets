@@ -34,6 +34,7 @@ export interface EngineStats {
   devEv: number;
   devGamma: number;
   hasStyleClipboard: boolean;  // M17a：样式剪贴板非空（粘贴菜单使能）
+  strokeBusy: boolean;  // P4：笔画线程在途（动作回放步等待落账）
 }
 
 /** RAW 重显影结果（developRaw 的 data，M15e）。 */
@@ -421,4 +422,19 @@ export interface PresetThumbDTO {
   w: number;
   h: number;
   rgba: ArrayBuffer;
+}
+
+/** D2 多文档：标签条会话条目（docsList）。 */
+export interface DocTabDTO {
+  id: number;
+  name: string;
+  width: number;
+  height: number;
+  active: boolean;
+  modified: boolean;
+}
+
+/** D2 多文档：docNew 返回。 */
+export interface DocNewData {
+  id: number;
 }

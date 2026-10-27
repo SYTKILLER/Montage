@@ -2428,24 +2428,26 @@ bool openProject(int fd, ProjectOpenResult* out, std::string& err) {
     }
     smart::bumpContentsSeqAbove(maxContentsId);
 
-    // 整档替换（02 §5 语义）：统一走 resetDocument（清撤销/会话态，撤销不跨文档）
+    // 整档替换（02 §5 语义）：统一走 resetDocument（清撤销/会话态，撤销不跨文档）。
+    // D2 落位：非空档新开会话（旧档与历史原样保留），resetDocument 作用于落位后 active
     auto& engine = Engine::get();
+    engine.prepareOpenSlot();
     engine.resetDocument();
     {
         std::lock_guard<std::mutex> lk(engine.docMutex);
-        engine.doc = std::move(full);
+        engine.doc() = std::move(full);
         // M14c/M21：样式/填充/智能对象派生渲染重建（不入库，读入后按参数重生成）
-        restyleDocument(engine.doc);
+        restyleDocument(engine.doc());
         engine.bumpRevisionLocked();
         engine.requestRender();
     }
     if (out != nullptr) {
-        out->width = engine.doc.width;
-        out->height = engine.doc.height;
+        out->width = engine.doc().width;
+        out->height = engine.doc().height;
         out->layers = layerCount;
     }
     OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "project opened: %{public}ux%{public}u, %{public}zu layers",
-                 engine.doc.width, engine.doc.height, layerCount);
+                 engine.doc().width, engine.doc().height, layerCount);
     return true;
 }
 

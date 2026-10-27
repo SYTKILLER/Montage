@@ -113,18 +113,19 @@ bool importTiffDocument(int fd, int* outWidth, int* outHeight, std::vector<std::
         layers.push_back(std::move(layer));
     }
 
-    // 整档替换（importPsd 同款收尾）
+    // 整档替换（importPsd 同款收尾）；D2 落位：非空档新开会话（prepareOpenSlot）
+    engine.prepareOpenSlot();
     engine.resetDocument();
     {
         std::lock_guard<std::mutex> lk(engine.docMutex);
-        engine.doc.width = w;
-        engine.doc.height = h;
-        engine.doc.name = "TIFF";
-        engine.doc.layers = std::move(layers);
-        engine.doc.activeId = engine.doc.layers.empty()
+        engine.doc().width = w;
+        engine.doc().height = h;
+        engine.doc().name = "TIFF";
+        engine.doc().layers = std::move(layers);
+        engine.doc().activeId = engine.doc().layers.empty()
                                   ? 0
-                                  : engine.doc.layers.back().id;
-        restyleDocument(engine.doc);
+                                  : engine.doc().layers.back().id;
+        restyleDocument(engine.doc());
         engine.bumpRevisionLocked();
         engine.requestRender();
     }

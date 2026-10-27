@@ -9,6 +9,10 @@ napi_value Init(napi_env env, napi_value exports) {
     napi_property_descriptor props[] = {
         {"newDocument", nullptr, montage::bridge::NewDocument, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"closeDocument", nullptr, montage::bridge::CloseDocument, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"docsList", nullptr, montage::bridge::DocsList, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"docSwitch", nullptr, montage::bridge::DocSwitch, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"docClose", nullptr, montage::bridge::DocClose, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"docNew", nullptr, montage::bridge::DocNew, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"openFileFromFd", nullptr, montage::bridge::OpenFileFromFd, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"openPsdFile", nullptr, montage::bridge::OpenPsdFile, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"openTiffFile", nullptr, montage::bridge::OpenTiffFile, nullptr, nullptr, nullptr, napi_default, nullptr},

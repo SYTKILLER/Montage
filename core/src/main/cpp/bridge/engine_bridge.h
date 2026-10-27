@@ -11,6 +11,11 @@ namespace bridge {
 // 会话
 napi_value NewDocument(napi_env env, napi_callback_info info);
 napi_value CloseDocument(napi_env env, napi_callback_info info);
+// D2 多文档标签条（P4）：会话清单/切换/关闭/新建 scratch
+napi_value DocsList(napi_env env, napi_callback_info info);
+napi_value DocSwitch(napi_env env, napi_callback_info info);
+napi_value DocClose(napi_env env, napi_callback_info info);
+napi_value DocNew(napi_env env, napi_callback_info info);
 // 导入（02 §6）：fd 所有权移交 native（含失败路径）
 napi_value OpenFileFromFd(napi_env env, napi_callback_info info);
 // PSD 导入（04 §1.1 PSD-1）：解析→烘焙→整档替换文档，notes 返回降级提示
