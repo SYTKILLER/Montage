@@ -15,6 +15,7 @@ export interface FilterParamDef {
 
 export interface FilterDef {
   id: string;        // 菜单命令 id 后缀（'filter.gauss' → id 'gauss'）
+  en: string;        // 英文标签（H1 注册表 en 语言包生成源）
   label: string;
   kind: number;      // 引擎 FilterKind
   menu: string;      // 分类
@@ -24,22 +25,22 @@ export interface FilterDef {
 
 export const FILTER_CATALOG: FilterDef[] = [
   {
-    id: 'gauss', label: '高斯模糊', kind: 0, menu: 'blur', hasSeed: false,
+    id: 'gauss', en: 'Gaussian Blur', label: '高斯模糊', kind: 0, menu: 'blur', hasSeed: false,
     params: [{ label: '半径', min: 0.1, max: 250, step: 0.1, def: 5, unit: 'px' }],
   },
   {
-    id: 'box', label: '方框模糊', kind: 1, menu: 'blur', hasSeed: false,
+    id: 'box', en: 'Box Blur', label: '方框模糊', kind: 1, menu: 'blur', hasSeed: false,
     params: [{ label: '半径', min: 1, max: 200, step: 1, def: 8, unit: 'px' }],
   },
   {
-    id: 'motion', label: '动感模糊', kind: 2, menu: 'blur', hasSeed: false,
+    id: 'motion', en: 'Motion Blur', label: '动感模糊', kind: 2, menu: 'blur', hasSeed: false,
     params: [
       { label: '角度', min: -360, max: 360, step: 1, def: 0, unit: '°' },
       { label: '距离', min: 1, max: 500, step: 1, def: 30, unit: 'px' },
     ],
   },
   {
-    id: 'usm', label: 'USM 锐化', kind: 3, menu: 'sharpen', hasSeed: false,
+    id: 'usm', en: 'Unsharp Mask', label: 'USM 锐化', kind: 3, menu: 'sharpen', hasSeed: false,
     params: [
       { label: '数量', min: 1, max: 500, step: 1, def: 100, unit: '%' },
       { label: '半径', min: 0.1, max: 100, step: 0.1, def: 2, unit: 'px' },
@@ -47,7 +48,7 @@ export const FILTER_CATALOG: FilterDef[] = [
     ],
   },
   {
-    id: 'smartSharpen', label: '智能锐化', kind: 4, menu: 'sharpen', hasSeed: false,
+    id: 'smartSharpen', en: 'Smart Sharpen', label: '智能锐化', kind: 4, menu: 'sharpen', hasSeed: false,
     params: [
       { label: '数量', min: 1, max: 500, step: 1, def: 100, unit: '%' },
       { label: '半径', min: 0.1, max: 100, step: 0.1, def: 2, unit: 'px' },
@@ -55,11 +56,11 @@ export const FILTER_CATALOG: FilterDef[] = [
     ],
   },
   {
-    id: 'highpass', label: '高反差保留', kind: 5, menu: 'sharpen', hasSeed: false,
+    id: 'highpass', en: 'High Pass', label: '高反差保留', kind: 5, menu: 'sharpen', hasSeed: false,
     params: [{ label: '半径', min: 0.1, max: 100, step: 0.1, def: 3, unit: 'px' }],
   },
   {
-    id: 'addNoise', label: '添加杂色', kind: 6, menu: 'noise', hasSeed: true,
+    id: 'addNoise', en: 'Add Noise', label: '添加杂色', kind: 6, menu: 'noise', hasSeed: true,
     params: [
       { label: '数量', min: 0, max: 400, step: 1, def: 20, unit: '%' },
       { label: '高斯分布', min: 0, max: 1, step: 1, def: 0, unit: '' },
@@ -67,50 +68,50 @@ export const FILTER_CATALOG: FilterDef[] = [
     ],
   },
   {
-    id: 'median', label: '中间值', kind: 7, menu: 'noise', hasSeed: false,
+    id: 'median', en: 'Median', label: '中间值', kind: 7, menu: 'noise', hasSeed: false,
     params: [{ label: '半径', min: 1, max: 10, step: 1, def: 1, unit: 'px' }],
   },
   {
-    id: 'dust', label: '蒙尘与划痕', kind: 8, menu: 'noise', hasSeed: false,
+    id: 'dust', en: 'Dust & Scratches', label: '蒙尘与划痕', kind: 8, menu: 'noise', hasSeed: false,
     params: [
       { label: '半径', min: 1, max: 10, step: 1, def: 2, unit: 'px' },
       { label: '阈值', min: 0, max: 255, step: 1, def: 20, unit: '级' },
     ],
   },
   {
-    id: 'reduceNoise', label: '减少杂色', kind: 9, menu: 'noise', hasSeed: false,
+    id: 'reduceNoise', en: 'Reduce Noise', label: '减少杂色', kind: 9, menu: 'noise', hasSeed: false,
     params: [{ label: '强度', min: 1, max: 10, step: 1, def: 3, unit: '' }],
   },
   {
-    id: 'mosaic', label: '彩块化', kind: 10, menu: 'pixelate', hasSeed: false,
+    id: 'mosaic', en: 'Mosaic', label: '彩块化', kind: 10, menu: 'pixelate', hasSeed: false,
     params: [{ label: '单元格大小', min: 2, max: 200, step: 1, def: 10, unit: 'px' }],
   },
   {
-    id: 'crystallize', label: '晶格化', kind: 11, menu: 'pixelate', hasSeed: true,
+    id: 'crystallize', en: 'Crystallize', label: '晶格化', kind: 11, menu: 'pixelate', hasSeed: true,
     params: [
       { label: '单元格大小', min: 3, max: 200, step: 1, def: 15, unit: 'px' },
     ],
   },
   {
-    id: 'mezzotint', label: '铜版画', kind: 12, menu: 'pixelate', hasSeed: true,
+    id: 'mezzotint', en: 'Mezzotint', label: '铜版画', kind: 12, menu: 'pixelate', hasSeed: true,
     params: [{ label: '类型(细/中/粗)', min: 0, max: 2, step: 1, def: 1, unit: '' }],
   },
   {
-    id: 'fragment', label: '碎片', kind: 13, menu: 'pixelate', hasSeed: false, params: [],
+    id: 'fragment', en: 'Fragment', label: '碎片', kind: 13, menu: 'pixelate', hasSeed: false, params: [],
   },
   {
-    id: 'pointillize', label: '点状化', kind: 14, menu: 'pixelate', hasSeed: true,
+    id: 'pointillize', en: 'Pointillize', label: '点状化', kind: 14, menu: 'pixelate', hasSeed: true,
     params: [{ label: '单元格大小', min: 3, max: 200, step: 1, def: 15, unit: 'px' }],
   },
   {
-    id: 'halftone', label: '彩色半调', kind: 15, menu: 'pixelate', hasSeed: false,
+    id: 'halftone', en: 'Color Halftone', label: '彩色半调', kind: 15, menu: 'pixelate', hasSeed: false,
     params: [{ label: '最大半径', min: 4, max: 127, step: 1, def: 8, unit: 'px' }],
   },
   {
-    id: 'findEdges', label: '查找边缘', kind: 16, menu: 'stylize', hasSeed: false, params: [],
+    id: 'findEdges', en: 'Find Edges', label: '查找边缘', kind: 16, menu: 'stylize', hasSeed: false, params: [],
   },
   {
-    id: 'emboss', label: '浮雕效果', kind: 17, menu: 'stylize', hasSeed: false,
+    id: 'emboss', en: 'Emboss', label: '浮雕效果', kind: 17, menu: 'stylize', hasSeed: false,
     params: [
       { label: '角度', min: -360, max: 360, step: 1, def: 135, unit: '°' },
       { label: '高度', min: 1, max: 100, step: 1, def: 2, unit: 'px' },
@@ -118,14 +119,14 @@ export const FILTER_CATALOG: FilterDef[] = [
     ],
   },
   {
-    id: 'wind', label: '风', kind: 18, menu: 'stylize', hasSeed: false,
+    id: 'wind', en: 'Wind', label: '风', kind: 18, menu: 'stylize', hasSeed: false,
     params: [
       { label: '方向(左/右)', min: 0, max: 1, step: 1, def: 1, unit: '' },
       { label: '强度', min: 1, max: 100, step: 1, def: 20, unit: '' },
     ],
   },
   {
-    id: 'tiles', label: '拼贴', kind: 19, menu: 'stylize', hasSeed: true,
+    id: 'tiles', en: 'Tiles', label: '拼贴', kind: 19, menu: 'stylize', hasSeed: true,
     params: [
       { label: '拼贴宽', min: 8, max: 500, step: 1, def: 64, unit: 'px' },
       { label: '拼贴高', min: 8, max: 500, step: 1, def: 64, unit: 'px' },
@@ -133,16 +134,16 @@ export const FILTER_CATALOG: FilterDef[] = [
     ],
   },
   {
-    id: 'exposure', label: '曝光过度', kind: 20, menu: 'stylize', hasSeed: false, params: [],
+    id: 'exposure', en: 'Solarize', label: '曝光过度', kind: 20, menu: 'stylize', hasSeed: false, params: [],
   },
   {
-    id: 'clouds', label: '云彩', kind: 21, menu: 'render', hasSeed: true, params: [],
+    id: 'clouds', en: 'Clouds', label: '云彩', kind: 21, menu: 'render', hasSeed: true, params: [],
   },
   {
-    id: 'diffClouds', label: '分层云彩', kind: 22, menu: 'render', hasSeed: true, params: [],
+    id: 'diffClouds', en: 'Difference Clouds', label: '分层云彩', kind: 22, menu: 'render', hasSeed: true, params: [],
   },
   {
-    id: 'lensFlare', label: '镜头光晕', kind: 23, menu: 'render', hasSeed: false,
+    id: 'lensFlare', en: 'Lens Flare', label: '镜头光晕', kind: 23, menu: 'render', hasSeed: false,
     params: [
       { label: '中心X', min: -2000, max: 8000, step: 1, def: 1000, unit: '' },
       { label: '中心Y', min: -2000, max: 8000, step: 1, def: 1000, unit: '' },
@@ -150,21 +151,21 @@ export const FILTER_CATALOG: FilterDef[] = [
     ],
   },
   {
-    id: 'minimum', label: '最小值', kind: 24, menu: 'other', hasSeed: false,
+    id: 'minimum', en: 'Minimum', label: '最小值', kind: 24, menu: 'other', hasSeed: false,
     params: [
       { label: '半径', min: 1, max: 100, step: 1, def: 2, unit: 'px' },
       { label: '圆盘', min: 0, max: 1, step: 1, def: 1, unit: '' },
     ],
   },
   {
-    id: 'maximum', label: '最大值', kind: 25, menu: 'other', hasSeed: false,
+    id: 'maximum', en: 'Maximum', label: '最大值', kind: 25, menu: 'other', hasSeed: false,
     params: [
       { label: '半径', min: 1, max: 100, step: 1, def: 2, unit: 'px' },
       { label: '圆盘', min: 0, max: 1, step: 1, def: 1, unit: '' },
     ],
   },
   {
-    id: 'offset', label: '位移', kind: 26, menu: 'other', hasSeed: false,
+    id: 'offset', en: 'Offset', label: '位移', kind: 26, menu: 'other', hasSeed: false,
     params: [
       { label: '水平', min: -2000, max: 2000, step: 1, def: 50, unit: 'px' },
       { label: '垂直', min: -2000, max: 2000, step: 1, def: 0, unit: 'px' },
@@ -172,7 +173,7 @@ export const FILTER_CATALOG: FilterDef[] = [
   },
   {
     // M20d 镜头校正（lens_ops；色差/暗角中点 v1 固定默认登记）
-    id: 'lensCorrection', label: '镜头校正', kind: 28, menu: 'other', hasSeed: false,
+    id: 'lensCorrection', en: 'Lens Correction', label: '镜头校正', kind: 28, menu: 'other', hasSeed: false,
     params: [
       { label: ' Remove Distortion', min: -100, max: 100, step: 1, def: 0, unit: '' },
       { label: '垂直透视', min: -100, max: 100, step: 1, def: 0, unit: '' },
@@ -185,7 +186,7 @@ export const FILTER_CATALOG: FilterDef[] = [
   {
     // M22 颜色查找：参数 = 表选择（0..内置数-1 / 100+用户槽）；
     // 对话框按 kind===30 渲染预设 chips（内置外观 + 已导入用户表）。
-    id: 'colorLookup', label: '颜色查找', kind: 30, menu: 'adjust', hasSeed: false,
+    id: 'colorLookup', en: 'Color Lookup', label: '颜色查找', kind: 30, menu: 'adjust', hasSeed: false,
     params: [{ label: '预设', min: 0, max: 115, step: 1, def: 0, unit: '' }],
   },
 ];

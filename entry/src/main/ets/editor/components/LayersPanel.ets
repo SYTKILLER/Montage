@@ -289,7 +289,100 @@ export struct LayersPanel {
         .backgroundColor($r('app.color.accent_container'))
       }
 
-      // 图层列表（自顶向下 = PS 惯例；绑定 onItemDragStart 后长按 170ms 起拖——SDK d.ts）
+      // 图层列表（自顶向下 = PS 惯例；绑定 onItemDragStart 后长按 170ms 起拖——SDK d.ts）。
+      // P3 实测修正：操作条必须在 List **之前**——layoutWeight(1) 的 List 把后随兄弟
+      // 挤出容器（4096 高窗口整条操作条消失，dumpLayout 无节点）；前置后确定可见。
+      // 操作条（P2 两行：9 柄单行 318px > 坞内宽 260，矮/窄窗口横向裁切——登记项收口）
+      Row({ space: 6 }) {
+        Button() {
+          SymbolGlyph($r('sys.symbol.plus')).fontSize(16)
+            .fontColor([$r('app.color.text_primary')])
+        }
+        .type(ButtonType.Circle)
+        .width(30).height(30)
+        .backgroundColor(Color.Transparent)
+        .onClick((): void => this.onAdd())
+        Button() {
+          SymbolGlyph($r('sys.symbol.adjustment')).fontSize(16)
+            .fontColor([$r('app.color.text_primary')])
+        }
+        .type(ButtonType.Circle)
+        .width(30).height(30)
+        .backgroundColor(Color.Transparent)
+        .onClick((): void => this.onAddAdjustment())
+        Button() {
+          SymbolGlyph($r('sys.symbol.square_dashed')).fontSize(16)
+            .fontColor([$r('app.color.text_primary')])
+        }
+        .type(ButtonType.Circle)
+        .width(30).height(30)
+        .backgroundColor(Color.Transparent)
+        .enabled(this.active() !== undefined)
+        .onClick((): void => this.onAddMask())
+        Button() {
+          SymbolGlyph($r('sys.symbol.folder_badge_plus')).fontSize(16)
+            .fontColor([$r('app.color.text_primary')])
+        }
+        .type(ButtonType.Circle)
+        .width(30).height(30)
+        .backgroundColor(Color.Transparent)
+        .enabled(this.active() !== undefined)
+        .onClick((): void => this.onGroup())
+        Button() {
+          SymbolGlyph($r('sys.symbol.folder_badge_arrow_left')).fontSize(16)
+            .fontColor([$r('app.color.text_primary')])
+        }
+        .type(ButtonType.Circle)
+        .width(30).height(30)
+        .backgroundColor(Color.Transparent)
+        .enabled(this.active()?.isGroup === true)
+        .onClick((): void => this.onUngroup())
+        // M14b：复制图层（M7.5 欠账）
+        Button() {
+          SymbolGlyph($r('sys.symbol.plus_square_on_square')).fontSize(16)
+            .fontColor([$r('app.color.text_primary')])
+        }
+        .type(ButtonType.Circle)
+        .width(30).height(30)
+        .backgroundColor(Color.Transparent)
+        .enabled(this.active() !== undefined)
+        .onClick((): void => this.onDuplicate())
+      }
+      .width('100%')
+      Row({ space: 6 }) {
+        // M14b：链接/解除链接 + 样式
+        Button() {
+          SymbolGlyph(this.anySelectedLinked() ? $r('sys.symbol.link_slash') : $r('sys.symbol.link'))
+            .fontSize(16)
+            .fontColor([$r('app.color.text_primary')])
+        }
+        .type(ButtonType.Circle)
+        .width(30).height(30)
+        .backgroundColor(Color.Transparent)
+        .enabled(this.selectionSize() >= 2 || this.anySelectedLinked())
+        .onClick((): void => this.onLinkToggle())
+        Button() {
+          SymbolGlyph($r('sys.symbol.slider_horizontal_2')).fontSize(16)
+            .fontColor([$r('app.color.text_primary')])
+        }
+        .type(ButtonType.Circle)
+        .width(30).height(30)
+        .backgroundColor(Color.Transparent)
+        .enabled(this.active() !== undefined && this.active()?.isGroup === false)
+        .onClick((): void => this.onStyle())
+        Blank()
+        Button() {
+          SymbolGlyph($r('sys.symbol.trash')).fontSize(16)
+            .fontColor([$r('app.color.danger')])
+        }
+        .type(ButtonType.Circle)
+        .width(30).height(30)
+        .backgroundColor(Color.Transparent)
+        .enabled(this.active() !== undefined)
+        .onClick((): void => this.onDelete())
+      }
+      .width('100%')
+
       List({ space: 4 }) {
         ForEach(this.reversed(), (l: LayerDTO) => {
           ListItem() {
@@ -422,96 +515,6 @@ export struct LayersPanel {
         this.dragFromId = 0;
       })
 
-      // 操作条（P2 两行：9 柄单行 318px > 坞内宽 260，矮/窄窗口横向裁切——登记项收口）
-      Row({ space: 6 }) {
-        Button() {
-          SymbolGlyph($r('sys.symbol.plus')).fontSize(16)
-            .fontColor([$r('app.color.text_primary')])
-        }
-        .type(ButtonType.Circle)
-        .width(30).height(30)
-        .backgroundColor(Color.Transparent)
-        .onClick((): void => this.onAdd())
-        Button() {
-          SymbolGlyph($r('sys.symbol.adjustment')).fontSize(16)
-            .fontColor([$r('app.color.text_primary')])
-        }
-        .type(ButtonType.Circle)
-        .width(30).height(30)
-        .backgroundColor(Color.Transparent)
-        .onClick((): void => this.onAddAdjustment())
-        Button() {
-          SymbolGlyph($r('sys.symbol.square_dashed')).fontSize(16)
-            .fontColor([$r('app.color.text_primary')])
-        }
-        .type(ButtonType.Circle)
-        .width(30).height(30)
-        .backgroundColor(Color.Transparent)
-        .enabled(this.active() !== undefined)
-        .onClick((): void => this.onAddMask())
-        Button() {
-          SymbolGlyph($r('sys.symbol.folder_badge_plus')).fontSize(16)
-            .fontColor([$r('app.color.text_primary')])
-        }
-        .type(ButtonType.Circle)
-        .width(30).height(30)
-        .backgroundColor(Color.Transparent)
-        .enabled(this.active() !== undefined)
-        .onClick((): void => this.onGroup())
-        Button() {
-          SymbolGlyph($r('sys.symbol.folder_badge_arrow_left')).fontSize(16)
-            .fontColor([$r('app.color.text_primary')])
-        }
-        .type(ButtonType.Circle)
-        .width(30).height(30)
-        .backgroundColor(Color.Transparent)
-        .enabled(this.active()?.isGroup === true)
-        .onClick((): void => this.onUngroup())
-        // M14b：复制图层（M7.5 欠账）
-        Button() {
-          SymbolGlyph($r('sys.symbol.plus_square_on_square')).fontSize(16)
-            .fontColor([$r('app.color.text_primary')])
-        }
-        .type(ButtonType.Circle)
-        .width(30).height(30)
-        .backgroundColor(Color.Transparent)
-        .enabled(this.active() !== undefined)
-        .onClick((): void => this.onDuplicate())
-      }
-      .width('100%')
-      Row({ space: 6 }) {
-        // M14b：链接/解除链接 + 样式
-        Button() {
-          SymbolGlyph(this.anySelectedLinked() ? $r('sys.symbol.link_slash') : $r('sys.symbol.link'))
-            .fontSize(16)
-            .fontColor([$r('app.color.text_primary')])
-        }
-        .type(ButtonType.Circle)
-        .width(30).height(30)
-        .backgroundColor(Color.Transparent)
-        .enabled(this.selectionSize() >= 2 || this.anySelectedLinked())
-        .onClick((): void => this.onLinkToggle())
-        Button() {
-          SymbolGlyph($r('sys.symbol.slider_horizontal_2')).fontSize(16)
-            .fontColor([$r('app.color.text_primary')])
-        }
-        .type(ButtonType.Circle)
-        .width(30).height(30)
-        .backgroundColor(Color.Transparent)
-        .enabled(this.active() !== undefined && this.active()?.isGroup === false)
-        .onClick((): void => this.onStyle())
-        Blank()
-        Button() {
-          SymbolGlyph($r('sys.symbol.trash')).fontSize(16)
-            .fontColor([$r('app.color.danger')])
-        }
-        .type(ButtonType.Circle)
-        .width(30).height(30)
-        .backgroundColor(Color.Transparent)
-        .enabled(this.active() !== undefined)
-        .onClick((): void => this.onDelete())
-      }
-      .width('100%')
     }
     .width('100%')
     .height('100%')

@@ -1143,7 +1143,8 @@ napi_value SetAdjustmentParams(napi_env env, napi_callback_info info) {
             l->adjustment->gamma == static_cast<float>(gamma)) {
             return makeOk(env, nullptr);
         }
-        e.history.beginEdit(e.doc, "adjust params", static_cast<uint64_t>(e.docRevision));
+        e.history.beginEdit(e.doc, "adjust params", static_cast<uint64_t>(e.docRevision),
+                            "adj:" + std::to_string(static_cast<long long>(id)));
         auto adj = std::make_shared<LayerAdjustment>(*l->adjustment);  // COW
         adj->inBlack = static_cast<float>(std::min(0.98, std::max(0.0, inBlack)));
         adj->inWhite = static_cast<float>(std::min(1.0, std::max(0.02, inWhite)));
@@ -1381,7 +1382,16 @@ napi_value SetLayerOpacity(napi_env env, napi_callback_info info) {
         if (l == nullptr) {
             return makeError(env, kErrBadParam, "setLayerOpacity: layer not found");
         }
-        l->opacity = std::min(1.0, std::max(0.0, v));
+        double nv = std::min(1.0, std::max(0.0, v));
+        if (l->opacity == nv) {
+            return makeOk(env, nullptr);
+        }
+        // H3：不透明度滑杆入历史（此前无事务不可撤销，PS「图层不透明度」语义）；
+        // coalesce 键按层——整段拖动只落一条历史。
+        e.history.beginEdit(e.doc, "layer opacity", static_cast<uint64_t>(e.docRevision),
+                            "op:" + std::to_string(static_cast<long long>(id)));
+        l->opacity = nv;
+        e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
         e.bumpRevisionLocked();
         e.requestRender();
     }
@@ -5190,7 +5200,8 @@ napi_value SetCurvePoints(napi_env env, napi_callback_info info) {
         if (l == nullptr || l->adjustment == nullptr) {
             return makeError(env, kErrBadParam, "setCurvePoints: not an adjustment layer");
         }
-        e.history.beginEdit(e.doc, "curves points", static_cast<uint64_t>(e.docRevision));
+        e.history.beginEdit(e.doc, "curves points", static_cast<uint64_t>(e.docRevision),
+                            "curve:" + std::to_string(static_cast<long long>(id)));
         // COW（照 setAdjustmentParams 范式）：History 快照浅拷贝 shared_ptr，原地改 pointee
         // 会同步污染撤销前快照 → undo 恢复不出旧曲线
         auto adj = std::make_shared<LayerAdjustment>(*l->adjustment);
@@ -7307,7 +7318,10 @@ napi_value runStyleCommand(napi_env env, const char* what, LayerId id,
         if (l->isGroup) {
             return makeError(env, kErrBadParam, std::string(what) + ": group has no style");
         }
-        e.history.beginEdit(e.doc, what, static_cast<uint64_t>(e.docRevision));
+        // H3 coalesce：键 = style:<实际层id>:<what>（what 已含效果名，跨效果不串账；
+        // 定位后再取 id，0=活动层的键不会跨层合并）
+        const std::string ck = "style:" + std::to_string(static_cast<long long>(l->id)) + ":" + what;
+        e.history.beginEdit(e.doc, what, static_cast<uint64_t>(e.docRevision), ck);
         std::string err;
         if (!apply(e.doc, *l, err)) {
             e.history.endEdit(e.doc, static_cast<uint64_t>(e.docRevision));
@@ -7916,7 +7930,8 @@ napi_value SetFillLayerParams(napi_env env, napi_callback_info info) {
         if (l == nullptr || l->fill == nullptr) {
             return makeError(env, kErrBadParam, "setFillLayerParams: not a fill layer");
         }
-        e.history.beginEdit(e.doc, "fill layer params", static_cast<uint64_t>(e.docRevision));
+        e.history.beginEdit(e.doc, "fill layer params", static_cast<uint64_t>(e.docRevision),
+                            "fill:" + std::to_string(static_cast<long long>(l->id)));
         // COW：fill 为 shared_ptr 且 History 浅拷贝，原地改会污染撤销前快照（同 adjustment）
         auto fill = std::make_shared<FillLayerState>(*l->fill);
         fill->kind = static_cast<int>(v[1]) == 1 ? 1 : 0;

@@ -33,6 +33,8 @@ import { AutomateDialog } from '../editor/components/AutomateDialog';
 import { automation, ActionStep } from 'core';
 import { Automate, BatchOptions, ProcessorOptions, BatchResult, BatchFileError } from 'core';
 import { controlServer } from '../editor/ControlServer';
+import { ActiveSnap, buildMenuVM, buildShortcutMap, MenuState, registerLangPacks, ShortcutEntry } from '../editor/CommandRegistry';
+import { getLang, setLang } from '../editor/I18n';
 
 const TAG: string = 'Montage.Shell';
 const DOMAIN: number = 0x4D30;
@@ -445,6 +447,7 @@ struct Index {
   @State polyPendingPts: number[] = [];  // M10a 多边形套索已落点（文档域扁平），非空 = 待闭合
   @State canUndo: boolean = false;
   @State canRedo: boolean = false;
+  @State langRev: number = 0;  // H8：语言切换重渲染依赖（菜单 VM 全量重建）
   @State fps: number = 0;
   @State recents: RecentProject[] = [];
   @State themeMode: ThemeMode = 'system';
@@ -531,6 +534,8 @@ struct Index {
   private ctrlHeld: boolean = false;
   private shiftHeld: boolean = false;
   private altHeld: boolean = false;
+  // H1 全量：注册表快捷键查表（键名 → 命中条目；aboutToAppear 构建一次）
+  private shortcutMap: Map<string, ShortcutEntry[]> = new Map();
   private rectDrag: boolean = false;
   private rectX0: number = 0;
   private rectY0: number = 0;
@@ -603,6 +608,10 @@ struct Index {
     if (hc !== undefined) {
       this.prefs.init(hc);
     }
+    // H1/H8：命令注册表 en 包注册 + 语言恢复 + 快捷键查表（菜单/快捷键四端同源）
+    registerLangPacks();
+    setLang(this.prefs.getString('lang', 'zh'));
+    this.shortcutMap = buildShortcutMap();
     this.themeMode = this.prefs.getThemeMode();
     if (hc !== undefined) {
       this.prefs.applyTheme(this.themeMode, hc);
@@ -647,6 +656,7 @@ struct Index {
     this.consumeDebugPresetB64();
     // M24c：控制通道（want debugControl=1 或调试菜单手动开启）
     controlServer.setEngine(this.engine);
+    controlServer.setStateProvider((): MenuState => this.menuState());  // P3-H1 commands.list 求值
     this.consumeDebugControl();
     this.engine.bindRevisionListener((revision: number): void => {
       hilog.info(DOMAIN, TAG, 'docVersion → %{public}d', revision);
@@ -6076,6 +6086,9 @@ struct Index {
         break;
       case 'edit.placeCustomSub':
         break;
+      case 'layer.linkToggle':
+        this.onLayerLinkToggle();
+        break;
       case 'layer.vectorMaskFromPath': {
         const a = this.activeLayer();
         if (a !== undefined) {
@@ -6364,6 +6377,14 @@ struct Index {
       case 'theme.dark':
         this.applyTheme(id.slice(6) as ThemeMode);
         break;
+      case 'lang.zh':
+      case 'lang.en':
+        // H8：命令面语言切换（菜单/注册表标签即时重建；对话框散落串维持 zh，登记按需扩）
+        setLang(id === 'lang.zh' ? 'zh' : 'en');
+        this.prefs.setString('lang', id === 'lang.zh' ? 'zh' : 'en');
+        this.langRev++;
+        this.log(`语言: ${id === 'lang.zh' ? '中文' : 'English'}`);
+        break;
       default: {
         // M18d：放置自定形状（edit.placeCustom:<id> 动态项）
         if (id.startsWith('edit.placeCustom:')) {
@@ -6376,7 +6397,9 @@ struct Index {
           }
           break;
         }
-        // 占位命令（M8/M10/M14+）：提示并登记
+        // 占位命令（M8/M10/M14+）：提示并登记（H1 纪律：注册表菜单 id 必须有 case，
+        // 落到这里 = 一致性缺口，宿主 E2E 拦截）
+        hilog.warn(DOMAIN, TAG, 'UNHANDLED command: %{public}s', id);
         this.toast('该功能在后续里程碑提供');
         this.log(`命令占位: ${id}`);
         break;
@@ -6982,273 +7005,71 @@ struct Index {
   }
 
   private buildMenuGroups(): MenuGroupVM[] {
-    const d = this.docOpen;
-    const file: MenuItemVM[] = [
-      leafItem('file.new', '新建', 'Ctrl+N', true),
-      leafItem('file.open', '打开…', 'Ctrl+O', true),
-      leafItem('file.save', '保存', 'Ctrl+S', d),
-      leafItem('file.saveAs', '另存为…', '', d),
-      subItem('file.exportSub', '导出', d, [
-        leafItem('file.export', '导出图像（PNG / JPEG）…', '', d),
-      ]),
-      leafItem('file.placeEmbedded', '置入嵌入的智能对象…', '', d),
-      leafItem('file.close', '关闭文档', '', d),
-    ];
-    const edit: MenuItemVM[] = [
-      leafItem('edit.undo', '撤销', 'Ctrl+Z', this.canUndo),
-      leafItem('edit.redo', '重做', 'Ctrl+Shift+Z', this.canRedo),
-      leafItem('edit.cut', '剪切', 'Ctrl+X', d && this.hasSelectionFlag),
-      leafItem('edit.copy', '拷贝', 'Ctrl+C', d && this.hasSelectionFlag),
-      leafItem('edit.copyMerged', '合并拷贝', 'Shift+Ctrl+C', d && this.hasSelectionFlag),
-      leafItem('edit.paste', '粘贴', 'Ctrl+V', d),
-      leafItem('edit.clear', '清除', '', d && this.hasSelectionFlag),
-      leafItem('edit.fill', '填充…', 'Shift+F5', d),
-      leafItem('edit.contentAwareFill', '内容识别填充', '', d && this.hasSelectionFlag),
-      leafItem('edit.stroke', '描边…', '', d && this.hasSelectionFlag),
-      leafItem('edit.definePattern', '定义图案', '', d && this.hasSelectionFlag),
-      // M22 颜色查找表导入（.cube/.3dl/.look；模拟器 picker 不可注入留真机）
-      leafItem('edit.importLookup', '载入查找表…', '', d),
-      leafItem('edit.defineCustomShape', '定义自定形状', '',
-        d && this.workPathNonEmpty === 1),
-      subItem('edit.placeCustomSub', '放置自定形状', d && this.hasCustomShapes,
-        this.engine.getCustomShapes().map((id: string): MenuItemVM =>
-          leafItem(`edit.placeCustom:${id}`, id, '', d))),
-    ];
-    const imageMenu: MenuItemVM[] = [
-      leafItem('image.canvasSize', '画布大小…', '', d),
-      leafItem('image.imageSize', '图像大小…', '', d),
-      leafItem('image.contentAwareScale', '内容感知比例…', '', d),
-      leafItem('image.rotate90cw', '顺时针旋转 90°', '', d),
-      leafItem('image.rotate90ccw', '逆时针旋转 90°', '', d),
-      leafItem('image.rotate180', '旋转 180°', '', d),
-      leafItem('image.rotateAny', '任意角度旋转…', '', d),
-      leafItem('image.flipH', '水平翻转画布', '', d),
-      leafItem('image.flipV', '垂直翻转画布', '', d),
-      leafItem('image.trim', '裁切（基于像素）', '', d),
-      leafItem('image.revealAll', '显示全部', '', d),
-      // M15e：RAW 显影参数（会话内导入过 DNG 才可用，P1）
-      leafItem('image.develop', 'RAW 显影参数…', '', d && this.hasRawDevelop),
-      // M24b：自动（批处理 / 图像处理器）
-      subItem('image.automateSub', '自动', true, [
-        leafItem('automate.batch', '批处理…', '', true),
-        leafItem('automate.processor', '图像处理器…', '', true),
-      ]),
-    ];
-    const layer: MenuItemVM[] = [
-      leafItem('layer.transform', '自由变换', 'Ctrl+T', d),
-      leafItem('layer.transformNumeric', '数值变换…', '', d),
-      leafItem('layer.new', '新建图层', '', d),
-      leafItem('layer.newGroup', '新建组…', '', d),
-      leafItem('layer.group', '图层编组', 'Ctrl+G', d && this.activeLayer()?.isGroup === false),
-      leafItem('layer.ungroup', '取消编组', '', d && this.activeLayer()?.isGroup === true),
-      leafItem('layer.duplicate', '复制图层', 'Ctrl+J', this.activeLayer() !== undefined),
-      leafItem('layer.mergeDown', '合并向下', 'Ctrl+E', d && this.activeLayer()?.isGroup === false),
-      leafItem('layer.mergeVisible', '合并可见', 'Shift+Ctrl+E', d),
-      leafItem('layer.stamp', '盖印', 'Shift+Ctrl+Alt+E', d),
-      leafItem('layer.flatten', '拼合图像', '', d),
-      leafItem('layer.style', '图层样式…', '', d && this.activeLayer()?.isGroup === false),
-      leafItem('layer.copyStyle', '拷贝图层样式', '',
-        d && this.activeLayer()?.hasStyle === true),
-      leafItem('layer.pasteStyle', '粘贴图层样式', '',
-        d && this.activeLayer()?.isGroup === false && this.hasStyleClipboard),
-      leafItem('layer.toggleEffects', '显示/隐藏全部效果', '',
-        d && this.activeLayer()?.hasStyle === true,
-        this.activeLayer()?.hasStyle === true && this.activeLayer()?.styleOn === false),
-      leafItem('layer.globalLight', '全局光角度…', '', d),
-      leafItem('layer.vectorMaskFromPath', '矢量蒙版（自工作路径）', '',
-        d && this.workPathNonEmpty === 1),
-      leafItem('layer.vectorMaskToggle', '启用/停用矢量蒙版', '',
-        d && this.activeLayer()?.hasVectorMask === true,
-        this.activeLayer()?.hasVectorMask === true && this.activeLayer()?.vectorMaskOn === false),
-      leafItem('layer.vectorMaskRemove', '删除矢量蒙版', '',
-        d && this.activeLayer()?.hasVectorMask === true),
-      leafItem('layer.rasterizeShape', '栅格化形状', '',
-        d && this.activeLayer()?.isShape === true),
-      // M21 智能对象组
-      leafItem('layer.convertSmart', '转换为智能对象', '',
-        d && this.activeLayer() !== undefined && this.activeLayer()?.isGroup === false &&
-          this.activeLayer()?.isSmart === false &&
-          this.activeLayer()?.isAdjustment === false),
-      leafItem('layer.smartFiltersDialog', '智能滤镜…', '',
-        d && this.activeLayer()?.isSmart === true &&
-          (this.activeLayer()?.smartFilters ?? 0) > 0),
-      leafItem('layer.smartViaCopy', '通过拷贝新建智能对象', '',
-        d && this.activeLayer()?.isSmart === true),
-      leafItem('layer.smartReplace', '替换内容…', '', d && this.activeLayer()?.isSmart === true),
-      leafItem('layer.smartExport', '导出内容…', '', d && this.activeLayer()?.isSmart === true),
-      leafItem('layer.smartFiltersToggle', '禁用/启用智能滤镜', '',
-        d && this.activeLayer()?.isSmart === true && (this.activeLayer()?.smartFilters ?? 0) > 0,
-        this.activeLayer()?.isSmart === true && this.activeLayer()?.smartFiltersOn === false),
-      // M21 收口：堆栈模式（源多可见层逐像素统计；photocraft StackMode 11 统计）
-      subItem('layer.stackModeSub', '堆栈模式', d && this.activeLayer()?.isSmart === true, [
-        leafItem('layer.stackOff', '关闭', '', true,
-          this.activeLayer()?.stackMode === 0),
-        leafItem('layer.stackMean', '平均值', '', true, this.activeLayer()?.stackMode === 3),
-        leafItem('layer.stackMedian', '中间值', '', true, this.activeLayer()?.stackMode === 4),
-        leafItem('layer.stackMin', '最小值', '', true, this.activeLayer()?.stackMode === 5),
-        leafItem('layer.stackMax', '最大值', '', true, this.activeLayer()?.stackMode === 2),
-        leafItem('layer.stackRange', '极差', '', true, this.activeLayer()?.stackMode === 6),
-        leafItem('layer.stackSum', '总和', '', true, this.activeLayer()?.stackMode === 9),
-        leafItem('layer.stackSd', '标准偏差', '', true, this.activeLayer()?.stackMode === 8),
-        leafItem('layer.stackVar', '方差', '', true, this.activeLayer()?.stackMode === 10),
-        leafItem('layer.stackEntropy', '熵', '', true, this.activeLayer()?.stackMode === 1),
-      ]),
-      leafItem('layer.smartMaskClear', '清除滤镜蒙版', '',
-        d && this.activeLayer()?.isSmart === true &&
-          this.activeLayer()?.smartHasMask === true),
-      leafItem('layer.smartRasterize', '栅格化智能对象', '',
-        d && this.activeLayer()?.isSmart === true),
-      leafItem('layer.fillSolid', '新建纯色填充图层', '', d),
-      leafItem('layer.fillGrad', '新建渐变填充图层', '', d),
-      leafItem('layer.linkToggle', '链接图层 / 解除链接', '',
-        d && (this.alignTargetIds().length >= 2 || this.layers.some((l: LayerDTO): boolean =>
-          l.isActive && l.linkId !== 0))),
-      subItem('layer.alignSub', '对齐', d && this.alignTargetIds().length >= 2, [
-        leafItem('layer.alignLeft', '左边', '', d),
-        leafItem('layer.alignHCenter', '水平居中', '', d),
-        leafItem('layer.alignRight', '右边', '', d),
-        leafItem('layer.alignTop', '顶边', '', d),
-        leafItem('layer.alignVCenter', '垂直居中', '', d),
-        leafItem('layer.alignBottom', '底边', '', d),
-      ]),
-      subItem('layer.distributeSub', '分布', d && this.alignTargetIds().length >= 3, [
-        leafItem('layer.distLeft', '左', '', d),
-        leafItem('layer.distHCenter', '水平居中', '', d),
-        leafItem('layer.distRight', '右', '', d),
-        leafItem('layer.distTop', '顶', '', d),
-        leafItem('layer.distVCenter', '垂直居中', '', d),
-        leafItem('layer.distBottom', '底', '', d),
-      ]),
-      leafItem('layer.rename', '重命名…', '', this.activeLayer() !== undefined),
-      leafItem('layer.delete', '删除图层', '', this.activeLayer() !== undefined),
-      leafItem('layer.moveUp', '上移一层', '', d),
-      leafItem('layer.moveDown', '下移一层', '', d),
-      leafItem('layer.clipToggle', '创建/释放剪贴蒙版', '', d),
-      leafItem('layer.maskAdd', '添加图层蒙版（显示全部）', '', d),
-      leafItem('layer.maskEnableToggle', '启用/停用蒙版', '', d && this.activeLayerHasMask()),
-      leafItem('layer.adjustAdd', '新建调整图层（色阶）', '', d),
-      leafItem('layer.rasterizeText', '栅格化文字', '',
-        d && this.activeLayer()?.isText === true),
-    ];
-    const selReady: boolean = d && this.hasSelectionFlag;  // M10b：选区类命令使能态
-    const select: MenuItemVM[] = [
-      leafItem('select.all', '全部选择', 'Ctrl+A', d),
-      leafItem('select.deselect', '取消选择', 'Ctrl+D', d),
-      leafItem('select.inverse', '反选', 'Ctrl+Shift+I', d),
-      leafItem('select.reselect', '重新选择', 'Shift+Ctrl+D', d),
-      leafItem('select.quickMask', '快速蒙版', 'Q', d, this.quickMaskActive),
-      leafItem('select.feather', '羽化…', 'Shift+F6', selReady),
-      leafItem('select.store', '存储选区…', '', selReady),
-      leafItem('select.load', '载入选区…', '', d && this.channelsCount > 0),
-      leafItem('select.border', '修改：边界…', '', selReady),
-      leafItem('select.smooth', '修改：平滑', '', selReady),
-      leafItem('select.expand', '修改：扩展…', '', selReady),
-      leafItem('select.contract', '修改：收缩…', '', selReady),
-    ];
-    // M13 滤镜菜单（分类子菜单；docs 未启用项不列）
-    const filterMenus: MenuItemVM[] = [];
-    const groups: Record<string, MenuItemVM[]> = {};
-    for (const f of FILTER_CATALOG) {
-      if (groups[f.menu] === undefined) {
-        groups[f.menu] = [];
-      }
-      groups[f.menu].push(leafItem(`filter.${f.id}`, `${f.label}…`, '', d));
-    }
-    const menuOf = (key: string, label: string): MenuItemVM =>
-      subItem(`filterGroup.${key}`, label, d, groups[key] ?? []);
-    filterMenus.push(leafItem('filter.cameraRaw', 'Camera Raw…', '', d));
-    filterMenus.push(leafItem('liquify.enter', '液化（笔刷变形）…', '', d));
-    filterMenus.push(leafItem('puppet.enter', '操控变形…', '', d));
-    filterMenus.push(leafItem('perspective.enter', '透视变形…', '', d));
-    filterMenus.push(leafItem('wideangle.enter', '自适应广角…', '', d));
-    filterMenus.push(leafItem('vanishing.enter', '消失点（透视克隆）…', '', d));
-    filterMenus.push(menuOf('adjust', '调整'));
-    filterMenus.push(menuOf('blur', '模糊'));
-    filterMenus.push(menuOf('sharpen', '锐化'));
-    filterMenus.push(menuOf('noise', '杂色'));
-    filterMenus.push(menuOf('pixelate', '像素化'));
-    filterMenus.push(menuOf('stylize', '风格化'));
-    filterMenus.push(menuOf('render', '渲染'));
-    filterMenus.push(menuOf('other', '其他'));
+    const _lr = this.langRev;  // 语言切换依赖入 build（H8）
+    return buildMenuVM(this.menuState());
+  }
 
-    const view: MenuItemVM[] = [
-      leafItem('view.zoomIn', '放大', 'Ctrl+=', d),
-      leafItem('view.zoomOut', '缩小', 'Ctrl+-', d),
-      leafItem('view.zoom100', '100%', 'Ctrl+1', d),
-      leafItem('view.fit', '适配画布', 'Ctrl+0', d),
-      leafItem('view.rulers', '标尺', 'Ctrl+R', true, this.rulersVisible),
-      subItem('view.rulerUnitSub', '标尺单位', true, [
-        leafItem('view.rulerUnitPx', '像素', '', true, this.rulerUnit === 0),
-        leafItem('view.rulerUnitPct', '百分比', '', true, this.rulerUnit === 1),
-      ]),
-      leafItem('view.guidesVisible', '显示参考线', 'Ctrl+;', true, this.guidesMirror.visible),
-      leafItem('view.guidesLocked', '锁定参考线', 'Alt+Ctrl+;', true, this.guidesMirror.locked),
-      leafItem('view.guidesClear', '清除参考线', '', true),
-      leafItem('view.grid', '显示网格', "Ctrl+'", true, this.gridVisible),
-      subItem('view.gridSpacingSub', '网格间距', true, [
-        leafItem('view.gridSpacing50', '50 px', '', true, this.gridSpacing === 50),
-        leafItem('view.gridSpacing100', '100 px', '', true, this.gridSpacing === 100),
-        leafItem('view.gridSpacing250', '250 px', '', true, this.gridSpacing === 250),
-        leafItem('view.gridSpacing500', '500 px', '', true, this.gridSpacing === 500),
-      ]),
-      leafItem('view.snapGuides', '对齐参考线', '', true, this.snapGuidesOn),
-      // M22 显示变换（视图级；软打样/色域警告/查找表）
-      subItem('view.proofSub', '校样设置', d, [
-        leafItem('view.proofOff', '关闭校样', '', true, !this.viewXformLut),
-        leafItem('view.proofCoated', '合成涂布纸 CMYK', '', true, this.viewXformLut && this.viewXformDesc === 'proof: coated-cmyk'),
-        leafItem('view.proofP3', 'Display P3（广色域）', '', true, this.viewXformLut && this.viewXformDesc === 'proof: display-p3'),
-      ]),
-      leafItem('view.gamutWarning', '色域警告（CMYK）', 'Shift+Ctrl+Y', true, this.viewXformGamut),
-      subItem('view.lookupSub', '校样颜色（外观）', d, [
-        leafItem('view.lookupOff', '关闭', '', true, !this.viewXformLut || this.viewXformDesc.startsWith('proof')),
-        leafItem('view.lookup0', 'Teal & Orange', '', true, this.viewXformDesc === 'lookup: tealOrange'),
-        leafItem('view.lookupMono', 'Mono High Contrast', '', true, this.viewXformDesc === 'lookup: monoContrast'),
-      ]),
-      leafItem('view.snapGrid', '对齐网格', "Shift+Ctrl+'", true, this.snapGridOn),
-      subItem('view.screenModeSub', '屏幕模式', true, [
-        leafItem('view.screenStd', '标准屏幕模式', 'F', true, this.screenMode === 0),
-        leafItem('view.screenFullMenu', '带菜单栏的全屏模式', '', true, this.screenMode === 1),
-        leafItem('view.screenFull', '全屏模式', '', true, this.screenMode === 2),
-      ]),
-    ];
-    const win: MenuItemVM[] = [
-      leafItem('window.toggleLayers', '图层面板', '', true, this.layersVisible),
-      leafItem('window.toggleHistory', '历史面板', '', true, this.historyVisible),
-      leafItem('window.toggleHistogram', '直方图面板', '', true, this.histogramVisible),
-      leafItem('window.toggleInfo', '信息面板', '', true, this.infoVisible),
-      leafItem('window.toggleActions', '动作面板', '', true, this.actionsVisible),
-      leafItem('window.togglePresets', '预设库', '', true, this.presetsVisible),
-    ];
-    const help: MenuItemVM[] = [
-      subItem('help.themeSub', '主题', true, [
-        leafItem('theme.system', '跟随系统', '', true, this.themeMode === 'system'),
-        leafItem('theme.light', '浅色', '', true, this.themeMode === 'light'),
-        leafItem('theme.dark', '深色', '', true, this.themeMode === 'dark'),
-      ]),
-      leafItem('help.shortcuts', '快捷键表', '', true),
-      leafItem('help.about', '关于 Montage', '', true),
-      // M15a：沙箱往返包调试通道（模拟器 picker 保存缺陷的替代验证路径；三键组合注入受限）
-      subItem('help.debugSub', '调试（沙箱往返）', true, [
-        leafItem('file.saveSandbox', '保存往返包到沙箱', '', d),
-        leafItem('file.openSandbox', '打开沙箱往返包', '', d),
-        leafItem('file.openSandboxDng', '打开沙箱 DNG（RAW 显影）', '', d),
-        leafItem('file.openSandboxCr2', '打开沙箱 CR2（M23 厂牌 RAW）', '', d),
-        leafItem('file.debugJpeg', 'JPEG 分带校准（M16）', '', true),
-        leafItem('debug.control', controlServer.isRunning() ? '停止控制通道' : '启动控制通道（M24）',
-          '', true),
-      ]),
-    ];
-    return [
-      { id: 'file', label: '文件', items: file },
-      { id: 'edit', label: '编辑', items: edit },
-      { id: 'image', label: '图像', items: imageMenu },
-      { id: 'layer', label: '图层', items: layer },
-      { id: 'select', label: '选择', items: select },
-      { id: 'filter', label: '滤镜', items: filterMenus },
-      { id: 'view', label: '视图', items: view },
-      { id: 'window', label: '窗口', items: win },
-      { id: 'help', label: '帮助', items: help },
-    ];
+  // H1 全量：菜单状态快照（Index 求值 → CommandRegistry.buildMenuVM 纯函数出 VM）
+  private menuState(): MenuState {
+    const a = this.activeLayer();
+    let snap: ActiveSnap | null = null;
+    if (a !== undefined) {
+      const s: ActiveSnap = {
+        isGroup: a.isGroup, hasStyle: a.hasStyle === true, styleOn: a.styleOn !== false,
+        hasVectorMask: a.hasVectorMask === true, vectorMaskOn: a.vectorMaskOn !== false,
+        isShape: a.isShape === true, isSmart: a.isSmart === true,
+        isAdjustment: a.isAdjustment === true, isText: a.isText === true,
+        smartFilters: a.smartFilters ?? 0, smartFiltersOn: a.smartFiltersOn !== false,
+        smartHasMask: a.smartHasMask === true, stackMode: a.stackMode ?? 0,
+      };
+      snap = s;
+    }
+    let linkActive = false;
+    for (const l of this.layers) {
+      if (l.isActive && l.linkId !== 0) {
+        linkActive = true;
+        break;
+      }
+    }
+    const ms: MenuState = {
+      docOpen: this.docOpen,
+      canUndo: this.canUndo,
+      canRedo: this.canRedo,
+      hasSelection: this.hasSelectionFlag,
+      channelsCount: this.channelsCount,
+      quickMask: this.quickMaskActive,
+      hasRawDevelop: this.hasRawDevelop,
+      hasCustomShapes: this.hasCustomShapes,
+      customShapeIds: this.engine.getCustomShapes(),
+      workPathNonEmpty: this.workPathNonEmpty === 1,
+      hasStyleClipboard: this.hasStyleClipboard,
+      alignCount: this.alignTargetIds().length,
+      linkActive: linkActive,
+      activeLayerHasMask: this.activeLayerHasMask(),
+      active: snap,
+      rulersVisible: this.rulersVisible,
+      rulerUnit: this.rulerUnit,
+      guidesVisible: this.guidesMirror.visible,
+      guidesLocked: this.guidesMirror.locked,
+      gridVisible: this.gridVisible,
+      gridSpacing: this.gridSpacing,
+      snapGuides: this.snapGuidesOn,
+      snapGrid: this.snapGridOn,
+      screenMode: this.screenMode,
+      viewXformOn: this.viewXformLut,
+      viewXformDesc: this.viewXformDesc,
+      viewGamut: this.viewXformGamut,
+      panelLayers: this.layersVisible,
+      panelHistory: this.historyVisible,
+      panelHistogram: this.histogramVisible,
+      panelInfo: this.infoVisible,
+      panelActions: this.actionsVisible,
+      panelPresets: this.presetsVisible,
+      themeMode: this.themeMode,
+      lang: getLang(),
+      controlRunning: controlServer.isRunning(),
+    };
+    return ms;
   }
 
   private buildTools(): ToolVM[] {
@@ -7295,6 +7116,60 @@ struct Index {
     for (const t of this.buildTools()) {
       if (t.id === id) {
         return t.label;
+      }
+    }
+    return '';
+  }
+
+  // ---------- H1 快捷键注册表查表 ----------
+
+  // keyCode → 注册表键名（字母/数字/F 键/符号；未映射返回 ''）。
+  // 键名以注册表 shortcut 字段的最后一个 '+' 段为准（'Ctrl+;' → ';'）。
+  private keyName(code: number): string {
+    if (code >= 2017 && code <= 2042) {
+      // KEYCODE_A(2017)..KEYCODE_Z(2042)（SDK keyCode.d.ts，KC_* 常量同源）
+      const arr: string[] = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
+        'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z'];
+      return arr[code - 2017];
+    }
+    if (code >= 2000 && code <= 2009) {
+      const digits: string[] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
+      return digits[code - 2000];
+    }
+    if (code === KC_EQUALS) {
+      return '=';
+    }
+    if (code === KC_MINUS) {
+      return '-';
+    }
+    if (code === KC_SEMICOLON) {
+      return ';';
+    }
+    if (code === KC_APOSTROPHE) {
+      return "'";
+    }
+    if (code === KC_F5) {
+      return 'F5';
+    }
+    if (code === KC_F6) {
+      return 'F6';
+    }
+    return '';
+  }
+
+  // 修饰键状态 + 键名 → 注册表命令 id（无命中 = ''）。工具字母/交互守卫不进注册表。
+  private matchShortcut(code: number): string {
+    const key = this.keyName(code);
+    if (key === '') {
+      return '';
+    }
+    const arr = this.shortcutMap.get(key);
+    if (arr === undefined) {
+      return '';
+    }
+    for (const ent of arr) {
+      if (ent.c === this.ctrlHeld && ent.a === this.altHeld && ent.s === this.shiftHeld) {
+        return ent.id;
       }
     }
     return '';
@@ -7415,101 +7290,11 @@ struct Index {
       }
     }
     const code = e.keyCode;
+    // H1 全量：Ctrl 族命令快捷键 → 注册表查表（含 Ctrl+Alt+S/O 沙箱调试、Ctrl+Shift+E 族）
     if (this.ctrlHeld) {
-      switch (code) {
-        case KC_Z:
-          this.runCommand(this.shiftHeld ? 'edit.redo' : 'edit.undo');
-          break;
-        case KC_Y:
-          this.runCommand('edit.redo');
-          break;
-        case KC_N:
-          this.runCommand('file.new');
-          break;
-        case KC_O:
-          if (this.altHeld) {
-            this.runCommand('file.openSandbox');  // 隐藏调试：打开沙箱往返包
-          } else {
-            this.runCommand('file.open');
-          }
-          break;
-        case KC_S:
-          if (this.altHeld) {
-            this.runCommand('file.saveSandbox');  // 隐藏调试：沙箱往返包（模拟器 save→open 验证通道）
-          } else {
-            this.runCommand('file.save');
-          }
-          break;
-        case KC_NUM0:
-          this.runCommand('view.fit');
-          break;
-        case KC_NUM1:
-          this.runCommand('view.zoom100');
-          break;
-        case KC_EQUALS:
-          this.runCommand('view.zoomIn');
-          break;
-        case KC_MINUS:
-          this.runCommand('view.zoomOut');
-          break;
-        case KC_D:
-          if (this.shiftHeld) {
-            // Shift+Ctrl+D 重新选择（M10a）
-            const ok = this.engine.reselectSelection();
-            this.hasSelectionFlag = ok;
-            this.log(`重新选择: ${ok ? '已恢复' : '无可恢复选区'}`);
-          } else {
-            this.runCommand('select.deselect');
-          }
-          break;
-        case KC_A:
-          this.runCommand('select.all');
-          break;
-        case KC_G:
-          this.runCommand('layer.group');  // M14a 编组（PS Ctrl+G）
-          break;
-        case KC_J:
-          this.runCommand('layer.duplicate');  // M14b 复制图层（PS Ctrl+J）
-          break;
-        case KC_E:
-          if (this.shiftHeld && this.altHeld) {
-            this.runCommand('layer.stamp');  // Shift+Ctrl+Alt+E 盖印
-          } else if (this.shiftHeld) {
-            this.runCommand('layer.mergeVisible');  // Shift+Ctrl+E 合并可见
-          } else {
-            this.runCommand('layer.mergeDown');  // Ctrl+E 合并向下
-          }
-          break;
-        case KC_C:
-          this.runCommand('edit.copy');
-          break;
-        case KC_X:
-          this.runCommand('edit.cut');
-          break;
-        case KC_V:
-          this.runCommand('edit.paste');
-          break;
-        case KC_I:
-          if (this.shiftHeld) {
-            this.runCommand('select.inverse');
-          }
-          break;
-        case KC_T_KEY:
-          this.runCommand('layer.transform');
-        break;
-        case KC_R:
-          this.runCommand('view.rulers');  // Ctrl+R 标尺（PS 语义）
-          break;
-        case KC_SEMICOLON:
-          // Ctrl+; 显示/隐藏参考线；Alt+Ctrl+; 锁定
-          this.runCommand(this.altHeld ? 'view.guidesLocked' : 'view.guidesVisible');
-          break;
-        case KC_APOSTROPHE:
-          // Ctrl+' 显示网格；Shift+Ctrl+' 对齐网格
-          this.runCommand(this.shiftHeld ? 'view.snapGrid' : 'view.grid');
-          break;
-        default:
-          break;
+      const cid = this.matchShortcut(code);
+      if (cid !== '') {
+        this.runCommand(cid);
       }
       return;
     }
@@ -7545,6 +7330,12 @@ struct Index {
       this.engine.setCloneSlot(slot - 1);
       this.cloneSlotIdx = slot - 1;
       this.log(`克隆源槽 ${slot}`);
+      return;
+    }
+    // H1 全量：单键命令快捷键（Q 快速蒙版）→ 注册表查表
+    const sid = this.matchShortcut(code);
+    if (sid !== '') {
+      this.runCommand(sid);
       return;
     }
     switch (code) {
@@ -7621,9 +7412,6 @@ struct Index {
         break;
       case KC_T_KEY:
         this.pickTool('text');  // M12 文字工具（PS T 语义）
-        break;
-      case KC_Q:
-        this.runCommand('select.quickMask');  // M10d 快速蒙版 toggle（PS Q 语义）
         break;
       case KC_C:
         this.pickTool('crop');
@@ -7899,7 +7687,8 @@ struct Index {
         `${this.historyCurrent}${this.historyLabels.length}` +
         `${this.hasRawDevelop ? 1 : 0}`  // M15e：RAW 显影菜单项使能随会话 RAW 翻转
         + `${this.workPathNonEmpty}${this.activeLayer()?.isShape ? 1 : 0}` +
-        `${this.activeLayer()?.hasVectorMask ? 1 : 0}${this.hasCustomShapes ? 1 : 0}`)  // M18：矢量菜单使能位
+        `${this.activeLayer()?.hasVectorMask ? 1 : 0}${this.hasCustomShapes ? 1 : 0}` +  // M18：矢量菜单使能位
+        `${this.langRev}`)  // H8：语言切换强制整表重建（同 key 复用坑，M14a 教训）
     }
     .width('100%')
     .height(36)

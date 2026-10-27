@@ -16,6 +16,8 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { automation, AutoResult } from 'core';
 import { Automate, BatchOptions, ProcessorOptions, BatchResult, ActionStep } from 'core';
 import { CompositorEngine } from 'core';
+import { COMMAND_TABLE, cmdChecked, cmdEnabled, i18nKeys, MenuState } from './CommandRegistry';
+import { coverage, missingFor, registeredLangs, t as tr } from './I18n';
 
 const TAG: string = 'Montage.Control';
 const DOMAIN: number = 0x4D30;
@@ -52,9 +54,15 @@ export class ControlServer {
   private port: number = 0;
   private running: boolean = false;
   private shotSeq: number = 0;
+  // P3-H1：菜单状态快照提供者（Index 注入 —— commands.list 使能/勾选现状求值用）
+  private stateFn: (() => MenuState) | null = null;
 
   setEngine(e: CompositorEngine): void {
     this.engine = e;
+  }
+
+  setStateProvider(fn: (() => MenuState) | null): void {
+    this.stateFn = fn;
   }
 
   isRunning(): boolean {
@@ -243,6 +251,63 @@ export class ControlServer {
       payload['suspended'] = automation.isSuspended();
       payload['port'] = this.port;
       this.reply(c, id, true, payload);
+      return;
+    }
+    if (method === 'commands.list') {
+      // P3-H1 四端同源导出：命令注册表全量元数据 + 使能/勾选现状求值 + 动作注册表
+      const st: MenuState | null = this.stateFn !== null ? this.stateFn() : null;
+      const menu: Record<string, Object>[] = [];
+      for (const s of COMMAND_TABLE) {
+        const row: Record<string, Object> = {};
+        row['id'] = s.id;
+        row['zh'] = s.zh;
+        row['en'] = s.en;
+        row['menu'] = s.menu;
+        row['parent'] = s.parent;
+        row['shortcut'] = s.shortcut;
+        row['params'] = s.params;
+        row['isSub'] = s.isSub;
+        row['coalesce'] = s.coalesce;
+        row['when'] = s.when;
+        row['chk'] = s.chk;
+        if (st !== null) {
+          row['label'] = s.isSub ? tr(`sub.${s.id}`, s.zh) : tr(`cmd.${s.id}`, s.zh);
+          row['enabled'] = cmdEnabled(s, st);
+          row['checked'] = cmdChecked(s, st);
+        }
+        menu.push(row);
+      }
+      const payload2: Record<string, Object> = {};
+      payload2['menu'] = menu as Object;
+      const auto = automation.specDump();
+      if (auto.value !== undefined) {
+        payload2['auto'] = auto.value;
+      }
+      payload2['count'] = menu.length;
+      this.reply(c, id, true, payload2);
+      return;
+    }
+    if (method === 'i18n.check') {
+      // P3-H8 强制覆盖测试（photocraft complete_menus 同义）：每个已注册语言包对
+      // 命令注册表全键核验，缺失清单非空 = 失败；随包缺键累计（missingFor）一并透出
+      const keys = i18nKeys();
+      const langs: Record<string, Object> = {};
+      let fail = false;
+      for (const lang of registeredLangs()) {
+        const miss = coverage(lang, keys).concat(missingFor(lang));
+        const arr: string[] = miss;
+        const v: Record<string, Object> = {};
+        v['missing'] = arr as Object;
+        v['missingCount'] = arr.length;
+        langs[lang] = v;
+        if (arr.length > 0) {
+          fail = true;
+        }
+      }
+      const pl: Record<string, Object> = {};
+      pl['keys'] = keys.length;
+      pl['langs'] = langs as Object;
+      this.reply(c, id, !fail, pl);
       return;
     }
     if (method === 'ui.screenshot') {

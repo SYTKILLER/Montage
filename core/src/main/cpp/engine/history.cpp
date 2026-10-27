@@ -13,30 +13,89 @@ constexpr const char* kTag = "Montage.History";
 namespace montage {
 
 // 独占字节估算：只在 before 或 after 之一出现的瓦片引用数 × 256KB（02 §4 R5 语义：
-// 共享瓦片零成本，代价 ∝ 被修改瓦片）。
+// 共享瓦片零成本，代价 ∝ 被修改瓦片）。H3 扩展覆盖面：除图层像素外，蒙版 patch、
+// 主选区、快速蒙版、Alpha 通道掩码同样计费（滑杆外的选区/蒙版编辑密集族不再漏账）；
+// 智能对象嵌入源字节按差值计（替换内容/置入的大字节真实占用）。
+namespace {
+size_t gridExclusive(std::set<const void*>& aTiles, const std::shared_ptr<const TileGrid>& g) {
+    if (g == nullptr) {
+        return 0;
+    }
+    size_t bytes = 0;
+    for (const auto& kv : g->tiles) {
+        if (aTiles.insert(kv.second.get()).second) {
+            bytes += static_cast<size_t>(kTileSize) * kTileSize * 4;
+        }
+    }
+    return bytes;
+}
+}  // namespace
+
 size_t History::exclusiveBytes(const Document& a, const Document& b) {
     std::set<const void*> aTiles;
+    size_t bytes = 0;
     for (const Layer& l : a.layers) {
         if (l.pixels != nullptr) {
             for (const auto& kv : l.pixels->tiles) {
                 aTiles.insert(kv.second.get());
             }
         }
-    }
-    size_t bytes = 0;
-    for (const Layer& l : b.layers) {
-        if (l.pixels != nullptr) {
-            for (const auto& kv : l.pixels->tiles) {
-                if (aTiles.count(kv.second.get()) == 0) {
-                    bytes += static_cast<size_t>(kTileSize) * kTileSize * 4;
-                }
+        if (l.mask != nullptr && l.mask->pixels != nullptr) {
+            for (const auto& kv : l.mask->pixels->tiles) {
+                aTiles.insert(kv.second.get());
             }
         }
+        if (l.smart != nullptr) {
+            if (l.smart->filterMask != nullptr && l.smart->filterMask->pixels != nullptr) {
+                for (const auto& kv : l.smart->filterMask->pixels->tiles) {
+                    aTiles.insert(kv.second.get());
+                }
+            }
+            aTiles.insert(l.smart->sourceBytes.data());
+        }
+    }
+    if (a.selection != nullptr) {
+        for (const auto& kv : a.selection->tiles) {
+            aTiles.insert(kv.second.get());
+        }
+    }
+    if (a.quickMask != nullptr) {
+        for (const auto& kv : a.quickMask->tiles) {
+            aTiles.insert(kv.second.get());
+        }
+    }
+    for (const AlphaChannel& c : a.channels) {
+        if (c.mask != nullptr) {
+            for (const auto& kv : c.mask->tiles) {
+                aTiles.insert(kv.second.get());
+            }
+        }
+    }
+    for (const Layer& l : b.layers) {
+        bytes += gridExclusive(aTiles, l.pixels);
+        if (l.mask != nullptr) {
+            bytes += gridExclusive(aTiles, l.mask->pixels);
+        }
+        if (l.smart != nullptr) {
+            if (l.smart->filterMask != nullptr) {
+                bytes += gridExclusive(aTiles, l.smart->filterMask->pixels);
+            }
+            // 源字节按「before 中无同址指针」计差值（同址 = 共享同一 vector 堆块）
+            if (aTiles.insert(l.smart->sourceBytes.data()).second) {
+                bytes += l.smart->sourceBytes.size();
+            }
+        }
+    }
+    bytes += gridExclusive(aTiles, b.selection);
+    bytes += gridExclusive(aTiles, b.quickMask);
+    for (const AlphaChannel& c : b.channels) {
+        bytes += gridExclusive(aTiles, c.mask);
     }
     return bytes;
 }
 
-void History::beginEdit(const Document& doc, const std::string& label, uint64_t revision) {
+void History::beginEdit(const Document& doc, const std::string& label, uint64_t revision,
+                        const std::string& coalesceKey) {
     std::lock_guard<std::mutex> lk(mtx_);
     if (pendingFlag_) {
         return;  // 嵌套：外层事务优先（M4a 简化）
@@ -44,6 +103,7 @@ void History::beginEdit(const Document& doc, const std::string& label, uint64_t 
     pendingSnap_.doc = doc;
     pendingSnap_.revision = revision;
     pendingLabel_ = label;
+    pendingCoalesce_ = coalesceKey;
     pendingFlag_ = true;
 }
 
@@ -53,8 +113,24 @@ void History::endEdit(const Document& doc, uint64_t revision) {
         return;
     }
     pendingFlag_ = false;
+    // H3 滑杆族合并：与末条目同合并键（且 redo 空——undo 后新编辑必须开新分支，
+    // 否则 redo 指向的状态会被合并破坏）时替换末条目 after，整段拖动只落一条历史。
+    // 键由桥接层按「效果:<层id>」构造，天然排除跨层/跨效果串账。
+    if (!pendingCoalesce_.empty() && redo_.empty() && !undo_.empty()
+        && undo_.back().coalesceKey == pendingCoalesce_) {
+        Entry& last = undo_.back();
+        if (exclusiveBytes(last.before.doc, doc) > maxExclusiveBytes_) {
+            undo_.pop_back();  // 合并后超预算：连同被合并条目整体弃（同单步超限防御语义）
+            OH_LOG_Print(LOG_APP, LOG_WARN, kDomain, kTag, "coalesce dropped: over budget");
+            return;
+        }
+        last.after.doc = doc;
+        last.after.revision = revision;
+        return;
+    }
     Entry entry;
     entry.label = pendingLabel_;
+    entry.coalesceKey = pendingCoalesce_;
     entry.before = pendingSnap_;
     entry.after.doc = doc;
     entry.after.revision = revision;

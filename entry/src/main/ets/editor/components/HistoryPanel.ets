@@ -40,6 +40,7 @@ const LABEL_ZH: Record<string, string> = {
   'group layer': '图层编组',
   'image size': '图像大小',
   'invert selection': '反选',
+  'layer opacity': '图层不透明度',
   'load selection': '载入选区',
   'magic wand': '魔棒',
   'mask enable': '启用蒙版',

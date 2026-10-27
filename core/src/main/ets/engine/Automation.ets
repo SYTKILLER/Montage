@@ -561,6 +561,20 @@ export class Automation {
     return out;
   }
 
+  /** P3-H1 一致性导出：注册表条目元数据（id/label/coalesce；commands.list 控制通道用）。 */
+  specDump(): AutoResult {
+    const rows: Record<string, Object>[] = [];
+    this.registry.forEach((c: CmdEntry): void => {
+      const r: Record<string, Object> = {};
+      r['id'] = c.id;
+      r['label'] = c.label;
+      r['coalesce'] = c.coalesce;
+      rows.push(r);
+    });
+    const out: AutoResult = { ok: true, error: '', value: rows as Object };
+    return out;
+  }
+
   labelOf(id: string): string {
     const c = this.registry.get(id);
     return c !== undefined ? c.label : id;

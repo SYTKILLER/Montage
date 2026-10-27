@@ -15,8 +15,11 @@ namespace montage {
 
 class History {
   public:
-    // 开始编辑：记录 before 快照（须与 docMutex 同线程；配对 endEdit）
-    void beginEdit(const Document& doc, const std::string& label, uint64_t revision);
+    // 开始编辑：记录 before 快照（须与 docMutex 同线程；配对 endEdit）。
+    // coalesceKey 非空 = 滑杆族连续编辑（H3）：endEdit 时与末条目同 key 且 redo 空
+    // 则合并（替换末条目 after），整段拖动只落一条历史。
+    void beginEdit(const Document& doc, const std::string& label, uint64_t revision,
+                   const std::string& coalesceKey = "");
     // 结束编辑：before==after 则丢弃；否则入 undo 栈并清 redo
     void endEdit(const Document& doc, uint64_t revision);
 
@@ -26,6 +29,11 @@ class History {
     bool canRedo() const;
     // 整档替换（打开工程/PSD）时清空：撤销不许跨文档回退
     void clear();
+    // 独占字节预算（02 §7 默认 128MB；宿主单测用小预算验证超限丢弃路径）
+    void setMaxExclusiveBytes(size_t bytes) { maxExclusiveBytes_ = bytes; }
+
+    // 独占字节估算（H3 扩展覆盖面见 history.cpp 注；公开供宿主单测与诊断直测）
+    static size_t exclusiveBytes(const Document& a, const Document& b);
 
     // M23c：取回并弃置挂起的 pending 事务（Camera Raw 预览取消还原用）。
     // 有 pending 时把 before 快照浅拷给 out 并清标志，返回 true。
@@ -54,6 +62,7 @@ class History {
     };
     struct Entry {
         std::string label;
+        std::string coalesceKey;  // H3：滑杆族合并键（空 = 不参与合并）
         Snapshot before;
         Snapshot after;
     };
@@ -70,12 +79,11 @@ class History {
     std::vector<RedoEntry> redo_;
     Snapshot pendingSnap_;     // beginEdit 后、endEdit 前的 before
     std::string pendingLabel_;
+    std::string pendingCoalesce_;  // H3：本次事务的合并键（空 = 普通）
     bool pendingFlag_ = false;
     
     size_t maxEntries_ = 100;
     size_t maxExclusiveBytes_ = 128ull * 1024 * 1024;  // 02 §7：撤销独占字节 128MB
-
-    static size_t exclusiveBytes(const Document& a, const Document& b);
 };
 
 }  // namespace montage
