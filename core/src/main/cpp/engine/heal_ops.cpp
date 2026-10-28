@@ -3,6 +3,8 @@
 
 #include "engine/heal_ops.h"
 
+#include "engine/auto_sample.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -295,15 +297,9 @@ bool contentAwareFill(Document& doc, std::string& err) {
     if (canvas.empty()) {
         canvas = inpaint::RectI{0, 0, ctx.gw, ctx.gh};
     }
-    inpaint::RectI win = inpaint::samplingWindow(holeDoc, canvas);
-    while (static_cast<double>(win.width()) * win.height() > 1.2e6 &&
-           (win.width() > holeDoc.width() * 2 || win.height() > holeDoc.height() * 2)) {
-        const int cx = (win.x0 + win.x1) / 2, cy = (win.y0 + win.y1) / 2;
-        const int nw = std::max((win.x1 - win.x0) / 2, holeDoc.width());
-        const int nh = std::max((win.y1 - win.y0) / 2, holeDoc.height());
-        win = inpaint::RectI{std::max(win.x0, cx - nw / 2), std::max(win.y0, cy - nh / 2),
-                             std::min(win.x1, cx - nw / 2 + nw), std::min(win.y1, cy - nh / 2 + nh)};
-    }
+    // P5④：16MP 预算 + 孔中心锚定向孔收缩（登记项收口；PS 采样域语义）
+    inpaint::RectI win = inpaint::shrinkWindowTowardHole(
+        inpaint::samplingWindow(holeDoc, canvas), holeDoc, 16.0e6);
     const int rx0 = std::max(0, win.x0 - ctx.ox), ry0 = std::max(0, win.y0 - ctx.oy);
     const int rx1 = std::min(ctx.gw, win.x1 - ctx.ox), ry1 = std::min(ctx.gh, win.y1 - ctx.oy);
     const int w = rx1 - rx0, h = ry1 - ry0;
@@ -335,9 +331,14 @@ bool contentAwareFill(Document& doc, std::string& err) {
         err = "empty selection";
         return false;
     }
-    std::vector<bool> source(w * h);
-    for (size_t i = 0; i < w * h; ++i) {
-        source[i] = !hole[i];
+    // P5③：Auto 采样区（图割判定与孔周边相似的像素；退化回退 = 孔外全部可用）
+    std::vector<bool> source = autosample::autoSampling(static_cast<size_t>(w),
+                                                        static_cast<size_t>(h), 4, img, hole);
+    if (source.empty()) {
+        source.assign(static_cast<size_t>(w) * h, false);
+        for (size_t i = 0; i < source.size(); ++i) {
+            source[i] = !hole[i];
+        }
     }
     const std::vector<float> filled = content_aware::fill(
         static_cast<size_t>(w), static_cast<size_t>(h), 4, img, hole, source,
@@ -468,16 +469,8 @@ bool contentAwareMove(Document& doc, int dx, int dy, bool extend, std::string& e
         if (canvas.empty()) {
             canvas = inpaint::RectI{0, 0, ctx.gw, ctx.gh};
         }
-        inpaint::RectI win = inpaint::samplingWindow(holeDoc, canvas);
-        while (static_cast<double>(win.width()) * win.height() > 1.2e6 &&
-               (win.width() > holeDoc.width() * 2 || win.height() > holeDoc.height() * 2)) {
-            const int cx = (win.x0 + win.x1) / 2, cy = (win.y0 + win.y1) / 2;
-            const int nw = std::max((win.x1 - win.x0) / 2, holeDoc.width());
-            const int nh = std::max((win.y1 - win.y0) / 2, holeDoc.height());
-            win = inpaint::RectI{std::max(win.x0, cx - nw / 2), std::max(win.y0, cy - nh / 2),
-                                 std::min(win.x1, cx - nw / 2 + nw),
-                                 std::min(win.y1, cy - nh / 2 + nh)};
-        }
+        inpaint::RectI win = inpaint::shrinkWindowTowardHole(
+            inpaint::samplingWindow(holeDoc, canvas), holeDoc, 16.0e6);  // P5④
         const int fx0 = std::max(0, win.x0 - ctx.ox), fy0 = std::max(0, win.y0 - ctx.oy);
         const int fx1 = std::min(ctx.gw, win.x1 - ctx.ox), fy1 = std::min(ctx.gh, win.y1 - ctx.oy);
         const int fw = fx1 - fx0, fh = fy1 - fy0;
@@ -498,9 +491,14 @@ bool contentAwareMove(Document& doc, int dx, int dy, bool extend, std::string& e
                     hole[k] = sg != nullptr && sg[0] > 0;
                 }
             }
-            std::vector<bool> source(fw * fh);
-            for (size_t i = 0; i < fw * fh; ++i) {
-                source[i] = !hole[i];
+            // P5③：Auto 采样区（同填充；退化回退孔外全部）
+            std::vector<bool> source = autosample::autoSampling(
+                static_cast<size_t>(fw), static_cast<size_t>(fh), 4, img, hole);
+            if (source.empty()) {
+                source.assign(static_cast<size_t>(fw) * fh, false);
+                for (size_t i = 0; i < source.size(); ++i) {
+                    source[i] = !hole[i];
+                }
             }
             const std::vector<float> filled = content_aware::fill(
                 static_cast<size_t>(fw), static_cast<size_t>(fh), 4, img, hole, source,

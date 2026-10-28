@@ -2014,6 +2014,24 @@ export class CompositorEngine {
   }
 
   // M19b 内容感知移动：选区内容 (dx,dy) 泊松融入新址；extend=1 复制模式。异步同上。
+  /** P5⑤ 感知移动实时预览（拖拽期；begin/update/end 与 UI 拖拽配对）。 */
+  beginCAMovePreview(): boolean {
+    const r = narrowResult(native.beginCAMovePreview() as Object);
+    return r.ok;
+  }
+
+  updateCAMovePreview(dx: number, dy: number): boolean {
+    const r = narrowResult(native.updateCAMovePreview(dx, dy) as Object);
+    return r.ok && r.data !== null && boolOf(r.data, 'previewed');
+  }
+
+  endCAMovePreview(): void {
+    const r = narrowResult(native.endCAMovePreview() as Object);
+    if (!r.ok && r.error !== null) {
+      hilog.error(DOMAIN, TAG, 'endCAMovePreview rejected: %{public}s', r.error.message);
+    }
+  }
+
   contentAwareMove(dx: number, dy: number, extend: boolean, onDone?: (changed: boolean) => void): boolean {
     const p = native.contentAwareMove(dx, dy, extend ? 1 : 0) as Promise<Object>;
     p.then((v: Object): void => {

@@ -1,6 +1,7 @@
 #include "engine/filters.h"
 
 #include "engine/camera_raw.h"
+#include "engine/motion_fft.h"
 
 #include "io/cms/lutfile.h"
 #include "engine/lens_ops.h"
@@ -301,25 +302,52 @@ bool applyFilter(const uint8_t* src, uint8_t* dst, uint32_t w, uint32_t h,
             break;
         }
         case FMotionBlur: {
-            // 沿角度方向线采样平均（photocraft motion 大距离走 FFT——v1 直接采样，登记）
+            // 沿角度方向线采样平均。P5①：dist ≥ 64 走 FFT 频域卷积（photocraft
+            // motion_fft 同语义：合并系数核 + overlap-save；行核为回退）。
+            // 行核 P5 修正对齐 PS/photocraft 语义：距离 = 条长（采样 ±dist/2，t∈
+            // [-0.5,0.5]，(steps+1) 站点双线性；v1 误用 ±dist 全距 = 条长 2×）。
             const float ang = p.p0 * kPi / 180.0f;
             const int dist = std::max(1, static_cast<int>(std::round(p.p1)));
+            if (dist >= kMotionFftCrossover) {
+                if (motionBlurFft(src, dst, w, h, p.p0, static_cast<float>(dist), err)) {
+                    break;
+                }
+                err.clear();  // FFT 资源不足 → 行采样回退
+            }
             std::vector<float> frac(n * 4u);
             const float dx = std::cos(ang);
             const float dy = std::sin(ang);
+            const int steps = dist;
+            const float norm = 1.0f / static_cast<float>(steps + 1);
             for (uint32_t y = 0; y < h; ++y) {
                 for (uint32_t x = 0; x < w; ++x) {
                     float acc[4] = {0, 0, 0, 0};
-                    for (int s = -dist; s <= dist; ++s) {
-                        float sp[4];
-                        getPxT(src, w, h, static_cast<int>(x) + static_cast<int>(std::lround(dx * s)),
-                               static_cast<int>(y) + static_cast<int>(std::lround(dy * s)), sp);
-                        for (int c = 0; c < 4; ++c) {
-                            acc[c] += sp[c];
+                    for (int i = 0; i <= steps; ++i) {
+                        const float t = static_cast<float>(i) / static_cast<float>(steps) - 0.5f;
+                        const float fx = static_cast<float>(x) + dx * static_cast<float>(dist) * t;
+                        const float fy = static_cast<float>(y) + dy * static_cast<float>(dist) * t;
+                        // 双线性（域外 = 透明；photocraft 行核合并系数的同义连续采样）
+                        const int ix = static_cast<int>(std::floor(fx));
+                        const int iy = static_cast<int>(std::floor(fy));
+                        const float fxf = fx - static_cast<float>(ix);
+                        const float fyf = fy - static_cast<float>(iy);
+                        const float wts[4] = {(1.0f - fxf) * (1.0f - fyf), fxf * (1.0f - fyf),
+                                              (1.0f - fxf) * fyf, fxf * fyf};
+                        const int xs[4] = {ix, ix + 1, ix, ix + 1};
+                        const int ys[4] = {iy, iy, iy + 1, iy + 1};
+                        for (int k = 0; k < 4; ++k) {
+                            if (wts[k] <= 0.0f) {
+                                continue;
+                            }
+                            float sp[4];
+                            getPxT(src, w, h, xs[k], ys[k], sp);
+                            for (int c = 0; c < 4; ++c) {
+                                acc[c] += wts[k] * sp[c];
+                            }
                         }
                     }
                     for (int c = 0; c < 4; ++c) {
-                        frac[(static_cast<size_t>(y) * w + x) * 4u + c] = acc[c] / (2.0f * dist + 1.0f);
+                        frac[(static_cast<size_t>(y) * w + x) * 4u + c] = acc[c] * norm;
                     }
                 }
             }
@@ -1027,6 +1055,61 @@ bool applyFilter(const uint8_t* src, uint8_t* dst, uint32_t w, uint32_t h,
             return false;
     }
     return true;
+}
+
+// P5② 分块 halo 预算：平移不变核（卷积/窗口族）= 核半径；图案/哈希/格锚定类 = 0。
+// convSep/box 族块缘 clamp 只污染 halo 区（不动有效区）——块输出与整幅逐字节一致。
+int filterHalo(const FilterParams& p) {
+    switch (p.kind) {
+        case FGaussianBlur:
+            return static_cast<int>(std::ceil(std::max(0.1f, p.p0) * 3.0f)) + 2;
+        case FBoxBlur:
+            return static_cast<int>(std::max(1.0f, p.p0)) * 2 + 2;
+        case FMotionBlur:
+            return static_cast<int>(std::ceil(std::max(1.0f, p.p1) * 0.5f)) + 2;
+        case FUnsharpMask:
+        case FSmartSharpen:
+        case FHighPass: {
+            const float r = p.kind == FHighPass ? std::max(0.1f, p.p0)
+                                                : std::max(0.1f, p.p1);
+            return static_cast<int>(std::ceil(r * 3.0f)) + 2;
+        }
+        case FMedian:
+        case FDustScratches:
+        case FReduceNoise:
+            return static_cast<int>(std::max(1.0f, p.p0)) + 2;
+        case FMinimum:
+        case FMaximum:
+            return static_cast<int>(std::max(1.0f, p.p0)) + 2;
+        case FCustom:
+            return 3;
+        case FEmboss:
+            return static_cast<int>(std::max(1.0f, p.p1)) + 2;
+        case FFindEdges:
+            return 2;
+        case FWind:
+            return static_cast<int>(std::max(1.0f, p.p1)) + 2;
+        default:
+            return 0;  // 图案/哈希/格锚定/逐点类：整幅执行
+    }
+}
+
+// P5②：块缘填充语义（见 filters.h）。getPx clamp 族 = true；getPxT 透明族 = false。
+bool filterEdgeClamped(const FilterParams& p) {
+    switch (p.kind) {
+        case FGaussianBlur:
+        case FBoxBlur:
+        case FUnsharpMask:
+        case FSmartSharpen:
+        case FHighPass:
+        case FMedian:
+        case FDustScratches:
+        case FReduceNoise:
+        case FCustom:
+            return true;
+        default:
+            return false;
+    }
 }
 
 }  // namespace filters

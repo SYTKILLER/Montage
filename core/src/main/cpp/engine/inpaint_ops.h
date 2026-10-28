@@ -96,6 +96,11 @@ struct RectI {
 };
 RectI samplingWindow(const RectI& hole, const RectI& canvas);
 
+// P5④ 采样窗口向孔收缩：超出预算（面积 > budget）时以孔中心为锚逐步半收缩，
+// 下限 = 孔尺寸（孔周采样域不小于孔本身）。PS Content-Aware 采样域语义；
+// heal_ops 两处调用（填充/感知移动）共用。budget = 16e6（M19 登记项 16MP）。
+RectI shrinkWindowTowardHole(const RectI& win, const RectI& hole, double budget);
+
 // ---- 以下暴露给宿主测试（photocraft pub(crate) 直迁）----
 
 // 布尔网格积分图（(w+1)×(h+1)）与裁剪窗口计数。

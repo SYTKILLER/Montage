@@ -10850,6 +10850,184 @@ napi_value ExportSmartContents(napi_env env, napi_callback_info info) {
     return makeOk(env, obj);
 }
 
+// ---------- P5⑤ 感知移动实时预览（拖拽期层像素平移合成；渲染快照按层替换） ----------
+
+namespace {
+
+// 预览网格：基底 COW + 选区内容平移 (dx,dy) 盖章（选区灰度作混合权重，目标域覆盖）。
+// bbox 平移并集 ≤ 4MP 预算，超限返回 nullptr（TS 退化为无预览）。
+std::shared_ptr<const TileGrid> buildCAMovePreview(const TileGrid& base, const TileGrid& sel,
+                                                   double originX, double originY, int dx,
+                                                   int dy) {
+    uint32_t bx = 0, by = 0, bw = 0, bh = 0;
+    if (!gridInkBBox(sel, bx, by, bw, bh)) {
+        return nullptr;
+    }
+    // 目标域（层局部）：墨迹 bbox 平移
+    const int64_t tx0 = static_cast<int64_t>(bx) + dx;
+    const int64_t ty0 = static_cast<int64_t>(by) + dy;
+    const int64_t tx1 = tx0 + bw;
+    const int64_t ty1 = ty0 + bh;
+    if (tx1 - tx0 <= 0 || ty1 - ty0 <= 0 ||
+        static_cast<uint64_t>(tx1 - tx0) * static_cast<uint64_t>(ty1 - ty0) > 4000000ull) {
+        return nullptr;
+    }
+    auto grid = std::make_shared<TileGrid>();
+    grid->cols = base.cols;
+    grid->rows = base.rows;
+    grid->revision = nextGridRevision();
+    grid->tiles = base.tiles;  // COW：未触及瓦片共享
+    const int32_t t0x = static_cast<int32_t>(tx0 / kTileSize);
+    const int32_t t0y = static_cast<int32_t>(ty0 / kTileSize);
+    const int32_t t1x = static_cast<int32_t>((tx1 - 1) / kTileSize);
+    const int32_t t1y = static_cast<int32_t>((ty1 - 1) / kTileSize);
+    for (int32_t ty = t0y; ty <= t1y; ++ty) {
+        for (int32_t tx = t0x; tx <= t1x; ++tx) {
+            if (tx < 0 || ty < 0 || tx >= static_cast<int32_t>(grid->cols) ||
+                ty >= static_cast<int32_t>(grid->rows)) {
+                continue;
+            }
+            const uint32_t key = static_cast<uint32_t>(ty) * grid->cols + tx;
+            // 可写拷贝（基底 tile 缺失 = 空瓦片，直接新建）
+            auto tile = std::make_shared<Tile>();
+            auto ebuf = std::make_unique<EngineBuffer>(kTileSize, kTileSize);
+            uint8_t* dst = ebuf->mapCpuWrite();
+            auto it = base.tiles.find(key);
+            if (it != base.tiles.end() && it->second != nullptr) {
+                const uint8_t* sbase = it->second->pixels->mapCpu();
+                if (sbase != nullptr) {
+                    for (uint32_t r = 0; r < kTileSize; ++r) {
+                        std::memcpy(dst + static_cast<size_t>(r) * kTileSize * 4u,
+                                    sbase + static_cast<size_t>(r) * it->second->pixels->rowBytes(),
+                                    static_cast<size_t>(kTileSize) * 4u);
+                    }
+                }
+            } else {
+                std::memset(dst, 0, static_cast<size_t>(kTileSize) * kTileSize * 4u);
+            }
+            // 盖章：目标域像素 ← 源像素 × 选区灰度（源 = 目标 - (dx,dy)，文档域取灰度）
+            for (uint32_t r = 0; r < kTileSize; ++r) {
+                const int32_t ly = static_cast<int32_t>(ty * kTileSize + r);
+                if (ly < ty0 || ly >= ty1) {
+                    continue;
+                }
+                const int32_t sy = ly - dy;  // 源层局部 y
+                for (uint32_t c = 0; c < kTileSize; ++c) {
+                    const int32_t lx = static_cast<int32_t>(tx * kTileSize + c);
+                    if (lx < tx0 || lx >= tx1) {
+                        continue;
+                    }
+                    const int32_t sx = lx - dx;  // 源层局部 x
+                    const uint8_t g = selectionGrayAt(sel,
+                                                      static_cast<int>(std::lround(originX)) + sx,
+                                                      static_cast<int>(std::lround(originY)) + sy);
+                    if (g == 0) {
+                        continue;
+                    }
+                    const uint8_t* sp = nullptr;
+                    const uint32_t stx = static_cast<uint32_t>(sx) / kTileSize;
+                    const uint32_t sty = static_cast<uint32_t>(sy) / kTileSize;
+                    auto sit = base.tiles.find(sty * base.cols + stx);
+                    if (sit != base.tiles.end() && sit->second != nullptr) {
+                        sp = sit->second->pixels->mapCpu();
+                    }
+                    if (sp == nullptr) {
+                        continue;
+                    }
+                    const uint32_t inRow = static_cast<uint32_t>(sy) % kTileSize;
+                    const uint32_t inCol = static_cast<uint32_t>(sx) % kTileSize;
+                    const uint8_t* s = sp + (static_cast<size_t>(inRow) * sit->second->pixels->rowBytes() +
+                                             static_cast<size_t>(inCol) * 4u);
+                    uint8_t* d = dst + (static_cast<size_t>(r) * kTileSize + c) * 4u;
+                    const float w = static_cast<float>(g) / 255.0f;
+                    for (int ch = 0; ch < 4; ++ch) {
+                        d[ch] = static_cast<uint8_t>(
+                            std::lround(static_cast<float>(s[ch]) * w +
+                                        static_cast<float>(d[ch]) * (1.0f - w)));
+                    }
+                }
+            }
+            tile->pixels = std::move(ebuf);
+            grid->tiles[key] = std::move(tile);
+        }
+    }
+    return grid;
+}
+
+}  // namespace
+
+napi_value BeginCAMovePreview(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    std::lock_guard<std::mutex> lk(e.docMutex);
+    if (e.doc().width == 0) {
+        return makeError(env, kErrNoDoc, "camMove preview: no document");
+    }
+    Layer* l = findLayerLocked(e.doc(), e.doc().activeId);
+    if (l == nullptr || l->pixels == nullptr || l->text != nullptr) {
+        return makeError(env, kErrBadParam, "camMove preview: no raster active layer");
+    }
+    auto& cm = e.active().camMove;
+    cm.active = true;
+    cm.layerId = l->id;
+    cm.base = l->pixels;
+    cm.preview = nullptr;
+    return makeOk(env, nullptr);
+}
+
+napi_value UpdateCAMovePreview(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "updateCAMovePreview(dx, dy) requires 2 args");
+    }
+    double dx = 0;
+    double dy = 0;
+    if (napi_get_value_double(env, argv[0], &dx) != napi_ok ||
+        napi_get_value_double(env, argv[1], &dy) != napi_ok || !std::isfinite(dx) ||
+        !std::isfinite(dy)) {
+        return makeError(env, kErrBadParam, "updateCAMovePreview: bad offset");
+    }
+    auto& e = Engine::get();
+    napi_value obj = nullptr;
+    napi_create_object(env, &obj);
+    bool previewed = false;
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        auto& cm = e.active().camMove;
+        if (cm.active && cm.base != nullptr) {
+            Layer* l = findLayerLocked(e.doc(), cm.layerId);
+            if (l != nullptr && l->pixels == cm.base && e.doc().selection != nullptr) {
+                auto pv = buildCAMovePreview(*cm.base, *e.doc().selection,
+                                             l->transform.originX, l->transform.originY,
+                                             static_cast<int>(std::lround(dx)),
+                                             static_cast<int>(std::lround(dy)));
+                if (pv != nullptr) {
+                    cm.preview = std::move(pv);
+                    previewed = true;
+                }
+            }
+        }
+    }
+    if (previewed) {
+        e.requestRender();
+    }
+    napi_value t = nullptr;
+    napi_get_boolean(env, previewed, &t);
+    napi_set_named_property(env, obj, "previewed", t);
+    return makeOk(env, obj);
+}
+
+napi_value EndCAMovePreview(napi_env env, napi_callback_info /*info*/) {
+    auto& e = Engine::get();
+    {
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        e.active().camMove = CAMovePreview{};
+    }
+    e.requestRender();
+    return makeOk(env, nullptr);
+}
+
 // ==================== P1 预设库与资源生态（io/presets + engine/preset_lib） ====================
 
 namespace {

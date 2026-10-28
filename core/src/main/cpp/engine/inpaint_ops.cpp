@@ -1677,6 +1677,25 @@ RectI samplingWindow(const RectI& hole, const RectI& canvas) {
     return RectI{sx.first, sy.first, sx.second, sy.second};
 }
 
+RectI shrinkWindowTowardHole(const RectI& win, const RectI& hole, double budget) {
+    RectI w = win;
+    if (hole.empty() || w.empty()) {
+        return w;
+    }
+    const int hx = (hole.x0 + hole.x1) / 2;
+    const int hy = (hole.y0 + hole.y1) / 2;
+    while (static_cast<double>(w.width()) * w.height() > budget &&
+           (w.width() > hole.width() * 2 || w.height() > hole.height() * 2)) {
+        const int nw = std::max(w.width() / 2, hole.width());
+        const int nh = std::max(w.height() / 2, hole.height());
+        // 孔中心锚定（PS 语义：采样域跟随选区收缩，不向窗心漂移）；clamp 回窗内
+        const int cx = std::clamp(hx, w.x0 + nw / 2, w.x1 - nw / 2);
+        const int cy = std::clamp(hy, w.y0 + nh / 2, w.y1 - nh / 2);
+        w = RectI{cx - nw / 2, cy - nh / 2, cx - nw / 2 + nw, cy - nh / 2 + nh};
+    }
+    return w;
+}
+
 bool onionPeel(size_t w, size_t h, size_t ch, int r, std::vector<float>& img,
                const std::vector<Px>& px, const std::vector<std::pair<int, int>>& sources,
                const CancelFn& cancel) {

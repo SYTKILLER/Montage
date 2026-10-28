@@ -376,6 +376,20 @@ void RenderLoop::doFrame() {
                 }
             }
         }
+        // P5⑤：感知移动实时预览——该层像素换平移合成网格（FilterPreview 同机制；
+        // 平移已烘进网格，无需 xform）
+        if (e.active().camMove.active && e.active().camMove.preview != nullptr) {
+            for (Layer& l : docSnap.layers) {
+                if (l.id == e.active().camMove.layerId) {
+                    if (l.smart != nullptr) {
+                        l.smartCache = e.active().camMove.preview;
+                    } else {
+                        l.pixels = e.active().camMove.preview;
+                    }
+                    break;
+                }
+            }
+        }
     }
     TileRenderer::StrokeOverlay overlay;
     if (strokeSnap.active) {

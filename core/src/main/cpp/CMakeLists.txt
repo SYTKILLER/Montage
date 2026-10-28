@@ -33,6 +33,9 @@ add_library(compositor SHARED
         engine/vector_render.cpp
         engine/filter_ops.cpp
         engine/filters.cpp
+        engine/motion_fft.cpp
+        engine/maxflow.cpp
+        engine/auto_sample.cpp
         engine/smart_ops.cpp
         engine/text_ops.cpp
         engine/text_raster_oh.cpp

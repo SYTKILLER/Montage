@@ -20,6 +20,13 @@ namespace montage {
 bool applyFilterToLayer(Document& doc, LayerId layerId, const filters::FilterParams& p,
                         std::string& err);
 
+// P5② 分块并行 strip 执行器：src/dst 全幅 strip（w×h）。halo>0 的平移不变核按
+// 512 对齐块 + filterHalo halo 执行（块内整幅 applyFilter，有效区回写——块输出与
+// 整幅逐字节一致）。halo=0 / halo≥256 / applyFilter 块内失败 → 返回 false（调用方
+// 退整幅单线程路径）。
+bool applyFilterStripTiled(const uint8_t* src, uint8_t* dst, uint32_t w, uint32_t h,
+                           const filters::FilterParams& p, int threads, std::string& err);
+
 // 计算层内容包围盒（非空瓦片并集；空层返回 false）。
 bool layerContentBBox(const TileGrid& grid, uint32_t& x, uint32_t& y, uint32_t& w, uint32_t& h);
 

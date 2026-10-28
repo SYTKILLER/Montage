@@ -97,6 +97,16 @@ struct FilterParams {
     std::string cameraJson;  // M23c：FCameraRaw 专用（CameraRaw camelCase JSON）
 };
 
+// P5②：核空间可达半径（分块 halo 预算，像素）。平移不变核（卷积/窗口族）= 核半径，
+// 块输出在 halo ≥ 该值时与整幅逐字节一致（块缘 clamp 只污染 halo 区，不进有效区——
+// convSep clamp 语义实证）。图案/哈希/格锚定类核（噪声/马赛克/晶格化/铜版画/拼贴/
+// 半调/云彩）返回 0 = 不分块（逐点便宜，且格锚定分块会改形状）。
+int filterHalo(const FilterParams& p);
+
+// P5②：块缘填充语义。true = clamp 取样核（卷积/中值族，图像缘复制边界像素），
+// false = 域外透明核（透明零填充）。分块器按此填充贴图块，块输出 == 整幅。
+bool filterEdgeClamped(const FilterParams& p);
+
 // 核执行：src/dst 均 w×h RGBA8888 直 alpha（stride = w*4）。域外取样 = 透明。
 bool applyFilter(const uint8_t* src, uint8_t* dst, uint32_t w, uint32_t h,
                  const FilterParams& p, std::string& err);

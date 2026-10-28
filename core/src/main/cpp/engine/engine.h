@@ -83,6 +83,16 @@ struct CameraPreviewSession {
     std::shared_ptr<const TileGrid> snap;
 };
 
+// P5⑤：感知移动实时预览会话（move 工具 caMoveMode>0 拖拽期）。base = 拖拽起点的
+// 层像素共享快照（COW 只读）；preview = 基底 + 选区内容平移 (dx,dy) 盖章的合成网格，
+// 渲染快照按层替换（FilterPreview 同机制）。松手 end 后走既有 contentAwareMove 一步事务。
+struct CAMovePreview {
+    bool active = false;
+    LayerId layerId = 0;
+    std::shared_ptr<const TileGrid> base;
+    std::shared_ptr<const TileGrid> preview;
+};
+
 // D2 多文档：一个打开的文档会话。池元素为 shared_ptr——异步任务按裸指针+epoch
 // 闩锁归属，发布段经 docIfUnchanged 锁内复核；池移除后 shared_ptr 仍护活到复核完。
 struct DocSession {
@@ -102,6 +112,7 @@ struct DocSession {
     FilterPreview filterPreview;
     RawDevelopSession rawDevelop;
     CameraPreviewSession camPreview;
+    CAMovePreview camMove;  // P5⑤ 感知移动实时预览（拖拽期）
 };
 
 class Engine {

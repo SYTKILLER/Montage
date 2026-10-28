@@ -314,6 +314,9 @@ napi_value RasterizeSmartObject(napi_env env, napi_callback_info info);
 napi_value NewSmartObjectViaCopy(napi_env env, napi_callback_info info);
 napi_value GetSmartInfo(napi_env env, napi_callback_info info);
 napi_value ExportSmartContents(napi_env env, napi_callback_info info);
+napi_value BeginCAMovePreview(napi_env env, napi_callback_info info);   // P5⑤
+napi_value UpdateCAMovePreview(napi_env env, napi_callback_info info);  // P5⑤
+napi_value EndCAMovePreview(napi_env env, napi_callback_info info);     // P5⑤
 // 页面销毁时释放回调与渲染线程
 napi_value Dispose(napi_env env, napi_callback_info info);
 

@@ -8,6 +8,7 @@
 #include <hilog/log.h>
 
 #include "engine/filters.h"
+#include "engine/parallel.h"
 
 namespace montage {
 
@@ -112,6 +113,75 @@ bool layerContentBBox(const TileGrid& grid, uint32_t& x, uint32_t& y, uint32_t& 
     return true;
 }
 
+// P5② 分块并行 strip 执行器：512 对齐块 + filterHalo halo；块内整幅 applyFilter
+//（复用全部核语义），有效区回写。块间无依赖 → parallelFor；块缘 clamp 只污染 halo
+//（convSep 域语义），有效区与整幅逐字节一致。核可达 ≥ 256 退整幅（分块无收益）。
+bool applyFilterStripTiled(const uint8_t* src, uint8_t* dst, uint32_t w, uint32_t h,
+                           const filters::FilterParams& p, int threads, std::string& err) {
+    const int halo = filters::filterHalo(p);
+    if (halo <= 0 || halo * 2 >= 256) {
+        return false;
+    }
+    const uint32_t block = 512;
+    const uint32_t nx = (w + block - 1) / block;
+    const uint32_t ny = (h + block - 1) / block;
+    const size_t nBlocks = static_cast<size_t>(nx) * ny;
+    if (nBlocks <= 1) {
+        return false;  // 单块 = 整幅路径（省双份拷贝）
+    }
+    std::atomic<bool> ok{true};
+    parallelFor(0, nBlocks, 1, threads, [&](size_t lo, size_t hi) {
+        for (size_t k = lo; k < hi; ++k) {
+            const uint32_t bx = static_cast<uint32_t>(k % nx);
+            const uint32_t by = static_cast<uint32_t>(k / nx);
+            const int32_t x0 = static_cast<int32_t>(bx * block);
+            const int32_t y0 = static_cast<int32_t>(by * block);
+            const int32_t rw = static_cast<int32_t>(
+                std::min<uint64_t>(block, w - bx * block));
+            const int32_t rh = static_cast<int32_t>(
+                std::min<uint64_t>(block, h - by * block));
+            const int32_t sw = rw + halo * 2;
+            const int32_t sh = rh + halo * 2;
+            std::vector<uint8_t> in(static_cast<size_t>(sw) * sh * 4u, 0);
+            std::vector<uint8_t> out(static_cast<size_t>(sw) * sh * 4u, 0);
+            // 块 strip（含 halo）。域外填充语义随核：clamp 核复制图像边界像素
+            //（== 整幅图像缘 clamp），透明核零填充（== getPxT 域外透明）
+            const bool edgeClampFill = filters::filterEdgeClamped(p);
+            for (int32_t r = 0; r < sh; ++r) {
+                const int32_t gy = y0 - halo + r;
+                const int32_t cy = std::clamp(gy, 0, static_cast<int32_t>(h) - 1);
+                const bool rowIn = gy >= 0 && gy < static_cast<int32_t>(h);
+                for (int32_t c = 0; c < sw; ++c) {
+                    const int32_t gx = x0 - halo + c;
+                    const int32_t cx = std::clamp(gx, 0, static_cast<int32_t>(w) - 1);
+                    if (!edgeClampFill && !(gx == cx && gy == cy)) {
+                        continue;  // 透明核：域外留零
+                    }
+                    std::memcpy(&in[(static_cast<size_t>(r) * sw + c) * 4u],
+                                src + (static_cast<size_t>(rowIn ? gy : cy) * w + cx) * 4u,
+                                4u);
+                }
+            }
+            std::string berr;
+            if (!filters::applyFilter(in.data(), out.data(), static_cast<uint32_t>(sw),
+                                      static_cast<uint32_t>(sh), p, berr)) {
+                ok = false;
+                continue;
+            }
+            for (int32_t r = 0; r < rh; ++r) {
+                std::memcpy(&dst[(static_cast<size_t>(y0 + r) * w + x0) * 4u],
+                            &out[(static_cast<size_t>(r + halo) * sw + halo) * 4u],
+                            static_cast<size_t>(rw) * 4u);
+            }
+        }
+    });
+    if (!ok) {
+        err = "tiled filter: block failed";
+        return false;
+    }
+    return true;
+}
+
 bool applyFilterToLayer(Document& doc, LayerId layerId, const filters::FilterParams& p,
                         std::string& err) {
     Layer* layer = nullptr;
@@ -157,7 +227,12 @@ bool applyFilterToLayer(Document& doc, LayerId layerId, const filters::FilterPar
     std::vector<uint8_t> strip;
     filterGridToStrip(*layer->pixels, gx, gy, w, h, strip);
     std::vector<uint8_t> out(strip.size(), 0);
-    if (!filters::applyFilter(strip.data(), out.data(), w, h, p, err)) {
+    // P5②：大面积 + 平移不变核 → 分块并行（块输出与整幅逐字节一致；小图/图案核走整幅）
+    bool tiledDone = false;
+    if (area > 1500000ull) {
+        tiledDone = applyFilterStripTiled(strip.data(), out.data(), w, h, p, 0, err);
+    }
+    if (!tiledDone && !filters::applyFilter(strip.data(), out.data(), w, h, p, err)) {
         return false;
     }
     // 选区约束（M7a coverage lerp；selection 在文档域，strip 原点 = transform.origin + bbox）

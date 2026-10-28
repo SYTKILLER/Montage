@@ -597,6 +597,9 @@ struct Index {
   private caStartY: number = 0;
   private caCurX: number = 0;
   private caCurY: number = 0;
+  private caPrevX: number = 0;   // P5⑤ 预览防抖（上帧位移/时间）
+  private caPrevY: number = 0;
+  private caPrevMs: number = 0;
   // M19a 污点修复模式（0 内容识别/1 创建纹理/2 接近匹配；引擎 kind = 2 + 模式）
   @State spotHealMode: number = 0;
   // M15a 参考线交互态（画布内拖动 + 标尺拖拽创建）
@@ -1661,8 +1664,9 @@ struct Index {
   }
 
   private moveTouch(e: TouchEvent, docX: number, docY: number): void {
-    // M19b 内容感知移动（caMoveMode 1=移动 2=扩展）：拖拽只累计位移，松手一步事务
-    //（无实时预览——感知补全是秒级异步量级，登记 v1 取舍）
+    // M19b 内容感知移动（caMoveMode 1=移动 2=扩展）。P5⑤：拖拽实时预览——
+    // begin 捕获基底 / update 防抖重建平移合成网格（渲染快照按层替换）/ end 后
+    // 走既有一步事务。预览不可用（超预算/无选区）时静默退化 = 旧行为。
     if (this.caMoveMode > 0) {
       if (e.type === TouchType.Down) {
         if (!this.hasSelectionFlag) {
@@ -1672,11 +1676,27 @@ struct Index {
         this.caDragging = true;
         this.caStartX = docX;
         this.caStartY = docY;
+        this.caPrevX = docX;
+        this.caPrevY = docY;
+        this.caPrevMs = 0;
+        this.engine.beginCAMovePreview();
       } else if (e.type === TouchType.Move && this.caDragging) {
         this.caCurX = docX;
         this.caCurY = docY;
+        const dx = Math.round(docX - this.caStartX);
+        const dy = Math.round(docY - this.caStartY);
+        const pdx = Math.round(this.caPrevX - this.caStartX);
+        const pdy = Math.round(this.caPrevY - this.caStartY);
+        const now = Date.now();
+        if ((dx !== pdx || dy !== pdy) && now - this.caPrevMs >= 45) {
+          this.caPrevX = docX;
+          this.caPrevY = docY;
+          this.caPrevMs = now;
+          this.engine.updateCAMovePreview(dx, dy);
+        }
       } else if ((e.type === TouchType.Up || e.type === TouchType.Cancel) && this.caDragging) {
         this.caDragging = false;
+        this.engine.endCAMovePreview();
         const dx = Math.round(this.caCurX - this.caStartX);
         const dy = Math.round(this.caCurY - this.caStartY);
         if (dx === 0 && dy === 0) {
