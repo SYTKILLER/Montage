@@ -288,15 +288,15 @@ bool motionBlurFft(const uint8_t* src, uint8_t* dst, uint32_t w, uint32_t h, flo
             }
             fft2d(local, n1, n2, 1);
             const double inv = 1.0 / static_cast<double>(n);
-            // 卷积读出偏移：核铺在 [0,sy]×[0,sx]、块 B(v,u)=P(oy+v+minY, ox+u+minX)，
-            // conv[m] = Σ w·B(m−t') = Σ w·P(ox + m − t.x + 2minX) → 图像位置 (oy+r, ox+c)
-            // 的模糊值落在块内 (r−2minY, c−2minX)（一维例：t=±2,minX=−2 → conv[c+4]
-            // = ½P(c−2)+½P(c+2) ✓）。
+            // 相关读出：conj(H) 乘法 = 循环相关 corr[m] = Σ B[m+j]·K[j]
+            // = Σ w·P(oy+r+t.y, ox+c+t.x) = 图像位置 (oy+r, ox+c) 的模糊值
+            // → 有效区就是块首 [0,rh)×[0,rw)（块原点 (oy+minY, ox+minX) 已补偿
+            // 核包络的负偏移；核铺 [0,sy]×[0,sx] 与包络原点对齐）。
             for (int32_t r = 0; r < rh; ++r) {
                 for (int32_t c = 0; c < rw; ++c) {
                     res[(static_cast<size_t>(r) * rw + c) * 4u + ch] =
-                        static_cast<float>(local[static_cast<size_t>(r - 2 * minY) * n2 +
-                                                 static_cast<size_t>(c - 2 * minX)].real() * inv);
+                        static_cast<float>(local[static_cast<size_t>(r) * n2 +
+                                                 static_cast<size_t>(c)].real() * inv);
                 }
             }
         }
