@@ -68,6 +68,15 @@ class CtrlJob {
   }
 }
 
+/** M-EC 编辑会话登记行（smart.list 透出；Index.smartEdits 的镜像）。 */
+export interface CtrlSmartEditRec {
+  sessionId: number;
+  parentId: number;
+  layerId: number;
+  contentsId: number;
+  fileName: string;
+}
+
 export class ControlServer {
   private engine: CompositorEngine | null = null;
   private server: socket.TCPSocketServer | null = null;
@@ -80,6 +89,10 @@ export class ControlServer {
   private stateFn: (() => MenuState) | null = null;
   // P4：无头笔画驱动（Index 注入——ui.stroke 走 strokeTouch 同管线，录制/回放 E2E 通路）
   private strokeFn: ((x0: number, y0: number, x1: number, y1: number) => void) | null = null;
+  // M-EC：智能对象编辑会话驱动（Index 注入——smart.edit/finish 走 UI 同管线）
+  private smartEditFn: ((layerId: number) => Promise<number>) | null = null;
+  private smartFinishFn: ((sessionId: number) => Promise<boolean>) | null = null;
+  private smartListFn: (() => CtrlSmartEditRec[]) | null = null;
   private jobs: CtrlJob[] = [];
   private jobSeq: number = 0;
 
@@ -93,6 +106,22 @@ export class ControlServer {
 
   setStrokeHandler(fn: ((x0: number, y0: number, x1: number, y1: number) => void) | null): void {
     this.strokeFn = fn;
+  }
+
+  /** M-EC：编辑会话原语（smart.edit/finish/list；Index 注入 UI 同管线）。 */
+  setSmartHandlers(editFn: ((layerId: number) => Promise<number>) | null,
+    finishFn: ((sessionId: number) => Promise<boolean>) | null,
+    listFn: (() => CtrlSmartEditRec[]) | null): void {
+    this.smartEditFn = editFn;
+    this.smartFinishFn = finishFn;
+    this.smartListFn = listFn;
+  }
+
+  // M-EC：raw docs.close 后的登记清理钩子（引擎原语不动 UI 态——Index 注入）
+  private docClosedFn: ((sessionId: number) => void) | null = null;
+
+  setDocClosedHandler(fn: ((sessionId: number) => void) | null): void {
+    this.docClosedFn = fn;
   }
 
   /** 后台 job 启动：立返 jobId；promise 结算入 job（done/failed；cancelled 由 cancel 路径收尾）。 */
@@ -418,6 +447,50 @@ export class ControlServer {
       this.reply(c, id, !fail, pl);
       return;
     }
+    // M-EC：智能对象编辑会话原语（E2E 通道，docs.* 同族；不入 automation 注册表）
+    if (method === 'smart.edit' || method === 'smart.finish' || method === 'smart.list') {
+      if (this.engine === null) {
+        this.reply(c, id, false, { 'error': 'no engine' });
+        return;
+      }
+      if (method === 'smart.list') {
+        const rows = this.smartListFn !== null ? this.smartListFn() : [];
+        this.reply(c, id, true, { 'edits': rows as Object });
+        return;
+      }
+      const sidV: Object = cmdParams['id'];
+      if (typeof sidV !== 'number') {
+        this.reply(c, id, false, { 'error': 'missing numeric "id"' });
+        return;
+      }
+      const sid = sidV as number;
+      if (method === 'smart.edit') {
+        if (this.smartEditFn === null) {
+          this.reply(c, id, false, { 'error': 'no smart edit handler' });
+          return;
+        }
+        this.smartEditFn(sid).then((newSid: number): void => {
+          if (newSid !== 0) {
+            this.reply(c, id, true, { 'sessionId': newSid });
+          } else {
+            this.reply(c, id, false, { 'error': 'smart edit failed (see hilog)' });
+          }
+        }).catch((e: Error): void => {
+          this.reply(c, id, false, { 'error': `smart.edit: ${e.message}` });
+        });
+        return;
+      }
+      if (this.smartFinishFn === null) {
+        this.reply(c, id, false, { 'error': 'no smart finish handler' });
+        return;
+      }
+      this.smartFinishFn(sid).then((ok: boolean): void => {
+        this.reply(c, id, ok, ok ? { 'sessionId': sid } : { 'error': 'smart finish failed' });
+      }).catch((e: Error): void => {
+        this.reply(c, id, false, { 'error': `smart.finish: ${e.message}` });
+      });
+      return;
+    }
     // P4 D2：多文档池驱动（E2E 通道；会话原语不入 automation 注册表——不可重放）
     if (method === 'docs.list' || method === 'docs.switch' || method === 'docs.close' ||
         method === 'docs.new') {
@@ -435,6 +508,9 @@ export class ControlServer {
         }
         const did = idV as number;
         const ok = method === 'docs.switch' ? this.engine.docSwitch(did) : this.engine.docClose(did);
+        if (ok && method === 'docs.close' && this.docClosedFn !== null) {
+          this.docClosedFn(did);  // M-EC：编辑会话登记同步清理
+        }
         this.reply(c, id, ok, ok ? {} : { 'error': `doc ${did} not found` });
       } else {
         const dn = this.engine.docNew();

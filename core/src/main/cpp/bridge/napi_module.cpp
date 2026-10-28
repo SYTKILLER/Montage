@@ -128,6 +128,8 @@ napi_value Init(napi_env env, napi_value exports) {
         {"convertToSmartObject", nullptr, montage::bridge::ConvertToSmartObject, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"placeEmbedded", nullptr, montage::bridge::PlaceEmbedded, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"replaceSmartContents", nullptr, montage::bridge::ReplaceSmartContents, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"replaceSmartContentsAll", nullptr, montage::bridge::ReplaceSmartContentsAll, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"reloadSmartLinked", nullptr, montage::bridge::ReloadSmartLinked, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setSmartTransform", nullptr, montage::bridge::SetSmartTransform, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"addSmartFilter", nullptr, montage::bridge::AddSmartFilter, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setSmartFilter", nullptr, montage::bridge::SetSmartFilter, nullptr, nullptr, nullptr, napi_default, nullptr},

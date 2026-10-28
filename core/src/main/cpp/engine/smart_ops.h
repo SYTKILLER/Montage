@@ -59,6 +59,14 @@ bool layerToSmart(const Layer& l, LayerId newId, Layer& out, std::string& err);
 // 源预解码入缓存（置入/替换命令用：取源尺寸算放置，后续 renderLayer 缓存命中不二次解码）
 bool ensureSourceCached(const SmartLayerState& sm, uint32_t& w, uint32_t& h, std::string& err);
 
+// M-EC：文档内同 contentsId 全实例换源重渲（替换内容/跨档 replaceAll 共用核）。
+// 字节替换 + 指纹失效 + psdRaw/uuid 清除 + 放置仿射保留；instCount = 换源实例数。
+// asEmbedded=false（重新加载链接）：只换字节，embedded/fileName 保持链接语义。
+// 渲染失败保留旧像素（源不可用语义）但状态已变——调用侧按 instCount>0 发布。
+bool replaceContentsById(Document& doc, uint64_t contentsId, const std::string& fileName,
+                         const std::vector<uint8_t>& bytes, int& instCount, std::string& err,
+                         bool asEmbedded = true);
+
 // 会话缓存清理（Engine::resetDocument 挂载点：源解码/placed 缓存随文档替换清空）
 void clearSessionCaches();
 

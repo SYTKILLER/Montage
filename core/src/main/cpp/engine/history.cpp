@@ -142,6 +142,8 @@ void History::endEdit(const Document& doc, uint64_t revision) {
     undo_.push_back(std::move(entry));
     redo_.clear();
     trim();
+    OH_LOG_Print(LOG_APP, LOG_INFO, kDomain, kTag, "history push: %{public}s (n=%{public}zu)",
+                 undo_.back().label.c_str(), undo_.size());
 }
 
 void History::trim() {

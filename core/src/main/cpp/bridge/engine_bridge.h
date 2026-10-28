@@ -300,6 +300,8 @@ napi_value SetVectorMaskEnabled(napi_env env, napi_callback_info info);
 napi_value ConvertToSmartObject(napi_env env, napi_callback_info info);
 napi_value PlaceEmbedded(napi_env env, napi_callback_info info);
 napi_value ReplaceSmartContents(napi_env env, napi_callback_info info);
+napi_value ReplaceSmartContentsAll(napi_env env, napi_callback_info info);  // M-EC 跨档
+napi_value ReloadSmartLinked(napi_env env, napi_callback_info info);        // M-EC 链接重载
 napi_value SetSmartTransform(napi_env env, napi_callback_info info);
 napi_value AddSmartFilter(napi_env env, napi_callback_info info);
 napi_value SetSmartFilter(napi_env env, napi_callback_info info);

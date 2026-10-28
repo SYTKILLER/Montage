@@ -32,7 +32,7 @@ import { ActionsPanel } from '../editor/components/ActionsPanel';
 import { AutomateDialog } from '../editor/components/AutomateDialog';
 import { automation, ActionStep } from 'core';
 import { Automate, BatchOptions, ProcessorOptions, BatchResult, BatchFileError } from 'core';
-import { controlServer } from '../editor/ControlServer';
+import { controlServer, CtrlSmartEditRec } from '../editor/ControlServer';
 import { ActiveSnap, buildMenuVM, buildShortcutMap, MenuDoc, MenuState, registerLangPacks, ShortcutEntry } from '../editor/CommandRegistry';
 import { getLang, setLang } from '../editor/I18n';
 
@@ -47,6 +47,15 @@ interface JpegCalibCheck {
   r: number;
   g: number;
   b: number;
+}
+
+// M-EC 智能对象编辑会话登记（tabId → 记录；回写/聚焦/拦截全靠它）
+interface SmartEditRec {
+  sessionId: number;   // 编辑会话（文档标签 id）
+  parentId: number;    // 父文档（SO 所在档）
+  layerId: number;     // 父档内 SO 层 id
+  contentsId: number;  // 内容指纹（双开聚焦/跨档联动定位）
+  fileName: string;    // 原源文件名（回写时保留）
 }
 
 // M16a：surface 尺寸变化回调（XComponentController 子类覆写，API 12 起）。旧 60Hz 常转
@@ -308,6 +317,11 @@ struct Index {
   @State showSmartFilters: boolean = false;  // M21 智能滤镜管理对话框
   @State smartInfo: SmartInfoDTO | null = null;
   @State smartEditIndex: number = -1;        // >=0 = 滤镜对话框编辑模式（预填+setSmartFilter）
+  // M-EC 智能对象编辑会话登记（sessionId → 父档/层/内容指纹；内存态不持久化）
+  @State smartEdits: Map<number, SmartEditRec> = new Map();
+  @State showSmartClose: boolean = false;    // 关闭拦截：未回写编辑会话三选模态
+  @State smartCloseId: number = 0;           // 待处置编辑会话 id
+  @State smartCloseRev: number = 0;          // 登记变化计数（tabLabel/ForEach key 用）
   @State filterP: number[] = [];        // 当前参数值（schema 序）
   @State filterSeed: number = 1;
   private filterTargetLayer: number = 0; // M24a：滤镜预览目标层（提交时录 filter.apply）
@@ -667,6 +681,17 @@ struct Index {
     controlServer.setStateProvider((): MenuState => this.menuState());  // P3-H1 commands.list 求值
     controlServer.setStrokeHandler((x0: number, y0: number, x1: number, y1: number): void => {
       this.debugStroke(x0, y0, x1, y1);  // P4：ui.stroke 无头笔画（录制/回放 E2E 通路）
+    });
+    // M-EC：编辑会话原语（smart.edit/finish/list——smartEditContents/finish UI 同管线）
+    controlServer.setSmartHandlers(
+      (layerId: number): Promise<number> => this.smartEditContents(layerId),
+      (sessionId: number): Promise<boolean> => this.smartFinish(sessionId),
+      (): CtrlSmartEditRec[] => this.smartEditRecords(),
+    );
+    controlServer.setDocClosedHandler((sessionId: number): void => {
+      if (this.smartEdits.delete(sessionId)) {
+        this.smartCloseRev++;  // raw docs.close（控制通道）同步清理编辑会话登记
+      }
     });
     this.refreshDocTabs();  // D2：activeDocId 初始化（保存路径键）
     this.consumeDebugControl();
@@ -3514,12 +3539,14 @@ struct Index {
   }
 
   private tabLabel(t: MenuDoc): string {
+    // M-EC：编辑会话标签标题后缀（PS「编辑内容」窗口提示语义）
+    const suffix = this.smartEdits.has(t.id) ? '·智能对象' : '';
     const u = this.saveUris.get(t.id);
     if (u !== undefined) {
       const seg = u.split('/');
-      return decodeURIComponent(seg[seg.length - 1]);
+      return decodeURIComponent(seg[seg.length - 1]) + suffix;
     }
-    return t.name;  // refreshDocTabs 兜底：会话名或「文档 N」
+    return t.name + suffix;  // refreshDocTabs 兜底：会话名或「文档 N」
   }
 
   private refreshDocTabs(): void {
@@ -3594,6 +3621,22 @@ struct Index {
   }
 
   private closeDocTab(id: number): void {
+    // M-EC 关闭拦截：编辑会话有修改 → 三选模态（回写并关闭/放弃修改/取消）
+    if (this.smartEdits.has(id)) {
+      let modified = false;
+      for (const d of this.engine.docsList()) {
+        if (d.id === id) {
+          modified = d.modified;
+        }
+      }
+      if (modified) {
+        this.smartCloseId = id;
+        this.showSmartClose = true;
+        return;
+      }
+      this.smartEdits.delete(id);  // 未修改：直接关（不回写）
+      this.smartCloseRev++;
+    }
     if (id !== this.activeDocId) {
       this.engine.docClose(id);
       this.saveUris.delete(id);
@@ -3670,6 +3713,22 @@ struct Index {
   }
 
   private doCloseDocument(): void {
+    // M-EC：active 是未回写编辑会话 → 拦截（file.close 与标签 ✕ 同语义）
+    if (this.smartEdits.has(this.activeDocId)) {
+      let modified = false;
+      for (const d of this.engine.docsList()) {
+        if (d.id === this.activeDocId) {
+          modified = d.modified;
+        }
+      }
+      if (modified) {
+        this.smartCloseId = this.activeDocId;
+        this.showSmartClose = true;
+        return;
+      }
+      this.smartEdits.delete(this.activeDocId);
+      this.smartCloseRev++;
+    }
     if (this.editingTextId !== 0) {
       this.editingTextId = 0;  // 引擎 resetDocument 已清会话，UI 镜像同步
     }
@@ -3881,6 +3940,269 @@ struct Index {
       }
     }).catch((e: BusinessError): void => {
       this.log(`导出内容 picker 失败: ${e.message}`);
+    });
+  }
+
+  // ---------- M-EC 智能对象编辑会话（Edit Contents 闭环） ----------
+
+  /** 编辑内容入口：探测源类型 → exportSmartContents 落盘 → 对应 open*（D2 落位自动新标签）
+   *  → 登记编辑会话。layerId=0 = 活动层（控制通道便捷入口）。
+   *  返回 sessionId（0 = 失败；控制通道 smart.edit 驱动同此路径）。 */
+  private async smartEditContents(layerId: number): Promise<number> {
+    if (layerId === 0) {
+      const a = this.activeLayer();
+      if (a === undefined) {
+        this.toast('无活动图层');
+        return 0;
+      }
+      layerId = a.id;
+    }
+    const info = this.engine.getSmartInfo(layerId);
+    if (!info.isSmart) {
+      this.toast('活动图层不是智能对象');
+      return 0;
+    }
+    if (!info.sourceAvailable || info.sourceKind === 'linked-missing') {
+      this.toast('链接源不可用（可尝试「替换内容」）');
+      this.log(`编辑内容 #${layerId}: 源不可用 kind=${info.sourceKind}`);
+      return 0;
+    }
+    // 同源已开编辑会话 → 聚焦（防双开并发回写互踩）
+    let focusId = 0;
+    this.smartEdits.forEach((rec: SmartEditRec, sid: number): void => {
+      if (focusId === 0 && rec.contentsId === info.contentsId) {
+        focusId = sid;
+      }
+    });
+    if (focusId !== 0) {
+      this.switchDocTab(focusId);
+      this.log(`编辑内容：同源编辑会话已开，聚焦标签 ${focusId}`);
+      return focusId;
+    }
+    const parentId = this.activeDocId;
+    const kind = info.sourceKind;  // montage/psd/raster（linked-missing 已拦）
+    const ext = kind === 'montage' ? '.montage' : kind === 'psd' ? '.psd'
+      : (info.fileName.lastIndexOf('.') >= 0
+          ? info.fileName.slice(info.fileName.lastIndexOf('.')) : '.png');
+    const path = this.cachePath(`smart_edit_${info.contentsId}${ext}`);
+    let fw: fs.File;
+    try {
+      fw = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+    } catch (e) {
+      this.log(`编辑内容落盘失败: ${(e as BusinessError).message}`);
+      this.toast('编辑内容失败（缓存不可写）');
+      return 0;
+    }
+    const n = this.engine.exportSmartContents(layerId, fw.fd);  // native 写完即关 fd
+    if (n < 0) {
+      this.toast('导出内容失败');
+      return 0;
+    }
+    let fr: fs.File;
+    try {
+      fr = fs.openSync(path, fs.OpenMode.READ_ONLY);
+    } catch (e) {
+      this.toast('编辑内容失败（缓存读回失败）');
+      return 0;
+    }
+    const fd = fr.fd;
+    // prepareOpenSlot 落位的新空标签：装载失败时收走（不残留空白 tab——D3 边界）
+    const failClose = (): void => {
+      this.refreshDocTabs();
+      const sid = this.activeDocId;
+      if (sid !== parentId) {
+        this.engine.docClose(sid);
+        this.refreshDocTabs();
+      }
+    };
+    const fail = (msg: string): number => {
+      failClose();
+      this.log(`编辑内容装载失败: ${msg}`);
+      this.toast('编辑内容装载失败');
+      return 0;
+    };
+    if (kind === 'montage') {
+      return this.engine.openProject(fd).then((d: OpenProjectData): number => {
+        this.docW = d.width;
+        this.docH = d.height;
+        this.afterDocChanged();
+        return this.registerSmartEdit(parentId, layerId, info.contentsId, info.fileName, kind, n);
+      }).catch((e: BusinessError): number => fail(e.message));
+    }
+    if (kind === 'psd') {
+      this.importing = true;
+      return this.engine.openPsdFile(fd).then((d: PsdOpenData): number => {
+        this.importing = false;
+        this.docW = d.width;
+        this.docH = d.height;
+        this.afterDocChanged();
+        return this.registerSmartEdit(parentId, layerId, info.contentsId, info.fileName, kind, n);
+      }).catch((e: BusinessError): number => {
+        this.importing = false;
+        return fail(e.message);
+      });
+    }
+    // raster：docNew 空会话 → openFileFromFd（失败收走空标签）
+    const dn = this.engine.docNew();
+    const slotId = dn !== null ? dn.id : 0;
+    return this.engine.openFileFromFd(fd).then((d: OpenFileData): number => {
+      this.docW = d.width;
+      this.docH = d.height;
+      this.afterDocChanged();
+      return this.registerSmartEdit(parentId, layerId, info.contentsId, info.fileName, kind, n);
+    }).catch((e: BusinessError): number => {
+      if (slotId !== 0) {
+        this.engine.docClose(slotId);
+        this.refreshDocTabs();
+      }
+      return fail(e.message);
+    });
+  }
+
+  /** 落位后登记：此刻 active = 新开的编辑会话标签。 */
+  private registerSmartEdit(parentId: number, layerId: number, contentsId: number,
+    fileName: string, kind: string, bytes: number): number {
+    this.refreshDocTabs();
+    const sid = this.activeDocId;
+    const rec: SmartEditRec = {
+      sessionId: sid, parentId: parentId, layerId: layerId,
+      contentsId: contentsId, fileName: fileName,
+    };
+    this.smartEdits.set(sid, rec);
+    this.smartCloseRev++;
+    this.updateTitle();
+    this.log(`编辑智能对象内容 #${layerId} → 标签 ${sid}（${kind} 源 ${bytes}B）`);
+    return sid;
+  }
+
+  /** 完成编辑：编辑会话 saveProject → 读包 → replaceSmartContentsAll（跨档实例联动）
+   *  → 关编辑标签 → 切回父档。false = 失败（登记保留，可重试/放弃）。 */
+  private async smartFinish(sessionId: number): Promise<boolean> {
+    const rec = this.smartEdits.get(sessionId);
+    if (rec === undefined) {
+      this.toast('该标签不是智能对象编辑会话');
+      return false;
+    }
+    // 父档存活检查（编辑期间父档可能被关——D2 会话互踩边界）
+    let parentAlive = false;
+    for (const d of this.engine.docsList()) {
+      if (d.id === rec.parentId) {
+        parentAlive = true;
+      }
+    }
+    if (!parentAlive) {
+      this.smartEdits.delete(sessionId);
+      this.smartCloseRev++;
+      this.engine.docClose(sessionId);
+      this.refreshDocMirror();
+      this.toast('父文档已关闭，放弃回写');
+      this.log(`编辑会话 ${sessionId}：父档已失，放弃回写`);
+      return false;
+    }
+    if (sessionId !== this.activeDocId && this.engine.docSwitch(sessionId)) {
+      this.refreshDocMirror();
+    }
+    const path = this.cachePath(`smart_finish_${sessionId}.montage`);
+    let fw: fs.File;
+    try {
+      fw = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+    } catch (e) {
+      this.toast('回写失败（缓存不可写）');
+      return false;
+    }
+    try {
+      await this.engine.saveProject(fw.fd);  // fd 所有权移交 native（全路径关闭）
+    } catch (e) {
+      this.log(`编辑会话保存失败: ${(e as BusinessError).message}`);
+      this.toast('编辑会话保存失败');
+      return false;
+    }
+    let bytes: ArrayBuffer;
+    try {
+      const st = fs.statSync(path);
+      const fr = fs.openSync(path, fs.OpenMode.READ_ONLY);
+      bytes = new ArrayBuffer(st.size);
+      fs.readSync(fr.fd, bytes);
+      fs.closeSync(fr);
+    } catch (e) {
+      this.toast('回写失败（读包失败）');
+      return false;
+    }
+    this.busyText = '回写智能对象内容…';
+    // 切回父档再替换：replaceAll 以活动档定位 layerId（层属于父档；方案数据流序）
+    if (this.engine.docSwitch(rec.parentId)) {
+      this.refreshDocMirror();
+    }
+    let published = 0;
+    try {
+      published = await this.engine.replaceSmartContentsAll(rec.layerId, rec.fileName, bytes);
+    } catch (e) {
+      this.busyText = '';
+      this.log(`回写失败: ${(e as BusinessError).message}`);
+      this.toast('回写失败');
+      return false;
+    }
+    this.busyText = '';
+    this.smartEdits.delete(sessionId);
+    this.smartCloseRev++;
+    this.engine.docClose(sessionId);  // 非 active 标签直接关
+    this.refreshDocMirror();
+    this.refreshLayers();
+    this.refreshHistory();
+    this.refreshStats();
+    this.updateTitle();
+    this.toast(published > 0 ? `内容已回写（${published} 档联动更新）` : '回写失败（文档状态已变化）');
+    this.log(`智能对象回写 #${rec.layerId}: ${published} 档`);
+    return published > 0;
+  }
+
+  /** 控制通道 smart.list 数据源（登记表镜像）。 */
+  private smartEditRecords(): CtrlSmartEditRec[] {
+    const rows: CtrlSmartEditRec[] = [];
+    this.smartEdits.forEach((rec: SmartEditRec): void => {
+      rows.push({
+        sessionId: rec.sessionId, parentId: rec.parentId, layerId: rec.layerId,
+        contentsId: rec.contentsId, fileName: rec.fileName,
+      });
+    });
+    return rows;
+  }
+
+  /** 放弃修改：关闭编辑标签不回写（关闭拦截「放弃修改」路径）。 */
+  private smartDiscard(sessionId: number): void {
+    if (this.smartEdits.delete(sessionId)) {
+      this.smartCloseRev++;
+    }
+    if (sessionId === this.activeDocId) {
+      this.doCloseDocument();  // active 标签走统一关闭路径（含单档退化）
+    } else {
+      this.engine.docClose(sessionId);
+      this.refreshDocTabs();
+    }
+    this.log(`放弃编辑会话 ${sessionId}（不回写）`);
+  }
+
+  /** 重新加载链接源（链接 SO；按 linkedPath 重读字节，单步历史）。 */
+  private smartReloadLinked(): void {
+    const a = this.activeLayer();
+    if (a === undefined || !a.isSmart) {
+      this.toast('活动图层不是智能对象');
+      return;
+    }
+    const info = this.engine.getSmartInfo(a.id);
+    if (info.embedded) {
+      this.toast('仅链接智能对象可重新加载');
+      return;
+    }
+    this.busyText = '重新加载链接源…';
+    this.engine.reloadSmartLinked(a.id).then((ok: boolean): void => {
+      this.busyText = '';
+      this.refreshLayers();
+      this.toast(ok ? '链接源已重新加载' : '重新加载失败（链接源不可用？）');
+      this.log(`重新加载链接 #${a.id}: ${ok}`);
+    }).catch((e: BusinessError): void => {
+      this.busyText = '';
+      this.log(`重新加载失败: ${e.message}`);
     });
   }
 
@@ -6089,6 +6411,21 @@ struct Index {
       case 'layer.smartExport':
         this.exportSmartContents();
         break;
+      case 'layer.smartEdit': {
+        const se = this.activeLayer();
+        if (se === undefined) {
+          this.toast('无活动图层');
+          break;
+        }
+        this.smartEditContents(se.id);
+        break;
+      }
+      case 'layer.smartFinish':
+        this.smartFinish(this.activeDocId);
+        break;
+      case 'layer.smartReload':
+        this.smartReloadLinked();
+        break;
       case 'layer.smartFiltersDialog':
         this.openSmartFiltersDialog();
         break;
@@ -7261,6 +7598,7 @@ struct Index {
         isAdjustment: a.isAdjustment === true, isText: a.isText === true,
         smartFilters: a.smartFilters ?? 0, smartFiltersOn: a.smartFiltersOn !== false,
         smartHasMask: a.smartHasMask === true, stackMode: a.stackMode ?? 0,
+        smartEmbedded: a.smartEmbedded !== false, smartSourceAvail: a.smartSourceAvail !== false,
       };
       snap = s;
     }
@@ -7287,6 +7625,7 @@ struct Index {
       linkActive: linkActive,
       activeLayerHasMask: this.activeLayerHasMask(),
       active: snap,
+      smartEditing: this.smartEdits.has(this.activeDocId),
       rulersVisible: this.rulersVisible,
       rulerUnit: this.rulerUnit,
       guidesVisible: this.guidesMirror.visible,
@@ -7988,7 +8327,8 @@ struct Index {
           .onClick((): void => {
             this.switchDocTab(t.id);
           })
-        }, (t: MenuDoc): string => `${t.id}|${t.active ? 1 : 0}|${t.modified ? 1 : 0}|${this.docTabRev}`)
+        }, (t: MenuDoc): string =>
+          `${t.id}|${t.active ? 1 : 0}|${t.modified ? 1 : 0}|${this.docTabRev}|${this.smartEdits.has(t.id) ? 1 : 0}|${this.smartCloseRev}`)
       }
       .padding({ left: 8, right: 8 })
     }
@@ -8951,6 +9291,57 @@ struct Index {
           .backgroundColor($r('app.color.surface'))
           .border({ width: 1, color: $r('app.color.border') })
           .width(360)
+        }
+      }
+      // M-EC：编辑会话关闭拦截（回写并关闭 / 放弃修改 / 取消）
+      if (this.showSmartClose) {
+        Stack() {
+          Column()
+            .width('100%')
+            .height('100%')
+            .backgroundColor('#66000000')
+            .onClick((): void => {
+              this.showSmartClose = false;
+            })
+          Column({ space: 14 }) {
+            Text('智能对象编辑会话').fontSize(16).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+            Text('编辑内容尚未回写到父文档，关闭前如何处理？').fontSize(13)
+              .fontColor($r('app.color.text_secondary'))
+            Row({ space: 12 }) {
+              Button('取消').fontSize(14).height(40).width(84)
+                .backgroundColor($r('app.color.surface'))
+                .fontColor($r('app.color.text_primary'))
+                .border({ width: 1, color: $r('app.color.border') })
+                .onClick((): void => {
+                  this.showSmartClose = false;
+                })
+              Button('放弃修改').fontSize(14).height(40).width(104)
+                .backgroundColor($r('app.color.surface'))
+                .fontColor($r('app.color.text_primary'))
+                .border({ width: 1, color: $r('app.color.border') })
+                .onClick((): void => {
+                  const id = this.smartCloseId;
+                  this.showSmartClose = false;
+                  this.smartDiscard(id);
+                })
+              Button('回写并关闭').fontSize(14).height(40).width(112)
+                .backgroundColor($r('app.color.accent'))
+                .fontColor($r('app.color.on_accent'))
+                .onClick((): void => {
+                  const id = this.smartCloseId;
+                  this.showSmartClose = false;
+                  this.smartFinish(id);
+                })
+            }
+            .justifyContent(FlexAlign.End)
+            .width('100%')
+          }
+          .padding(20)
+          .borderRadius(14)
+          .backgroundColor($r('app.color.surface'))
+          .border({ width: 1, color: $r('app.color.border') })
+          .width(400)
         }
       }
       // M24a：动作重命名对话框

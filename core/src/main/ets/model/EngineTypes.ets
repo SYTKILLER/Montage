@@ -171,6 +171,8 @@ export interface LayerDTO {
   smartFiltersOn: boolean; // M21 整栈开关（非 SO 层恒 true）
   stackMode: number;      // M21 堆栈模式（0=关闭 1..11 统计量；非 SO 层恒 0）
   smartHasMask: boolean;   // M21 滤镜蒙版存在
+  smartEmbedded: boolean;  // M-EC 链接态（非 SO 层恒 true）
+  smartSourceAvail: boolean; // M-EC 源可用（菜单「编辑内容」灰显数据源）
   shapeLiveKind: number;  // 0=None 1=Rect 2=Ellipse 3=Polygon 4=Line
   shapeRect: number[];    // [x,y,w,h]
   shapeRadii: number[];   // [tl,tr,br,bl]
@@ -356,6 +358,7 @@ export interface SmartInfoDTO {
   embedded: boolean;
   fileName: string;
   linkedPath: string;
+  sourceKind: string;  // M-EC：montage/psd/raster/linked-missing
   filtersEnabled: boolean;
   stackMode: number;
   hasFilterMask: boolean;

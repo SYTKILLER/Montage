@@ -764,6 +764,40 @@ bool ensureSourceCached(const SmartLayerState& sm, uint32_t& w, uint32_t& h, std
     return getSourceFlat(sm, hash, w, h, rgba, err);
 }
 
+bool replaceContentsById(Document& doc, uint64_t contentsId, const std::string& fileName,
+                         const std::vector<uint8_t>& bytes, int& instCount, std::string& err,
+                         bool asEmbedded) {
+    instCount = 0;
+    std::vector<Layer*> inst;
+    for (Layer& l : doc.layers) {
+        if (l.smart != nullptr && l.smart->contentsId == contentsId) {
+            inst.push_back(&l);
+        }
+    }
+    if (inst.empty()) {
+        err = "replaceContents: no instance of contents";
+        return false;
+    }
+    for (Layer* l : inst) {
+        auto sm = std::make_shared<SmartLayerState>(*l->smart);
+        sm->sourceBytes = bytes;
+        sm->sourceHash = 0;
+        sm->psdRaw.clear();  // psdRaw 失效清除——内容已变
+        sm->uuid.clear();
+        if (asEmbedded) {
+            sm->embedded = true;
+            sm->fileName = fileName;
+        }
+        l->smart = std::move(sm);
+        l->smartCacheHash = 0;
+        if (!renderLayer(*l, err)) {
+            continue;  // 渲染失败保留旧像素（源不可用语义），其余实例继续
+        }
+        ++instCount;
+    }
+    return instCount > 0;
+}
+
 bool renderLayer(Layer& l, std::string& err) {
     if (l.smart == nullptr) {
         return false;
@@ -944,6 +978,10 @@ bool layersToSmart(const std::string& name, LayerId newId, std::vector<Layer>& m
     sub.width = static_cast<uint32_t>(std::ceil(rx1 - rx0)) + 32u;
     sub.height = static_cast<uint32_t>(std::ceil(ry1 - ry0)) + 32u;
     sub.layers = std::move(members);
+    // 子文档活动层（M-EC：编辑会话打开后笔画/转换落活动层——包缺 activeId = 「无活动层」）
+    if (!sub.layers.empty()) {
+        sub.activeId = sub.layers.front().id;
+    }
     shiftStack(sub.layers, -regionX, -regionY);
     // 3) 派生重建 + 扁平合成（子文档全幅）
     uint32_t fw = 0;

@@ -186,6 +186,12 @@ function buildTable(): CmdSpec[] {
     { when: 'smartFilters' }));
   v.push(c('layer.smartViaCopy', '通过拷贝新建智能对象', 'New Smart Object via Copy', 'layer',
     { when: 'isSmart' }));
+  v.push(c('layer.smartEdit', '编辑内容…', 'Edit Contents…', 'layer',
+    { when: 'smartEditSrc' }));
+  v.push(c('layer.smartFinish', '完成编辑（回写）', 'Finish Editing (Write Back)', 'layer',
+    { when: 'smartEditing' }));
+  v.push(c('layer.smartReload', '重新加载链接', 'Reload Link', 'layer',
+    { when: 'linkedSmart' }));
   v.push(c('layer.smartReplace', '替换内容…', 'Replace Contents…', 'layer', { when: 'isSmart' }));
   v.push(c('layer.smartExport', '导出内容…', 'Export Contents…', 'layer', { when: 'isSmart' }));
   v.push(c('layer.smartFiltersToggle', '禁用/启用智能滤镜', 'Disable/Enable Smart Filters',
@@ -438,6 +444,8 @@ export interface ActiveSnap {
   smartFilters: number;
   smartFiltersOn: boolean;
   smartHasMask: boolean;
+  smartEmbedded: boolean;    // M-EC：false = 链接 SO
+  smartSourceAvail: boolean; // M-EC：源可用（嵌入有字节/链接路径可达）
   stackMode: number;
 }
 
@@ -458,6 +466,7 @@ export interface MenuState {
   linkActive: boolean;
   activeLayerHasMask: boolean;
   active: ActiveSnap | null;
+  smartEditing: boolean;  // M-EC：活动标签是智能对象编辑会话
   rulersVisible: boolean;
   rulerUnit: number;
   guidesVisible: boolean;
@@ -512,6 +521,11 @@ const PRED: Record<string, Pred> = {
   'smartFilters': (s: MenuState): boolean => s.docOpen && s.active !== null &&
     s.active.isSmart && s.active.smartFilters > 0,
   'isSmart': (s: MenuState): boolean => s.docOpen && s.active !== null && s.active.isSmart,
+  'smartEditSrc': (s: MenuState): boolean => s.docOpen && s.active !== null && s.active.isSmart &&
+    s.active.smartSourceAvail,
+  'smartEditing': (s: MenuState): boolean => s.docOpen && s.smartEditing,
+  'linkedSmart': (s: MenuState): boolean => s.docOpen && s.active !== null && s.active.isSmart &&
+    !s.active.smartEmbedded,
   'smartMask': (s: MenuState): boolean => s.docOpen && s.active !== null && s.active.isSmart &&
     s.active.smartHasMask,
   'isText': (s: MenuState): boolean => s.docOpen && s.active !== null && s.active.isText,

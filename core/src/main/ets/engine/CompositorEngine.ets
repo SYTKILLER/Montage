@@ -174,6 +174,8 @@ function narrowLayer(r: Record<string, Object>): LayerDTO {
     smartFiltersOn: boolOf(r, 'smartFiltersOn'),
       stackMode: num(r, 'stackMode'),
     smartHasMask: boolOf(r, 'smartHasMask'),
+    smartEmbedded: boolOf(r, 'smartEmbedded'),
+    smartSourceAvail: boolOf(r, 'smartSourceAvail'),
     shapeLiveKind: num(r, 'shapeLiveKind'),
     shapeRect: numArr(r, 'shapeRect'),
     shapeRadii: numArr(r, 'shapeRadii'),
@@ -2808,8 +2810,12 @@ export class CompositorEngine {
     if (!r.ok || r.data === null) {
       return 0;
     }
+    const newId = num(r.data, 'layer');
+    if (newId === 0) {
+      hilog.error(DOMAIN, TAG, 'convertToSmartObject rejected: %{public}s', str(r.data, 'error'));
+    }
     automation.note('smart.convert', { 'layerIds': layerIds });
-    return num(r.data, 'layer');
+    return newId;
   }
 
   /** 置入嵌入的智能对象（源字节 ArrayBuffer + 文件名；适配居中放置）。 */
@@ -2911,8 +2917,8 @@ export class CompositorEngine {
     const empty: SmartFilterDTO[] = [];
     const emptyInfo: SmartInfoDTO = {
       isSmart: false, contentsId: 0, embedded: true, fileName: '', linkedPath: '',
-      filtersEnabled: true, stackMode: 0, hasFilterMask: false, filterMaskEnabled: false,
-      sourceAvailable: false, filters: empty
+      sourceKind: '', filtersEnabled: true, stackMode: 0, hasFilterMask: false,
+      filterMaskEnabled: false, sourceAvailable: false, filters: empty
     };
     const r = narrowResult(native.getSmartInfo(layerId) as Object);
     if (!r.ok || r.data === null) {
@@ -2941,7 +2947,8 @@ export class CompositorEngine {
     return {
       isSmart: boolOf(d, 'isSmart'), contentsId: num(d, 'contentsId'),
       embedded: boolOf(d, 'embedded'), fileName: str(d, 'fileName'),
-      linkedPath: str(d, 'linkedPath'), filtersEnabled: boolOf(d, 'filtersEnabled'),
+      linkedPath: str(d, 'linkedPath'), sourceKind: str(d, 'sourceKind'),
+      filtersEnabled: boolOf(d, 'filtersEnabled'),
       stackMode: num(d, 'stackMode'),
       hasFilterMask: boolOf(d, 'hasFilterMask'), filterMaskEnabled: boolOf(d, 'filterMaskEnabled'),
       sourceAvailable: boolOf(d, 'sourceAvailable'), filters: filtersArr
@@ -2955,6 +2962,26 @@ export class CompositorEngine {
       return -1;
     }
     return num(r.data, 'bytes');
+  }
+
+  /** M-EC 跨档替换内容（遍历会话池对同 contentsId 层逐一替换；published = 更新档数）。 */
+  async replaceSmartContentsAll(layerId: number, fileName: string, bytes: Object):
+    Promise<number> {
+    const value: Object =
+      await (native.replaceSmartContentsAll(layerId, fileName, bytes) as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok || r.data === null) {
+      hilog.error(DOMAIN, TAG, 'replaceAll rejected: %{public}s', JSON.stringify(value));
+      return 0;
+    }
+    return num(r.data, 'published');
+  }
+
+  /** M-EC 重新加载链接源（按 linkedPath 重读字节；false = 失败/链接不可用）。 */
+  async reloadSmartLinked(layerId: number): Promise<boolean> {
+    const value: Object = await (native.reloadSmartLinked(layerId) as Promise<Object>);
+    const r = narrowResult(value);
+    return r.ok && r.data !== null && boolOf(r.data, 'changed');
   }
 
   dispose(): void {

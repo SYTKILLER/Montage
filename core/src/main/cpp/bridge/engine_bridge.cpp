@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #include <hilog/log.h>
 #include <multimedia/image_framework/image/pixelmap_native.h>
@@ -1058,6 +1059,19 @@ napi_value makeLayerDto(napi_env env, const Layer& l, bool isActive) {
                                                                      : 0)));
     napi_set_named_property(env, obj, "smartHasMask",
                             makeBool(env, l.smart != nullptr && l.smart->filterMask != nullptr));
+    // M-EC 菜单谓词数据源：链接态 + 源可用（嵌入=有字节；链接=路径可达）
+    napi_set_named_property(env, obj, "smartEmbedded",
+                            makeBool(env, l.smart == nullptr || l.smart->embedded));
+    bool srcAvail = true;
+    if (l.smart != nullptr) {
+        if (l.smart->embedded) {
+            srcAvail = !l.smart->sourceBytes.empty();
+        } else {
+            struct stat st{};
+            srcAvail = stat(l.smart->linkedPath.c_str(), &st) == 0;
+        }
+    }
+    napi_set_named_property(env, obj, "smartSourceAvail", makeBool(env, srcAvail));
     if (l.shape != nullptr) {
         const ShapeLayerState& sh = *l.shape;
         napi_set_named_property(env, obj, "shapeLiveKind", makeInt32(env, static_cast<int32_t>(sh.live.kind)));
@@ -2729,7 +2743,7 @@ napi_value CaOpAsync(napi_env env, napi_callback_info info, int op) {
         ctx->docSnap = e.doc();
         ctx->epoch = e.docEpoch();
         ctx->revision = e.docRevision();
-        ctx->docSess = &e.doc();
+        ctx->docSess = &e.active();
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -2926,7 +2940,7 @@ napi_value ApplyLiquify(napi_env env, napi_callback_info info) {
         ctx->docSnap = e.doc();
         ctx->epoch = e.docEpoch();
         ctx->revision = e.docRevision();
-        ctx->docSess = &e.doc();
+        ctx->docSess = &e.active();
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -3136,7 +3150,7 @@ napi_value ApplyPuppet(napi_env env, napi_callback_info info) {
         ctx->docSnap = e.doc();
         ctx->epoch = e.docEpoch();
         ctx->revision = e.docRevision();
-        ctx->docSess = &e.doc();
+        ctx->docSess = &e.active();
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -3299,7 +3313,7 @@ napi_value ApplyPerspective(napi_env env, napi_callback_info info) {
         ctx->docSnap = e.doc();
         ctx->epoch = e.docEpoch();
         ctx->revision = e.docRevision();
-        ctx->docSess = &e.doc();
+        ctx->docSess = &e.active();
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -3567,7 +3581,7 @@ napi_value ApplyWideAngle(napi_env env, napi_callback_info info) {
         ctx->docSnap = e.doc();
         ctx->epoch = e.docEpoch();
         ctx->revision = e.docRevision();
-        ctx->docSess = &e.doc();
+        ctx->docSess = &e.active();
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -3882,7 +3896,7 @@ napi_value ApplyVpClone(napi_env env, napi_callback_info info) {
         ctx->docSnap = e.doc();
         ctx->epoch = e.docEpoch();
         ctx->revision = e.docRevision();
-        ctx->docSess = &e.doc();
+        ctx->docSess = &e.active();
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -4665,7 +4679,7 @@ napi_value DocGeomAsync(napi_env env, napi_callback_info info, int op) {
         ctx->docSnap = e.doc();
         ctx->epoch = e.docEpoch();
         ctx->revision = e.docRevision();
-        ctx->docSess = &e.doc();
+        ctx->docSess = &e.active();
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -5236,7 +5250,7 @@ napi_value BakeLayerMatrix(napi_env env, napi_callback_info info) {
         ctx->docSnap = e.doc();
         ctx->epoch = e.docEpoch();
         ctx->revision = e.docRevision();
-        ctx->docSess = &e.doc();
+        ctx->docSess = &e.active();
         // 预览态即清（渲染回到未变换；烘焙结果异步发布）
         e.active().transformPreview.active = false;
         e.requestRender();
@@ -9747,13 +9761,23 @@ napi_value SetVectorMaskEnabled(napi_env env, napi_callback_info info) {
 // ---------- M21 智能对象与智能滤镜（photocraft smart_cmds.rs 命令面；重渲一律异步
 // CaOp 范式：锁内快照 → 锁外渲染 → 发布段 epoch/revision 复核） ----------
 
-// 共享内容实例收集（contentsId 相同 = 同源实例，含组内；替换内容全实例联动）
-void smartCollectInstances(Document& doc, uint64_t contentsId, std::vector<Layer*>& out) {
-    for (Layer& l : doc.layers) {
-        if (l.smart != nullptr && l.smart->contentsId == contentsId) {
-            out.push_back(&l);
+// 读整个文件（M-EC 重新加载链接源；沙箱可见路径——与 exportSmartContents 同语义）
+bool readFileBytes(const std::string& path, std::vector<uint8_t>& out) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        return false;
+    }
+    std::fseek(f, 0, SEEK_END);
+    const long sz = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (sz > 0) {
+        out.resize(static_cast<size_t>(sz));
+        if (std::fread(out.data(), 1, out.size(), f) != out.size()) {
+            out.clear();
         }
     }
+    std::fclose(f);
+    return !out.empty();
 }
 
 // 当前选区 → 滤镜蒙版（ink bbox 裁剪 patch；offset 相对 SO 层 origin——放置域局部）
@@ -9840,10 +9864,24 @@ struct SmartOpCtx {
     LayerId newLayerId = 0;
     bool changed = false;
     std::string err;
+    // M-EC op11 跨档替换：逐会话快照（各档独立渲染/发布/历史一条）
+    struct SessWork {
+        Document snap;
+        DocSession* sess = nullptr;
+        uint64_t epoch = 0;
+        int64_t revision = 0;
+        bool changed = false;
+        int instCount = 0;
+        std::string err;
+    };
+    uint64_t contentsId = 0;
+    std::vector<SessWork> works;
+    int published = 0;
 };
 
 // op 表：0 convert 1 placeEmbedded 2 replaceContents 3 setTransform 4 addFilter
 //        5 setFilter 6 removeFilter 7 moveFilter 8 filtersEnabled 9 filterMask
+//        11 replaceContentsAll（M-EC 跨档） 12 reloadLinked（M-EC 重新加载链接）
 napi_value SmartOpAsync(napi_env env, napi_callback_info info, int op) {
     auto& e = Engine::get();
     auto* ctx = new SmartOpCtx();
@@ -9853,9 +9891,10 @@ napi_value SmartOpAsync(napi_env env, napi_callback_info info, int op) {
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     const char* needMsg = op == 0 ? "convertToSmartObject(layerIds) requires 1 arg"
                           : op == 1 ? "placeEmbedded(name, bytes) requires 2 args"
-                          : op == 2 ? "replaceSmartContents(id, name, bytes) requires 3 args"
-                                    : "smart op requires args";
-    const size_t needN = op == 0 ? 1 : op == 1 ? 2 : op == 2 ? 3 : 1;
+                          : (op == 2 || op == 11)
+                              ? "replaceSmartContents(id, name, bytes) requires 3 args"
+                              : "smart op requires args";
+    const size_t needN = op == 0 ? 1 : (op == 2 || op == 11) ? 3 : op == 1 ? 2 : 1;
     if (argc < needN) {
         delete ctx;
         return makeError(env, kErrBadParam, needMsg);
@@ -9881,9 +9920,9 @@ napi_value SmartOpAsync(napi_env env, napi_callback_info info, int op) {
             }
             ctx->ids.push_back(static_cast<LayerId>(v));
         }
-    } else if (op == 1 || op == 2) {
-        const size_t base = op == 1 ? 0 : 1;
-        if (op == 2) {
+    } else if (op == 2 || op == 11) {
+        const size_t base = 1;
+        {
             double id = 0;
             if (!num(0, &id)) {
                 delete ctx;
@@ -10021,10 +10060,42 @@ napi_value SmartOpAsync(napi_env env, napi_callback_info info, int op) {
             delete ctx;
             return makeError(env, kErrNoDoc, "smart op: no document");
         }
-        ctx->docSnap = e.doc();
-        ctx->epoch = e.docEpoch();
-        ctx->revision = e.docRevision();
-        ctx->docSess = &e.doc();
+        if (op == 11) {
+            // M-EC 跨档替换：active 定位 contentsId → 遍历池，凡含同源实例的会话各出一份快照
+            Layer* first = findLayerLocked(e.doc(), ctx->layerId);
+            if (first == nullptr || first->smart == nullptr) {
+                delete ctx;
+                return makeError(env, kErrBadParam,
+                                 "replaceSmartContentsAll: layer is not a smart object");
+            }
+            ctx->contentsId = first->smart->contentsId;
+            for (auto& s : e.docs) {
+                bool hit = false;
+                for (Layer& l : s->doc.layers) {
+                    if (l.smart != nullptr && l.smart->contentsId == ctx->contentsId) {
+                        hit = true;
+                        break;
+                    }
+                }
+                if (hit) {
+                    SmartOpCtx::SessWork w;
+                    w.sess = s.get();
+                    w.epoch = s->epoch;
+                    w.revision = static_cast<int64_t>(s->revision);
+                    w.snap = s->doc;
+                    ctx->works.push_back(std::move(w));
+                }
+            }
+            if (ctx->works.empty()) {
+                delete ctx;
+                return makeError(env, kErrBadParam, "replaceSmartContentsAll: no instances");
+            }
+        } else {
+            ctx->docSnap = e.doc();
+            ctx->epoch = e.docEpoch();
+            ctx->revision = e.docRevision();
+            ctx->docSess = &e.active();
+        }
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -10038,6 +10109,12 @@ napi_value SmartOpAsync(napi_env env, napi_callback_info info, int op) {
             switch (c->op) {
                 case 0: {
                     // 转换：成员段（组带子树段）收集 → 移出 → layersToSmart → 原位插入
+                    // id=0 = 活动层（控制通道便捷入口；层 id 全局单调不可预知）
+                    for (size_t i = 0; i < c->ids.size(); ++i) {
+                        if (c->ids[i] == 0) {
+                            c->ids[i] = work.activeId;
+                        }
+                    }
                     std::unordered_set<LayerId> kill(c->ids.begin(), c->ids.end());
                     for (LayerId id : c->ids) {
                         for (size_t i = 0; i < work.layers.size(); ++i) {
@@ -10148,30 +10225,17 @@ napi_value SmartOpAsync(napi_env env, napi_callback_info info, int op) {
                     break;
                 }
                 case 2: {
-                    // 替换内容：全共享实例换源重渲（psdRaw 失效清除——内容已变）
+                    // 替换内容：全共享实例换源重渲（共用核；psdRaw 失效清除——内容已变）
                     Layer* first = findLayerLocked(work, c->layerId);
                     if (first == nullptr || first->smart == nullptr) {
                         c->err = "replaceSmartContents: layer is not a smart object";
                         break;
                     }
-                    const uint64_t cid = first->smart->contentsId;
-                    std::vector<Layer*> inst;
-                    smartCollectInstances(work, cid, inst);
-                    for (Layer* l : inst) {
-                        auto sm = std::make_shared<SmartLayerState>(*l->smart);
-                        sm->embedded = true;
-                        sm->fileName = c->fileName;
-                        sm->sourceBytes = c->bytes;
-                        sm->sourceHash = 0;
-                        sm->psdRaw.clear();
-                        sm->uuid.clear();
-                        l->smart = std::move(sm);
-                        l->smartCacheHash = 0;
-                        if (!smart::renderLayer(*l, c->err)) {
-                            break;
-                        }
+                    int instCount = 0;
+                    if (smart::replaceContentsById(work, first->smart->contentsId, c->fileName,
+                                                   c->bytes, instCount, c->err)) {
+                        c->changed = true;
                     }
-                    c->changed = !inst.empty();
                     break;
                 }
                 case 3: {
@@ -10328,6 +10392,41 @@ napi_value SmartOpAsync(napi_env env, napi_callback_info info, int op) {
                     c->changed = smart::renderLayer(*l, c->err) || true;
                     break;
                 }
+                case 11: {
+                    // M-EC 跨档替换：逐快照换源重渲（渲染在锁外；发布在下方逐会话段）
+                    for (auto& w : c->works) {
+                        if (!smart::replaceContentsById(w.snap, c->contentsId, c->fileName,
+                                                        c->bytes, w.instCount, w.err)) {
+                            continue;
+                        }
+                        restyleDocument(w.snap);
+                        w.changed = true;
+                    }
+                    break;
+                }
+                case 12: {
+                    // M-EC 重新加载链接：锁外读链接源字节 → 全实例换字节（保持链接语义）
+                    Layer* l = findLayerLocked(work, c->layerId);
+                    if (l == nullptr || l->smart == nullptr) {
+                        c->err = "reloadSmartLinked: layer is not a smart object";
+                        break;
+                    }
+                    if (l->smart->embedded) {
+                        c->err = "reloadSmartLinked: layer is not linked";
+                        break;
+                    }
+                    std::vector<uint8_t> src;
+                    if (!readFileBytes(l->smart->linkedPath, src)) {
+                        c->err = "reloadSmartLinked: linked file unavailable";
+                        break;
+                    }
+                    int instCount = 0;
+                    if (smart::replaceContentsById(work, l->smart->contentsId, std::string(), src,
+                                                   instCount, c->err, false)) {
+                        c->changed = true;
+                    }
+                    break;
+                }
                 default:
                     c->err = "smart op: unsupported";
                     break;
@@ -10336,6 +10435,36 @@ napi_value SmartOpAsync(napi_env env, napi_callback_info info, int op) {
                 restyleDocument(work);
             }
             auto& eg = Engine::get();
+            if (c->op == 11) {
+                // M-EC：逐会话发布（各档独立 DocStamp 复核；每档一条历史、修改指示点亮）
+                std::lock_guard<std::mutex> lk(eg.docMutex);
+                for (auto& w : c->works) {
+                    if (!w.changed) {
+                        continue;
+                    }
+                    auto sess = eg.docIfUnchanged(Engine::DocStamp{
+                        w.sess, w.epoch, static_cast<uint32_t>(w.revision)});
+                    if (sess == nullptr) {
+                        w.changed = false;
+                        w.err = "document changed during render";
+                        continue;
+                    }
+                    sess->history.beginEdit(sess->doc, "替换智能对象内容",
+                                            static_cast<uint64_t>(sess->revision));
+                    sess->doc = std::move(w.snap);
+                    sess->history.endEdit(sess->doc, static_cast<uint64_t>(sess->revision));
+                    eg.bumpRevisionLocked(sess.get());
+                    ++c->published;
+                }
+                if (c->published > 0) {
+                    c->changed = true;  // 发布成功（此前漏设——回包恒 changed:false）
+                    eg.requestRender();
+                } else {
+                    c->changed = false;
+                    c->err = "smart replaceAll: documents changed during render";
+                }
+                return;
+            }
             std::lock_guard<std::mutex> lk(eg.docMutex);
             auto sess = eg.docIfUnchanged(Engine::DocStamp{static_cast<DocSession*>(c->docSess),
                                                            c->epoch,
@@ -10362,6 +10491,16 @@ napi_value SmartOpAsync(napi_env env, napi_callback_info info, int op) {
             napi_create_object(env, &dataObj);
             napi_set_named_property(env, dataObj, "changed",
                                     makeBool(env, status == napi_ok && c->changed));
+            if (c->changed && c->published > 0) {
+                napi_set_named_property(env, dataObj, "published",
+                                        makeDouble(env, static_cast<double>(c->published)));
+            }
+            if (!c->changed && !c->err.empty()) {
+                // M-EC：失败原因透出（reload/replaceAll 诊断；旧 op 保持原形状不变）
+                napi_set_named_property(env, dataObj, "error", makeString(env, c->err.c_str()));
+                OH_LOG_Print(LOG_APP, LOG_ERROR, kDomain, kTag, "smartOp op=%{public}d err=%{public}s",
+                             c->op, c->err.c_str());
+            }
             if (c->changed && c->newLayerId != 0) {
                 napi_set_named_property(env, dataObj, "layer",
                                         makeDouble(env, static_cast<double>(c->newLayerId)));
@@ -10406,6 +10545,16 @@ napi_value PlaceEmbedded(napi_env env, napi_callback_info info) {
 
 napi_value ReplaceSmartContents(napi_env env, napi_callback_info info) {
     return SmartOpAsync(env, info, 2);
+}
+
+// M-EC 跨档替换：遍历会话池对同 contentsId 层逐一替换（PS 同源多实例跨文档语义）
+napi_value ReplaceSmartContentsAll(napi_env env, napi_callback_info info) {
+    return SmartOpAsync(env, info, 11);
+}
+
+// M-EC 重新加载链接：按 linkedPath 重读源字节替换（保持链接语义，单步历史）
+napi_value ReloadSmartLinked(napi_env env, napi_callback_info info) {
+    return SmartOpAsync(env, info, 12);
 }
 
 napi_value SetSmartTransform(napi_env env, napi_callback_info info) {
@@ -10562,6 +10711,32 @@ napi_value GetSmartInfo(napi_env env, napi_callback_info info) {
     napi_set_named_property(env, obj, "fileName", t);
     napi_create_string_utf8(env, sm.linkedPath.c_str(), sm.linkedPath.size(), &t);
     napi_set_named_property(env, obj, "linkedPath", t);
+    // M-EC 源类型分流（编辑内容入口）：montage/psd/raster；链接源不可达 = linked-missing
+    {
+        auto extKind = [](const std::string& fn) -> std::string {
+            std::string low = fn;
+            for (char& ch : low) {
+                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            }
+            if (low.size() >= 8 && low.compare(low.size() - 8, 8, ".montage") == 0) {
+                return "montage";
+            }
+            if (low.size() >= 4 && low.compare(low.size() - 4, 4, ".psd") == 0) {
+                return "psd";
+            }
+            return "raster";
+        };
+        std::string kind;
+        if (sm.embedded) {
+            kind = extKind(sm.fileName);
+        } else {
+            struct stat st{};
+            kind = stat(sm.linkedPath.c_str(), &st) == 0 ? extKind(sm.linkedPath)
+                                                         : "linked-missing";
+        }
+        napi_create_string_utf8(env, kind.c_str(), kind.size(), &t);
+        napi_set_named_property(env, obj, "sourceKind", t);
+    }
     napi_get_boolean(env, sm.filtersEnabled, &t);
     napi_set_named_property(env, obj, "filtersEnabled", t);
     napi_create_double(env, static_cast<double>(sm.stackMode), &t);
