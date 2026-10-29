@@ -239,6 +239,7 @@ function buildRegistry(): Map<string, CmdEntry> {
         pb(p, 'contiguous', true), pn(p, 'op', 0), pn(p, 'allLayers', 0),
         pn(p, 'sampleSize', 1)) },
     { id: 'select.all', label: '全部选择', coalesce: false, apply: (e) => e.selectAll() },
+    { id: 'select.deselect', label: '取消选择', coalesce: false, apply: (e) => e.clearSelection() },
     { id: 'select.inverse', label: '反选', coalesce: false, apply: (e) => e.invertSelection() },
     { id: 'select.reselect', label: '重新选择', coalesce: false, apply: (e) => e.reselectSelection() },
     { id: 'select.feather', label: '羽化', coalesce: false,
@@ -484,6 +485,16 @@ function buildRegistry(): Map<string, CmdEntry> {
         pb(p, 'flag', true)) },
     { id: 'smart.rasterize', label: '栅格化智能对象', coalesce: false,
       apply: (e, p) => e.rasterizeSmartObject(pn(p, 'layerId', 0)) },
+    // P5⑤ 感知移动实时预览（会话三原语；提交走 edit.contentAwareMove 录制步）
+    { id: 'cam.previewBegin', label: '感知移动预览开始', coalesce: false,
+      apply: (e, p) => e.beginCAMovePreview() },
+    { id: 'cam.previewUpdate', label: '感知移动预览更新', coalesce: false,
+      apply: (e, p) => e.updateCAMovePreview(pn(p, 'dx', 0), pn(p, 'dy', 0)) },
+    { id: 'cam.previewEnd', label: '感知移动预览结束', coalesce: false,
+      apply: (e, p) => {
+        e.endCAMovePreview();
+        return true;
+      } },
   ];
   const map: Map<string, CmdEntry> = new Map();
   for (const c of t) {

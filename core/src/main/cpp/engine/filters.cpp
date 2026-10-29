@@ -314,6 +314,9 @@ bool applyFilter(const uint8_t* src, uint8_t* dst, uint32_t w, uint32_t h,
                 }
                 err.clear();  // FFT 资源不足 → 行采样回退
             }
+            // 预乘域采样（与 motion_fft 同语义）：透明邻域参与平均只压 alpha，
+            // RGB 由 alpha 还原（非预乘平均会在透明边缘产生错误变暗，且与
+            // dist ≥ 64 的 FFT 路径在 crossover 处不连续）。
             std::vector<float> frac(n * 4u);
             const float dx = std::cos(ang);
             const float dy = std::sin(ang);
@@ -321,7 +324,8 @@ bool applyFilter(const uint8_t* src, uint8_t* dst, uint32_t w, uint32_t h,
             const float norm = 1.0f / static_cast<float>(steps + 1);
             for (uint32_t y = 0; y < h; ++y) {
                 for (uint32_t x = 0; x < w; ++x) {
-                    float acc[4] = {0, 0, 0, 0};
+                    float accC[3] = {0, 0, 0};
+                    float accA = 0.0f;
                     for (int i = 0; i <= steps; ++i) {
                         const float t = static_cast<float>(i) / static_cast<float>(steps) - 0.5f;
                         const float fx = static_cast<float>(x) + dx * static_cast<float>(dist) * t;
@@ -341,18 +345,28 @@ bool applyFilter(const uint8_t* src, uint8_t* dst, uint32_t w, uint32_t h,
                             }
                             float sp[4];
                             getPxT(src, w, h, xs[k], ys[k], sp);
-                            for (int c = 0; c < 4; ++c) {
-                                acc[c] += wts[k] * sp[c];
+                            const float a = sp[3];  // getPxT 已归一 0..1
+                            accA += wts[k] * a;
+                            for (int c = 0; c < 3; ++c) {
+                                accC[c] += wts[k] * sp[c] * a;
                             }
                         }
                     }
-                    for (int c = 0; c < 4; ++c) {
-                        frac[(static_cast<size_t>(y) * w + x) * 4u + c] = acc[c] * norm;
-                    }
+                    float* fo = &frac[(static_cast<size_t>(y) * w + x) * 4u];
+                    fo[0] = accC[0] * norm;
+                    fo[1] = accC[1] * norm;
+                    fo[2] = accC[2] * norm;
+                    fo[3] = accA * norm;
                 }
             }
-            for (size_t i = 0; i < n * 4u; ++i) {
-                dst[i] = static_cast<uint8_t>(std::clamp(frac[i], 0.0f, 1.0f) * 255.0f + 0.5f);
+            for (size_t i = 0; i < n; ++i) {
+                const float a = std::clamp(frac[i * 4u + 3], 0.0f, 1.0f);
+                const float inv = a > 1e-6f ? 1.0f / a : 0.0f;
+                for (int c = 0; c < 3; ++c) {
+                    dst[i * 4u + c] = static_cast<uint8_t>(
+                        std::clamp(frac[i * 4u + c] * inv, 0.0f, 1.0f) * 255.0f + 0.5f);
+                }
+                dst[i * 4u + 3] = static_cast<uint8_t>(a * 255.0f + 0.5f);
             }
             break;
         }

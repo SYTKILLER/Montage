@@ -6496,12 +6496,15 @@ napi_value ApplyFilter(napi_env env, napi_callback_info info) {
         if (e.doc().width == 0) {
             return makeError(env, kErrNoDoc, "applyFilter: no document");
         }
+        // id=0 = 活动层（paint.brushStroke / smart.* 同约定；动作回放与 E2E 依赖）
+        const LayerId lid =
+            id == 0 ? e.doc().activeId : static_cast<LayerId>(id);
         if (e.active().textEditOpen || e.active().filterPreview.active || e.active().camPreview.open) {
             return makeError(env, kErrBadParam, "applyFilter: edit/preview session open");
         }
         e.history().beginEdit(e.doc(), "filter", static_cast<uint64_t>(e.docRevision()));
         std::string err;
-        if (!applyFilterToLayer(e.doc(), static_cast<LayerId>(id), p, err)) {
+        if (!applyFilterToLayer(e.doc(), lid, p, err)) {
             e.history().endEdit(e.doc(), static_cast<uint64_t>(e.docRevision()));  // before==after 丢弃
             return makeError(env, kErrBadParam, "applyFilter: " + err);
         }
@@ -6527,7 +6530,8 @@ napi_value BeginFilterPreview(napi_env env, napi_callback_info info) {
         if (e.doc().width == 0) {
             return makeError(env, kErrNoDoc, "beginFilterPreview: no document");
         }
-        Layer* layer = findLayerLocked(e.doc(), static_cast<LayerId>(id));
+        Layer* layer = findLayerLocked(e.doc(),
+                                       id == 0 ? e.doc().activeId : static_cast<LayerId>(id));
         if (layer == nullptr) {
             return makeError(env, kErrBadParam, "beginFilterPreview: layer not found");
         }
