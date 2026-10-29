@@ -1,4 +1,5 @@
 #include "engine/transform_ops.h"
+#include "engine/pixel_access.h"
 
 #include <algorithm>
 #include <cmath>
@@ -226,7 +227,7 @@ bool visibleContentBBox(const Document& doc, int& x, int& y, int& w, int& h) {
         if (!l.visible || l.adjustment != nullptr) {
             continue;
         }
-        const std::shared_ptr<const TileGrid> g = l.effectivePixels();
+        const std::shared_ptr<const TileGrid> g = l.displayPixels();
         if (g == nullptr || g->tiles.empty()) {
             continue;
         }
@@ -280,6 +281,9 @@ bool flipDocument(Document& doc, bool horizontal) {
     if (doc.width == 0 || doc.height == 0) {
         return false;
     }
+
+    // P6 D1-b：深色层变换垫片（像素搬运降位-升位无损）
+    std::vector<pixel_access::DeepEditGuard> deepGuards = pixel_access::guardAllLayers(doc.layers);
     for (Layer& l : doc.layers) {
         // M18：形状层路径同仿射（几何真源 = 路径点；hash 变化 → 收尾 restyleDocument 重派生）
         if (l.shape != nullptr) {
@@ -319,6 +323,9 @@ bool rotateDocument90(Document& doc, bool clockwise) {
     if (doc.width == 0 || doc.height == 0) {
         return false;
     }
+
+    // P6 D1-b：深色层变换垫片（像素搬运降位-升位无损）
+    std::vector<pixel_access::DeepEditGuard> deepGuards = pixel_access::guardAllLayers(doc.layers);
     const uint32_t oldW = doc.width;
     const uint32_t oldH = doc.height;
     for (Layer& l : doc.layers) {
@@ -403,7 +410,7 @@ bool alignBBoxOf(const Layer& l, int& x, int& y, int& w, int& h) {
     if (l.isGroup || l.adjustment != nullptr) {
         return false;
     }
-    const std::shared_ptr<const TileGrid> px = l.effectivePixels();
+    const std::shared_ptr<const TileGrid> px = l.displayPixels();
     if (px == nullptr) {
         return false;
     }

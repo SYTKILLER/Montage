@@ -1,4 +1,5 @@
 #include "engine/filter_ops.h"
+#include "engine/pixel_access.h"
 
 #include <algorithm>
 #include <atomic>
@@ -203,6 +204,8 @@ bool applyFilterToLayer(Document& doc, LayerId layerId, const filters::FilterPar
         err = "rasterize text layer first";
         return false;
     }
+    // P6 D1-b：深色层滤镜垫片——strip 域 U8（内核 float 化登记），出口升位写回层深度
+    const pixel_access::DeepEditGuard deepGuard(*layer, layer->pixels->revision + 1);
     uint32_t gx = 0, gy = 0, w = 0, h = 0;
     if (!layerContentBBox(*layer->pixels, gx, gy, w, h)) {
         err = "no content";

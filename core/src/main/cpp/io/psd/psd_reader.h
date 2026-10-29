@@ -36,6 +36,11 @@ struct Record {
     int width = 0;                   // 0 = 无像素（组/空层）
     int height = 0;
     std::vector<uint8_t> rgba;       // 预乘 RGBA（PSDChannelCoder 语义）
+    // P6 D1-b：深色保真平面（16/32 位 RGB/Gray 模式；f32 RGBA 直 alpha 0..1 预乘，
+    // width×height×4）。CMYK/Lab 深色 v1 维持受管降 8（deepValid=false）。
+    std::vector<float> deepRgba;
+    bool deepValid = false;
+    uint16_t deepDepth = 8;
     bool hasMask = false;
     int maskLeft = 0;
     int maskTop = 0;

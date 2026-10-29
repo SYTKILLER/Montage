@@ -154,6 +154,44 @@ bool rleToBytes(const uint8_t* data, size_t len, size_t& offset, size_t rowBytes
 
 }  // namespace
 
+std::optional<std::vector<float>> planeToF32(const uint8_t* data, size_t len, uint16_t depth,
+                                             size_t width, size_t height, std::string& err) {
+    const size_t n = width * height;
+    switch (depth) {
+        case 16: {
+            if (len < n * 2) {
+                err = "truncated";
+                return std::nullopt;
+            }
+            std::vector<float> out(n);
+            for (size_t i = 0; i < n; ++i) {
+                const uint32_t v = static_cast<uint32_t>(data[2 * i]) << 8 | data[2 * i + 1];
+                out[i] = static_cast<float>(v) * (1.0f / 65535.0f);
+            }
+            return out;
+        }
+        case 32: {
+            if (len < n * 4) {
+                err = "truncated";
+                return std::nullopt;
+            }
+            std::vector<float> out(n);
+            for (size_t i = 0; i < n; ++i) {
+                const uint32_t bits = static_cast<uint32_t>(data[4 * i]) << 24 |
+                                      static_cast<uint32_t>(data[4 * i + 1]) << 16 |
+                                      static_cast<uint32_t>(data[4 * i + 2]) << 8 | data[4 * i + 3];
+                float v = 0.0f;
+                std::memcpy(&v, &bits, 4);
+                out[i] = std::isnan(v) ? 0.0f : v;
+            }
+            return out;
+        }
+        default:
+            err = "planeToF32: unsupported depth " + std::to_string(depth);
+            return std::nullopt;
+    }
+}
+
 std::optional<std::vector<uint8_t>> decodeDeepChannel(int compression, size_t width, size_t height,
                                                       uint16_t depth, bool largeDoc, const uint8_t* payload,
                                                       size_t len, const int* crop, std::string& err) {

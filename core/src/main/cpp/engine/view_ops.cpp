@@ -118,7 +118,7 @@ bool layerContentBBox(const Document& doc, LayerId id,
         err = "adjustment layer has no bounds";
         return false;
     }
-    const std::shared_ptr<const TileGrid> px = found->effectivePixels();
+    const std::shared_ptr<const TileGrid> px = found->displayPixels();
     if (px == nullptr) {
         err = "layer has no pixels";
         return false;

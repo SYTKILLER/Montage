@@ -27,6 +27,10 @@ std::vector<uint8_t> unpackBitsPlane(const uint8_t* data, size_t len, size_t wid
 // 32：大端 f32，NaN → 0，clamp 0..1 后四舍五入。不支持深度返回空。
 std::optional<std::vector<uint8_t>> planeToU8(const uint8_t* data, size_t len, uint16_t depth, size_t width,
                                               size_t height, std::string& err);
+// P6 D1-b：深度平面 → f32 归一化平面（16 位大端 u16 /65535；32 位大端 IEEE f32，NaN→0；
+// 值域不钳——HDR 负值/超 1 由消费端语义决定；仅 16/32，1/8 位走 planeToU8）。
+std::optional<std::vector<float>> planeToF32(const uint8_t* data, size_t len, uint16_t depth, size_t width,
+                                             size_t height, std::string& err);
 
 // 通道压缩段 → 原始字节平面（宽 × 高 × bps/8）。compression 0 = raw、1 = RLE
 //（行计数 u16，PSB u32；行距 = deepRowBytes）。crop 为空 = 整面；

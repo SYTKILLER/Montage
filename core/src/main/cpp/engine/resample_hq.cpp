@@ -781,11 +781,18 @@ bool resampleDocumentHQ(Document& doc, uint32_t newW, uint32_t newH, ResampleMet
     }
     const double sx = static_cast<double>(newW) / doc.width;
     const double sy = static_cast<double>(newH) / doc.height;
+    // 瓦片域 clamp（P6 顺手修既有缺陷，同 resampleDocument）：微缩文档大比例炸瓦片数
+    const uint32_t capCols = std::max(1u, newW / kTileSize + 2u);
+    const uint32_t capRows = std::max(1u, newH / kTileSize + 2u);
     for (Layer& l : doc.layers) {
-        const uint32_t newCols = std::max(
-            1u, static_cast<uint32_t>(std::ceil(static_cast<double>(l.pixels ? l.pixels->cols : 1) * sx)));
-        const uint32_t newRows = std::max(
-            1u, static_cast<uint32_t>(std::ceil(static_cast<double>(l.pixels ? l.pixels->rows : 1) * sy)));
+        const uint32_t newCols = std::min(
+            std::max(1u, static_cast<uint32_t>(
+                             std::ceil(static_cast<double>(l.pixels ? l.pixels->cols : 1) * sx))),
+            capCols);
+        const uint32_t newRows = std::min(
+            std::max(1u, static_cast<uint32_t>(
+                             std::ceil(static_cast<double>(l.pixels ? l.pixels->rows : 1) * sy))),
+            capRows);
         if (l.shape != nullptr) {
             // M18：形状路径同步缩放（x'=sx·x, y'=sy·y）
             affineShapeLayer(l, sx, 0.0, 0.0, sy, 0.0, 0.0);

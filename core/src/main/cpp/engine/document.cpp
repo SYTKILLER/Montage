@@ -1,4 +1,5 @@
 #include "engine/document.h"
+#include "engine/pixel_access.h"
 
 #include <algorithm>
 #include <cmath>
@@ -8,8 +9,9 @@
 
 namespace montage {
 
-EngineBuffer::EngineBuffer(uint32_t width, uint32_t height)
-    : width_(width), height_(height), rowBytes_(width * 4u) {
+EngineBuffer::EngineBuffer(uint32_t width, uint32_t height, PixelDepth depth)
+    : width_(width), height_(height), rowBytes_(width * static_cast<uint32_t>(bytesPerPel(depth))),
+      depth_(depth) {
     bytes_ = static_cast<uint8_t*>(std::malloc(static_cast<size_t>(rowBytes_) * height_));
     if (bytes_ == nullptr) {
         throw std::bad_alloc();
@@ -38,7 +40,7 @@ EngineBuffer& TileGridBuilder::ensureTile(uint32_t tx, uint32_t ty) {
         return *static_cast<EngineBuffer*>(tile->pixels.get());
     }
     auto tile = std::make_shared<Tile>();
-    tile->pixels = std::make_unique<EngineBuffer>(kTileSize, kTileSize);
+    tile->pixels = std::make_unique<EngineBuffer>(kTileSize, kTileSize, depth_);
     auto* buf = static_cast<EngineBuffer*>(tile->pixels.get());
     tiles_.emplace(idx, std::move(tile));
     return *buf;
@@ -53,6 +55,7 @@ std::shared_ptr<const TileGrid> TileGridBuilder::publish(uint64_t revision) {
     grid->cols = cols_;
     grid->rows = rows_;
     grid->revision = revision;
+    grid->depth = depth_;
     grid->tiles = tiles_;  // shared_ptr 共享，拷贝轻量
     return grid;
 }
@@ -265,6 +268,7 @@ std::shared_ptr<const TileGrid> composeMasked(std::shared_ptr<const TileGrid> sr
     out->cols = shared.cols;
     out->rows = shared.rows;
     out->revision = shared.revision;
+    out->depth = shared.depth;  // P6：蒙版派生跟随源深度（纯 alpha 乘法精度无损）
     // 无 patch：整层取 outside（255 = 全显 → 原样返回；0 = 全隐 → 空网格）
     if (mask.pixels == nullptr) {
         if (mask.outside >= 128) {
@@ -294,23 +298,33 @@ std::shared_ptr<const TileGrid> composeMasked(std::shared_ptr<const TileGrid> sr
             }
             continue;
         }
-        auto buf = std::make_unique<EngineBuffer>(kTileSize, kTileSize);
+        // P6 D1-b：源深度感知（f32 域 alpha 乘法；U8 路径同公式零语义漂移）
+        const PixelDepth dep = shared.depth;
+        auto buf = std::make_unique<EngineBuffer>(kTileSize, kTileSize, dep);
         uint8_t* dst = buf->mapCpuWrite();
         const uint8_t* srcPx = tile->pixels->mapCpu();
         const uint32_t srcStride = tile->pixels->rowBytes();
+        const uint32_t dstStride = buf->rowBytes();
         for (int ry = 0; ry < kTile; ++ry) {
             const int gy = y0 + ry;  // 图层局部 y
             const uint8_t* srcRow = srcPx + static_cast<size_t>(ry) * srcStride;
-            uint8_t* dstRow = dst + static_cast<size_t>(ry) * kTileSize * 4u;
+            uint8_t* dstRow = dst + static_cast<size_t>(ry) * dstStride;
             for (int rx = 0; rx < kTile; ++rx) {
                 const int gx = x0 + rx;
                 const uint8_t m = layerMaskGrayAt(mask, gx, gy);
-                const uint8_t* s = srcRow + static_cast<size_t>(rx) * 4u;
-                uint8_t* d = dstRow + static_cast<size_t>(rx) * 4u;
-                d[0] = s[0];
-                d[1] = s[1];
-                d[2] = s[2];
-                d[3] = static_cast<uint8_t>((s[3] * m + 127) / 255);
+                const uint8_t* s = srcRow + static_cast<size_t>(rx) * static_cast<uint32_t>(bytesPerPel(dep));
+                uint8_t* d = dstRow + static_cast<size_t>(rx) * static_cast<uint32_t>(bytesPerPel(dep));
+                if (dep == PixelDepth::U8) {
+                    d[0] = s[0];
+                    d[1] = s[1];
+                    d[2] = s[2];
+                    d[3] = static_cast<uint8_t>((s[3] * m + 127) / 255);
+                } else {
+                    float v4[4];
+                    pixel_access::pixelDepthReadF32(dep, s, v4);
+                    v4[3] *= static_cast<float>(m) * (1.0f / 255.0f);
+                    pixel_access::pixelDepthWriteF32(dep, d, v4);
+                }
             }
         }
         auto t = std::make_shared<Tile>();

@@ -940,7 +940,7 @@ bool layersToSmart(const std::string& name, LayerId newId, std::vector<Layer>& m
     bool any = false;
     double rx0 = 0, ry0 = 0, rx1 = 0, ry1 = 0;
     for (const Layer& l : members) {
-        const std::shared_ptr<const TileGrid> eff = l.effectivePixels();
+        const std::shared_ptr<const TileGrid> eff = l.displayPixels();
         if (eff == nullptr) {
             continue;
         }

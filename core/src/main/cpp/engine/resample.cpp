@@ -1,4 +1,5 @@
 #include "engine/resample.h"
+#include "engine/pixel_access.h"
 
 #include "engine/text_ops.h"
 #include "engine/vector_render.h"
@@ -149,17 +150,28 @@ bool resampleDocument(Document& doc, uint32_t newW, uint32_t newH) {
     if (doc.width == 0 || doc.height == 0 || newW == 0 || newH == 0) {
         return false;
     }
+    // P6 D1-b：深色层重采样垫片（HQ 插值域 U8，登记后续 float 化）
+    std::vector<pixel_access::DeepEditGuard> deepGuards = pixel_access::guardAllLayers(doc.layers);
     if (newW == doc.width && newH == doc.height) {
         return false;
     }
     const double sx = static_cast<double>(newW) / doc.width;
     const double sy = static_cast<double>(newH) / doc.height;
+    // 瓦片域 clamp（P6 顺手修既有缺陷）：256 对齐网格域按比例放大在小图大比例时
+    // 炸瓦片数（4×3 文档 ×24 → 576 瓦片 ≈ 数百 MB OOM）。层域目标 clamp 到文档新
+    // 尺寸所需瓦片 + 2 余量（v1 层域 = 画布域 ± 置入越界边；透明边截断登记）。
+    const uint32_t capCols = std::max(1u, newW / kTileSize + 2u);
+    const uint32_t capRows = std::max(1u, newH / kTileSize + 2u);
     for (Layer& l : doc.layers) {
         const double m[6] = {sx, 0.0, 0.0, 0.0, sy, 0.0};  // x'=sx·x, y'=sy·y（行主序）
-        const uint32_t newCols = std::max(1u, static_cast<uint32_t>(
-            std::ceil(static_cast<double>(l.pixels ? l.pixels->cols : 1) * sx)));
-        const uint32_t newRows = std::max(1u, static_cast<uint32_t>(
-            std::ceil(static_cast<double>(l.pixels ? l.pixels->rows : 1) * sy)));
+        const uint32_t newCols = std::min(
+            std::max(1u, static_cast<uint32_t>(
+                             std::ceil(static_cast<double>(l.pixels ? l.pixels->cols : 1) * sx))),
+            capCols);
+        const uint32_t newRows = std::min(
+            std::max(1u, static_cast<uint32_t>(
+                             std::ceil(static_cast<double>(l.pixels ? l.pixels->rows : 1) * sy))),
+            capRows);
         if (l.text != nullptr) {
             // P2 文字跟随重采样（M12 登记项）：文字参数随文档缩放 + relayout 再生清晰
             // 栅格（warp 像素仅兜底——重排失败时保留）。字号随 sy（行高垂直主导）、

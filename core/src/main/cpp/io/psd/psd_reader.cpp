@@ -149,6 +149,10 @@ struct RawLayer {
     int section = -1;               // 对齐源 Int?（-1 = 无）
     std::vector<uint8_t> image;     // 预乘 RGBA
     std::vector<uint8_t> maskImage; // 灰度 patch
+    // P6 D1-b：深色保真平面（f32 RGBA 预乘直 alpha 0..1；RGB/Gray 16/32 位）
+    std::vector<float> deepRgba;
+    bool deepValid = false;
+    uint16_t deepDepth = 8;
     // 裁剪（画布越界预算兜底，对拍 PSDCrop/cropped）
     bool imageCropValid = false;
     int imageCropX = 0, imageCropY = 0, imageCropW = 0, imageCropH = 0;
@@ -1143,6 +1147,9 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
         const int sourceMaskW = std::max(0, layer.sourceMaskRight - layer.sourceMaskLeft);
         const int sourceMaskH = std::max(0, layer.sourceMaskBottom - layer.sourceMaskTop);
         std::map<int, std::vector<uint8_t>> planes;
+        // P6 D1-b：RGB/Gray 16/32 位 f32 平面收集（保真装配用；CMYK/Lab 维持降 8）
+        const bool deepF32Wanted = depth == 16 || depth == 32;
+        std::map<int, std::vector<float>> deepF;
         const size_t sectionStart = c.offset;
         for (const auto& ch : layer.channels) {
             const size_t start = c.offset;
@@ -1177,6 +1184,8 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
             std::string derr;
             if (deepActive) {
                 // 深色路径：字节平面（大端样本）→ 8-bit 平面；裁剪按采样粒度换算。
+                // P6 D1-b：RGB/Gray 16/32 位同步产出 f32 平面（层原生深度保真；CMYK/Lab
+                // 维持受管降 8）。蒙版通道（-2）恒灰度 U8 域。
                 const int srcW = isMask ? sourceMaskW : sourceW;
                 const int srcH = isMask ? sourceMaskH : sourceH;
                 int cropArr[4] = {crop.x, crop.y, crop.w, crop.h};
@@ -1190,6 +1199,14 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
                 }
                 const int dstW = cropValid ? crop.w : srcW;
                 const int dstH = cropValid ? crop.h : srcH;
+                if (deepF32Wanted && !isMask) {
+                    auto pf = planeToF32(rawPlane->data(), rawPlane->size(), depth,
+                                         static_cast<size_t>(std::max(dstW, 0)),
+                                         static_cast<size_t>(std::max(dstH, 0)), derr);
+                    if (pf) {
+                        deepF[ch.first] = std::move(*pf);
+                    }
+                }
                 auto p8 = planeToU8(rawPlane->data(), rawPlane->size(), depth,
                                     static_cast<size_t>(std::max(dstW, 0)),
                                     static_cast<size_t>(std::max(dstH, 0)), derr);
@@ -1266,6 +1283,42 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
                 layer.image[i * 4 + 1] = static_cast<uint8_t>((static_cast<uint16_t>((*rgba)[i * 4 + 1]) * a + 127) / 255);
                 layer.image[i * 4 + 2] = static_cast<uint8_t>((static_cast<uint16_t>((*rgba)[i * 4 + 2]) * a + 127) / 255);
                 layer.image[i * 4 + 3] = a;
+            }
+            // P6 D1-b：深色保真装配（f32 预乘 RGBA 直 alpha；色彩通道齐 + 模式 RGB/Gray）
+            if (deepF32Wanted && (mode == 1 || mode == 3) &&
+                static_cast<int>(deepF.size()) >= static_cast<int>(colorCount)) {
+                bool ok = true;
+                layer.deepRgba.assign(count2 * 4, 0.0f);
+                for (int k = 0; k < static_cast<int>(colorCount); ++k) {
+                    auto it = deepF.find(k);
+                    if (it == deepF.end() || it->second.size() < count2) {
+                        ok = false;
+                        break;
+                    }
+                }
+                const std::vector<float>* alphaF =
+                    deepF.count(-1) ? &deepF[-1] : nullptr;
+                if (ok && (alphaF == nullptr || alphaF->size() >= count2)) {
+                    for (size_t i = 0; i < count2; ++i) {
+                        const float a = alphaF != nullptr ? (*alphaF)[i] : 1.0f;
+                        if (mode == 1) {
+                            const float g = deepF[0][i] * a;
+                            layer.deepRgba[i * 4] = g;
+                            layer.deepRgba[i * 4 + 1] = g;
+                            layer.deepRgba[i * 4 + 2] = g;
+                        } else {
+                            for (int k = 0; k < static_cast<int>(colorCount); ++k) {
+                                layer.deepRgba[i * 4 + static_cast<size_t>(k)] =
+                                    deepF[static_cast<int>(k)][i] * a;
+                            }
+                        }
+                        layer.deepRgba[i * 4 + 3] = a;
+                    }
+                    layer.deepValid = true;
+                    layer.deepDepth = depth;
+                } else {
+                    layer.deepRgba.clear();
+                }
             }
         } else {
         const std::vector<uint8_t>& red = planes.count(0) ? planes[0] : black;
@@ -1482,6 +1535,9 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
             rec.width = width;
             rec.height = height;
             rec.rgba = layer.image;
+            rec.deepRgba = layer.deepRgba;
+            rec.deepValid = layer.deepValid;
+            rec.deepDepth = layer.deepDepth;
             rec.hasMask = layer.hasMask;
             rec.maskLeft = layer.maskLeft;
             rec.maskTop = layer.maskTop;

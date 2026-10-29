@@ -1,4 +1,5 @@
 #include "io/psd/psd_import.h"
+#include "engine/pixel_access.h"
 
 #include <algorithm>
 #include <cmath>
@@ -303,6 +304,29 @@ bool assemblePsdLayers(psd::PsdDocument& doc, const std::function<uint64_t()>& n
                 (static_cast<uint32_t>(rec.width) + kTileSize - 1u) / kTileSize;
             const uint32_t rows =
                 (static_cast<uint32_t>(rec.height) + kTileSize - 1u) / kTileSize;
+            // P6 D1-b：深色保真层（RGB/Gray 16/32）→ 层像素挂原生深度网格（不降位）；
+            // 显示/合成经 displayPixels 降位；编辑经 DeepEditGuard/画笔深域。
+            const bool deepLayer = rec.deepValid &&
+                                   rec.deepRgba.size() >=
+                                       static_cast<size_t>(rec.width) * rec.height * 4u;
+            if (deepLayer) {
+                const PixelDepth pd = rec.deepDepth == 32 ? PixelDepth::F32 : PixelDepth::U16;
+                // reader 产出的 deepRgba 为预乘（c×a，U8 路径 unpremultiply 同语义）；
+                // 层网格恒直 alpha → f32 域除回
+                std::vector<float> straight(rec.deepRgba.size());
+                for (size_t i = 0; i < static_cast<size_t>(rec.width) * rec.height; ++i) {
+                    const float a = rec.deepRgba[i * 4 + 3];
+                    straight[i * 4 + 3] = a;
+                    const float inv = a > 1e-6f ? 1.0f / a : 0.0f;
+                    for (int c = 0; c < 3; ++c) {
+                        straight[i * 4 + c] = std::min(rec.deepRgba[i * 4 + c] * inv, 1.0f);
+                    }
+                }
+                layer.pixels = pixel_access::f32ToGrid(
+                    straight.data(), static_cast<uint32_t>(rec.width),
+                    static_cast<uint32_t>(rec.height), pd, 1);
+                layer.depth = pd;
+            } else {
             TileGridBuilder builder(cols, rows);
             for (uint32_t ty = 0; ty < rows; ++ty) {
                 const uint32_t tileY0 = ty * kTileSize;
@@ -323,6 +347,7 @@ bool assemblePsdLayers(psd::PsdDocument& doc, const std::function<uint64_t()>& n
                 }
             }
             layer.pixels = builder.publish(1);
+            }
             // M5a 非破坏蒙版：patch 独立成网格 + 合成派生网格（原 bakeMask 改为不改像素）
             layer.mask = buildMask(rec);
             if (layer.mask != nullptr && layer.mask->enabled) {
@@ -494,6 +519,9 @@ bool importPsd(int fd, int* outWidth, int* outHeight, std::vector<std::string>* 
         engine.doc().workPath = doc.workPath;
         // M22：深色/多模式往返元数据（渲染仍 8-bit；导出回写原深/模式）
         engine.doc().psdSrcDepth = doc.srcDepth;
+        // P6 D1-b：文档位深 = 源深度（16/32 保真；显示/编辑垫片在消费端）
+        engine.doc().depth = doc.srcDepth == 32 ? PixelDepth::F32
+                             : (doc.srcDepth == 16 ? PixelDepth::U16 : PixelDepth::U8);
         engine.doc().psdSrcMode = doc.srcMode;
         engine.doc().psdSrcChannels = doc.srcChannels;
         engine.doc().psdIccProfile = doc.iccProfile;

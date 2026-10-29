@@ -1,4 +1,5 @@
 #include "engine/brush.h"
+#include "engine/pixel_access.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -45,6 +46,11 @@ bool StrokeDraft::begin(const Document& doc, LayerId layerId, const BrushSetting
     maskTarget_ = false;
     qmTarget_ = false;
     cloneMode_ = false;
+    // P6 D1-b：笔画工作深度 = 目标网格深度（像素目标=层深度/空层=文档深度；QM/蒙版恒 U8）
+    depth_ = (onMask || onQuickMask) ? PixelDepth::U8
+             : (layer != nullptr && layer->pixels != nullptr ? layer->depth : doc.depth);
+    workDeep_.clear();
+    deepU8Fb_.clear();
     patternMode_ = false;
     srcGrid_ = nullptr;
     srcCacheBase_ = nullptr;
@@ -199,6 +205,23 @@ void StrokeDraft::ensureWorking(uint32_t key) {
         }
     }
     work_[key] = std::move(px);
+    // P6：深色层平行深域瓦片（base 深字节直拷；空瓦片 = 透明零）
+    if (depth_ != PixelDepth::U8) {
+        const size_t bpp = static_cast<size_t>(kTileSize) * kTileSize *
+                           static_cast<size_t>(bytesPerPel(depth_));
+        std::vector<uint8_t> dp(bpp, 0);
+        if (base_ != nullptr) {
+            auto it = base_->tiles.find(key);
+            if (it != base_->tiles.end() && it->second != nullptr) {
+                const uint8_t* src = it->second->pixels->mapCpu();
+                if (src != nullptr) {
+                    std::memcpy(dp.data(), src, bpp);
+                }
+                it->second->pixels->unmap();
+            }
+        }
+        workDeep_[key] = std::move(dp);
+    }
 }
 
 // 当前段有效 dab 半径：压感线性调制直径（clamp 到微小下限，pressure=0 仍留针尖）
@@ -572,8 +595,7 @@ const uint8_t* StrokeDraft::baseAt(int gx, int gy) const {
 }
 
 // publish 语义（对拍 publish()）：瓦片 = base + color × coverage × opacity；
-// 橡皮 = destinationOut。直通 alpha 域换算。
-void StrokeDraft::paintTile(uint32_t key) {
+// 橡皮 = destinationOut。直通 alpha 域换算。void StrokeDraft::paintTile(uint32_t key) {
     auto covIt = coverage_.find(key);
     auto workIt = work_.find(key);
     if (covIt == coverage_.end() || workIt == work_.end()) {
@@ -591,6 +613,9 @@ void StrokeDraft::paintTile(uint32_t key) {
     uint8_t* px = workIt->second.data();
     const float op = settings_.opacity;
     if (effect_ != BrushEffect::None) {
+        if (depth_ != PixelDepth::U8) {
+            deepU8Fb_[key] = true;  // P6：效果核 v1 无深域版本（提交 U8 升位，登记精度）
+        }
         // M11e dab 内核族：像素域逐像素 × coverage（orig 副本供邻域/混合基准）
         constexpr size_t kN = static_cast<size_t>(kTileSize) * kTileSize;
         std::vector<uint8_t> orig(px, px + kN * 4u);
@@ -672,6 +697,9 @@ void StrokeDraft::paintTile(uint32_t key) {
         return;
     }
     if (cloneMode_) {
+        if (depth_ != PixelDepth::U8) {
+            deepU8Fb_[key] = true;  // P6：克隆/恢复域 v1 U8（提交升位，登记精度）
+        }
         // M11d 仿制图章：out = src × covA + dst × (1−covA)（src 含自身 alpha；
         // 源恒读笔画开始快照——本笔已画像素在 work_，绝不重采）。
         // M11f 历史画笔 restoreMode：RGBA 直混（含 alpha 还原——快照透明也要恢复），
@@ -753,6 +781,23 @@ void StrokeDraft::paintTile(uint32_t key) {
         }
         return;
     }
+    // P6 D1-b：深色层双写——U8 work 照常（live 预览域），workDeep_ 同步 f32 真合成
+    //（提交即真深域，笔触精度无损）。公式与 U8 路径逐项一致。
+    uint8_t* dpx = nullptr;
+    size_t dbpp = 0;
+    if (depth_ != PixelDepth::U8) {
+        auto dit = workDeep_.find(key);
+        if (dit == workDeep_.end()) {
+            ensureWorking(key);
+            dit = workDeep_.find(key);
+        }
+        if (dit != workDeep_.end()) {
+            dpx = dit->second.data();
+            dbpp = static_cast<size_t>(bytesPerPel(depth_));
+        } else {
+            deepU8Fb_[key] = true;  // 防御：深域瓦片缺失 → 提交升位回退
+        }
+    }
     for (size_t i = 0; i < static_cast<size_t>(kTileSize) * kTileSize; ++i) {
         const float cv = cov[i] / 255.0f;
         const float covA = cv * op;  // 笔画级 opacity 上限（覆盖层语义）
@@ -760,12 +805,22 @@ void StrokeDraft::paintTile(uint32_t key) {
         if (settings_.erasing) {
             // destinationOut：alpha 乘减，rgb 不动（直通域）
             p[3] = static_cast<uint8_t>(std::lround(p[3] * (1.0f - covA)));
+            if (dpx != nullptr) {
+                float d4[4];
+                pixel_access::pixelDepthReadF32(depth_, dpx + i * dbpp, d4);
+                d4[3] *= 1.0f - covA;
+                pixel_access::pixelDepthWriteF32(depth_, dpx + i * dbpp, d4);
+            }
             continue;
         }
         const float as = p[3] / 255.0f;
         const float ao = covA + as * (1.0f - covA);
         if (ao <= 0.0001f) {
             p[0] = p[1] = p[2] = p[3] = 0;
+            if (dpx != nullptr) {
+                const float z[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                pixel_access::pixelDepthWriteF32(depth_, dpx + i * dbpp, z);
+            }
             continue;
         }
         const float srcRgb[3] = {settings_.red, settings_.green, settings_.blue};
@@ -778,6 +833,20 @@ void StrokeDraft::paintTile(uint32_t key) {
                 static_cast<uint8_t>(std::lround(std::min(1.0f, outP / ao) * 255.0f));
         }
         p[3] = static_cast<uint8_t>(std::lround(std::min(1.0f, ao) * 255.0f));
+        if (dpx != nullptr) {
+            float d4[4];
+            pixel_access::pixelDepthReadF32(depth_, dpx + i * dbpp, d4);
+            const float das = d4[3];
+            const float dao = covA + das * (1.0f - covA);
+            if (dao > 0.0001f) {
+                for (int c = 0; c < 3; ++c) {
+                    const float outP = srcRgb[c] * covA + d4[c] * das * (1.0f - covA);
+                    d4[c] = std::min(1.0f, dao > 0.0001f ? outP / dao : 0.0f);
+                }
+            }
+            d4[3] = std::min(1.0f, dao);
+            pixel_access::pixelDepthWriteF32(depth_, dpx + i * dbpp, d4);
+        }
     }
 }
 
@@ -792,6 +861,7 @@ std::shared_ptr<const TileGrid> StrokeDraft::commitGrid(const TileGrid* original
     grid->cols = gridCols_;
     grid->rows = gridRows_;
     grid->revision = gridRevision;
+    grid->depth = depth_;
     if (original != nullptr) {
         for (const auto& kv : original->tiles) {
             grid->tiles[kv.first] = kv.second;
@@ -827,9 +897,31 @@ std::shared_ptr<const TileGrid> StrokeDraft::commitGrid(const TileGrid* original
             continue;
         }
         auto tile = std::make_shared<Tile>();
-        auto buf = std::make_unique<EngineBuffer>(kTileSize, kTileSize);
-        std::memcpy(buf->mapCpuWrite(), it->second.data(),
-                    static_cast<size_t>(kTileSize) * kTileSize * 4);
+        // P6 D1-b：深色层产出真深格式瓦片——workDeep_ 有深域合成结果（普通/橡皮路径）
+        // 直拷；效果/克隆/修复族（deepU8Fb_）从 U8 work 升位覆盖（v1 精度登记）。
+        auto buf = std::make_unique<EngineBuffer>(kTileSize, kTileSize, depth_);
+        uint8_t* dst = buf->mapCpuWrite();
+        const auto fb = deepU8Fb_.find(key);
+        const auto dit = workDeep_.find(key);
+        if (depth_ != PixelDepth::U8) {
+            // 深色层：fallback（效果/克隆/修复族）或深域瓦片缺失 → U8 work 升位；否则真深直拷
+            const bool u8Fb = (fb != deepU8Fb_.end() && fb->second) || dit == workDeep_.end();
+            const size_t bpp = static_cast<size_t>(bytesPerPel(depth_));
+            if (u8Fb) {
+                for (size_t i = 0; i < static_cast<size_t>(kTileSize) * kTileSize; ++i) {
+                    const uint8_t* u = it->second.data() + i * 4u;
+                    const float in4[4] = {u[0] * (1.0f / 255.0f), u[1] * (1.0f / 255.0f),
+                                          u[2] * (1.0f / 255.0f), u[3] * (1.0f / 255.0f)};
+                    pixel_access::pixelDepthWriteF32(depth_, dst + i * bpp, in4);
+                }
+            } else {
+                std::memcpy(dst, dit->second.data(),
+                            static_cast<size_t>(kTileSize) * kTileSize * bpp);
+            }
+        } else {
+            std::memcpy(dst, it->second.data(),
+                        static_cast<size_t>(kTileSize) * kTileSize * 4);
+        }
         tile->pixels = std::move(buf);
         grid->tiles[key] = std::move(tile);
     }
@@ -1073,6 +1165,9 @@ bool StrokeDraft::commitHeal() {
 // out = healed × covA + base × (1 − covA)（RGBA 四通道直混——透明修复结果必须能删除
 // 目标墨迹，src-over 会保留原污点，M11f restoreMode 同一语义教训）；色源区外 = base 原样。
 void StrokeDraft::paintTileHeal(uint32_t key) {
+    if (depth_ != PixelDepth::U8) {
+        deepU8Fb_[key] = true;  // P6：heal 色源/泊松域 v1 U8（提交升位，登记精度）
+    }
     auto covIt = coverage_.find(key);
     auto workIt = work_.find(key);
     if (covIt == coverage_.end() || workIt == work_.end()) {

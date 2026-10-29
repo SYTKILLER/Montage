@@ -168,7 +168,7 @@ FlattenJob BuildFlattenJobSingle(const Layer& layer, int regionX, int regionY, i
     fl.clipping = false;
     fl.visible = true;
     fl.isAdjustment = false;
-    fl.pixels = layer.effectivePixels();
+    fl.pixels = layer.displayPixels();
     fl.originX = layer.effectiveOriginX();
     fl.originY = layer.effectiveOriginY();
     if (fl.pixels != nullptr) {
@@ -218,7 +218,7 @@ bool rangeContentBBox(const Document& doc, int start, int end, int& bx, int& by,
         if (!l.visible || l.adjustment != nullptr) {
             continue;
         }
-        const std::shared_ptr<const TileGrid> px = l.effectivePixels();
+        const std::shared_ptr<const TileGrid> px = l.displayPixels();
         if (px == nullptr) {
             continue;
         }
@@ -309,7 +309,7 @@ void appendLayerRange(const Document& doc, int start, int end, FlattenJob& job, 
         if (fl.isAdjustment) {
             fl.adjustment = *l.adjustment;
         } else {
-            fl.pixels = l.effectivePixels();
+            fl.pixels = l.displayPixels();
             if (fl.pixels == nullptr) {
                 continue;  // 空图层跳过
             }
@@ -321,7 +321,7 @@ void appendLayerRange(const Document& doc, int start, int end, FlattenJob& job, 
                     if (b.isGroup || !b.visible || b.clipping || b.adjustment != nullptr) {
                         continue;
                     }
-                    fl.clipBasePixels = b.effectivePixels();
+                    fl.clipBasePixels = b.displayPixels();
                     fl.clipBaseOriginX = b.transform.originX;
                     fl.clipBaseOriginY = b.transform.originY;
                     break;

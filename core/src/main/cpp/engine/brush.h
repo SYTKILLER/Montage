@@ -192,6 +192,12 @@ class StrokeDraft {
     std::map<uint32_t, std::vector<uint8_t>> work_;
     std::map<uint32_t, uint32_t> workRev_;  // key → 发布版本（paintTile++/撤出 erase）
     std::set<uint32_t> touched_;
+    // P6 D1-b：深色层笔画域。work_ 恒 U8 RGBA（live 预览/效果核/克隆/修复族工作域）；
+    // workDeep_ 与层深度一致的平行工作瓦片（普通/橡皮路径在深域 f32 双写真合成）；
+    // 效果/克隆/修复族 v1 无深域核（deepU8Fb_ 瓦片提交时从 U8 work 升位覆盖，登记精度）。
+    PixelDepth depth_ = PixelDepth::U8;
+    std::map<uint32_t, std::vector<uint8_t>> workDeep_;
+    std::map<uint32_t, bool> deepU8Fb_;
     // provisional tail 备份：key → 尾段前整瓦 coverage（空 vector = 尾段前无 coverage）
     std::map<uint32_t, std::vector<uint8_t>> tailBackup_;
     // M7a：选区约束（文档域掩码；null = 无选区）。dab coverage × 选区灰度

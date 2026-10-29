@@ -1,4 +1,5 @@
 #include "io/project_open.h"
+#include "engine/pixel_access.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -33,7 +34,7 @@ constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Open";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
 constexpr int kMinVersion = 1;
-constexpr int kMaxVersion = 15;  // v15：+形状填充 stops 渐变/图案（fillStops/fillAngleDeg/fillPatternId/fillPatScale，P1，可选字段读兼容 v1–v14）；v14：+深色 PSD 往返（文档 psd 块 + 层 psdSrc blob，M22，可选字段读兼容 v1–v13）；v13：+智能对象（smart 块 + 包内源文件/滤镜蒙版 PNG，M21，可选字段读兼容 v1–v12）；v12：+形状层/矢量蒙版/工作路径/保存路径/自定义形状（M18）；v11：+等高线/Range/图案叠加/文档图案（M17d）；v10：+图层样式效果扩展（M17a）；v9：+参考线 guides 块（M15a）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
+constexpr int kMaxVersion = 16;  // v16：+位深泛化（文档/层 depth 字段 + 深色层 images/<id>.d<depth>.bin MDP1 f32 平面；U8 层 .png 与 v15 字节同构，可选字段读兼容 v1–v15）；v15：+形状填充 stops 渐变/图案（fillStops/fillAngleDeg/fillPatternId/fillPatScale，P1，可选字段读兼容 v1–v14）；v14：+深色 PSD 往返（文档 psd 块 + 层 psdSrc blob，M22，可选字段读兼容 v1–v13）；v13：+智能对象（smart 块 + 包内源文件/滤镜蒙版 PNG，M21，可选字段读兼容 v1–v12）；v12：+形状层/矢量蒙版/工作路径/保存路径/自定义形状（M18）；v11：+等高线/Range/图案叠加/文档图案（M17d）；v10：+图层样式效果扩展（M17a）；v9：+参考线 guides 块（M15a）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层扩充；v3：+调整层（按字段存在性兼容旧版）
 constexpr uint32_t kMaxSide = 30000;
 constexpr uint64_t kMaxTotalPixels = 100ull * 1000 * 1000;
 constexpr size_t kMaxLayers = 10000;
@@ -506,6 +507,7 @@ struct LayerRecord {
     uint32_t width = 0;
     uint32_t height = 0;
     bool hasImage = false;
+    PixelDepth depth = PixelDepth::U8;  // P6 v16：层像素深度（非 U8 = MDP1 bin）
     // v2 蒙版
     bool hasMask = false;
     bool maskEnabled = true;
@@ -670,6 +672,16 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
     if (jname != nullptr && jname->type == JValue::Str) {
         doc.name = jname->str;
     }
+    // P6 v16：文档位深（U8/缺省 = 历史语义）
+    const JValue* jdepth = root.find("depth");
+    if (jdepth != nullptr) {
+        double dd = 0;
+        if (!getDouble(*jdepth, dd) || (dd != 8 && dd != 16 && dd != 32)) {
+            err = "bad document depth";
+            return false;
+        }
+        doc.depth = dd == 32 ? PixelDepth::F32 : (dd == 16 ? PixelDepth::U16 : PixelDepth::U8);
+    }
     const JValue* jlayers = root.find("layers");
     if (jlayers == nullptr || jlayers->type != JValue::Arr ||
         jlayers->arr.size() > kMaxLayers) {
@@ -733,8 +745,25 @@ bool parseManifest(const std::vector<uint8_t>& bytes, Document& doc, std::vector
         }
         const JValue* jimg = item.find("imageFile");
         if (jimg != nullptr && jimg->type == JValue::Str) {
-            // 文件名与 id 强绑定（对齐上游 validate），杜绝路径注入
-            if (jimg->str != "images/" + std::to_string(l.id) + ".png") {
+            // 文件名与 id 强绑定（对齐上游 validate），杜绝路径注入。
+            // P6 v16：深色层 = images/<id>.d<depth>.bin（MDP1 f32 平面）
+            l.depth = PixelDepth::U8;
+            const JValue* jdep = item.find("depth");
+            if (jdep != nullptr) {
+                double dd = 0;
+                if (!getDouble(*jdep, dd) || (dd != 8 && dd != 16 && dd != 32)) {
+                    err = "bad layer depth";
+                    return false;
+                }
+                l.depth = dd == 32 ? PixelDepth::F32 : PixelDepth::U16;
+            }
+            const std::string expectPng = "images/" + std::to_string(l.id) + ".png";
+            const std::string expectBin =
+                l.depth == PixelDepth::U8
+                    ? expectPng
+                    : "images/" + std::to_string(l.id) + ".d" +
+                          std::to_string(static_cast<int32_t>(l.depth)) + ".bin";
+            if (jimg->str != expectPng && jimg->str != expectBin) {
                 err = "imageFile mismatch";
                 return false;
             }
@@ -2171,6 +2200,50 @@ bool openProjectBytes(const std::vector<uint8_t>& data, Document& full, size_t* 
             }
         }
         if (rec.hasImage) {
+            // 资产尺寸须与 manifest 声明一致（上游 validate 语义）
+            const uint32_t expectCols = (rec.width + kTileSize - 1u) / kTileSize;
+            const uint32_t expectRows = (rec.height + kTileSize - 1u) / kTileSize;
+            if (rec.depth != PixelDepth::U8) {
+                // P6 v16：MDP1 raw 平面（头 16B 校验 + f32 RGBA 直 alpha → 原生深度网格）
+                const std::string binName = "images/" + std::to_string(rec.id) + ".d" +
+                                            std::to_string(static_cast<int32_t>(rec.depth)) +
+                                            ".bin";
+                const ZipReader::CdEntry* bin = zip.find(binName);
+                if (bin == nullptr) {
+                    err = "layer deep image missing: " + std::to_string(rec.id);
+                    return false;
+                }
+                std::vector<uint8_t> raw;
+                if (!zip.extract(*bin, raw, err)) {
+                    return false;
+                }
+                const size_t n = static_cast<size_t>(rec.width) * rec.height;
+                if (raw.size() < 16 + n * 4u * sizeof(float)) {
+                    err = "deep image truncated: " + std::to_string(rec.id);
+                    return false;
+                }
+                if (std::memcmp(raw.data(), "MDP1", 4) != 0 || raw[4] != static_cast<uint8_t>(static_cast<int32_t>(rec.depth))) {
+                    err = "deep image header mismatch: " + std::to_string(rec.id);
+                    return false;
+                }
+                uint32_t bw = 0, bh = 0;
+                std::memcpy(&bw, raw.data() + 8, 4);
+                std::memcpy(&bh, raw.data() + 12, 4);
+                if (bw != rec.width || bh != rec.height) {
+                    err = "deep image size mismatch: " + std::to_string(rec.id);
+                    return false;
+                }
+                const float* f = reinterpret_cast<const float*>(raw.data() + 16);
+                std::shared_ptr<const TileGrid> grid =
+                    pixel_access::f32ToGrid(f, rec.width, rec.height, rec.depth,
+                                            1);
+                if (grid->cols != expectCols || grid->rows != expectRows) {
+                    err = "deep image grid mismatch: " + std::to_string(rec.id);
+                    return false;
+                }
+                l.pixels = std::move(grid);
+                l.depth = rec.depth;
+            } else {
             const ZipReader::CdEntry* png = zip.find("images/" + std::to_string(rec.id) + ".png");
             if (png == nullptr) {
                 err = "layer image missing: " + std::to_string(rec.id);
@@ -2185,14 +2258,12 @@ bool openProjectBytes(const std::vector<uint8_t>& data, Document& full, size_t* 
             if (grid == nullptr) {
                 return false;
             }
-            // 资产尺寸须与 manifest 声明一致（上游 validate 语义）
-            const uint32_t expectCols = (rec.width + kTileSize - 1u) / kTileSize;
-            const uint32_t expectRows = (rec.height + kTileSize - 1u) / kTileSize;
             if (grid->cols != expectCols || grid->rows != expectRows) {
                 err = "layer image size mismatch: " + std::to_string(rec.id);
                 return false;
             }
             l.pixels = std::move(grid);
+            }
         }
         if (rec.hasMask) {
             // v2 蒙版：patch PNG → LayerMask → 合成派生网格

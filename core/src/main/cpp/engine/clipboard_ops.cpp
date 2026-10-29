@@ -1,4 +1,5 @@
 #include "engine/clipboard_ops.h"
+#include "engine/pixel_access.h"
 
 #include <algorithm>
 #include <cstring>
@@ -111,7 +112,7 @@ bool copySelectionToClipboard(const Document& doc, bool merged, ClipBuffer& out)
             break;
         }
     }
-    if (!merged && (l == nullptr || l->effectivePixels() == nullptr)) {
+    if (!merged && (l == nullptr || l->displayPixels() == nullptr)) {
         return false;
     }
 
@@ -126,7 +127,7 @@ bool copySelectionToClipboard(const Document& doc, bool merged, ClipBuffer& out)
         region = std::move(res.rgba);
     } else {
         // 单层拷贝：effectivePixels（蒙版已合成）网格域 → 选区包围盒
-        const TileGrid& grid = *l->effectivePixels();
+        const TileGrid& grid = *l->displayPixels();
         const int gridW = static_cast<int>(grid.cols * kTile);
         const int gridH = static_cast<int>(grid.rows * kTile);
         const double orgX = l->transform.originX;
@@ -194,12 +195,15 @@ bool eraseSelectionPixels(Document& doc) {
     if (l == nullptr || l->pixels == nullptr) {
         return false;
     }
+    // P6 D1-b：深色层清除垫片（置透明按深度写；出口升位写回层深度）
+    const pixel_access::DeepEditGuard deepGuard(*l, l->pixels->revision + 1);
     const TileGrid& sel = *doc.selection;
     const TileGrid& grid = *l->pixels;
     auto out = std::make_shared<TileGrid>();
     out->cols = grid.cols;
     out->rows = grid.rows;
     out->revision = grid.revision + 1;
+    out->depth = grid.depth;
     bool changed = false;
     for (const auto& [key, tile] : grid.tiles) {
         if (tile == nullptr || tile->pixels == nullptr) {

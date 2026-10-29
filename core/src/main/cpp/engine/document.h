@@ -20,9 +20,31 @@
 
 namespace montage {
 
+struct TileGrid;  // 前置声明（pixel_access 垫片 API 在完整定义前引用）
+
+namespace pixel_access {
+std::shared_ptr<const TileGrid> gridToU8Grid(const TileGrid& grid, uint64_t revision);
+}  // namespace pixel_access
+
 constexpr uint32_t kTileSize = 256;  // 定案 R2：256px（256KB/瓦片 RGBA8888）
 
 using LayerId = uint64_t;
+
+// P6 D1-b 位深泛化：像素深度数据化（07 §8-D1 定案 b——接口先行、存储/往返/合成
+// 三端原生深度，编辑域统一 f32 工作缓冲，显示端恒 U8 降位）。bytesPerPel：
+// U8=4（RGBA8888）/ U16=8（RGBA64 大端序仅在文件域，内存域小端 u16）/ F32=16（RGBA32F）。
+// 归一化读统一 0..1（U8 v/255、U16 v/65535、F32 原值）；写回对称量化。
+enum class PixelDepth : int32_t {
+    U8 = 8,
+    U16 = 16,
+    F32 = 32,
+};
+constexpr int bytesPerPel(PixelDepth d) {
+    return d == PixelDepth::U8 ? 4 : (d == PixelDepth::U16 ? 8 : 16);
+}
+inline const char* pixelDepthName(PixelDepth d) {
+    return d == PixelDepth::U8 ? "8" : (d == PixelDepth::U16 ? "16" : "32");
+}
 
 // 混合模式全集（M2.1 定案：对齐源 LayerBlendMode 顺序，24 值 = PS 25 减 Dissolve/Darker/Lighter；
 // 索引即 UI Select 序号；非可分离 4 值 hue/saturation/color/luminosity 走 W3C SetLum/SetSat/ClipColor）
@@ -67,10 +89,11 @@ class PixelSource {
     virtual void unmap() = 0;
 };
 
-// 初版唯一实现：malloc 内存，内部一律 RGBA8888。
+// 初版唯一实现：malloc 内存。P6 起深度可配（默认 U8 = 历史语义全兼容；U16=RGBA64、
+// F32=RGBA32F 同布局直 alpha）。rowBytes 随深度倍增，消费方一律经 PixelSource 接口。
 class EngineBuffer : public PixelSource {
   public:
-    EngineBuffer(uint32_t width, uint32_t height);
+    explicit EngineBuffer(uint32_t width, uint32_t height, PixelDepth depth = PixelDepth::U8);
     ~EngineBuffer() override;
     EngineBuffer(const EngineBuffer&) = delete;
     EngineBuffer& operator=(const EngineBuffer&) = delete;
@@ -83,10 +106,13 @@ class EngineBuffer : public PixelSource {
     OH_NativeBuffer* nativeBuffer() override { return nullptr; }
     void unmap() override {}
 
+    PixelDepth depth() const { return depth_; }
+
   private:
     uint32_t width_ = 0;
     uint32_t height_ = 0;
     uint32_t rowBytes_ = 0;
+    PixelDepth depth_ = PixelDepth::U8;
     uint8_t* bytes_ = nullptr;
 };
 
@@ -95,10 +121,12 @@ struct Tile {
 };
 
 // 不可变瓦片组（发布后不再改）。revision 随每次发布递增，供脏追踪与缓存键。
+// P6：depth 为网格级单一深度（构建器统一定，瓦片内一致）；默认 U8 全兼容。
 struct TileGrid {
     uint32_t cols = 0;
     uint32_t rows = 0;
     uint64_t revision = 0;
+    PixelDepth depth = PixelDepth::U8;
     // key = ty*cols+tx；哈希定位 O(1)，稀疏：空白瓦片不存在
     std::unordered_map<uint32_t, std::shared_ptr<const Tile>> tiles;
 };
@@ -106,10 +134,12 @@ struct TileGrid {
 // 构建期可变视图（导入/绘制线程私有），publish 生成不可变快照（map 拷贝，量级=瓦片数）。
 class TileGridBuilder {
   public:
-    TileGridBuilder(uint32_t cols, uint32_t rows) : cols_(cols), rows_(rows) {}
+    explicit TileGridBuilder(uint32_t cols, uint32_t rows, PixelDepth depth = PixelDepth::U8)
+        : cols_(cols), rows_(rows), depth_(depth) {}
 
     uint32_t cols() const { return cols_; }
     uint32_t rows() const { return rows_; }
+    PixelDepth depth() const { return depth_; }
     uint32_t tileIndex(uint32_t tx, uint32_t ty) const { return ty * cols_ + tx; }
 
     EngineBuffer& ensureTile(uint32_t tx, uint32_t ty);
@@ -120,6 +150,7 @@ class TileGridBuilder {
   private:
     uint32_t cols_ = 0;
     uint32_t rows_ = 0;
+    PixelDepth depth_ = PixelDepth::U8;
     std::unordered_map<uint32_t, std::shared_ptr<const Tile>> tiles_;
 };
 
@@ -445,6 +476,9 @@ struct Layer {
     BlendMode blendMode = BlendMode::Normal;
     Transform transform;
     std::shared_ptr<const TileGrid> pixels;  // null = 空图层（源：画笔开始才分配）
+    // P6 D1-b：像素网格深度（pixels 为 null 时无意义）。U8 文档层恒 U8；深色文档层 =
+    // 原生深度（编辑经 f32 工作缓冲写回原生，不降位）。蒙版/派生渲染网格恒 U8（显示域）。
+    PixelDepth depth = PixelDepth::U8;
     std::shared_ptr<LayerMask> mask = nullptr;         // null = 无蒙版
     std::shared_ptr<const TileGrid> render = nullptr;  // 蒙版启用时的合成结果（派生缓存，
                                                        // 变更点主动维护、随 History 快照走）
@@ -497,6 +531,10 @@ struct Layer {
     uint16_t psdSrcChannels = 3;
     int psdSrcLeft = 0, psdSrcTop = 0, psdSrcRight = 0, psdSrcBottom = 0;  // 源矩形（verbatim 回写）
     int psdSrcMaskLeft = 0, psdSrcMaskTop = 0, psdSrcMaskRight = 0, psdSrcMaskBottom = 0;
+    // P6 D1-b 显示降位缓存（displayPixels 用；mutable 纯派生，键 = 网格身份+revision）
+    mutable std::shared_ptr<const TileGrid> displayCache;
+    mutable std::shared_ptr<const TileGrid> displayCacheSrc;
+    mutable uint64_t displayCacheRev = 0;
     // M14c/M18/M21 渲染/缩略图取数优先级：样式/填充派生（含独立 origin，经 effectiveRenderOrigin）
     // → 矢量蒙版派生（已含像素蒙版）→ 蒙版合成 → 智能对象派生 → 形状派生 → 原像素
     std::shared_ptr<const TileGrid> effectivePixels() const {
@@ -517,6 +555,27 @@ struct Layer {
             return shapeCache;
         }
         return pixels;
+    }
+
+    // P6 D1-b 显示域取数（一切「看」的路径：GL 渲染/flatten 导出/缩略图/直方图/探针）。
+    // 原生深度网格（U16/F32）在此降 8（显示端恒 U8 定案）；U8 网格零开销直通。
+    // 降位结果缓存（键 = 网格 revision，幂等纯派生；拷贝随快照走但键保证一致性）。
+    // 编辑/写回路径必须走 effectivePixels()（原深度域），不得用本函数结果做 COW 基底。
+    std::shared_ptr<const TileGrid> displayPixels() const {
+        std::shared_ptr<const TileGrid> src = effectivePixels();
+        if (src == nullptr || src->depth == PixelDepth::U8) {
+            return src;
+        }
+        // 缓存键 = 网格指针身份 + revision（revision 是会话内计数，COW 换网格后可回绕
+        // ——笔画提交产物 revision 从 draft 计数重取，仅比 revision 会假命中旧缓存）
+        if (displayCache != nullptr && displayCacheSrc == src &&
+            displayCacheRev == src->revision && displayCache->depth == PixelDepth::U8) {
+            return displayCache;
+        }
+        displayCache = montage::pixel_access::gridToU8Grid(*src, src->revision);
+        displayCacheSrc = src;
+        displayCacheRev = src->revision;
+        return displayCache;
     }
 
     // 派生渲染生效时的文档落点（与 transform.origin 分离——投影/描边扩展域偏移）
@@ -552,6 +611,9 @@ struct Document {
     uint32_t width = 0;
     uint32_t height = 0;
     std::string name;
+    // P6 D1-b：文档位深（8/16/32）。新建恒 U8；PSD 16/32 导入 = 原生（不降位往返）。
+    // 层 depth 默认跟随文档；合成 flatten 按文档深度输出；显示端恒降 8。
+    PixelDepth depth = PixelDepth::U8;
     std::vector<Layer> layers;  // bottom → top（对齐源 CanvasDocument.layers）
     LayerId activeId = 0;
     // M7a 选区：文档域 8-bit 覆盖掩码（null = 无选区，全图可编辑）；随 Document 快照走撤销

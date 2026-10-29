@@ -1,4 +1,5 @@
 #include "engine/gradient_ops.h"
+#include "engine/pixel_access.h"
 
 #include <algorithm>
 #include <cmath>
@@ -255,11 +256,20 @@ bool applyGradientStops(Document& doc, LayerId layerId, const GradientSpec& spec
         originX = static_cast<int>(std::lround(layer->transform.originX));
         originY = static_cast<int>(std::lround(layer->transform.originY));
     } else {
+        // P6：空层深色文档建原生深度网格（层 depth 跟随文档）
         cols = (doc.width + kTileSize - 1u) / kTileSize;
         rows = (doc.height + kTileSize - 1u) / kTileSize;
         originX = 0;
         originY = 0;
+        if (doc.depth != PixelDepth::U8) {
+            TileGridBuilder deepBuilder(cols, rows, doc.depth);
+            layer->pixels = deepBuilder.publish(1);
+            layer->depth = doc.depth;
+            base = layer->pixels;
+        }
     }
+    // P6 D1-b：深色层渐变垫片（U8 工作域，出口升位写回层深度；蒙版目标恒 U8 不入此路径）
+    const pixel_access::DeepEditGuard deepGuard(*layer, 1 + (base != nullptr ? base->revision : 0));
     TileGridBuilder builder(cols, rows);
     std::vector<uint8_t> out(static_cast<size_t>(kTileSize) * kTileSize * 4u);
     for (uint32_t ty = 0; ty < rows; ++ty) {
@@ -339,9 +349,12 @@ bool fillWithColor(Document& doc, LayerId layerId, FillSource source, float fr, 
         // 空层填充：建文档域网格（选区约束仍生效；全透明端不落瓦片由 publish 兜底）
         const uint32_t cols = (doc.width + kTileSize - 1u) / kTileSize;
         const uint32_t rows = (doc.height + kTileSize - 1u) / kTileSize;
-        TileGridBuilder builder(cols, rows);
+        TileGridBuilder builder(cols, rows, doc.depth);
         layer->pixels = builder.publish(1);
+        layer->depth = doc.depth;  // P6：新层跟随文档深度
     }
+    // P6 D1-b：深色层填充垫片（U8 工作域，出口升位写回层深度）
+    const pixel_access::DeepEditGuard deepGuard(*layer, layer->pixels->revision + 1);
     const std::shared_ptr<const TileGrid> base = layer->pixels;  // 持共享引用防自替换
     const TileGrid& grid = *base;
     const TileGrid* selGrid = doc.selection != nullptr ? doc.selection.get() : nullptr;

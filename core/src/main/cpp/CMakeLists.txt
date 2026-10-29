@@ -12,6 +12,7 @@ add_library(compositor SHARED
         engine/camera_raw.cpp
         engine/clipboard_ops.cpp
         engine/document.cpp
+        engine/pixel_access.cpp
         engine/engine.cpp
         engine/heal_ops.cpp
         engine/content_aware_ops.cpp

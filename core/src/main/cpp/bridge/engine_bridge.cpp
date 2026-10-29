@@ -1642,7 +1642,7 @@ napi_value GetLayerThumbnail(napi_env env, napi_callback_info info) {
         std::lock_guard<std::mutex> lk(e.docMutex);
         Layer* l = findLayerLocked(e.doc(), ctx->layerId);
         if (l != nullptr) {
-            ctx->pixels = l->effectivePixels();
+            ctx->pixels = l->displayPixels();  // 缩略图显示域（P6 深网格降 8）
         }
     }
     napi_value workName = nullptr;
@@ -1952,11 +1952,11 @@ std::shared_ptr<const TileGrid> computeWandMaskLocked(Engine& e, int x, int y, i
         src = tiles::makeFlatSource(std::move(flat), e.doc().width, e.doc().height);
     } else {
         Layer* l = findLayerLocked(e.doc(), e.doc().activeId);
-        if (l == nullptr || l->effectivePixels() == nullptr) {
+        if (l == nullptr || l->displayPixels() == nullptr) {
             err = "wand: no pixels to sample";
             return nullptr;
         }
-        src = tiles::makeTileSource(*l->effectivePixels());
+        src = tiles::makeTileSource(*l->displayPixels());
     }
     return tiles::wandMask(*src, e.doc().width, e.doc().height, x, y, tol, contiguous, sampleSize);
 }
@@ -5600,7 +5600,7 @@ napi_value ExportPsd(napi_env env, napi_callback_info info) {
             pl.opacity = l.opacity;
             pl.blendMode = l.blendMode;
             pl.clipping = l.clipping;
-            pl.pixels = l.effectivePixels();
+            pl.pixels = l.displayPixels();  // P6：导出域 U8（深色层确定性降位，verbatim hash 两侧一致）
             // M15c：样式派生域 origin 独立于 transform（投影/描边扩展），导出须对齐像素
             pl.originX = l.effectiveOriginX();
             pl.originY = l.effectiveOriginY();
@@ -10618,6 +10618,7 @@ napi_value RasterizeSmartObject(napi_env env, napi_callback_info info) {
         }
         e.history().beginEdit(e.doc(), "栅格化图层", static_cast<uint64_t>(e.docRevision()));
         l->pixels = l->effectivePixels();
+        l->depth = l->pixels != nullptr ? l->pixels->depth : PixelDepth::U8;  // P6：派生缓存域
         l->transform.originX = l->effectiveOriginX();
         l->transform.originY = l->effectiveOriginY();
         l->smart = nullptr;

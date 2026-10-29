@@ -1,4 +1,5 @@
 #include "io/project_save.h"
+#include "engine/pixel_access.h"
 
 #include <cinttypes>
 #include <cstdint>
@@ -25,7 +26,7 @@ namespace {
 constexpr unsigned int kDomain = 0x4D30;
 constexpr const char* kTag = "Montage.Save";
 constexpr const char* kFormatId = "com.sytkiller.montage.project";
-constexpr int kFormatVersion = 15;  // v15：+形状填充 stops 渐变/图案（fillStops/fillAngleDeg/fillPatternId/fillPatScale，P1，非默认才写 = v14 包字节不变）；v14：+深色 PSD 往返（文档 psd 块 + 层 psdSrc blob，M22，无深色数据 = 字节兼容 v13）；v13：+智能对象（smart 块 + 包内源文件/滤镜蒙版 PNG，M21，无 SO 层 = 字节兼容 v12）；v12：+形状层/矢量蒙版/工作路径/保存路径/自定义形状（M18）；v11：+等高线/Range/图案叠加/文档图案（M17d）；v10：+图层样式效果扩展（M17a 内阴影/外发光/内发光/渐变叠加，非默认才写）；v9：+参考线 guides 块（M15a，空则不写兼容 v8 包）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
+constexpr int kFormatVersion = 16;  // v16：+位深泛化（文档 depth 字段 + 层 depth 字段 + 深色像素 images/<id>.d16/.d32.bin = "MDP1"头 + f32 RGBA 直 alpha 平面；U8 层恒 .png 与 v15 字节同构）；v15：+形状填充 stops 渐变/图案（fillStops/fillAngleDeg/fillPatternId/fillPatScale，P1，非默认才写 = v14 包字节不变）；v14：+深色 PSD 往返（文档 psd 块 + 层 psdSrc blob，M22，无深色数据 = 字节兼容 v13）；v13：+智能对象（smart 块 + 包内源文件/滤镜蒙版 PNG，M21，无 SO 层 = 字节兼容 v12）；v12：+形状层/矢量蒙版/工作路径/保存路径/自定义形状（M18）；v11：+等高线/Range/图案叠加/文档图案（M17d）；v10：+图层样式效果扩展（M17a 内阴影/外发光/内发光/渐变叠加，非默认才写）；v9：+参考线 guides 块（M15a，空则不写兼容 v8 包）；v8：+图层样式/填充图层（M14c）；v7：+图层组（M14a）；v6：+文本层（M12）；v5：+Alpha 通道；v4：调整层 kind 扩充+p0..p3；v3：+调整层；v2：+蒙版
 constexpr int kDeflateLevel = 6;
 // 04 §1.3 格式上限（沿用上游档位，与引擎运行预算分立）
 constexpr uint32_t kMaxSide = 30000;
@@ -463,6 +464,7 @@ struct LayerSnapshot {
     double opacity = 1.0;
     BlendMode blendMode = BlendMode::Normal;
     std::shared_ptr<const TileGrid> pixels;  // null = 空图层
+    PixelDepth depth = PixelDepth::U8;       // P6 v16：像素网格深度（派生缓存恒 U8）
     double originX = 0.0;
     double originY = 0.0;
     // 内容包围盒（图层局部像素坐标）
@@ -517,6 +519,7 @@ struct DocSnapshot {
     uint32_t height = 0;
     std::string name;
     LayerId activeId = 0;
+    PixelDepth depth = PixelDepth::U8;  // P6 v16：文档位深
     std::vector<LayerSnapshot> layers;
     std::vector<ChannelSnapshot> channels;  // v5：Alpha 通道（存储选区）
     // v9：参考线（M15a 会话态；空且全默认则整块不写——v8 及以下包字节不变）
@@ -657,6 +660,10 @@ std::string buildManifest(const DocSnapshot& doc) {
     j += "  \"width\": " + std::to_string(doc.width) + ",\n";
     j += "  \"height\": " + std::to_string(doc.height) + ",\n";
     j += "  \"activeLayerId\": " + std::to_string(doc.activeId) + ",\n";
+    if (doc.depth != PixelDepth::U8) {
+        // P6 v16：文档位深（U8 省略 = 旧包字节不变；≤v15 读取方按未知字段忽略）
+        j += "  \"depth\": " + std::to_string(static_cast<int32_t>(doc.depth)) + ",\n";
+    }
     j += "  \"layers\": [\n";
     for (size_t i = 0; i < doc.layers.size(); ++i) {
         const LayerSnapshot& l = doc.layers[i];
@@ -1241,7 +1248,14 @@ std::string buildManifest(const DocSnapshot& doc) {
             fields.push_back("      \"originY\": " + std::to_string(static_cast<int64_t>(l.originY)));
             fields.push_back("      \"width\": " + std::to_string(l.pw));
             fields.push_back("      \"height\": " + std::to_string(l.ph));
-            fields.push_back("      \"imageFile\": \"images/" + std::to_string(l.id) + ".png\"");
+            if (l.depth != PixelDepth::U8) {
+                // P6 v16：深色层 = MDP1 raw 平面（f32 RGBA 直 alpha；≤v15 读取方按未知后缀失败降级）
+                fields.push_back("      \"imageFile\": \"images/" + std::to_string(l.id) + ".d" +
+                                 std::to_string(static_cast<int32_t>(l.depth)) + ".bin\"");
+                fields.push_back("      \"depth\": " + std::to_string(static_cast<int32_t>(l.depth)));
+            } else {
+                fields.push_back("      \"imageFile\": \"images/" + std::to_string(l.id) + ".png\"");
+            }
         } else {
             fields.push_back("      \"imageFile\": null");
         }
@@ -1442,6 +1456,7 @@ void buildDocSnapshot(const Document& doc, DocSnapshot& snap) {
         s.opacity = l.opacity;
         s.blendMode = l.blendMode;
         s.pixels = l.pixels;
+        s.depth = l.depth;  // P6 v16
         s.originX = l.transform.originX;
         s.originY = l.transform.originY;
         if (l.mask != nullptr) {
@@ -1465,6 +1480,7 @@ void buildDocSnapshot(const Document& doc, DocSnapshot& snap) {
         if (l.shape != nullptr && s.pixels == nullptr) {
             // M18：形状层像素 = shapeCache 派生结果、origin = shapeOrigin（PNG 编码复用）
             s.pixels = l.shapeCache;
+            s.depth = PixelDepth::U8;  // 派生缓存恒 U8（P6）
             s.originX = l.shapeOriginX;
             s.originY = l.shapeOriginY;
         }
@@ -1473,6 +1489,7 @@ void buildDocSnapshot(const Document& doc, DocSnapshot& snap) {
             s.smart = l.smart;
             if (l.smartCache != nullptr) {
                 s.pixels = l.smartCache;
+                s.depth = PixelDepth::U8;  // 派生缓存恒 U8（P6）
                 s.originX = l.transform.originX;
                 s.originY = l.transform.originY;
             }
@@ -1507,6 +1524,7 @@ void buildDocSnapshot(const Document& doc, DocSnapshot& snap) {
         snap.layers.push_back(std::move(s));
     }
     // v14：文档级深色元数据
+    snap.depth = doc.depth;  // P6 v16
     snap.psdSrcDepth = doc.psdSrcDepth;
     snap.psdSrcMode = doc.psdSrcMode;
     snap.psdSrcChannels = doc.psdSrcChannels;
@@ -1612,6 +1630,65 @@ bool encodeProject(const DocSnapshot& snap, ZipSink& sink, size_t* outLayers, ui
             continue;
         }
         const TileGrid& grid = *l.pixels;
+        // P6 v16：深色层 = MDP1 raw 平面（f32 RGBA 直 alpha，行式写出；DEFLATE）
+        if (grid.depth != PixelDepth::U8) {
+            if (!zip.beginEntry("images/" + std::to_string(l.id) + ".d" +
+                                    std::to_string(static_cast<int32_t>(grid.depth)) + ".bin",
+                                8)) {
+                err = "zip init failed";
+                return false;
+            }
+            constexpr uint8_t kMagic[4] = {'M', 'D', 'P', '1'};
+            // 头 = 魔数(4) + depth(1) + 保留(3) + w(4) + h(4)，小端
+            uint8_t head[16];
+            std::memcpy(head, kMagic, 4);
+            head[4] = static_cast<uint8_t>(static_cast<int32_t>(grid.depth));
+            head[5] = head[6] = head[7] = 0;
+            const uint32_t wle = l.pw;
+            const uint32_t hle = l.ph;
+            std::memcpy(head + 8, &wle, 4);
+            std::memcpy(head + 12, &hle, 4);
+            if (!zip.writeEntryBytes(head, 16)) {
+                err = "write failed";
+                return false;
+            }
+            std::vector<float> rowF(static_cast<size_t>(l.pw) * 4u);
+            const uint32_t tx0 = l.px / kTileSize;
+            const uint32_t ty0 = l.py / kTileSize;
+            for (uint32_t ry = 0; ry < l.ph; ++ry) {
+                const uint32_t ty = ty0 + ry / kTileSize;
+                const uint32_t inTileY = ry % kTileSize;
+                for (uint32_t rx = 0; rx < l.pw; ++rx) {
+                    float v4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                    const uint32_t tx = tx0 + rx / kTileSize;
+                    auto it = grid.tiles.find(ty * grid.cols + tx);
+                    if (it != grid.tiles.end() && it->second != nullptr) {
+                        const uint8_t* src = it->second->pixels->mapCpu();
+                        const uint32_t stride = it->second->pixels->rowBytes();
+                        pixel_access::pixelDepthReadF32(
+                            grid.depth,
+                            src + static_cast<size_t>(inTileY) * stride +
+                                static_cast<size_t>(rx % kTileSize) *
+                                    static_cast<uint32_t>(bytesPerPel(grid.depth)),
+                            v4);
+                        it->second->pixels->unmap();
+                    }
+                    rowF[static_cast<size_t>(rx) * 4u] = v4[0];
+                    rowF[static_cast<size_t>(rx) * 4u + 1] = v4[1];
+                    rowF[static_cast<size_t>(rx) * 4u + 2] = v4[2];
+                    rowF[static_cast<size_t>(rx) * 4u + 3] = v4[3];
+                }
+                if (!zip.writeEntryBytes(reinterpret_cast<const uint8_t*>(rowF.data()), static_cast<size_t>(l.pw) * 4u * sizeof(float))) {
+                    err = "write failed";
+                    return false;
+                }
+            }
+            if (!zip.endEntry()) {
+                err = "bin finalize failed";
+                return false;
+            }
+            continue;
+        }
         if (!zip.beginEntry("images/" + std::to_string(l.id) + ".png", 0)) {
             err = "zip init failed";
             return false;

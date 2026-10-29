@@ -400,7 +400,7 @@ void TileRenderer::drawQuad(GLuint program, float rx, float ry, float rw, float 
 
 void TileRenderer::drawTiles(const Layer& layer, float zoom, float panX, float panY, float vw,
                              float vh, const StrokeOverlay* stroke, const double* xform) {
-    const std::shared_ptr<const TileGrid> effective = layer.effectivePixels();
+    const std::shared_ptr<const TileGrid> effective = layer.displayPixels();  // P6 显示域（深网格降 8）
     if (effective == nullptr) {
         return;
     }
@@ -844,7 +844,7 @@ int TileRenderer::composeLayerRange(const Document& doc, int from, int to, const
             accIdx = outIdx;
             continue;
         }
-        if (!layer.visible || layer.effectivePixels() == nullptr) {
+        if (!layer.visible || layer.displayPixels() == nullptr) {
             // 非剪贴层缺席 → 其上剪贴组无有效基（PS：基隐藏则剪贴组隐藏）
             if (!layer.clipping) {
                 baseTexValid = false;
