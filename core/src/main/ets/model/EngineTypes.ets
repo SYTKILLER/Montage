@@ -35,6 +35,36 @@ export interface EngineStats {
   devGamma: number;
   hasStyleClipboard: boolean;  // M17a：样式剪贴板非空（粘贴菜单使能）
   strokeBusy: boolean;  // P4：笔画线程在途（动作回放步等待落账）
+  pluginsCount: number;  // M26：插件注册数（E2E 断言注册成功）
+}
+
+/** M26 插件清单项（pluginsList 的 data）。 */
+export interface PluginInfo {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  author: string;
+  paramsJson: string;  // 参数 schema JSON 串（PluginDialog 展开）
+  canvas: boolean;
+  overlap: number;
+  builtin: boolean;
+  poisoned: boolean;
+}
+
+/** M26 插件注册结果（pluginRegister 的 data）。 */
+export interface PluginRegData {
+  ok: boolean;
+  id: string;
+  name: string;
+  err: string;
+}
+
+/** M26 插件运行结果（pluginRun 的 data）。 */
+export interface PluginRunData {
+  ok: boolean;
+  changed: boolean;
+  err: string;
 }
 
 /** RAW 重显影结果（developRaw 的 data，M15e）。 */

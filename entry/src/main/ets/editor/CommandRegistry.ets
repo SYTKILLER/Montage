@@ -280,6 +280,7 @@ function buildTable(): CmdSpec[] {
   v.push(c('select.contract', '修改：收缩…', 'Modify: Contract…', 'select', { when: 'docSel' }));
   // ----- 滤镜（变形族 + Camera Raw 静态；27 目录滤镜 + 8 分类容器自 FILTER_CATALOG 生成） -----
   v.push(c('filter.cameraRaw', 'Camera Raw…', 'Camera Raw…', 'filter', { when: 'doc' }));
+  v.push(c('filterGroup.plugins', '插件', 'Plug-ins', 'filter', { isSub: true, when: 'doc' }));  // M26：子项动态追加（appendPluginCommands）
   v.push(c('liquify.enter', '液化（笔刷变形）…', 'Liquify (Brush Warp)…', 'filter',
     { when: 'doc' }));
   v.push(c('puppet.enter', '操控变形…', 'Puppet Warp…', 'filter', { when: 'doc' }));
@@ -731,6 +732,28 @@ export function buildShortcutMap(): Map<string, ShortcutEntry[]> {
 }
 
 // ---------- H8 i18n：en 语言包（注册表 en 字段生成；强制覆盖测试对全表键核验） ----------
+
+/** M26：插件命令动态追加（启动加载/注入完成后调用；重注册覆盖同 id）。 */
+export interface PluginCmdInfo {
+  id: string;
+  name: string;
+  paramsJson: string;
+}
+
+export function appendPluginCommands(items: PluginCmdInfo[]): void {
+  for (const it of items) {
+    const cid = `plugin.${it.id}`;
+    const exist = COMMAND_TABLE.find((x: CmdSpec): boolean => x.id === cid);
+    const spec = c(cid, `${it.name}…`, `${it.name}…`, 'filter',
+      { parent: 'filterGroup.plugins', when: 'doc', params: it.paramsJson });
+    if (exist !== undefined) {
+      const idx = COMMAND_TABLE.indexOf(exist);
+      COMMAND_TABLE[idx] = spec;
+    } else {
+      COMMAND_TABLE.push(spec);
+    }
+  }
+}
 
 export function i18nKeys(): string[] {
   const keys: string[] = [];

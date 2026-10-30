@@ -13,6 +13,8 @@ add_library(compositor SHARED
         engine/clipboard_ops.cpp
         engine/document.cpp
         engine/pixel_access.cpp
+        engine/plugins.cpp
+        engine/plugins_jsvm.cpp
         engine/engine.cpp
         engine/heal_ops.cpp
         engine/content_aware_ops.cpp
@@ -128,4 +130,5 @@ target_link_libraries(compositor PUBLIC
         libEGL.so
         libGLESv3.so
         libnative_drawing.so
+        libjsvm.so
         z)

@@ -2,7 +2,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
 import { automation } from './Automation';
-import { EngineStats, ExportPngData, ExportImageData, CodecCapabilities, CodecCap, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, SmartFilterDTO, SmartInfoDTO, LookupPresetDTO, LookupImportData, ViewTransformData, PresetSwatchDTO, PresetGroupDTO, PresetGradientDTO, GradientFileData, LibPatternDTO, BrushPresetDTO, BrushFileData, PresetThumbDTO, DocTabDTO, DocNewData, PsdExportOptions } from '../model/EngineTypes';
+import { EngineStats, ExportPngData, ExportImageData, CodecCapabilities, CodecCap, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, SmartFilterDTO, SmartInfoDTO, LookupPresetDTO, LookupImportData, ViewTransformData, PresetSwatchDTO, PresetGroupDTO, PresetGradientDTO, GradientFileData, LibPatternDTO, BrushPresetDTO, BrushFileData, PresetThumbDTO, DocTabDTO, DocNewData, PsdExportOptions, PluginInfo, PluginRegData, PluginRunData } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -110,6 +110,7 @@ function narrowStats(r: Record<string, Object>): EngineStats {
     devGamma: num(r, 'devGamma'),
     hasStyleClipboard: boolOf(r, 'hasStyleClipboard'),
     strokeBusy: boolOf(r, 'strokeBusy'),
+    pluginsCount: num(r, 'pluginsCount'),
   };
 }
 
@@ -2607,6 +2608,7 @@ export class CompositorEngine {
         renderCallbacks: 0, hasRawDevelop: false, devTemp: 0, devTint: 0, devEv: 0, devGamma: 1,
         hasStyleClipboard: false,
         strokeBusy: false,
+        pluginsCount: 0,
       };
     }
     return narrowStats(r.data);
@@ -3030,5 +3032,59 @@ export class CompositorEngine {
     this.revisionBound = false;
     this.importBound = false;
     hilog.info(DOMAIN, TAG, 'disposed');
+  }
+  /** M26：注册插件（异步校验运行；成功入进程注册表）。 */
+  async pluginRegister(source: string, builtin: number): Promise<PluginRegData> {
+    const value: Object = await (native.pluginRegister(source, builtin) as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok || r.data === null) {
+      throw new Error(r.error !== null ? r.error.message : 'pluginRegister failed');
+    }
+    return {
+      ok: boolOf(r.data, 'ok'),
+      id: str(r.data, 'id'),
+      name: str(r.data, 'name'),
+      err: str(r.data, 'err'),
+    };
+  }
+
+  /** M26：插件清单（同步注册表镜像）。 */
+  async pluginsList(): Promise<PluginInfo[]> {
+    const value: Object = await (native.pluginsList() as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok || r.data === null) {
+      throw new Error(r.error !== null ? r.error.message : 'pluginsList failed');
+    }
+    const out: PluginInfo[] = [];
+    const arr: Object = r.data as Object;
+    if (Array.isArray(arr)) {
+      for (const item of arr as Object[]) {
+        const e = toRecord(item);
+        out.push({
+          id: str(e, 'id'), name: str(e, 'name'), version: str(e, 'version'),
+          description: str(e, 'description'), author: str(e, 'author'),
+          paramsJson: str(e, 'paramsJson'), canvas: boolOf(e, 'canvas'),
+          overlap: num(e, 'overlap'), builtin: boolOf(e, 'builtin'),
+          poisoned: boolOf(e, 'poisoned'),
+        });
+      }
+    }
+    return out;
+  }
+
+  /** M26：运行插件滤镜（异步 band 执行 + 一步历史事务）。 */
+  async pluginRun(layerId: number, id: string, paramsJson: string): Promise<PluginRunData> {
+    hilog.info(DOMAIN, TAG, 'pluginRun ts: %{public}d %{public}s', layerId, id);
+    const value: Object = await (native.pluginRun(layerId, id, paramsJson) as Promise<Object>);
+    hilog.info(DOMAIN, TAG, 'pluginRun ts raw: %{public}s', JSON.stringify(value));
+    const r = narrowResult(value);
+    if (!r.ok || r.data === null) {
+      throw new Error(r.error !== null ? r.error.message : 'pluginRun failed');
+    }
+    return {
+      ok: boolOf(r.data, 'ok'),
+      changed: boolOf(r.data, 'changed'),
+      err: str(r.data, 'err'),
+    };
   }
 }

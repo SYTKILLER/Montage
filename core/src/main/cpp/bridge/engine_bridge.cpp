@@ -29,7 +29,10 @@
 #include "io/cms/lut3d.h"
 #include "io/cms/gamut.h"
 #include "io/cms/transform.h"
+#include <chrono>
 #include "engine/engine.h"
+#include "engine/plugins.h"
+#include "engine/plugins_jsvm.h"
 #include "engine/heal_ops.h"
 #include "engine/filter_ops.h"
 #include "engine/preset_lib.h"
@@ -1140,6 +1143,9 @@ napi_value GetStats(napi_env env, napi_callback_info /*info*/) {
     // M17d：文档图案数（「定义图案」菜单使能/图案列表刷新键）
     napi_set_named_property(env, data, "patternCount", makeDouble(env,
                             static_cast<double>(e.doc().patterns.size())));
+    // M26：插件注册数（E2E 断言注册成功）
+    napi_set_named_property(env, data, "pluginsCount", makeDouble(env,
+                            static_cast<double>(plugins::PluginRegistry::get().count())));
     return makeOk(env, data);
 }
 
@@ -11906,6 +11912,396 @@ napi_value SetCloneSlot(napi_env env, napi_callback_info info) {
     std::lock_guard<std::mutex> lk(e.docMutex);
     e.cloneSlot = static_cast<int>(slot);
     return makeOk(env, nullptr);
+}
+
+namespace {
+int64_t nowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// M26：JSVM 主线程执行器（模拟器 musl emutls 非主线程崩，cppcrash 两例同点——
+// 全部 JSVM 调用经 threadsafe function 回到 ArkTS JS 线程执行；运行期 UI 冻结由 deadline 兜底）。
+struct JsThreadJob {
+    const std::function<void(std::string&)>* fn = nullptr;
+    std::string* err = nullptr;
+    bool* ok = nullptr;
+    std::mutex* mtx = nullptr;
+    std::condition_variable* cv = nullptr;
+    bool* done = nullptr;
+};
+
+void jsThreadExecCallback(napi_env env, napi_value /*jsCb*/, void* /*context*/, void* data) {
+    auto* j = static_cast<JsThreadJob*>(data);
+    bool ok = true;
+    try {
+        (*j->fn)(*j->err);
+    } catch (const std::exception& e) {
+        ok = false;
+        if (j->err->empty()) {
+            *j->err = std::string("host: ") + e.what();
+        }
+    } catch (...) {
+        ok = false;
+        if (j->err->empty()) {
+            *j->err = "host: unknown exception";
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(*j->mtx);
+        *j->ok = ok;
+        *j->done = true;
+    }
+    j->cv->notify_one();
+}
+
+napi_threadsafe_function g_pluginTsfn = nullptr;
+
+void pluginEnsureExecutor(napi_env env) {
+    if (g_pluginTsfn != nullptr) {
+        return;
+    }
+    napi_value fn = nullptr;
+    napi_value name = nullptr;
+    napi_create_string_utf8(env, "pluginJsExec", NAPI_AUTO_LENGTH, &name);
+    napi_create_function(env, "pluginJsExec", NAPI_AUTO_LENGTH,
+                         [](napi_env, napi_callback_info) -> napi_value { return nullptr; },
+                         nullptr, &fn) ;
+    if (napi_create_threadsafe_function(env, fn, nullptr, name, 8, 1, nullptr, nullptr,
+                                        nullptr, jsThreadExecCallback,
+                                        &g_pluginTsfn) != napi_ok) {
+        g_pluginTsfn = nullptr;
+        return;
+    }
+    plugins::pluginSetHostExecutor([](const std::function<void(std::string&)>& fn,
+                                      std::string& err, bool& ok) {
+        if (g_pluginTsfn == nullptr) {
+            err = "plugin js executor unavailable";
+            ok = false;
+            return;
+        }
+        std::mutex mtx;
+        std::condition_variable cv;
+        bool done = false;
+        JsThreadJob j{&fn, &err, &ok, &mtx, &cv, &done};
+        if (napi_call_threadsafe_function(g_pluginTsfn, &j, napi_tsfn_blocking) != napi_ok) {
+            err = "plugin js executor call failed";
+            ok = false;
+            return;
+        }
+        std::unique_lock<std::mutex> lk(mtx);
+        // 主线程冻结预算 = 运行时限 + 30s 余量（deadline 后 apply 返回 false，正常能到）
+        cv.wait_for(lk, std::chrono::milliseconds(plugins::kRunTimeMs + 30000),
+                    [&]() { return done; });
+        if (!done) {
+            err = "plugin js executor timed out";
+            ok = false;
+        }
+    });
+}
+}  // namespace
+
+// ---------- M26 插件（P8，docs/40-方案设计/14）----------
+
+// params schema → JSON 串（TS 对话框/注册表 params 字段同款手写串形态）。
+std::string pluginParamsJson(const plugins::Manifest& m) {
+    std::string out = "{";
+    bool first = true;
+    for (const auto& kv : m.params) {
+        if (!first) {
+            out += ",";
+        }
+        first = false;
+        const plugins::ParamSpec& sp = kv.second;
+        out += "\"" + kv.first + "\":{\"type\":\"";
+        const char* t = sp.type == plugins::ParamSpec::Number ? "number"
+                        : sp.type == plugins::ParamSpec::Int ? "int"
+                        : sp.type == plugins::ParamSpec::Bool ? "bool" : "choice";
+        out += t;
+        out += "\"";
+        if (sp.type == plugins::ParamSpec::Number || sp.type == plugins::ParamSpec::Int) {
+            out += ",\"min\":" + std::to_string(sp.mn) + ",\"max\":" + std::to_string(sp.mx) +
+                   ",\"default\":" + std::to_string(sp.def);
+        } else if (sp.type == plugins::ParamSpec::Bool) {
+            out += std::string(",\"default\":") + (sp.bdef ? "true" : "false");
+        } else {
+            out += ",\"options\":[";
+            for (size_t i = 0; i < sp.options.size(); ++i) {
+                if (i > 0) {
+                    out += ",";
+                }
+                out += "\"" + sp.options[i] + "\"";
+            }
+            out += "],\"default\":\"" + sp.cdef + "\"";
+        }
+        out += "}";
+    }
+    out += "}";
+    return out;
+}
+
+// PluginRegister(source, builtin) → Promise<{ok, id?, name?, err?}>——校验运行在 async
+// work 线程（注册期 5s 时限；重注册经 upsert 重置 poisoned）。
+struct PluginRegCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    std::string source;
+    bool builtin = false;
+    bool ok = false;
+    plugins::Manifest man;
+    std::string err;
+};
+
+napi_value PluginRegister(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "pluginRegister(source, builtin?) invalid");
+    }
+    size_t slen = 0;
+    if (napi_get_value_string_utf8(env, argv[0], nullptr, 0, &slen) != napi_ok) {
+        return makeError(env, kErrBadParam, "pluginRegister: source must be a string");
+    }
+    pluginEnsureExecutor(env);
+    auto* ctx = new PluginRegCtx();
+    ctx->source.resize(slen + 1);
+    size_t copied = 0;
+    napi_get_value_string_utf8(env, argv[0], ctx->source.data(), slen + 1, &copied);
+    ctx->source.resize(copied);
+    if (argc >= 2 && argv[1] != nullptr) {
+        double b = 0;
+        if (napi_get_value_double(env, argv[1], &b) == napi_ok) {
+            ctx->builtin = b != 0;
+        }
+    }
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value name = nullptr;
+    napi_create_string_utf8(env, "montagePluginRegister", NAPI_AUTO_LENGTH, &name);
+    const napi_status st = napi_create_async_work(
+        env, nullptr, name,
+        [](napi_env /*env*/, void* data) {
+            auto* c = static_cast<PluginRegCtx*>(data);
+            c->ok = plugins::pluginValidateSource(c->source, c->man, c->err);
+            if (c->ok) {
+                plugins::PluginEntry e;
+                e.man = c->man;
+                e.source = c->source;
+                e.builtin = c->builtin;
+                plugins::PluginRegistry::get().upsert(e);
+            }
+        },
+        [](napi_env env, napi_status status, void* data) {
+            auto* c = static_cast<PluginRegCtx*>(data);
+            napi_value obj = nullptr;
+            napi_create_object(env, &obj);
+            const bool ok = status == napi_ok && c->ok;
+            if (!ok && !c->err.empty()) {
+                OH_LOG_Print(LOG_APP, LOG_WARN, 0xD0026, "Montage.M26",
+                             "pluginRegister err: %{public}s", c->err.c_str());
+            }
+            napi_set_named_property(env, obj, "ok", makeBool(env, ok));
+            if (ok) {
+                napi_value idv = nullptr;
+                napi_create_string_utf8(env, c->man.id.c_str(), NAPI_AUTO_LENGTH, &idv);
+                napi_set_named_property(env, obj, "id", idv);
+                napi_value nmv = nullptr;
+                napi_create_string_utf8(env, c->man.name.c_str(), NAPI_AUTO_LENGTH, &nmv);
+                napi_set_named_property(env, obj, "name", nmv);
+            } else {
+                napi_value ev = nullptr;
+                napi_create_string_utf8(env, c->err.c_str(), NAPI_AUTO_LENGTH, &ev);
+                napi_set_named_property(env, obj, "err", ev);
+            }
+            napi_resolve_deferred(env, c->deferred, makeOk(env, obj));
+            napi_delete_async_work(env, c->work);
+            delete c;
+        },
+        ctx, &ctx->work);
+    if (st != napi_ok) {
+        delete ctx;
+        return makeError(env, kErrInternal, "create async work failed");
+    }
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+// PluginsList() → [{id,name,version,description,author,canvas,overlap,paramsJson,builtin,poisoned}]
+napi_value PluginsList(napi_env env, napi_callback_info /*info*/) {
+    const std::vector<plugins::PluginEntry> list = plugins::PluginRegistry::get().list();
+    napi_value arr = nullptr;
+    napi_create_array(env, &arr);
+    uint32_t k = 0;
+    for (const plugins::PluginEntry& e : list) {
+        napi_value o = nullptr;
+        napi_create_object(env, &o);
+        auto setStr = [&](const char* key, const std::string& v) {
+            napi_value sv = nullptr;
+            napi_create_string_utf8(env, v.c_str(), NAPI_AUTO_LENGTH, &sv);
+            napi_set_named_property(env, o, key, sv);
+        };
+        setStr("id", e.man.id);
+        setStr("name", e.man.name);
+        setStr("version", e.man.version);
+        setStr("description", e.man.description);
+        setStr("author", e.man.author);
+        setStr("paramsJson", pluginParamsJson(e.man));
+        napi_set_named_property(env, o, "canvas", makeBool(env, e.man.canvasArea));
+        napi_set_named_property(env, o, "overlap", makeDouble(env, e.man.overlap));
+        napi_set_named_property(env, o, "builtin", makeBool(env, e.builtin));
+        napi_set_named_property(env, o, "poisoned", makeBool(env, e.poisoned));
+        napi_set_element(env, arr, k++, o);
+    }
+    return makeOk(env, arr);
+}
+
+// PluginRun(layerId, id, paramsJson) → Promise<{ok, changed?, err?}>——CaOp 同范式：
+// 锁内快照 → async work 线程跑 JSVM（band 循环）→ 发布段 DocStamp 复核入账。
+struct PluginRunCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    Document docSnap;
+    uint64_t epoch = 0;
+    void* docSess = nullptr;
+    int64_t revision = 0;
+    LayerId layerId = 0;
+    plugins::PluginEntry entry;
+    std::string paramsJson;
+    bool changed = false;
+    std::string err;
+};
+
+napi_value PluginRun(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return makeError(env, kErrBadParam, "pluginRun(layerId, id, paramsJson?) invalid");
+    }
+    double lid = 0;
+    size_t idlen = 0;
+    if (napi_get_value_double(env, argv[0], &lid) != napi_ok ||
+        napi_get_value_string_utf8(env, argv[1], nullptr, 0, &idlen) != napi_ok) {
+        return makeError(env, kErrBadParam, "pluginRun: invalid args");
+    }
+    std::string pluginId(idlen + 1, '\0');
+    size_t idCopied = 0;
+    napi_get_value_string_utf8(env, argv[1], pluginId.data(), idlen + 1, &idCopied);
+    pluginId.resize(idCopied);
+    pluginEnsureExecutor(env);
+    auto* ctx = new PluginRunCtx();
+    ctx->layerId = static_cast<LayerId>(std::llround(lid));
+    plugins::PluginEntry* found = plugins::PluginRegistry::get().find(pluginId);
+    if (found == nullptr) {
+        delete ctx;
+        return makeError(env, kErrBadParam, "pluginRun: unknown plugin " + pluginId);
+    }
+    if (found->poisoned) {
+        delete ctx;
+        return makeError(env, kErrBadParam, "pluginRun: plugin disabled after timeout");
+    }
+    ctx->entry = *found;  // 快照（注册表后续 poison 不影响本次）
+    if (argc >= 3 && argv[2] != nullptr) {
+        size_t plen = 0;
+        if (napi_get_value_string_utf8(env, argv[2], nullptr, 0, &plen) == napi_ok) {
+            ctx->paramsJson.resize(plen + 1);
+            size_t pcopied = 0;
+            napi_get_value_string_utf8(env, argv[2], ctx->paramsJson.data(), plen + 1, &pcopied);
+            ctx->paramsJson.resize(pcopied);
+        }
+    }
+    {
+        auto& e = Engine::get();
+        std::lock_guard<std::mutex> lk(e.docMutex);
+        if (e.doc().width == 0) {
+            delete ctx;
+            return makeError(env, kErrNoDoc, "pluginRun: no document");
+        }
+        ctx->docSnap = e.doc();
+        ctx->epoch = e.docEpoch();
+        ctx->revision = e.docRevision();
+        ctx->docSess = &e.active();
+        // id=0 = 活动层（applyFilter / smart.* 同约定；快照内解析为实际 id）
+        if (ctx->layerId == 0) {
+            ctx->layerId = e.doc().activeId;
+        }
+    }
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value wname = nullptr;
+    napi_create_string_utf8(env, "montagePluginRun", NAPI_AUTO_LENGTH, &wname);
+    // 弃线程登记员：到期 poison（正常完成后 poison 幂等无害——「下轮禁用」可接受，方案 §4.2）
+    plugins::startPoisonMonitor(pluginId, nowMs(), plugins::kRunTimeMs);
+    const napi_status st = napi_create_async_work(
+        env, nullptr, wname,
+        [](napi_env /*env*/, void* data) {
+            auto* c = static_cast<PluginRunCtx*>(data);
+            OH_LOG_Print(LOG_APP, LOG_INFO, 0xD0026, "Montage.M26",
+                         "pluginRun execute: layer=%{public}llu id=%{public}s",
+                         static_cast<unsigned long long>(c->layerId), c->entry.man.id.c_str());
+            Document work = c->docSnap;
+            std::vector<std::pair<std::string, plugins::PValue>> params;
+            if (!plugins::resolveParams(c->entry.man, c->paramsJson, params, c->err)) {
+                OH_LOG_Print(LOG_APP, LOG_WARN, 0xD0026, "Montage.M26",
+                             "resolveParams fail: %{public}s", c->err.c_str());
+                return;
+            }
+            c->changed = plugins::pluginRunFilter(work, c->layerId, c->entry, params, c->err);
+            OH_LOG_Print(LOG_APP, LOG_INFO, 0xD0026, "Montage.M26",
+                         "pluginRun filter done: changed=%{public}d err=%{public}s",
+                         c->changed ? 1 : 0, c->err.c_str());
+            if (c->changed) {
+                restyleDocument(work);
+            }
+            auto& eg = Engine::get();
+            std::lock_guard<std::mutex> lk(eg.docMutex);
+            auto sess = eg.docIfUnchanged(Engine::DocStamp{static_cast<DocSession*>(c->docSess),
+                                                           c->epoch,
+                                                           static_cast<uint32_t>(c->revision)});
+            if (c->changed && sess != nullptr) {
+                sess->history.beginEdit(sess->doc, "插件: " + c->entry.man.name,
+                                        static_cast<uint64_t>(sess->revision));
+                sess->doc = std::move(work);
+                sess->history.endEdit(sess->doc, static_cast<uint64_t>(sess->revision));
+                eg.bumpRevisionLocked(sess.get());
+                eg.requestRender();
+            } else {
+                c->changed = false;
+            }
+        },
+        [](napi_env env, napi_status status, void* data) {
+            auto* c = static_cast<PluginRunCtx*>(data);
+            auto& eg = Engine::get();
+            const bool ok = status == napi_ok && c->err.empty();
+            if (!c->err.empty()) {
+                OH_LOG_Print(LOG_APP, LOG_WARN, 0xD0026, "Montage.M26",
+                             "pluginRun err: %{public}s", c->err.c_str());
+            }
+            if (status == napi_ok && c->changed) {
+                eg.historyVersion.fetch_add(1);
+            }
+            napi_value obj = nullptr;
+            napi_create_object(env, &obj);
+            napi_set_named_property(env, obj, "ok", makeBool(env, ok));
+            napi_set_named_property(env, obj, "changed", makeBool(env, c->changed));
+            if (!c->err.empty()) {
+                napi_value ev = nullptr;
+                napi_create_string_utf8(env, c->err.c_str(), NAPI_AUTO_LENGTH, &ev);
+                napi_set_named_property(env, obj, "err", ev);
+            }
+            napi_resolve_deferred(env, c->deferred, makeOk(env, obj));
+            napi_delete_async_work(env, c->work);
+            delete c;
+        },
+        ctx, &ctx->work);
+    if (st != napi_ok) {
+        delete ctx;
+        return makeError(env, kErrInternal, "create async work failed");
+    }
+    napi_queue_async_work(env, ctx->work);
+    return promise;
 }
 
 }  // namespace bridge

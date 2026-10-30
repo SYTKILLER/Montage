@@ -59,6 +59,21 @@ export default class EntryAbility extends UIAbility {
         }
       }
       // M22：调试命令直通（runCommand；uitest 注入退化时的 E2E 旁路）
+      // M26：插件源码注入通道（debugPluginPart/debugPluginFlush 分段；flush 拼 b64
+      // → Index 消费 → pluginRegister——E2E/开发用，同 debugPre 族）
+      const plugPart = want.parameters?.debugPluginPart;
+      if (typeof plugPart === 'string' && plugPart.length > 0) {
+        const prevP = AppStorage.get<string>('debugPluginAccum') ?? '';
+        AppStorage.setOrCreate('debugPluginAccum', prevP + plugPart);
+      }
+      const plugFlush = want.parameters?.debugPluginFlush;
+      if (typeof plugFlush === 'string' && plugFlush === '1') {
+        const accP = AppStorage.get<string>('debugPluginAccum') ?? '';
+        if (accP.length > 0) {
+          AppStorage.setOrCreate('debugPluginB64', accP);
+          AppStorage.setOrCreate('debugPluginAccum', '');
+        }
+      }
       const dbgCmd = want.parameters?.debugCmd;
       if (typeof dbgCmd === 'string' && dbgCmd.length > 0) {
         AppStorage.setOrCreate('debugCmd', dbgCmd);
@@ -123,6 +138,21 @@ export default class EntryAbility extends UIAbility {
           const name2 = AppStorage.get<string>('debugPreName') ?? 'sample.aco';
           AppStorage.setOrCreate('debugPresetB64', `${kind2}|${name2}|${acc2}`);
           AppStorage.setOrCreate('debugPreAccum', '');
+        }
+      }
+      // M26：插件源码注入通道（debugPluginPart/debugPluginFlush 分段；flush 拼 b64
+      // → Index 消费 → pluginRegister——E2E/开发用，同 debugPre 族）
+      const plugPart = want.parameters?.debugPluginPart;
+      if (typeof plugPart === 'string' && plugPart.length > 0) {
+        const prevP = AppStorage.get<string>('debugPluginAccum') ?? '';
+        AppStorage.setOrCreate('debugPluginAccum', prevP + plugPart);
+      }
+      const plugFlush = want.parameters?.debugPluginFlush;
+      if (typeof plugFlush === 'string' && plugFlush === '1') {
+        const accP = AppStorage.get<string>('debugPluginAccum') ?? '';
+        if (accP.length > 0) {
+          AppStorage.setOrCreate('debugPluginB64', accP);
+          AppStorage.setOrCreate('debugPluginAccum', '');
         }
       }
       const dbgCmd = want.parameters?.debugCmd;

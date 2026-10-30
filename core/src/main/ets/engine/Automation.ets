@@ -454,6 +454,13 @@ function buildRegistry(): Map<string, CmdEntry> {
       apply: (e, p) => e.applyFilter(pn(p, 'layerId', 0), pn(p, 'kind', 0), pn(p, 'p0', 0),
         pn(p, 'p1', 0), pn(p, 'p2', 0), pn(p, 'p3', 0), pn(p, 'p4', 0), pn(p, 'p5', 0),
         pn(p, 'seed', 0)) },
+    { id: 'plugin.apply', label: '应用插件滤镜', coalesce: false,
+      apply: (e, p) => e.pluginRun(pn(p, 'layerId', 0), ps(p, 'id', ''), ps(p, 'params', '{}'))
+        .then((v: Object): boolean => {
+          const r = v as Record<string, Object>;
+          const okv: Object = r['ok'];
+          return okv === true;
+        }) },
     { id: 'develop.raw', label: 'RAW 显影', coalesce: false,
       apply: (e, p) => e.developRaw(pn(p, 'temp', 0), pn(p, 'tint', 0), pn(p, 'ev', 0),
         pn(p, 'gamma', 1), ps(p, 'cameraJson', ''), 0).then((v: Object): boolean => v !== null) },

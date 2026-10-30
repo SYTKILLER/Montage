@@ -5,7 +5,7 @@ import { common } from '@kit.AbilityKit';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
 import { window } from '@kit.ArkUI';
-import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, RawDevelopData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, SmartInfoDTO, SmartFilterDTO, LookupPresetDTO, LookupImportData, PresetGroupDTO, PresetSwatchDTO, PresetGradientDTO, BrushPresetDTO, LibPatternDTO } from 'core';
+import { CompositorEngine, LayerDTO, LayerThumb, OpenFileData, TransformOverlayBox, OpenProjectData, PsdOpenData, RawDevelopData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, SmartInfoDTO, SmartFilterDTO, LookupPresetDTO, LookupImportData, PresetGroupDTO, PresetSwatchDTO, PresetGradientDTO, BrushPresetDTO, LibPatternDTO, PluginInfo } from 'core';
 import { PresetLibrary } from '../editor/components/PresetLibrary';
 import { AppPrefs, RecentProject, ThemeMode } from '../editor/AppPrefs';
 import { leafItem, MenuGroupVM, MenuItemVM, subItem, ToolVM } from '../editor/MenuModel';
@@ -33,7 +33,8 @@ import { AutomateDialog } from '../editor/components/AutomateDialog';
 import { automation, ActionStep } from 'core';
 import { Automate, BatchOptions, ProcessorOptions, BatchResult, BatchFileError } from 'core';
 import { controlServer, CtrlSmartEditRec } from '../editor/ControlServer';
-import { ActiveSnap, buildMenuVM, buildShortcutMap, MenuDoc, MenuState, registerLangPacks, ShortcutEntry } from '../editor/CommandRegistry';
+import { ActiveSnap, appendPluginCommands, buildMenuVM, buildShortcutMap, MenuDoc, MenuState, PluginCmdInfo, registerLangPacks, ShortcutEntry } from '../editor/CommandRegistry';
+import { BUILTIN_PLUGIN_FILES, parsePluginParams, PluginParamVM } from '../editor/PluginCatalog';
 import { getLang, setLang } from '../editor/I18n';
 
 const TAG: string = 'Montage.Shell';
@@ -137,6 +138,8 @@ struct Index {
   @StorageProp('debugCmd') @Watch('onDebugCmd') debugCmdProp: string = '';
   // P1：预设资源导入通道（EntryAbility flush 拼 "kind|name|b64" → consumeDebugPresetB64）
   @StorageProp('debugPresetB64') @Watch('onDebugPresetB64') debugPresetB64Prop: string = '';
+  // M26：插件源码注入通道（EntryAbility flush 拼 b64 → consumeDebugPluginB64 → 注册）
+  @StorageProp('debugPluginB64') @Watch('onDebugPluginB64') debugPluginB64Prop: string = '';
   @StorageProp('importProgress') importProgress: number = 0;
   @State docOpen: boolean = false;
   @State docW: number = 0;
@@ -309,6 +312,15 @@ struct Index {
   @State fillColor: string = '#D93025';
   @State fillAngle: number = 90;
   @State showFilter: boolean = false;   // M13 滤镜对话框（proxy 预览）
+  // M26 插件对话框（无实时预览；manifest schema 驱动）
+  @State showPlugin: boolean = false;
+  @State pluginDef: PluginInfo | null = null;
+  @State pluginVM: PluginParamVM[] = [];
+  @State pluginNumVals: number[] = [];
+  @State pluginBoolVals: boolean[] = [];
+  @State pluginChoiceSel: number[] = [];
+  @State pluginsListMirror: PluginInfo[] = [];
+  @State pluginsRev: number = 0;        // 菜单重建依赖（插件动态注册后 ++）
   @State lookupPresets: LookupPresetDTO[] = [];  // M22 颜色查找预设（内置 + 会话导入）
   @State viewXformLut: boolean = false;   // M22 显示变换镜像
   @State viewXformGamut: boolean = false;
@@ -664,6 +676,9 @@ struct Index {
       this.prefs.setString('actions_json', automation.serialize());
     });
     this.actionsVisible = this.prefs.getBool('panel_actions', false);
+    // M26：内置插件加载（rawfile → 注册 → 菜单动态追加；async 不阻塞首帧）
+    this.loadBuiltinPlugins();
+    this.consumeDebugPluginB64();  // 冷启动注入消费（@StorageProp 初值不走 @Watch，P3 坑）
     // P1：预设库载入（色板/渐变/笔刷参数全量 + 图案/笔刷 tip 清单；像素进程级重启丢失）
     this.loadPresetLib();
     this.presetsVisible = this.prefs.getBool('panel_presets', false);
@@ -2785,6 +2800,178 @@ struct Index {
     return out;
   }
 
+  // ---------- M26 插件 ----------
+
+  private onDebugPluginB64(): void {
+    this.consumeDebugPluginB64();
+  }
+
+  private consumeDebugPluginB64(): void {
+    const raw = AppStorage.get<string>('debugPluginB64');
+    if (raw === undefined || raw.length === 0) {
+      return;
+    }
+    AppStorage.setOrCreate('debugPluginB64', '');
+    const bin: Uint8Array = new util.Base64Helper().decodeSync(raw);
+    const source = util.TextDecoder.create('utf-8').decodeToString(bin);
+    this.registerPluginSource(source, 0);
+  }
+
+  /** M26：内置插件加载（rawfile/plugins/；注册完成刷新目录 + 菜单）。 */
+  private loadBuiltinPlugins(): void {
+    const ctx = this.hostCtx();
+    if (ctx === undefined) {
+      return;
+    }
+    const rm = ctx.resourceManager;
+    for (const f of BUILTIN_PLUGIN_FILES) {
+      rm.getRawFileContent(f).then((raw: Uint8Array): Promise<void> => {
+        const source = util.TextDecoder.create('utf-8').decodeToString(raw);
+        return this.registerPluginSource(source, 1);
+      }).catch((e: BusinessError): void => {
+        this.log(`插件加载失败 ${f}: ${e.message ?? ''}`);
+      });
+    }
+  }
+
+  private async registerPluginSource(source: string, builtin: number): Promise<void> {
+    try {
+      const r = await this.engine.pluginRegister(source, builtin);
+      if (r.ok) {
+        this.log(`插件已注册: ${r.name} (${r.id})`);
+        await this.refreshPluginCatalog();
+      } else {
+        this.log(`插件注册被拒: ${r.err}`);
+      }
+    } catch (e) {
+      const msg = (e as BusinessError).message !== undefined ? (e as BusinessError).message : String(e);
+      this.log(`插件注册失败: ${msg}`);
+    }
+  }
+
+  /** 注册表镜像 → 菜单命令追加 + en 包重建 + 菜单重建依赖 ++。 */
+  private async refreshPluginCatalog(): Promise<void> {
+    const list = await this.engine.pluginsList();
+    this.pluginsListMirror = list;
+    const cmds: PluginCmdInfo[] = [];
+    for (const it of list) {
+      if (it.poisoned) {
+        continue;  // 时限弃线程禁用（重启恢复）
+      }
+      const ci: PluginCmdInfo = { id: it.id, name: it.name, paramsJson: it.paramsJson };
+      cmds.push(ci);
+    }
+    appendPluginCommands(cmds);
+    registerLangPacks();  // en 包全量重建（含新插件键）
+    this.shortcutMap = buildShortcutMap();
+    this.pluginsRev++;
+  }
+
+  private openPluginDialog(def: PluginInfo): void {
+    const a = this.activeLayer();
+    if (!this.docOpen || a === undefined) {
+      this.toast('无文档或无活动图层');
+      return;
+    }
+    if (a.isText) {
+      this.toast('文字层请先栅格化再应用插件');
+      return;
+    }
+    if (a.isSmart) {
+      this.toast('智能对象层暂不支持插件滤镜（请先栅格化）');
+      return;
+    }
+    this.pluginDef = def;
+    this.pluginVM = parsePluginParams(def.paramsJson);
+    const nums: number[] = [];
+    const bools: boolean[] = [];
+    const choices: number[] = [];
+    for (const vm of this.pluginVM) {
+      if (vm.type === 'bool') {
+        bools.push(vm.boolDef);
+      } else if (vm.type === 'choice') {
+        choices.push(vm.choiceDef >= 0 ? vm.choiceDef : 0);
+      } else {
+        nums.push(vm.def);
+      }
+    }
+    this.pluginNumVals = nums;
+    this.pluginBoolVals = bools;
+    this.pluginChoiceSel = choices;
+    this.showPlugin = true;
+    this.log(`插件对话框: ${def.name}`);
+  }
+
+  private buildPluginParamsJson(): string {
+    let json = '{';
+    let ni = 0;
+    let bi = 0;
+    let ci = 0;
+    let first = true;
+    for (const vm of this.pluginVM) {
+      if (!first) {
+        json += ',';
+      }
+      first = false;
+      if (vm.type === 'bool') {
+        json += `"${vm.key}":${this.pluginBoolVals[bi] ? 'true' : 'false'}`;
+        bi++;
+      } else if (vm.type === 'choice') {
+        const opt = vm.options[this.pluginChoiceSel[ci]] ?? vm.options[0];
+        json += `"${vm.key}":"${opt}"`;
+        ci++;
+      } else {
+        let v = this.pluginNumVals[ni] ?? vm.def;
+        if (vm.type === 'int') {
+          v = Math.round(v);
+        }
+        json += `"${vm.key}":${v}`;
+        ni++;
+      }
+    }
+    json += '}';
+    return json;
+  }
+
+  private async commitPluginDialog(): Promise<void> {
+    if (!this.showPlugin || this.pluginDef === null) {
+      return;
+    }
+    const def = this.pluginDef;
+    const paramsJson = this.buildPluginParamsJson();
+    const a = this.activeLayer();
+    if (a === undefined) {
+      return;
+    }
+    this.showPlugin = false;
+    this.pluginDef = null;
+    this.toast(`插件运行中: ${def.name}`);
+    automation.note('plugin.apply', {
+      'layerId': a.id, 'id': def.id, 'params': paramsJson, 'label': def.name,
+    });
+    try {
+      const r = await this.engine.pluginRun(a.id, def.id, paramsJson);
+      if (r.ok) {
+        this.log(r.changed ? `插件已应用: ${def.name}` : `插件无输出域（空内容）: ${def.name}`);
+        this.refreshStats();
+        this.refreshLayers();
+        this.refreshHistory();
+      } else {
+        this.toast(`插件失败: ${r.err}`);
+        this.log(`插件失败: ${def.name} — ${r.err}`);
+      }
+    } catch (e) {
+      const msg = (e as BusinessError).message !== undefined ? (e as BusinessError).message : String(e);
+      this.toast(`插件失败: ${msg}`);
+      this.log(`插件异常: ${def.name} — ${msg}`);
+    }
+  }
+
+  private cancelPluginDialog(): void {
+    this.showPlugin = false;
+    this.pluginDef = null;
+  }
+
   // ---------- M13 滤镜对话框 ----------
 
   private openFilterDialog(def: FilterDef): void {
@@ -3643,6 +3830,10 @@ struct Index {
       this.showFilter = false;  // 滤镜对话框随切档收起（引擎 filterPreview 随会话走）
       this.filterDef = null;
     }
+    if (this.showPlugin) {
+      this.showPlugin = false;
+      this.pluginDef = null;
+    }
     if (this.filterDebounce >= 0) {
       clearTimeout(this.filterDebounce);
       this.filterDebounce = -1;
@@ -3787,6 +3978,10 @@ struct Index {
     if (this.showFilter) {
       this.showFilter = false;  // M13：预览会话随文档清空（引擎 resetDocument 已清）
       this.filterDef = null;
+    }
+    if (this.showPlugin) {
+      this.showPlugin = false;  // M26：插件对话框随文档清空
+      this.pluginDef = null;
     }
     const ok = this.engine.closeDocument();  // D2：单档=清空会话；多档=关 active 标签
     this.saveUris.delete(this.activeDocId);
@@ -6035,6 +6230,19 @@ struct Index {
       }
       return;
     }
+    // M26 插件命令：'plugin.<id>' → 开对话框（无实时预览；确定即异步运行）
+    if (id.startsWith('plugin.')) {
+      const pid = id.substring(7);
+      const info = this.pluginsListMirror.find((x: PluginInfo): boolean => x.id === pid);
+      if (info !== undefined) {
+        if (info.poisoned) {
+          this.toast('插件已因超时被禁用（重启恢复）');
+        } else {
+          this.openPluginDialog(info);
+        }
+      }
+      return;
+    }
     switch (id) {
       case 'file.new':
         this.doNewDocument();
@@ -7658,6 +7866,7 @@ struct Index {
 
   private buildMenuGroups(): MenuGroupVM[] {
     const _lr = this.langRev;  // 语言切换依赖入 build（H8）
+    const _pr = this.pluginsRev;  // M26：插件动态注册依赖入 build
     return buildMenuVM(this.menuState());
   }
 
@@ -7876,7 +8085,7 @@ struct Index {
       return;
     }
     // 对话框打开时：Esc 关闭，其余不抢
-    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform || this.showModify || this.showStoreSel || this.showLoadSel || this.showFill || this.showStyle || this.showFilter || this.showDevelop || this.showGlobalLight || this.showContour || this.showStopsEd || this.showPatternPick || this.showColorPick) {
+    if (this.showExport || this.showRename || this.showShortcuts || this.showAbout || this.showTheme || this.showTransform || this.showModify || this.showStoreSel || this.showLoadSel || this.showFill || this.showStyle || this.showFilter || this.showDevelop || this.showGlobalLight || this.showContour || this.showStopsEd || this.showPatternPick || this.showColorPick || this.showPlugin) {
       if (e.keyCode === KC_ESC) {
         this.showTransform = false;
         this.showExport = false;
@@ -8359,7 +8568,7 @@ struct Index {
         `${this.hasRawDevelop ? 1 : 0}`  // M15e：RAW 显影菜单项使能随会话 RAW 翻转
         + `${this.workPathNonEmpty}${this.activeLayer()?.isShape ? 1 : 0}` +
         `${this.activeLayer()?.hasVectorMask ? 1 : 0}${this.hasCustomShapes ? 1 : 0}` +  // M18：矢量菜单使能位
-        `${this.langRev}`)  // H8：语言切换强制整表重建（同 key 复用坑，M14a 教训）
+        `${this.langRev}` + `${this.pluginsRev}`)  // H8 语言 + M26 插件注册强制整表重建
     }
     .width('100%')
     .height(36)
@@ -9769,6 +9978,91 @@ struct Index {
             }.justifyContent(FlexAlign.End).width('100%')
           }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
             .border({ width: 1, color: $r('app.color.border') }).width(400)
+        }.width('100%').height('100%')
+      }
+      // M26 插件参数对话框（manifest schema 驱动；无实时预览，确定=异步运行）
+      if (this.showPlugin && this.pluginDef !== null) {
+        Stack() {
+          Column().width('100%').height('100%').backgroundColor('#66000000')
+            .onClick((): void => { this.cancelPluginDialog(); })
+          Column({ space: 14 }) {
+            Text(this.pluginDef.name)
+              .fontSize(16).fontWeight(FontWeight.Bold)
+              .fontColor($r('app.color.text_primary'))
+            if (this.pluginDef.description.length > 0) {
+              Text(this.pluginDef.description).fontSize(11)
+                .fontColor($r('app.color.text_secondary'))
+            }
+            if (this.pluginVM.length === 0) {
+              Text('无参数').fontSize(12).fontColor($r('app.color.text_secondary'))
+            }
+            ForEach(this.pluginVM, (vm: PluginParamVM, idx: number) => {
+              if (vm.type === 'bool') {
+                Row({ space: 10 }) {
+                  Text(vm.key).fontSize(13)
+                    .fontColor($r('app.color.text_secondary')).layoutWeight(1)
+                  Toggle({ type: ToggleType.Switch, isOn: this.pluginBoolVals[idx] })
+                    .selectedColor($r('app.color.accent'))
+                    .onChange((on: boolean): void => {
+                      const next = this.pluginBoolVals.slice();
+                      next[idx] = on;
+                      this.pluginBoolVals = next;
+                    })
+                }.width('100%')
+              } else if (vm.type === 'choice') {
+                Column({ space: 6 }) {
+                  Text(vm.key).fontSize(13).fontColor($r('app.color.text_secondary'))
+                  Flex({ wrap: FlexWrap.Wrap }) {
+                    ForEach(vm.options, (opt: string, oi: number) => {
+                      Text(opt)
+                        .fontSize(11)
+                        .fontColor(this.pluginChoiceSel[idx] === oi
+                          ? $r('app.color.on_accent') : $r('app.color.text_primary'))
+                        .backgroundColor(this.pluginChoiceSel[idx] === oi
+                          ? $r('app.color.accent') : $r('app.color.surface'))
+                        .borderRadius(6)
+                        .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+                        .margin(2)
+                        .onClick((): void => {
+                          const next = this.pluginChoiceSel.slice();
+                          next[idx] = oi;
+                          this.pluginChoiceSel = next;
+                        })
+                    }, (opt: string, oi: number): string => `${idx}|${oi}|${opt}`)
+                  }.width('100%')
+                }.alignItems(HorizontalAlign.Start).width('100%')
+              } else {
+                Row({ space: 10 }) {
+                  Text(`${vm.key} (${vm.type})`).fontSize(13)
+                    .fontColor($r('app.color.text_secondary')).width(110)
+                  Slider({ value: this.pluginNumVals[idx] ?? vm.def, min: vm.min,
+                    max: vm.max, step: vm.type === 'int' ? 1 : Math.max((vm.max - vm.min) / 200, 0.01) })
+                    .layoutWeight(1)
+                    .onChange((v: number): void => {
+                      const nv = vm.type === 'int' ? Math.round(v) : v;
+                      const next = this.pluginNumVals.slice();
+                      next[idx] = nv;
+                      this.pluginNumVals = next;
+                    })
+                  Text(`${Math.round((this.pluginNumVals[idx] ?? vm.def) * 10) / 10}`)
+                    .fontSize(12).fontColor($r('app.color.text_primary')).width(56)
+                    .textAlign(TextAlign.End)
+                }.width('100%')
+              }
+            }, (vm: PluginParamVM, idx: number): string => `${idx}|${vm.key}|${this.pluginsRev}`)
+            Row({ space: 12 }) {
+              Button('取消').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.surface'))
+                .fontColor($r('app.color.text_primary'))
+                .border({ width: 1, color: $r('app.color.border') })
+                .onClick((): void => { this.cancelPluginDialog(); })
+              Button('确定').fontSize(14).height(40).width(96)
+                .backgroundColor($r('app.color.accent'))
+                .fontColor($r('app.color.on_accent'))
+                .onClick((): void => { this.commitPluginDialog(); })
+            }.justifyContent(FlexAlign.End).width('100%')
+          }.padding(20).borderRadius(14).backgroundColor($r('app.color.surface'))
+            .border({ width: 1, color: $r('app.color.border') }).width(420)
         }.width('100%').height('100%')
       }
       // M15e RAW 显影参数面板（会话内有 RAW 缓存才可开；确定=异步重显影+一步事务）

@@ -318,6 +318,10 @@ napi_value ExportSmartContents(napi_env env, napi_callback_info info);
 napi_value BeginCAMovePreview(napi_env env, napi_callback_info info);   // P5⑤
 napi_value UpdateCAMovePreview(napi_env env, napi_callback_info info);  // P5⑤
 napi_value EndCAMovePreview(napi_env env, napi_callback_info info);     // P5⑤
+// ---------- M26 插件（P8）----------
+napi_value PluginRegister(napi_env env, napi_callback_info info);   // (source, builtin) → Promise
+napi_value PluginsList(napi_env env, napi_callback_info info);      // → [{id,name,...,paramsJson}]
+napi_value PluginRun(napi_env env, napi_callback_info info);        // (layerId, id, paramsJson) → Promise
 // 页面销毁时释放回调与渲染线程
 napi_value Dispose(napi_env env, napi_callback_info info);
 
