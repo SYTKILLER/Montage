@@ -2,7 +2,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import native from 'libcompositor.so';
 import { automation } from './Automation';
-import { EngineStats, ExportPngData, ExportImageData, CodecCapabilities, CodecCap, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, SmartFilterDTO, SmartInfoDTO, LookupPresetDTO, LookupImportData, ViewTransformData, PresetSwatchDTO, PresetGroupDTO, PresetGradientDTO, GradientFileData, LibPatternDTO, BrushPresetDTO, BrushFileData, PresetThumbDTO, DocTabDTO, DocNewData } from '../model/EngineTypes';
+import { EngineStats, ExportPngData, ExportImageData, CodecCapabilities, CodecCap, HistogramData, QuickMaskState, RawDevelopData, TransformOverlayBox, ExportPsdData, FlattenData, LayerDTO, LayerThumb, OpenFileData, OpenProjectData, OpResultData, PixelProbe, PixelTestData, PsdOpenData, SamplePixelData, SaveProjectData, ViewportData, GuidesData, LayerBoundsData, HistoryListData, PatternInfo, LiquifyStrokeDTO, PuppetPinDTO, SmartFilterDTO, SmartInfoDTO, LookupPresetDTO, LookupImportData, ViewTransformData, PresetSwatchDTO, PresetGroupDTO, PresetGradientDTO, GradientFileData, LibPatternDTO, BrushPresetDTO, BrushFileData, PresetThumbDTO, DocTabDTO, DocNewData, PsdExportOptions } from '../model/EngineTypes';
 
 const DOMAIN: number = 0x4D30;
 const TAG: string = 'Montage.Bridge';
@@ -2494,9 +2494,10 @@ export class CompositorEngine {
     };
   }
 
-  /** PSD 导出（M8b：层/蒙版/剪贴/混合键/luni 中文名；调整层跳过+提示）。 */
-  async exportPsd(fd: number): Promise<ExportPsdData> {
-    const value: Object = await (native.exportPsd(fd) as Promise<Object>);
+  /** PSD 导出（M8b：层/蒙版/剪贴/混合键/luni 中文名；调整层跳过+提示）。
+   *  P7：opts.zip = 合成图 ZIP 压缩；opts.psb = 强制 PSB（>30000px 自动升，无需开关）。 */
+  async exportPsd(fd: number, opts?: PsdExportOptions): Promise<ExportPsdData> {
+    const value: Object = await (native.exportPsd(fd, opts) as Promise<Object>);
     const r = narrowResult(value);
     if (!r.ok || r.data === null) {
       throw new Error(r.error !== null ? r.error.message : 'exportPsd failed');
@@ -2747,6 +2748,28 @@ export class CompositorEngine {
     if (!r.ok || r.data === null) {
       const errObj = r.error;
       throw new Error(errObj !== null ? errObj.message : 'tiff open failed');
+    }
+    const d = r.data;
+    const notes: string[] = [];
+    const rawNotes: Object = d['notes'];
+    if (Array.isArray(rawNotes)) {
+      for (const n of rawNotes as Object[]) {
+        if (typeof n === 'string') {
+          notes.push(n);
+        }
+      }
+    }
+    const outData: PsdOpenData = { width: num(d, 'width'), height: num(d, 'height'), notes: notes };
+    return outData;
+  }
+
+  /** 打开 GIF（P7：单帧=单层；多帧=帧序列图层化，帧 1 在最底）。 */
+  async openGifFile(fd: number): Promise<PsdOpenData> {
+    const value: Object = await (native.openGifFile(fd) as Promise<Object>);
+    const r = narrowResult(value);
+    if (!r.ok || r.data === null) {
+      const errObj = r.error;
+      throw new Error(errObj !== null ? errObj.message : 'gif open failed');
     }
     const d = r.data;
     const notes: string[] = [];

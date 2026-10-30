@@ -24,6 +24,11 @@ std::shared_ptr<const TileGrid> gridFromRgba(uint32_t w, uint32_t h,
 bool importTiffDocument(int fd, int* outWidth, int* outHeight, std::vector<std::string>* notes,
                         std::string& err);
 
+// P7：GIF 文档打开。单帧 → 单层（旧语义）；多帧 → 帧序列图层化
+//（bottom→top = 帧 1..N，PS 打开动画 GIF 同构；delay 不入 v1 档，登记）。
+bool importGifDocument(int fd, int* outWidth, int* outHeight, std::vector<std::string>* notes,
+                       std::string& err);
+
 }  // namespace io
 }  // namespace montage
 

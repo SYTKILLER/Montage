@@ -65,9 +65,110 @@
 #include "io/psd_export.h"
 #include "render/render_loop.h"
 #include "tiles/pixel_probe.h"
+#include "bridge/psd_snap.h"
 
 namespace montage {
 namespace bridge {
+
+// P7：PsdDocSnap 快照构建（ExportPsd/分层 TIFF 导出共用；调用方持 docMutex）。
+void BuildPsdDocSnapLocked(Engine& e, io::PsdDocSnap& snap) {
+    snap.workPath = e.doc().workPath;  // M18d：路径资源导出
+    snap.paths = e.doc().paths;
+    snap.width = e.doc().width;
+    snap.height = e.doc().height;
+    snap.name = e.doc().name;
+    // M22：深色/多模式往返元数据（原 header/ICC/色板/全局块）
+    snap.psdSrcDepth = e.doc().psdSrcDepth;
+    snap.psdSrcMode = e.doc().psdSrcMode;
+    snap.psdSrcChannels = e.doc().psdSrcChannels;
+    snap.psdIccProfile = e.doc().psdIccProfile;
+    snap.psdColorModeData = e.doc().psdColorModeData;
+    snap.globalBlocks = e.doc().psdGlobalExtra;
+    for (const Layer& l : e.doc().layers) {
+        io::PsdLayerSnap pl;
+        pl.name = l.name;
+        pl.visible = l.visible;
+        pl.opacity = l.opacity;
+        pl.blendMode = l.blendMode;
+        pl.clipping = l.clipping;
+        pl.pixels = l.displayPixels();  // P6：导出域 U8（深色层确定性降位，verbatim hash 两侧一致）
+        // M15c：样式派生域 origin 独立于 transform（投影/描边扩展），导出须对齐像素
+        pl.originX = l.effectiveOriginX();
+        pl.originY = l.effectiveOriginY();
+        // M22：深色 verbatim 元数据（源矩形由 reader 捕获存 transform 附字段；此处从
+        // Layer 的 psd* 直拷——指纹重算在 exportPsd 内做）
+        pl.psdSrcSection = l.psdSrcSection;
+        pl.psdChannelIds = l.psdChannelIds;
+        pl.psdChannelLens = l.psdChannelLens;
+        pl.psdImportHash = l.psdImportHash;
+        pl.psdSrcCropped = l.psdSrcCropped;
+        pl.psdRectW = static_cast<uint32_t>(l.transform.width);
+        pl.psdRectH = static_cast<uint32_t>(l.transform.height);
+        pl.srcLeft = l.psdSrcLeft;
+        pl.srcTop = l.psdSrcTop;
+        pl.srcRight = l.psdSrcRight;
+        pl.srcBottom = l.psdSrcBottom;
+        pl.srcMaskLeft = l.psdSrcMaskLeft;
+        pl.srcMaskTop = l.psdSrcMaskTop;
+        pl.srcMaskRight = l.psdSrcMaskRight;
+        pl.srcMaskBottom = l.psdSrcMaskBottom;
+        if (l.mask != nullptr) {
+            pl.maskGrid = l.mask->pixels;
+            pl.maskW = l.mask->width;
+            pl.maskH = l.mask->height;
+            pl.maskOffsetX = l.mask->offsetX;
+            pl.maskOffsetY = l.mask->offsetY;
+            pl.maskOutside = l.mask->outside;
+            pl.maskEnabled = l.mask->enabled;
+        }
+        pl.isAdjustment = l.adjustment != nullptr;
+        pl.vectorMask = l.vectorMask;  // M18d：vmsk 导出
+        if (l.smart != nullptr) {
+            pl.smart = l.smart;  // M21：智能对象导出（SoLd/lnk2 或烘焙降级）
+        }
+        // M15c（PSD-2）：组树 + 降级标记 + 调整层参数
+        pl.id = l.id;
+        pl.parentId = l.parentId;
+        pl.isGroup = l.isGroup;
+        pl.collapsed = l.collapsed;
+        pl.isText = l.text != nullptr;
+        pl.isFill = l.fill != nullptr;
+        // M17c：样式 → lrFX 导出。仅当已启用效果全部可由 lrFX 五类表示（无光泽/斜面/
+        // 渐变叠加/spread）才走「原始像素 + lrFX」；否则维持烘焙像素 + 降级 note，
+        // 避免 PS 端像素已含效果再叠 lrFX 双重应用。
+        if (l.style != nullptr && l.style->enabled) {
+            const LayerStyle& st = *l.style;
+            // M17d：自定义等高线/非默认 Range/图案叠加同样不可由 lrFX PS5 布局承载
+            //（photocraft parse_lrfx 对 contour/range 硬编码 Linear/0.5）→ 走烘焙分流。
+            const bool contourCustom =
+                st.shadowContour.custom || st.isContour.custom || st.ogContour.custom ||
+                st.igContour.custom || st.satinContour.custom || st.bevelContour.custom ||
+                st.bevelGlossContour.custom;
+            const bool allRepresentable =
+                !st.satin && !st.bevel && !st.gradientOverlay && !st.patternOverlay &&
+                !contourCustom && st.shadowSpread == 0.0 && st.isSpread == 0.0 &&
+                st.ogSpread == 0.0 && st.igSpread == 0.0 && st.ogRange == 0.5 &&
+                st.igRange == 0.5;
+            if (allRepresentable) {
+                pl.style = l.style;
+                pl.pixels = l.pixels;  // 原始像素（效果由 lrFX 承载，PS 端渲染）
+                pl.originX = l.transform.originX;
+                pl.originY = l.transform.originY;
+            }
+        }
+        pl.hasStyle = l.style != nullptr && pl.style == nullptr;
+        if (l.adjustment != nullptr) {
+            pl.adjKind = static_cast<int32_t>(l.adjustment->kind);
+            pl.adjInBlack = l.adjustment->inBlack;
+            pl.adjInWhite = l.adjustment->inWhite;
+            pl.adjGamma = l.adjustment->gamma;
+            pl.adjCurveX = l.adjustment->curveX;
+            pl.adjCurveY = l.adjustment->curveY;
+        }
+        snap.layers.push_back(std::move(pl));
+    }
+}
+
 namespace {
 
 constexpr unsigned int kDomain = 0x4D30;
@@ -528,6 +629,69 @@ napi_value OpenTiffFile(napi_env env, napi_callback_info info) {
         std::string err;
         payload->ok = io::importTiffDocument(fd, &payload->width, &payload->height,
                                              &payload->notes, err);
+        if (!payload->ok) {
+            payload->error = err;
+        }
+        auto& e = Engine::get();
+        {
+            std::lock_guard<std::mutex> lk(e.import.mtx);
+            e.import.running = false;
+        }
+        napi_call_threadsafe_function(tsfn, payload, napi_tsfn_nonblocking);
+        napi_release_threadsafe_function(tsfn, napi_tsfn_release);
+    }).detach();
+    return promise;
+}
+
+// P7：GIF 文档打开（单帧=单层；多帧=帧序列图层化——importGifDocument）
+napi_value OpenGifFile(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return makeError(env, kErrBadParam, "openGifFile(fd) requires 1 arg");
+    }
+    int32_t fd = -1;
+    if (napi_get_value_int32(env, argv[0], &fd) != napi_ok || fd < 0) {
+        return makeError(env, kErrBadParam, "openGifFile: invalid fd");
+    }
+    napi_value promise = nullptr;
+    napi_deferred deferred = nullptr;
+    napi_create_promise(env, &deferred, &promise);
+
+    auto* ctx = new OpenCtx();
+    ctx->deferred = deferred;
+    napi_value fn = nullptr;
+    napi_value name = nullptr;
+    napi_create_string_utf8(env, "gifDone", NAPI_AUTO_LENGTH, &name);
+    napi_create_function(env, "onGifDone", NAPI_AUTO_LENGTH, noopJsCallback, nullptr, &fn);
+    napi_status st = napi_create_threadsafe_function(env, fn, nullptr, name, 4, 1, ctx,
+                                                     finalizeOpenCtx, ctx, psdDoneJsCallback,
+                                                     &ctx->tsfn);
+    if (st != napi_ok) {
+        finalizeOpenCtx(env, ctx, nullptr);
+        napi_resolve_deferred(env, deferred, makeError(env, kErrInternal, "create tsfn failed"));
+        return promise;
+    }
+    {
+        auto& e = Engine::get();
+        std::lock_guard<std::mutex> lk(e.import.mtx);
+        if (e.import.running) {
+            close(fd);
+            napi_resolve_deferred(env, deferred,
+                                  makeError(env, kErrBusy, "another import is running"));
+            napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);
+            return promise;
+        }
+        e.import.cancel = false;
+        e.import.progress = 0.0;
+        e.import.running = true;
+    }
+    std::thread([fd, tsfn = ctx->tsfn]() {
+        auto* payload = new PsdPayload();
+        std::string err;
+        payload->ok = io::importGifDocument(fd, &payload->width, &payload->height,
+                                            &payload->notes, err);
         if (!payload->ok) {
             payload->error = err;
         }
@@ -5558,10 +5722,12 @@ napi_value RotateDocumentArbitrary(napi_env env, napi_callback_info info) {
     return DocGeomAsync(env, info, 5);
 }
 
-// M8b：PSD 导出（锁内拍快照 + 扁平化任务，锁外编码写出；fd 全路径接管）
+// M8b：PSD 导出（锁内拍快照 + 扁平化任务，锁外编码写出；fd 全路径接管）。
+// P7：可选 argv[1] = { zip?: boolean, psb?: boolean }——合成图 ZIP 压缩 / 强制 PSB
+//（尺寸 >30000px 已自动升 PSB，此开关覆盖小文档强制版本 2）。
 napi_value ExportPsd(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value argv[1] = {nullptr};
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 1) {
         return makeError(env, kErrBadParam, "exportPsd(fd) requires 1 arg");
@@ -5569,6 +5735,20 @@ napi_value ExportPsd(napi_env env, napi_callback_info info) {
     int32_t fd = -1;
     if (napi_get_value_int32(env, argv[0], &fd) != napi_ok || fd < 0) {
         return makeError(env, kErrBadParam, "exportPsd: invalid fd");
+    }
+    bool zipComposite = false;
+    bool forcePsb = false;
+    if (argc >= 2 && argv[1] != nullptr) {
+        napi_valuetype vt = napi_undefined;
+        if (napi_typeof(env, argv[1], &vt) == napi_ok && vt == napi_object) {
+            napi_value v = nullptr;
+            if (napi_get_named_property(env, argv[1], "zip", &v) == napi_ok && v != nullptr) {
+                napi_get_value_bool(env, v, &zipComposite);
+            }
+            if (napi_get_named_property(env, argv[1], "psb", &v) == napi_ok && v != nullptr) {
+                napi_get_value_bool(env, v, &forcePsb);
+            }
+        }
     }
     auto& e = Engine::get();
     auto* ctx = new ExportCtx();
@@ -5581,101 +5761,9 @@ napi_value ExportPsd(napi_env env, napi_callback_info info) {
             return makeError(env, kErrNoDoc, "exportPsd: no document");
         }
         io::PsdDocSnap snap;
-        snap.workPath = e.doc().workPath;  // M18d：路径资源导出
-        snap.paths = e.doc().paths;
-        snap.width = e.doc().width;
-        snap.height = e.doc().height;
-        snap.name = e.doc().name;
-        // M22：深色/多模式往返元数据（原 header/ICC/色板/全局块）
-        snap.psdSrcDepth = e.doc().psdSrcDepth;
-        snap.psdSrcMode = e.doc().psdSrcMode;
-        snap.psdSrcChannels = e.doc().psdSrcChannels;
-        snap.psdIccProfile = e.doc().psdIccProfile;
-        snap.psdColorModeData = e.doc().psdColorModeData;
-        snap.globalBlocks = e.doc().psdGlobalExtra;
-        for (const Layer& l : e.doc().layers) {
-            io::PsdLayerSnap pl;
-            pl.name = l.name;
-            pl.visible = l.visible;
-            pl.opacity = l.opacity;
-            pl.blendMode = l.blendMode;
-            pl.clipping = l.clipping;
-            pl.pixels = l.displayPixels();  // P6：导出域 U8（深色层确定性降位，verbatim hash 两侧一致）
-            // M15c：样式派生域 origin 独立于 transform（投影/描边扩展），导出须对齐像素
-            pl.originX = l.effectiveOriginX();
-            pl.originY = l.effectiveOriginY();
-            // M22：深色 verbatim 元数据（源矩形由 reader 捕获存 transform 附字段；此处从
-            // Layer 的 psd* 直拷——指纹重算在 exportPsd 内做）
-            pl.psdSrcSection = l.psdSrcSection;
-            pl.psdChannelIds = l.psdChannelIds;
-            pl.psdChannelLens = l.psdChannelLens;
-            pl.psdImportHash = l.psdImportHash;
-            pl.psdSrcCropped = l.psdSrcCropped;
-            pl.psdRectW = static_cast<uint32_t>(l.transform.width);
-            pl.psdRectH = static_cast<uint32_t>(l.transform.height);
-            pl.srcLeft = l.psdSrcLeft;
-            pl.srcTop = l.psdSrcTop;
-            pl.srcRight = l.psdSrcRight;
-            pl.srcBottom = l.psdSrcBottom;
-            pl.srcMaskLeft = l.psdSrcMaskLeft;
-            pl.srcMaskTop = l.psdSrcMaskTop;
-            pl.srcMaskRight = l.psdSrcMaskRight;
-            pl.srcMaskBottom = l.psdSrcMaskBottom;
-            if (l.mask != nullptr) {
-                pl.maskGrid = l.mask->pixels;
-                pl.maskW = l.mask->width;
-                pl.maskH = l.mask->height;
-                pl.maskOffsetX = l.mask->offsetX;
-                pl.maskOffsetY = l.mask->offsetY;
-                pl.maskOutside = l.mask->outside;
-                pl.maskEnabled = l.mask->enabled;
-            }
-            pl.isAdjustment = l.adjustment != nullptr;
-            pl.vectorMask = l.vectorMask;  // M18d：vmsk 导出
-            if (l.smart != nullptr) {
-                pl.smart = l.smart;  // M21：智能对象导出（SoLd/lnk2 或烘焙降级）
-            }
-            // M15c（PSD-2）：组树 + 降级标记 + 调整层参数
-            pl.id = l.id;
-            pl.parentId = l.parentId;
-            pl.isGroup = l.isGroup;
-            pl.collapsed = l.collapsed;
-            pl.isText = l.text != nullptr;
-            pl.isFill = l.fill != nullptr;
-            // M17c：样式 → lrFX 导出。仅当已启用效果全部可由 lrFX 五类表示（无光泽/斜面/
-            // 渐变叠加/spread）才走「原始像素 + lrFX」；否则维持烘焙像素 + 降级 note，
-            // 避免 PS 端像素已含效果再叠 lrFX 双重应用。
-            if (l.style != nullptr && l.style->enabled) {
-                const LayerStyle& st = *l.style;
-                // M17d：自定义等高线/非默认 Range/图案叠加同样不可由 lrFX PS5 布局承载
-                //（photocraft parse_lrfx 对 contour/range 硬编码 Linear/0.5）→ 走烘焙分流。
-                const bool contourCustom =
-                    st.shadowContour.custom || st.isContour.custom || st.ogContour.custom ||
-                    st.igContour.custom || st.satinContour.custom || st.bevelContour.custom ||
-                    st.bevelGlossContour.custom;
-                const bool allRepresentable =
-                    !st.satin && !st.bevel && !st.gradientOverlay && !st.patternOverlay &&
-                    !contourCustom && st.shadowSpread == 0.0 && st.isSpread == 0.0 &&
-                    st.ogSpread == 0.0 && st.igSpread == 0.0 && st.ogRange == 0.5 &&
-                    st.igRange == 0.5;
-                if (allRepresentable) {
-                    pl.style = l.style;
-                    pl.pixels = l.pixels;  // 原始像素（效果由 lrFX 承载，PS 端渲染）
-                    pl.originX = l.transform.originX;
-                    pl.originY = l.transform.originY;
-                }
-            }
-            pl.hasStyle = l.style != nullptr && pl.style == nullptr;
-            if (l.adjustment != nullptr) {
-                pl.adjKind = static_cast<int32_t>(l.adjustment->kind);
-                pl.adjInBlack = l.adjustment->inBlack;
-                pl.adjInWhite = l.adjustment->inWhite;
-                pl.adjGamma = l.adjustment->gamma;
-                pl.adjCurveX = l.adjustment->curveX;
-                pl.adjCurveY = l.adjustment->curveY;
-            }
-            snap.layers.push_back(std::move(pl));
-        }
+        bridge::BuildPsdDocSnapLocked(e, snap);
+        snap.zipComposite = zipComposite;
+        snap.psb = forcePsb;
         ctx->psdSnap = std::move(snap);
         ctx->job = io::BuildFlattenJob(e.doc(), 0, 0, 0, 0);
     }

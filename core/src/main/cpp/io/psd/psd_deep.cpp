@@ -4,10 +4,52 @@
 #include <cmath>
 #include <cstring>
 
+#include <zlib.h>
+
 #include "io/cms/convert.h"
 
 namespace montage {
 namespace psd {
+
+bool zipToBytes(const uint8_t* data, size_t len, size_t rowBytes, size_t rows, bool prediction,
+                std::vector<uint8_t>& out, std::string& err) {
+    const size_t target = rowBytes * rows;
+    if (target == 0) {
+        out.clear();
+        return true;
+    }
+    z_stream zs{};
+    if (inflateInit(&zs) != Z_OK) {
+        err = "zip init failed";
+        return false;
+    }
+    out.assign(target, 0);
+    zs.next_in = const_cast<Bytef*>(data);
+    zs.avail_in = static_cast<uInt>(std::min<size_t>(len, static_cast<size_t>(UINT32_MAX)));
+    zs.next_out = out.data();
+    zs.avail_out = static_cast<uInt>(std::min<size_t>(target, static_cast<size_t>(UINT32_MAX)));
+    const int rc = inflate(&zs, Z_FINISH);
+    inflateEnd(&zs);
+    // Z_OK/Z_BUF_ERROR = 输出满即止（流后允余数据）；Z_STREAM_END = 恰好耗尽
+    if (rc != Z_OK && rc != Z_BUF_ERROR && rc != Z_STREAM_END) {
+        err = "zip inflate failed";
+        return false;
+    }
+    if (zs.total_out < target) {
+        err = "zip truncated";
+        return false;
+    }
+    if (prediction) {
+        // 每行独立：首字节原样，后续字节累加（mod 256）。
+        for (size_t r = 0; r < rows; ++r) {
+            uint8_t* row = out.data() + r * rowBytes;
+            for (size_t i = 1; i < rowBytes; ++i) {
+                row[i] = static_cast<uint8_t>(row[i] + row[i - 1]);
+            }
+        }
+    }
+    return true;
+}
 
 size_t deepRowBytes(size_t width, uint16_t depth) {
     if (depth == 1) {
@@ -230,6 +272,19 @@ std::optional<std::vector<uint8_t>> decodeDeepChannel(int compression, size_t wi
         std::vector<uint8_t> full(rb * height, 0);
         size_t offset = 0;
         if (!rleToBytes(payload, len, offset, rb, height, largeDoc, full.data(), err)) {
+            return std::nullopt;
+        }
+        for (int row = 0; row < ch; ++row) {
+            const size_t srcRow = static_cast<size_t>(cy + row) * rb +
+                                  (crop != nullptr ? deepRowBytes(static_cast<size_t>(cx), depth) : 0);
+            std::memcpy(out.data() + static_cast<size_t>(row) * outRb, full.data() + srcRow, outRb);
+        }
+        return out;
+    }
+    if (compression == 2 || compression == 3) {
+        // P7：ZIP（2）/ ZIP+预测（3）——单 zlib 流整解后裁剪列带（与 RLE 同式）。
+        std::vector<uint8_t> full;
+        if (!zipToBytes(payload, len, rb, height, compression == 3, full, err)) {
             return std::nullopt;
         }
         for (int row = 0; row < ch; ++row) {

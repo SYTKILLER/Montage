@@ -88,6 +88,14 @@ struct PsdDocSnap {
     uint16_t psdSrcChannels = 3;
     std::vector<uint8_t> psdIccProfile;
     std::vector<uint8_t> psdColorModeData;
+
+    // P7 PSB（Large Document）：强制版本 2 写出（u64 偏移段加宽）。未设时尺寸
+    // > 30000px 由 exportPsd 自动升 PSB（PSD v1 矩形上限，PS 同规则）。
+    bool psb = false;
+
+    // P7：合成图（ImageData 段）ZIP 压缩（compression=2，单 zip 流平面序）。
+    // false = RLE（v1 行为不变）。层通道数据不受此开关影响（恒 RLE）。
+    bool zipComposite = false;
 };
 
 struct PsdExportResult {
@@ -100,6 +108,13 @@ struct PsdExportResult {
 
 // fd 所有权移交（成功/失败都关闭）。快照由调用方在 docMutex 内构建。
 PsdExportResult exportPsd(int fd, const PsdDocSnap& snap);
+
+// P7：内存变体（分层 TIFF Layr 块构建等复用；不触 fd）。快照同上。
+PsdExportResult exportPsdToMemory(const PsdDocSnap& snap, std::vector<uint8_t>& out);
+
+// P7：快照合成图扁平化（exportPsd 内部同式：flattenedRgba 直用，否则现场 FlattenVisible；
+// 失败回退全透明底）。分层 TIFF 合成图与 PSD ImageData 共用。
+std::vector<uint8_t> flattenSnapComposite(const PsdDocSnap& snap);
 
 }  // namespace io
 }  // namespace montage

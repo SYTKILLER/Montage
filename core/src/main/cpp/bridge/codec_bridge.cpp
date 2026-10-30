@@ -7,7 +7,10 @@
 
 #include "engine/engine.h"
 #include "io/codecs/codec_table.h"
+#include "io/codecs/gif_codec.h"
+#include "io/codecs/tiff_codec.h"
 #include "io/image_export.h"
+#include "bridge/psd_snap.h"
 
 // M25 编解码批命令面（engine_bridge.cpp 之外独立文件，最小化并行批冲突面）。
 // make* 辅助在 engine_bridge.cpp 匿名命名空间（内链）——此处本地复制同实现，
@@ -81,6 +84,18 @@ struct CodecExportCtx {
     int quality = 90;
     std::vector<uint8_t> encoded;
     uint64_t bytes = 0;
+    // P7：分层 TIFF（tif/tiff 且文档 ≤30000px 且有层）——合成图 + 37724 Layr
+    io::PsdDocSnap psdSnap;
+    bool layered = false;
+    // P7：GIF 多帧（≥2 可见像素层）——每层 displayPixels 全画布帧
+    struct GifFrameSrc {
+        std::shared_ptr<const TileGrid> pixels;
+        double originX = 0.0;
+        double originY = 0.0;
+    };
+    std::vector<GifFrameSrc> gifFrames;
+    uint32_t gifW = 0;
+    uint32_t gifH = 0;
 };
 
 }  // namespace
@@ -129,6 +144,47 @@ napi_value ExportImage(napi_env env, napi_callback_info info) {
             return makeErrorLocal(env, kErrNoDoc, "exportImage: no document");
         }
         ctx->job = io::BuildFlattenJob(e.doc(), 0, 0, 0, 0);
+        // P7：GIF 多帧判定（≥2 可见像素层 → 层=帧）
+        if (format == "gif") {
+            for (const Layer& l : e.doc().layers) {
+                if (!l.visible || l.isGroup || l.adjustment != nullptr) {
+                    continue;
+                }
+                auto px = l.displayPixels();
+                if (px == nullptr || px->tiles.empty()) {
+                    continue;
+                }
+                CodecExportCtx::GifFrameSrc src;
+                src.pixels = std::move(px);
+                src.originX = l.effectiveOriginX();
+                src.originY = l.effectiveOriginY();
+                ctx->gifFrames.push_back(std::move(src));
+                if (ctx->gifFrames.size() >= 64) {
+                    break;  // v1 帧数上限（超出回退合成图单帧）
+                }
+            }
+            if (ctx->gifFrames.size() < 2) {
+                ctx->gifFrames.clear();
+            }
+            ctx->gifW = e.doc().width;
+            ctx->gifH = e.doc().height;
+        }
+        // P7：分层 TIFF 判定（tif/tiff、≤30000px、至少一个层记录——空档回退平铺）
+        if (format == "tif" || format == "tiff") {
+            if (e.doc().width <= 30000 && e.doc().height <= 30000) {
+                bridge::BuildPsdDocSnapLocked(e, ctx->psdSnap);
+                ctx->psdSnap.zipComposite = false;
+                ctx->psdSnap.psb = false;
+                bool anyLayer = false;
+                for (const auto& pl : ctx->psdSnap.layers) {
+                    if (pl.pixels != nullptr || pl.isGroup || pl.isAdjustment) {
+                        anyLayer = true;
+                        break;
+                    }
+                }
+                ctx->layered = anyLayer;
+            }
+        }
     }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
@@ -143,11 +199,82 @@ napi_value ExportImage(napi_env env, napi_callback_info info) {
                 return;
             }
             std::string err;
-            if (!io::codecs::encode(c->format, c->result.rgba.data(), c->result.width,
+            if (!c->gifFrames.empty()) {
+                // P7：层→帧（displayPixels 全画布合成，透明底；每帧独立量化）
+                std::vector<std::vector<uint8_t>> bufs;
+                std::vector<const uint8_t*> fptrs;
+                std::vector<uint16_t> delays;
+                for (const auto& src : c->gifFrames) {
+                    bufs.emplace_back(static_cast<size_t>(c->gifW) * c->gifH * 4, 0);
+                    std::vector<uint8_t>& canvas = bufs.back();
+                    const TileGrid& g = *src.pixels;
+                    const uint32_t gw = g.cols * kTileSize;
+                    const uint32_t gh = g.rows * kTileSize;
+                    std::vector<uint8_t> row(gw * 4);
+                    for (uint32_t y = 0; y < gh; ++y) {
+                        const int64_t dy = static_cast<int64_t>(src.originY) + y;
+                        if (dy < 0 || dy >= static_cast<int64_t>(c->gifH)) {
+                            continue;
+                        }
+                        for (uint32_t tx = 0; tx < g.cols; ++tx) {
+                            const uint32_t x0 = tx * kTileSize;
+                            auto it = g.tiles.find(static_cast<uint32_t>(y / kTileSize) * g.cols + tx);
+                            if (it == g.tiles.end() || it->second == nullptr) {
+                                continue;
+                            }
+                            const uint8_t* tp = it->second->pixels->mapCpu();
+                            if (tp == nullptr) {
+                                continue;
+                            }
+                            std::memcpy(row.data() + static_cast<size_t>(x0) * 4,
+                                        tp + static_cast<size_t>(y % kTileSize) *
+                                                 it->second->pixels->rowBytes(),
+                                        static_cast<size_t>(kTileSize) * 4);
+                            it->second->pixels->unmap();
+                        }
+                        uint8_t* drow = canvas.data() + static_cast<size_t>(dy) * c->gifW * 4;
+                        for (uint32_t x = 0; x < gw; ++x) {
+                            const int64_t dx = static_cast<int64_t>(src.originX) + x;
+                            if (dx < 0 || dx >= static_cast<int64_t>(c->gifW)) {
+                                continue;
+                            }
+                            const uint8_t* s4 = row.data() + static_cast<size_t>(x) * 4;
+                            if (s4[3] != 0) {
+                                uint8_t* d4 = drow + static_cast<size_t>(dx) * 4;
+                                d4[0] = s4[0];
+                                d4[1] = s4[1];
+                                d4[2] = s4[2];
+                                d4[3] = s4[3];
+                            }
+                        }
+                    }
+                    fptrs.push_back(canvas.data());
+                    delays.push_back(10);  // 100ms/帧 v1 固定
+                }
+                if (!io::codecs::gifEncodeFrames(fptrs, c->gifW, c->gifH, delays, 256, false,
+                                                 c->encoded, err)) {
+                    c->encoded.clear();  // 回退合成图单帧
+                }
+            }
+            if (c->encoded.empty()) {
+            if (c->layered) {
+                // P7：分层 TIFF（合成图直用扁平结果；失败回退平铺编码）
+                c->psdSnap.flattenedRgba =
+                    std::make_shared<std::vector<uint8_t>>(c->result.rgba);
+                if (io::codecs::tiffEncodeLayers(c->psdSnap, "deflate", c->encoded, err)) {
+                    // fallthrough to write
+                } else {
+                    c->layered = false;  // 回退平铺
+                    c->encoded.clear();
+                }
+            }
+            if (!c->layered &&
+                !io::codecs::encode(c->format, c->result.rgba.data(), c->result.width,
                                     c->result.height, c->quality, c->encoded, err)) {
                 c->result.ok = false;
                 c->result.error = err;
                 return;
+            }
             }
             size_t off = 0;
             while (off < c->encoded.size()) {

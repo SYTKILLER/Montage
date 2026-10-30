@@ -9,6 +9,7 @@
 #include "engine/engine.h"
 #include "engine/style_ops.h"
 #include "io/codecs/codec_table.h"
+#include "io/codecs/gif_codec.h"
 #include "io/codecs/tiff_codec.h"
 #include "io/psd/psd_import.h"
 #include "io/psd/psd_reader.h"
@@ -141,6 +142,95 @@ bool importTiffDocument(int fd, int* outWidth, int* outHeight, std::vector<std::
     OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Codec",
                  "tiff document open %{public}ux%{public}u layered=%{public}d", w, h,
                  layered ? 1 : 0);
+    return true;
+}
+bool importGifDocument(int fd, int* outWidth, int* outHeight, std::vector<std::string>* notes,
+                       std::string& err) {
+    constexpr off_t kMaxBytes = 512ll * 1024 * 1024;
+    auto& engine = Engine::get();
+    off_t sz = lseek(fd, 0, SEEK_END);
+    if (sz <= 0) {
+        close(fd);
+        err = "empty file";
+        return false;
+    }
+    if (sz > kMaxBytes) {
+        close(fd);
+        err = "gif file too large";
+        return false;
+    }
+    lseek(fd, 0, SEEK_SET);
+    std::vector<uint8_t> data(static_cast<size_t>(sz));
+    size_t got = 0;
+    while (got < data.size()) {
+        const ssize_t n = read(fd, data.data() + got, data.size() - got);
+        if (n <= 0) {
+            break;
+        }
+        got += static_cast<size_t>(n);
+    }
+    close(fd);
+    if (got != data.size()) {
+        err = "read failed";
+        return false;
+    }
+
+    std::vector<codecs::GifFrameRec> frames;
+    if (!codecs::gifDecodeFrames(data.data(), data.size(), frames, err)) {
+        return false;
+    }
+    const uint32_t w = frames.front().img.w;
+    const uint32_t h = frames.front().img.h;
+    const bool multi = frames.size() > 1;
+
+    std::vector<Layer> layers;
+    layers.reserve(frames.size());
+    for (size_t i = 0; i < frames.size(); ++i) {
+        Layer layer;
+        layer.id = engine.nextLayerId();
+        layer.name = multi ? ("帧 " + std::to_string(i + 1)) : "Background";
+        layer.transform.width = w;
+        layer.transform.height = h;
+        layer.pixels = gridFromRgba(w, h, frames[i].img.rgba);
+        if (layer.pixels == nullptr) {
+            err = "gif: grid build failed";
+            return false;
+        }
+        layers.push_back(std::move(layer));
+    }
+    std::vector<std::string> localNotes;
+    if (multi) {
+        localNotes.push_back("动图已按帧拆分为 " + std::to_string(frames.size()) +
+                             " 个图层（帧 1 在最底）。");
+    }
+
+    engine.prepareOpenSlot();
+    engine.resetDocument();
+    {
+        std::lock_guard<std::mutex> lk(engine.docMutex);
+        engine.doc().width = w;
+        engine.doc().height = h;
+        engine.doc().name = "GIF";
+        engine.doc().layers = std::move(layers);
+        engine.doc().activeId = engine.doc().layers.empty()
+                                    ? 0
+                                    : engine.doc().layers.back().id;
+        restyleDocument(engine.doc());
+        engine.bumpRevisionLocked();
+        engine.requestRender();
+    }
+    if (outWidth != nullptr) {
+        *outWidth = static_cast<int>(w);
+    }
+    if (outHeight != nullptr) {
+        *outHeight = static_cast<int>(h);
+    }
+    if (notes != nullptr) {
+        *notes = std::move(localNotes);
+    }
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0x4D30, "Montage.Codec",
+                 "gif document open %{public}ux%{public}u frames=%{public}zu", w, h,
+                 frames.size());
     return true;
 }
 

@@ -7,6 +7,8 @@
 
 #include <cstdio>
 
+#include <zlib.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -266,11 +268,33 @@ class BeWriter {
         }
     }
     size_t size() const { return buf_.size(); }
+    std::vector<uint8_t> takeBuffer() { return std::move(buf_); }
     void patchU32(size_t at, uint32_t v) {
         buf_[at + 0] = static_cast<uint8_t>((v >> 24) & 0xFF);
         buf_[at + 1] = static_cast<uint8_t>((v >> 16) & 0xFF);
         buf_[at + 2] = static_cast<uint8_t>((v >> 8) & 0xFF);
         buf_[at + 3] = static_cast<uint8_t>(v & 0xFF);
+    }
+    void patchU64(size_t at, uint64_t v) {
+        for (int i = 7; i >= 0; --i) {
+            buf_[at + static_cast<size_t>(7 - i)] =
+                static_cast<uint8_t>((v >> (i * 8)) & 0xFF);
+        }
+    }
+    // P7 PSB：段长度字段按版本定宽（PSB = u64）
+    void lenField(size_t at, uint64_t v, bool psb) {
+        if (psb) {
+            patchU64(at, v);
+        } else {
+            patchU32(at, static_cast<uint32_t>(v));
+        }
+    }
+    void writeLenField(uint64_t v, bool psb) {
+        if (psb) {
+            u64(v);
+        } else {
+            u32(static_cast<uint32_t>(v));
+        }
     }
 
     bool flushTo(int fd, std::string* err) const {
@@ -428,14 +452,21 @@ const char* blendToKey(BlendMode m) {
 struct Plane {
     std::vector<uint16_t> counts;   // 每行压缩长
     std::vector<uint8_t> payload;   // 全部行压缩数据
-    uint32_t totalLen() const {     // 含 compression 头
-        return 2u + static_cast<uint32_t>(counts.size()) * 2u +
+    uint32_t totalLen(bool psb = false) const {     // 含 compression 头
+        return 2u + static_cast<uint32_t>(counts.size()) * (psb ? 4u : 2u) +
                static_cast<uint32_t>(payload.size());
     }
-    void writeTo(BeWriter& w) const {
+    void writeTo(BeWriter& w, bool psb = false) const {
         w.u16(1);  // RLE
-        for (uint16_t c : counts) {
-            w.u16(c);
+        if (psb) {
+            // PSB：行计数表 u32（reader rleToBytes/unpackRLE largeDoc 同构）
+            for (uint16_t c : counts) {
+                w.u32(c);
+            }
+        } else {
+            for (uint16_t c : counts) {
+                w.u16(c);
+            }
         }
         w.raw(payload);
     }
@@ -620,11 +651,15 @@ std::vector<uint8_t> buildVmsk(const VectorMaskData& vm, uint32_t w, uint32_t h)
     out.insert(out.end(), records.begin(), records.end());
     return out;
 }
-PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
+// P7：公共核（fd < 0 = 纯内存；sink 非空 = 输出缓冲）
+PsdExportResult exportPsdCommon(int fd, const PsdDocSnap& snap, std::vector<uint8_t>* sink);
+PsdExportResult exportPsdCommon(int fd, const PsdDocSnap& snap, std::vector<uint8_t>* sink) {
     PsdExportResult res;
     if (snap.width == 0 || snap.height == 0) {
         res.error = "psd: empty document";
-        close(fd);
+        if (fd >= 0) {
+            close(fd);
+        }
         return res;
     }
 
@@ -647,8 +682,10 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
     const auto deepFingerprint = [&](const PsdLayerSnap& l) -> uint64_t {
         // 矩形缺省（.montage 打开后 transform 尺寸 = 0 = 用像素尺寸）时从源矩形推导
         //（verbatim 前提 !cropped ⇒ 源矩形 = 导入矩形，reader 指纹语义一致）。
-        uint32_t rectW = rectW;
-        uint32_t rectH = rectH;
+        // P7 修复：旧代码 `uint32_t rectW = rectW` 自引用未初始化（UB）——栈上非零即
+        // 指纹失配、深色 verbatim 回写路径静默失效（测试栈恰零侥幸绿）。
+        uint32_t rectW = l.psdRectW;
+        uint32_t rectH = l.psdRectH;
         if ((rectW == 0 || rectH == 0) && !l.psdSrcCropped) {
             rectW = static_cast<uint32_t>(l.srcRight - l.srcLeft);
             rectH = static_cast<uint32_t>(l.srcBottom - l.srcTop);
@@ -1001,50 +1038,10 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
     emitRange(roots, 0);
     res.layers = static_cast<uint32_t>(layers.size());
 
-    // ---- 合成图（ImageData；快照未携带时现场扁平化） ----
-    std::vector<uint8_t> flat;
-    if (snap.flattenedRgba != nullptr) {
-        flat = *snap.flattenedRgba;
-    } else {
-        FlattenJob job;
-        job.docWidth = snap.width;
-        job.docHeight = snap.height;
-        for (const PsdLayerSnap& l : snap.layers) {
-            if (!l.visible || l.isAdjustment || l.pixels == nullptr) {
-                continue;
-            }
-            FlatLayer fl;
-            fl.blend = l.blendMode;
-            fl.opacity = l.opacity;
-            fl.clipping = l.clipping;
-            fl.visible = true;
-            fl.pixels = l.pixels;  // bridge 拍快照时取 effectivePixels（蒙版已合成）
-            fl.originX = l.originX;
-            fl.originY = l.originY;
-            if (fl.clipping) {
-                for (size_t j = job.layers.size(); j-- > 0;) {
-                    if (job.layers[j].clipping) {
-                        continue;
-                    }
-                    fl.clipBasePixels = job.layers[j].pixels;
-                    fl.clipBaseOriginX = job.layers[j].originX;
-                    fl.clipBaseOriginY = job.layers[j].originY;
-                    break;
-                }
-            }
-            job.layers.push_back(std::move(fl));
-        }
-        FlattenResult fr = FlattenVisible(job, 0, 0, 0, 0);
-        if (!fr.ok || fr.rgba.size() < static_cast<size_t>(snap.width) * snap.height * 4) {
-            fr = FlattenResult{};
-            fr.ok = true;
-            fr.width = snap.width;
-            fr.height = snap.height;
-            fr.rgba.assign(static_cast<size_t>(snap.width) * snap.height * 4, 0);
-        }
-        flat = std::move(fr.rgba);
-    }
-    // 合成图三平面 RLE（planar RGB，直通——PS ImageData 段无 alpha 语义混淆，a 舍弃）
+    // ---- 合成图（ImageData；快照未携带时现场扁平化——P7 提取为 flattenSnapComposite） ----
+    std::vector<uint8_t> flat = flattenSnapComposite(snap);
+    // 合成图三平面 RLE（planar RGB，直通——PS ImageData 段无 alpha 语义混淆，a 舍弃）。
+    // P7：zipComposite 时 RLE 预构建跳过（ZIP 路径直接取原始平面，省一趟 packBits）。
     Plane flatR;
     Plane flatG;
     Plane flatB;
@@ -1056,12 +1053,14 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
                 plane[i] = flat[i * 4 + static_cast<size_t>(c)];
             }
             Plane p;
-            p.counts.resize(snap.height);
-            for (uint32_t r = 0; r < snap.height; ++r) {
-                std::vector<uint8_t> packed = packBitsRow(
-                    plane.data() + static_cast<size_t>(r) * snap.width, snap.width);
-                p.counts[r] = static_cast<uint16_t>(packed.size());
-                p.payload.insert(p.payload.end(), packed.begin(), packed.end());
+            if (!snap.zipComposite) {
+                p.counts.resize(snap.height);
+                for (uint32_t r = 0; r < snap.height; ++r) {
+                    std::vector<uint8_t> packed = packBitsRow(
+                        plane.data() + static_cast<size_t>(r) * snap.width, snap.width);
+                    p.counts[r] = static_cast<uint16_t>(packed.size());
+                    p.payload.insert(p.payload.end(), packed.begin(), packed.end());
+                }
             }
             if (c == 0) {
                 flatR = std::move(p);
@@ -1075,9 +1074,11 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
 
     // ---- Pass 2/3：写文件 ----
     BeWriter w(fd);
+    // P7 PSB：版本 2（u64 偏移段）；显式 psb 标记或尺寸超 PSD v1 矩形上限（30000px，PS 同规则）
+    const bool psb = snap.psb || snap.width > 30000 || snap.height > 30000;
     // Header
     w.ascii("8BPS", 4);
-    w.u16(1);
+    w.u16(psb ? 2 : 1);
     w.zeros(6);
     // M22：深色文档还原原通道数/深度/模式（8-bit RGB 文档 = 4/8/3 不变）。
     w.u16(snap.psdSrcChannels > 0 ? snap.psdSrcChannels : 4);
@@ -1129,11 +1130,12 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
         w.raw(res);
     }
 
-    // Layer & Mask Info（占位回填）
+    // Layer & Mask Info（占位回填；PSB 两级段长均 u64）
+    const bool psbFlag = psb;
     const size_t lmLenAt = w.size();
-    w.u32(0);
+    w.writeLenField(0, psbFlag);
     const size_t liLenAt = w.size();
-    w.u32(0);
+    w.writeLenField(0, psbFlag);
     const size_t countAt = w.size();
     w.i16(static_cast<int16_t>(layers.size()));  // 正数 = 透明度不含合并图
 
@@ -1144,22 +1146,22 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
         w.i32(el.bottom);
         w.i32(el.right);
         if (el.recordType != 0) {
-            // M15c：组/divider/调整层 = 4 条零长通道（reader 按长度跳过）
+            // M15c：组/divider/调整层 = 4 条零长通道（reader 按长度跳过）；PSB 长度字段 u64
             w.u16(4);
             w.i16(0);
-            w.u32(0);
+            w.writeLenField(0, psbFlag);
             w.i16(1);
-            w.u32(0);
+            w.writeLenField(0, psbFlag);
             w.i16(2);
-            w.u32(0);
+            w.writeLenField(0, psbFlag);
             w.i16(-1);
-            w.u32(0);
+            w.writeLenField(0, psbFlag);
         } else if (el.verbatim) {
-            // M22：深色未编辑层——通道信息表原样回写。
+            // M22：深色未编辑层——通道信息表原样回写（长度字段按版本定宽）。
             w.u16(static_cast<uint16_t>(el.vChannelIds.size()));
             for (size_t k = 0; k < el.vChannelIds.size(); ++k) {
                 w.i16(el.vChannelIds[k]);
-                w.u32(static_cast<uint32_t>(el.vChannelLens[k]));
+                w.writeLenField(static_cast<uint64_t>(el.vChannelLens[k]), psbFlag);
             }
         } else if (!el.deepPlanes.empty()) {
             // M22：深色重编码层——[色彩 cc 平面..., alpha]（+蒙版）。
@@ -1167,29 +1169,29 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
             w.u16(static_cast<uint16_t>(chanCount));
             for (size_t k = 0; k < el.deepPlanes.size(); ++k) {
                 w.i16(static_cast<int16_t>(k));
-                w.u32(el.deepPlanes[k].totalLen());
+                w.writeLenField(el.deepPlanes[k].totalLen(psbFlag), psbFlag);
             }
             if (el.hasMask) {
                 w.i16(-2);
-                w.u32(el.maskPlane.totalLen());
+                w.writeLenField(el.maskPlane.totalLen(psbFlag), psbFlag);
             }
         } else {
-            // 通道表 = [nch u16][每通道 id i16 + len u32]（reader/PSD 规范同构）。
+            // 通道表 = [nch u16][每通道 id i16 + len（PSD u32 / PSB u64）]（reader 同构）。
             // 396d006 起此处多写了一个 i16(0) 且 len/id 逆序——单层往返侥幸对齐、
             // 多记录（M15c 组/divider）起整体 2 字节/记录漂移，readPsd truncated。
             const int chanCount = el.hasMask ? 5 : 4;
             w.u16(static_cast<uint16_t>(chanCount));
             w.i16(0);
-            w.u32(el.red.totalLen());
+            w.writeLenField(el.red.totalLen(psbFlag), psbFlag);
             w.i16(1);
-            w.u32(el.green.totalLen());
+            w.writeLenField(el.green.totalLen(psbFlag), psbFlag);
             w.i16(2);
-            w.u32(el.blue.totalLen());
+            w.writeLenField(el.blue.totalLen(psbFlag), psbFlag);
             w.i16(-1);
-            w.u32(el.alpha.totalLen());
+            w.writeLenField(el.alpha.totalLen(psbFlag), psbFlag);
             if (el.hasMask) {
                 w.i16(-2);
-                w.u32(el.maskPlane.totalLen());
+                w.writeLenField(el.maskPlane.totalLen(psbFlag), psbFlag);
             }
         }
         w.ascii("8BIM", 4);
@@ -1326,23 +1328,24 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
         }
         if (!el.deepPlanes.empty()) {
             for (const Plane& p : el.deepPlanes) {
-                p.writeTo(w);
+                p.writeTo(w, psbFlag);
             }
         } else {
-            el.red.writeTo(w);
-            el.green.writeTo(w);
-            el.blue.writeTo(w);
-            el.alpha.writeTo(w);
+            el.red.writeTo(w, psbFlag);
+            el.green.writeTo(w, psbFlag);
+            el.blue.writeTo(w, psbFlag);
+            el.alpha.writeTo(w, psbFlag);
         }
         if (el.hasMask) {
-            el.maskPlane.writeTo(w);
+            el.maskPlane.writeTo(w, psbFlag);
         }
     }
 
     const uint32_t layerInfoLen =
         static_cast<uint32_t>(w.size() - countAt);  // count + records + channel data
-    w.pad2In(liLenAt + 4);  // LayerInfo 数据须偶数（liLenAt 指向长度字段，数据从 +4 起）
-    w.patchU32(liLenAt, static_cast<uint32_t>(w.size() - liLenAt - 4));
+    // LayerInfo 数据须偶数（liLenAt 指向长度字段，数据从 +4（PSD）/ +8（PSB）起）
+    w.pad2In(liLenAt + (psbFlag ? 8u : 4u));
+    w.lenField(liLenAt, w.size() - liLenAt - (psbFlag ? 8u : 4u), psbFlag);
     // global layer mask info（空段）
     w.u32(0);
     // M21：全局附加块——lnk2（内嵌链接文件；u64 长度键）+ 原样透传块
@@ -1393,10 +1396,42 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
             w.pad2In(w.size() - lnk2.size());
         }
     }
-    w.pad2In(lmLenAt + 4);
-    w.patchU32(lmLenAt, static_cast<uint32_t>(w.size() - lmLenAt - 4));
+    w.pad2In(lmLenAt + (psbFlag ? 8u : 4u));
+    w.lenField(lmLenAt, w.size() - lmLenAt - (psbFlag ? 8u : 4u), psbFlag);
 
     // ---- Image Data（合并图） ----
+    // P7：zipComposite = compression 2（单 zip 流，全平面拼接平面序——PSD 规范）。
+    // raws = 深度感知原始平面字节；RLE 回写走 encodePlaneFromBytes（与预构建
+    // flatR/G/B 逐字节同式），zip 失败自动回退 RLE（回归安全）。
+    auto writeImageData = [&](std::vector<std::vector<uint8_t>> raws, uint16_t rleDepth) {
+        if (snap.zipComposite) {
+            size_t total = 0;
+            for (const auto& p : raws) {
+                total += p.size();
+            }
+            uLong bound = compressBound(static_cast<uLong>(std::max<size_t>(total, 1)));
+            std::vector<uint8_t> zbuf(bound);
+            uLongf zlen = static_cast<uLongf>(zbuf.size());
+            std::vector<uint8_t> blob(total);
+            size_t off = 0;
+            for (const auto& p : raws) {
+                if (!p.empty()) {
+                    std::memcpy(blob.data() + off, p.data(), p.size());
+                    off += p.size();
+                }
+            }
+            if (compress2(zbuf.data(), &zlen, blob.data(), static_cast<uLong>(blob.size()),
+                          Z_BEST_SPEED) == Z_OK) {
+                w.u16(2);
+                w.bytes(zbuf.data(), zlen);
+                return;
+            }
+            res.notes.push_back("Composite ZIP compression failed; falling back to RLE.");
+        }
+        for (const auto& raw : raws) {
+            encodePlaneFromBytes(raw, snap.width, snap.height, rleDepth).writeTo(w, psbFlag);
+        }
+    };
     if (snap.psdSrcDepth != 8 || snap.psdSrcMode != 3) {
         // M22 深色：合成图按文档模式/深度回写（扁平 RGBA → 模式色彩平面 + alpha/零补
         // 平面至 srcChannels；bitmap 1 位阈值化）。
@@ -1407,44 +1442,76 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
                 snap.psdColorModeData.size() >= 768 ? snap.psdColorModeData.data() : nullptr;
             auto planes = psd::rgbaToModePlanes(snap.psdSrcMode, flat.data(), n, palette);
             if (planes) {
-                std::vector<Plane> out;
-                out.reserve(snap.psdSrcChannels);
+                std::vector<std::vector<uint8_t>> raws;
+                raws.reserve(snap.psdSrcChannels);
                 for (size_t k = 0; k < planes->size(); ++k) {
-                    out.push_back(encodePlaneFromBytes(
-                        psd::planeToDepth((*planes)[k], snap.psdSrcDepth, snap.width, snap.height),
-                        snap.width, snap.height, snap.psdSrcDepth));
+                    raws.push_back(
+                        psd::planeToDepth((*planes)[k], snap.psdSrcDepth, snap.width, snap.height));
                 }
                 // alpha 平面（合成图无 alpha 语义混淆时补全不透明——PS 以 extra alpha 存）。
                 if (snap.psdSrcChannels > planes->size()) {
                     std::vector<uint8_t> a8(n, 255);
-                    out.push_back(encodePlaneFromBytes(
-                        psd::planeToDepth(a8, snap.psdSrcDepth, snap.width, snap.height), snap.width,
-                        snap.height, snap.psdSrcDepth));
+                    raws.push_back(
+                        psd::planeToDepth(a8, snap.psdSrcDepth, snap.width, snap.height));
                 }
                 // 余下平面（专色通道等）零填充。
                 std::vector<uint8_t> zeros(psd::deepRowBytes(snap.width, snap.psdSrcDepth), 0);
-                while (out.size() < snap.psdSrcChannels) {
-                    out.push_back(encodePlaneFromBytes(zeros, snap.width, snap.height, snap.psdSrcDepth));
+                while (raws.size() < snap.psdSrcChannels) {
+                    raws.push_back(zeros);
                 }
-                for (const Plane& p : out) {
-                    p.writeTo(w);
+                if (snap.zipComposite) {
+                    writeImageData(std::move(raws), snap.psdSrcDepth);
+                } else {
+                    for (const auto& raw : raws) {
+                        encodePlaneFromBytes(raw, snap.width, snap.height, snap.psdSrcDepth)
+                            .writeTo(w, psbFlag);
+                    }
                 }
             } else {
-                flatR.writeTo(w);
-                flatG.writeTo(w);
-                flatB.writeTo(w);
+                const size_t n2 = static_cast<size_t>(snap.width) * snap.height;
+                std::vector<std::vector<uint8_t>> raws(3);
+                for (int c = 0; c < 3; ++c) {
+                    raws[static_cast<size_t>(c)].resize(n2);
+                    for (size_t i = 0; i < n2; ++i) {
+                        raws[static_cast<size_t>(c)][i] = flat[i * 4 + static_cast<size_t>(c)];
+                    }
+                }
+                writeImageData(std::move(raws), 8);
             }
         } else {
-            flatR.writeTo(w);
-            flatG.writeTo(w);
-            flatB.writeTo(w);
+            const size_t n2 = static_cast<size_t>(snap.width) * snap.height;
+            std::vector<std::vector<uint8_t>> raws(3);
+            for (int c = 0; c < 3; ++c) {
+                raws[static_cast<size_t>(c)].resize(n2);
+                for (size_t i = 0; i < n2; ++i) {
+                    raws[static_cast<size_t>(c)][i] = flat[i * 4 + static_cast<size_t>(c)];
+                }
+            }
+            writeImageData(std::move(raws), 8);
         }
+    } else if (snap.zipComposite) {
+        const size_t n = static_cast<size_t>(snap.width) * snap.height;
+        std::vector<std::vector<uint8_t>> raws(3);
+        for (int c = 0; c < 3; ++c) {
+            raws[static_cast<size_t>(c)].resize(n);
+            for (size_t i = 0; i < n; ++i) {
+                raws[static_cast<size_t>(c)][i] = flat[i * 4 + static_cast<size_t>(c)];
+            }
+        }
+        writeImageData(std::move(raws), 8);
     } else {
-        flatR.writeTo(w);
-        flatG.writeTo(w);
-        flatB.writeTo(w);
+        flatR.writeTo(w, psbFlag);
+        flatG.writeTo(w, psbFlag);
+        flatB.writeTo(w, psbFlag);
     }
 
+    // P7：sink 非空 = 内存变体（分层 TIFF Layr 提取）；否则落 fd。
+    if (sink != nullptr) {
+        *sink = w.takeBuffer();
+        res.bytes = sink->size();
+        res.ok = true;
+        return res;
+    }
     if (!w.flushTo(fd, &res.error)) {
         close(fd);
         return res;
@@ -1453,6 +1520,59 @@ PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
     res.ok = true;
     close(fd);
     return res;
+}
+
+PsdExportResult exportPsd(int fd, const PsdDocSnap& snap) {
+    return exportPsdCommon(fd, snap, nullptr);
+}
+
+PsdExportResult exportPsdToMemory(const PsdDocSnap& snap, std::vector<uint8_t>& out) {
+    return exportPsdCommon(-1, snap, &out);
+}
+
+std::vector<uint8_t> flattenSnapComposite(const PsdDocSnap& snap) {
+    std::vector<uint8_t> flat;
+    if (snap.flattenedRgba != nullptr) {
+        flat = *snap.flattenedRgba;
+        return flat;
+    }
+    FlattenJob job;
+    job.docWidth = snap.width;
+    job.docHeight = snap.height;
+    for (const PsdLayerSnap& l : snap.layers) {
+        if (!l.visible || l.isAdjustment || l.pixels == nullptr) {
+            continue;
+        }
+        FlatLayer fl;
+        fl.blend = l.blendMode;
+        fl.opacity = l.opacity;
+        fl.clipping = l.clipping;
+        fl.visible = true;
+        fl.pixels = l.pixels;  // bridge 拍快照时取 effectivePixels（蒙版已合成）
+        fl.originX = l.originX;
+        fl.originY = l.originY;
+        if (fl.clipping) {
+            for (size_t j = job.layers.size(); j-- > 0;) {
+                if (job.layers[j].clipping) {
+                    continue;
+                }
+                fl.clipBasePixels = job.layers[j].pixels;
+                fl.clipBaseOriginX = job.layers[j].originX;
+                fl.clipBaseOriginY = job.layers[j].originY;
+                break;
+            }
+        }
+        job.layers.push_back(std::move(fl));
+    }
+    FlattenResult fr = FlattenVisible(job, 0, 0, 0, 0);
+    if (!fr.ok || fr.rgba.size() < static_cast<size_t>(snap.width) * snap.height * 4) {
+        fr = FlattenResult{};
+        fr.ok = true;
+        fr.width = snap.width;
+        fr.height = snap.height;
+        fr.rgba.assign(static_cast<size_t>(snap.width) * snap.height * 4, 0);
+    }
+    return fr.rgba;
 }
 
 }  // namespace io

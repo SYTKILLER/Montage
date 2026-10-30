@@ -724,8 +724,10 @@ bool tiffDecode(const uint8_t* data, size_t len, CodecImage& out, std::string& e
     return true;
 }
 
-bool tiffEncode(const uint8_t* rgba, uint32_t w, uint32_t h, int bitDepth, bool withAlpha,
-                const std::string& compression, std::vector<uint8_t>& out, std::string& err) {
+// P7：core = tiffEncode 主体 + 可选 ImageSourceData 附加 tag（37724，分层 TIFF）。
+bool tiffEncodeCore(const uint8_t* rgba, uint32_t w, uint32_t h, int bitDepth, bool withAlpha,
+                    const std::string& compression, const std::vector<uint8_t>* isd,
+                    std::vector<uint8_t>& out, std::string& err) {
     if (rgba == nullptr || w == 0 || h == 0 ||
         static_cast<uint64_t>(w) * h > kLimit) {
         err = "tiff encode: bad input";
@@ -801,12 +803,13 @@ bool tiffEncode(const uint8_t* rgba, uint32_t w, uint32_t h, int bitDepth, bool 
         return false;
     }
 
-    // 布局：头 8 + 像素数据 + IFD + 外置值
+    // 布局：头 8 + 像素数据 + IFD + 外置值（+ ImageSourceData）
     size_t stripTotal = 0;
     for (const auto& s : stripData) stripTotal += s.size();
+    const bool hasIsd = isd != nullptr && !isd->empty();
     const size_t ifdPos = 8 + stripTotal;
-    // 条目数：基础 12（含 296/339）+ alpha extraSamples（entry 调用数恒定，与 strips 无关）
-    const int nEntries = doAlpha ? 13 : 12;
+    // 条目数：基础 12（含 296/339）+ alpha extraSamples + ISD（entry 调用数恒定，与 strips 无关）
+    const int nEntries = (doAlpha ? 13 : 12) + (hasIsd ? 1 : 0);
     const size_t ifdBytes = 2 + static_cast<size_t>(nEntries) * 12 + 4;
     const size_t extPos = ifdPos + ifdBytes;
     // 外置值区：bps 数组(若 alpha 4×SHORT=8B>4) + stripOffsets(4×strips) + stripByteCounts
@@ -814,7 +817,8 @@ bool tiffEncode(const uint8_t* rgba, uint32_t w, uint32_t h, int bitDepth, bool 
     const size_t bpsOff = bpsExt ? extPos : 0;
     const size_t soOff = extPos + (bpsExt ? 8 : 0);
     const size_t bcOff = soOff + static_cast<size_t>(strips) * 4;
-    const size_t total = bcOff + static_cast<size_t>(strips) * 4;
+    const size_t isdOff = bcOff + static_cast<size_t>(strips) * 4;
+    const size_t total = isdOff + (hasIsd ? isd->size() : 0);
 
     out.clear();
     out.resize(total, 0);
@@ -878,8 +882,103 @@ bool tiffEncode(const uint8_t* rgba, uint32_t w, uint32_t h, int bitDepth, bool 
         entry(338, 3, 1, 2);  // unassociated alpha
     }
     entry(339, 3, 1, 1);  // sample format uint
+    if (hasIsd) {
+        // P7：ImageSourceData（37724，type UNDEFINED）——外置数据在 ext 值区之后
+        std::memcpy(out.data() + isdOff, isd->data(), isd->size());
+        entry(37724, 7, static_cast<uint32_t>(isd->size()), static_cast<uint32_t>(isdOff));
+    }
     w32(e, 0);  // 下一个 IFD = 无
     return true;
+}
+
+bool tiffEncode(const uint8_t* rgba, uint32_t w, uint32_t h, int bitDepth, bool withAlpha,
+                const std::string& compression, std::vector<uint8_t>& out, std::string& err) {
+    return tiffEncodeCore(rgba, w, h, bitDepth, withAlpha, compression, nullptr, out, err);
+}
+
+// ---------- P7：分层 TIFF 写出（合成图 + 37724 ImageSourceData/Layr） ----------
+
+bool tiffEncodeLayers(const PsdDocSnap& snap, const std::string& compression,
+                      std::vector<uint8_t>& out, std::string& err) {
+    out.clear();
+    if (snap.width == 0 || snap.height == 0) {
+        err = "tiff layers: empty document";
+        return false;
+    }
+    if (snap.width > 30000 || snap.height > 30000) {
+        // PSD v1 层记录矩形域上限；经典 TIFF 合成图 >4GB 同因（BigTIFF 写出 v1 不做）
+        err = "tiff layers: document exceeds 30000px (use PSD/PSB)";
+        return false;
+    }
+    // 1) 层信息段提取：exportPsdToMemory（v1 布局，尺寸上限已保证不触发 PSB）→
+    //    Layer Info content = [count i16][records+channels] → Layr = [count u32][records+channels]
+    PsdDocSnap psdSnap = snap;
+    psdSnap.psb = false;
+    psdSnap.zipComposite = false;
+    std::vector<uint8_t> psdBytes;
+    const PsdExportResult pr = exportPsdToMemory(psdSnap, psdBytes);
+    if (!pr.ok || psdBytes.size() < 30) {
+        err = pr.error.empty() ? "tiff layers: psd layer encode failed" : pr.error;
+        return false;
+    }
+    auto be32 = [&](size_t p) -> uint32_t {
+        if (p + 4 > psdBytes.size()) return 0;
+        return (static_cast<uint32_t>(psdBytes[p]) << 24) |
+               (static_cast<uint32_t>(psdBytes[p + 1]) << 16) |
+               (static_cast<uint32_t>(psdBytes[p + 2]) << 8) | static_cast<uint32_t>(psdBytes[p + 3]);
+    };
+    size_t p = 26;  // sig4+ver2+res6+ch2+h4+w4+depth2+mode2
+    const uint32_t cmdLen = be32(p);
+    p += 4 + cmdLen;
+    const uint32_t resLen = be32(p);
+    p += 4 + resLen;
+    if (p + 8 > psdBytes.size()) {
+        err = "tiff layers: psd layout truncated";
+        return false;
+    }
+    const size_t liPos = p + 4;  // lmLen 字段后 = Layer Info 长度字段
+    const uint32_t liLen = be32(liPos);
+    if (liLen < 2 || liPos + 4 + liLen > psdBytes.size()) {
+        err = "tiff layers: layer info truncated";
+        return false;
+    }
+    const uint8_t* content = psdBytes.data() + liPos + 4;
+    const uint32_t layerCount = static_cast<uint32_t>(static_cast<uint16_t>(
+        (content[0] << 8) | content[1]));
+    if (layerCount == 0) {
+        err = "tiff layers: no layers";
+        return false;
+    }
+    // Layr 载荷 = [count u32 BE][records+channels]（buildSyntheticPsd 读取契约同构）
+    std::vector<uint8_t> layr;
+    layr.reserve(static_cast<size_t>(liLen) + 2);
+    layr.push_back(static_cast<uint8_t>(layerCount >> 24));
+    layr.push_back(static_cast<uint8_t>(layerCount >> 16));
+    layr.push_back(static_cast<uint8_t>(layerCount >> 8));
+    layr.push_back(static_cast<uint8_t>(layerCount));
+    layr.insert(layr.end(), content + 2, content + liLen);
+
+    // 2) ImageSourceData = "Photoshop 3.0\0"（对齐 4）+ 8BIM Layr 块（偶对齐）
+    std::vector<uint8_t> isd;
+    isd.reserve(16 + 12 + layr.size() + 1);
+    const char sig[14] = {'P', 'h', 'o', 't', 'o', 's', 'h', 'o', 'p', ' ', '3', '.', '0', '\0'};
+    isd.insert(isd.end(), sig, sig + 14);
+    while (isd.size() % 4 != 0) {
+        isd.push_back(0);
+    }
+    isd.insert(isd.end(), {'8', 'B', 'I', 'M', 'L', 'a', 'y', 'r'});
+    isd.push_back(static_cast<uint8_t>(layr.size() >> 24));
+    isd.push_back(static_cast<uint8_t>(layr.size() >> 16));
+    isd.push_back(static_cast<uint8_t>(layr.size() >> 8));
+    isd.push_back(static_cast<uint8_t>(layr.size()));
+    isd.insert(isd.end(), layr.begin(), layr.end());
+    if (layr.size() % 2 == 1) {
+        isd.push_back(0);
+    }
+
+    // 3) 合成图（快照未携带时现场扁平化）+ 8-bit RGBA core 写出
+    std::vector<uint8_t> flat = flattenSnapComposite(snap);
+    return tiffEncodeCore(flat.data(), snap.width, snap.height, 8, true, compression, &isd, out, err);
 }
 
 // ---------- Photoshop 分层 tag（37724 ImageSourceData → 合成 PSD 容器喂 psd_reader） ----------
@@ -933,6 +1032,9 @@ bool buildSyntheticPsd(const uint8_t* layr, size_t len, bool psb, std::vector<ui
     out.reserve(38 + lmLen);
     // 文件头
     out.insert(out.end(), {'8', 'B', 'P', 'S'});
+    // P7 修复：版本为 u16——旧代码只 push 1 字节（头整体错位 1B → version 读成
+    // 0x0100=256 恒拒），分层 TIFF 导入从未真正通过、恒被合成图回退掩盖。
+    out.push_back(0);
     out.push_back(psb ? 2 : 1);  // 版本（PSB=2）
     for (int i = 0; i < 6; ++i) out.push_back(0);
     out.push_back(0); out.push_back(3);  // channels=3（大端）

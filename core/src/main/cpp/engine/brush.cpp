@@ -595,7 +595,8 @@ const uint8_t* StrokeDraft::baseAt(int gx, int gy) const {
 }
 
 // publish 语义（对拍 publish()）：瓦片 = base + color × coverage × opacity；
-// 橡皮 = destinationOut。直通 alpha 域换算。void StrokeDraft::paintTile(uint32_t key) {
+// 橡皮 = destinationOut。直通 alpha 域换算。
+void StrokeDraft::paintTile(uint32_t key) {
     auto covIt = coverage_.find(key);
     auto workIt = work_.find(key);
     if (covIt == coverage_.end() || workIt == work_.end()) {

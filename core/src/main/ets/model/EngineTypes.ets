@@ -302,6 +302,12 @@ export interface ExportPsdData {
   notes: string[];
 }
 
+/** PSD 导出选项（P7：合成图 ZIP 压缩 / 强制 PSB；尺寸 >30000px 自动升 PSB 无需开关）。 */
+export interface PsdExportOptions {
+  zip?: boolean;
+  psb?: boolean;
+}
+
 /** 直方图（getHistogram 的 data，M9a；0..255 各 256 bin，透明区不计）。 */
 export interface HistogramData {
   luma: number[];

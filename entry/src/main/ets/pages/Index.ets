@@ -821,6 +821,38 @@ struct Index {
           });
           return;
         }
+        // P7：GIF 多帧文档打开（单帧=单层；多帧=帧序列图层化）
+        const tiffHead = String.fromCharCode(bin[0], bin[1]);
+        const isTiff =
+            (bin[0] === 0x49 && bin[1] === 0x49) || (bin[0] === 0x4D && bin[1] === 0x4D);
+        if (tiffHead === 'II' || tiffHead === 'MM' || isTiff) {
+          this.engine.openTiffFile(f.fd).then((dd: PsdOpenData): void => {
+            this.docW = dd.width;
+            this.docH = dd.height;
+            this.docOpen = true;
+            this.log(`调试直通打开(TIFF): ${dd.width}x${dd.height} notes=${dd.notes.length}`);
+            for (const nt of dd.notes) {
+              this.log(`  note: ${nt}`);
+            }
+          }).catch((e: BusinessError): void => {
+            this.log(`调试直通打开失败(TIFF): ${e.message}`);
+          });
+          return;
+        }
+        if (head === 'GIF8') {
+          this.engine.openGifFile(f.fd).then((dd: PsdOpenData): void => {
+            this.docW = dd.width;
+            this.docH = dd.height;
+            this.docOpen = true;
+            this.log(`调试直通打开(GIF): ${dd.width}x${dd.height} notes=${dd.notes.length}`);
+            for (const nt of dd.notes) {
+              this.log(`  note: ${nt}`);
+            }
+          }).catch((e: BusinessError): void => {
+            this.log(`调试直通打开失败(GIF): ${e.message}`);
+          });
+          return;
+        }
         this.engine.openFileFromFd(f.fd).then((dd: OpenFileData): void => {
           this.docW = dd.width;
           this.docH = dd.height;
@@ -4243,6 +4275,8 @@ struct Index {
         this.openProjectByUri(uris[0]);
       } else if (uri.endsWith('.tif') || uri.endsWith('.tiff')) {
         this.openTiffByUri(uris[0]);
+      } else if (uri.endsWith('.gif')) {
+        this.openGifByUri(uris[0]);
       } else {
         this.openByUri(uris[0]);
       }
@@ -4270,6 +4304,27 @@ struct Index {
       this.importing = false;
       this.busyText = '';
       this.log(`PSD 打开失败: ${e.message}`);
+    });
+  }
+
+  private openGifByUri(uri: string): void {
+    const f = fs.openSync(uri, fs.OpenMode.READ_ONLY);
+    this.importing = true;
+    this.busyText = 'GIF 解析中…';
+    this.engine.openGifFile(f.fd).then((d: PsdOpenData): void => {
+      this.importing = false;
+      this.busyText = '';
+      this.docW = d.width;
+      this.docH = d.height;
+      this.afterDocChanged();
+      this.log(`GIF 打开完成 ${d.width}x${d.height}，${d.notes.length} 条提示`);
+      for (let i = 0; i < d.notes.length && i < 8; i++) {
+        this.log(`提示: ${d.notes[i]}`);
+      }
+    }).catch((e: BusinessError): void => {
+      this.importing = false;
+      this.busyText = '';
+      this.log(`GIF 打开失败: ${e.message}`);
     });
   }
 

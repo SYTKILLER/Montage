@@ -16,6 +16,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"openFileFromFd", nullptr, montage::bridge::OpenFileFromFd, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"openPsdFile", nullptr, montage::bridge::OpenPsdFile, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"openTiffFile", nullptr, montage::bridge::OpenTiffFile, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"openGifFile", nullptr, montage::bridge::OpenGifFile, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"exportImage", nullptr, montage::bridge::ExportImage, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getCodecCapabilities", nullptr, montage::bridge::GetCodecCapabilities, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"saveProject", nullptr, montage::bridge::SaveProject, nullptr, nullptr, nullptr, napi_default, nullptr},

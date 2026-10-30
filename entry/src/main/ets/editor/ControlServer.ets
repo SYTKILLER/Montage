@@ -379,6 +379,16 @@ export class ControlServer {
       const payload: Record<string, Object> = {};
       if (this.engine !== null) {
         payload['stats'] = this.engine.getStats() as Object as Record<string, Object>;
+        // P7 E2E：层清单镜像（id/name/visible——GIF 帧序列/分层 TIFF 导入断言用）
+        const lyr: Object[] = [];
+        for (const l of this.engine.getLayerListSnapshot()) {
+          const lo: Record<string, Object> = {};
+          lo['id'] = l.id as Object;
+          lo['name'] = l.name as Object;
+          lo['visible'] = l.visible as Object;
+          lyr.push(lo as Object);
+        }
+        payload['layers'] = lyr as Object;
       }
       const acts = automation.listActions();
       if (acts.value !== undefined) {

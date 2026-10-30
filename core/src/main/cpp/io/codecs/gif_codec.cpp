@@ -1,5 +1,6 @@
 #include "io/codecs/gif_codec.h"
 
+#include <cstdio>
 #include <cstring>
 #include <unordered_map>
 
@@ -428,6 +429,346 @@ bool gifEncode(const uint8_t* rgba, uint32_t w, uint32_t h, int maxColors, bool 
     }
     out.push_back(0);  // 数据块终止
     out.push_back(0x3B);  // trailer
+    return true;
+}
+
+// ---------- P7：多帧读写 ----------
+
+namespace {
+
+// 单帧图像块解码 → 索引 + 几何（descriptor 已越过 LCT）。
+bool decodeGifImageBlock(const uint8_t* data, size_t len, size_t& pos, uint16_t& fw, uint16_t& fh,
+                         uint16_t& fleft, uint16_t& ftop, bool& interlace,
+                         std::vector<uint8_t>& lct, const std::vector<uint8_t>& gct,
+                         std::vector<uint8_t>& indices, std::string& err) {
+    if (pos + 9 > len) {
+        err = "gif: image descriptor truncated";
+        return false;
+    }
+    fleft = rdU16(data + pos);
+    ftop = rdU16(data + pos + 2);
+    fw = rdU16(data + pos + 4);
+    fh = rdU16(data + pos + 6);
+    const uint8_t ipacked = data[pos + 8];
+    pos += 9;
+    if (fw == 0 || fh == 0 || static_cast<uint64_t>(fw) * fh > kLimit) {
+        err = "gif: frame size out of limits";
+        return false;
+    }
+    interlace = (ipacked & 0x40) != 0;
+    lct.clear();
+    if (ipacked & 0x80) {
+        const size_t n = static_cast<size_t>(3) * (1u << ((ipacked & 7) + 1));
+        if (pos + n > len) {
+            err = "gif: lct truncated";
+            return false;
+        }
+        lct.assign(data + pos, data + pos + n);
+        pos += n;
+    }
+    if (pos >= len) {
+        err = "gif: missing lzw min code size";
+        return false;
+    }
+    const int minCodeSize = data[pos++];
+    std::vector<uint8_t> stream;
+    while (pos < len) {
+        const uint8_t sz = data[pos++];
+        if (sz == 0) {
+            break;
+        }
+        if (pos + sz > len) {
+            err = "gif: lzw data truncated";
+            return false;
+        }
+        stream.insert(stream.end(), data + pos, data + pos + sz);
+        pos += sz;
+    }
+    const std::vector<uint8_t>& pal = lct.empty() ? gct : lct;
+    if (pal.empty()) {
+        err = "gif: no color table";
+        return false;
+    }
+    if (!lzwDecode(stream.data(), stream.size(), minCodeSize, indices,
+                   static_cast<size_t>(fw) * fh, err)) {
+        return false;
+    }
+    if (indices.size() < static_cast<size_t>(fw) * fh) {
+        err = "gif: index stream short";
+        return false;
+    }
+    return true;
+}
+
+// 索引 → RGBA 行展开（interlace 行序还原 + 透明索引）
+void expandGifFrame(const std::vector<uint8_t>& indices, const std::vector<uint8_t>& pal,
+                    int transIdx, uint16_t fw, uint16_t fh, bool interlace, uint8_t* outRgba,
+                    size_t outStride) {
+    static constexpr int kStart[4] = {0, 4, 2, 1};
+    static constexpr int kStep[4] = {8, 8, 4, 2};
+    std::vector<int> rowMap;
+    rowMap.reserve(fh);
+    if (!interlace) {
+        for (int y = 0; y < fh; ++y) {
+            rowMap.push_back(y);
+        }
+    } else {
+        for (int pass = 0; pass < 4; ++pass) {
+            for (int y = kStart[pass]; y < fh; y += kStep[pass]) {
+                rowMap.push_back(y);
+            }
+        }
+    }
+    for (int y = 0; y < fh; ++y) {
+        const int dy = rowMap[y];
+        uint8_t* drow = outRgba + static_cast<size_t>(dy) * outStride;
+        for (int x = 0; x < fw; ++x) {
+            const uint8_t idx = indices[static_cast<size_t>(y) * fw + x];
+            const size_t pe = static_cast<size_t>(idx) * 3;
+            drow[x * 4 + 0] = pe + 2 < pal.size() ? pal[pe + 0] : 0;
+            drow[x * 4 + 1] = pe + 2 < pal.size() ? pal[pe + 1] : 0;
+            drow[x * 4 + 2] = pe + 2 < pal.size() ? pal[pe + 2] : 0;
+            drow[x * 4 + 3] = (transIdx >= 0 && idx == transIdx) ? 0 : 255;
+        }
+    }
+}
+
+}  // namespace
+
+bool gifDecodeFrames(const uint8_t* data, size_t len, std::vector<GifFrameRec>& out,
+                     std::string& err) {
+    out.clear();
+    if (len < 13) {
+        err = "gif: truncated header";
+        return false;
+    }
+    if (std::memcmp(data, "GIF87a", 6) != 0 && std::memcmp(data, "GIF89a", 6) != 0) {
+        err = "gif: bad magic";
+        return false;
+    }
+    uint16_t sw = rdU16(data + 6);
+    uint16_t sh = rdU16(data + 8);
+    const uint8_t packed = data[10];
+    size_t pos = 13;
+    std::vector<uint8_t> gct;
+    if (packed & 0x80) {
+        const size_t n = static_cast<size_t>(3) * (1u << ((packed & 7) + 1));
+        if (pos + n > len) {
+            err = "gif: gct truncated";
+            return false;
+        }
+        gct.assign(data + pos, data + pos + n);
+        pos += n;
+    }
+
+    // 全画布：screen 尺寸（0 时随首帧升级）
+    uint32_t cw = sw;
+    uint32_t chh = sh;
+    std::vector<uint8_t> canvas;  // 当前合成态（直 alpha）
+    bool canvasValid = false;
+
+    // GCE 状态（作用于紧随的图像块）
+    int transIdx = -1;
+    uint16_t delayCs = 0;
+    uint8_t disposal = 0;
+    int frameCount = 0;
+
+    while (pos < len) {
+        const uint8_t block = data[pos++];
+        if (block == 0x3B) {
+            break;
+        }
+        if (block == 0x21) {
+            if (pos >= len) {
+                break;
+            }
+            const uint8_t label = data[pos++];
+            if (label == 0xF9 && pos + 5 <= len && data[pos] == 4) {  // GCE
+                const uint8_t gpacked = data[pos + 1];
+                delayCs = rdU16(data + pos + 2);
+                transIdx = (gpacked & 0x01) ? data[pos + 4] : -1;
+                disposal = (gpacked >> 2) & 0x07;
+                pos += 6;
+            } else {
+                // 通用子块跳过（应用扩展/注释/纯文本）
+                while (pos < len) {
+                    const uint8_t sz = data[pos++];
+                    if (sz == 0) {
+                        break;
+                    }
+                    pos += sz;
+                }
+            }
+            continue;
+        }
+        if (block == 0x2C) {
+            uint16_t fw = 0;
+            uint16_t fh = 0;
+            uint16_t fleft = 0;
+            uint16_t ftop = 0;
+            bool interlace = false;
+            std::vector<uint8_t> lct;
+            std::vector<uint8_t> indices;
+            if (!decodeGifImageBlock(data, len, pos, fw, fh, fleft, ftop, interlace, lct, gct,
+                                     indices, err)) {
+                return false;
+            }
+            // 画布随首帧定尺寸
+            if (!canvasValid) {
+                if (cw == 0) {
+                    cw = fw;
+                }
+                if (chh == 0) {
+                    chh = fh;
+                }
+                if (cw == 0 || chh == 0 ||
+                    static_cast<uint64_t>(cw) * chh > kLimit) {
+                    err = "gif: canvas size out of limits";
+                    return false;
+                }
+                canvas.assign(static_cast<size_t>(cw) * chh * 4, 0);
+                canvasValid = true;
+            }
+            // disposal 2（恢复背景 = 恢复透明）：先清帧矩形
+            if (disposal == 2 && frameCount > 0) {
+                // 作用于「上一帧矩形」——v1 简化：清全画布透明（逐帧独立叠加序列在
+                // 导入端按层取用，全清语义对常见导出器帧序列无损；组合帧留 v1 登记）
+                std::fill(canvas.begin(), canvas.end(), 0);
+            }
+            const std::vector<uint8_t>& pal = lct.empty() ? gct : lct;
+            if (static_cast<uint64_t>(fleft) + fw > cw || static_cast<uint64_t>(ftop) + fh > chh) {
+                err = "gif: frame exceeds canvas";
+                return false;
+            }
+            // 帧矩形直拷到画布（不透明像素覆盖）
+            std::vector<uint8_t> frameRgba(static_cast<size_t>(fw) * fh * 4, 0);
+            expandGifFrame(indices, pal, transIdx, fw, fh, interlace, frameRgba.data(),
+                           static_cast<size_t>(fw) * 4);
+            for (uint32_t r = 0; r < fh; ++r) {
+                uint8_t* drow = canvas.data() + (static_cast<size_t>(ftop) + r) * cw * 4 +
+                                static_cast<size_t>(fleft) * 4;
+                const uint8_t* srow = frameRgba.data() + static_cast<size_t>(r) * fw * 4;
+                for (uint32_t x = 0; x < fw; ++x) {
+                    if (srow[x * 4 + 3] != 0) {
+                        drow[x * 4 + 0] = srow[x * 4 + 0];
+                        drow[x * 4 + 1] = srow[x * 4 + 1];
+                        drow[x * 4 + 2] = srow[x * 4 + 2];
+                        drow[x * 4 + 3] = srow[x * 4 + 3];
+                    }
+                }
+            }
+            GifFrameRec rec;
+            rec.img.w = cw;
+            rec.img.h = chh;
+            rec.img.rgba = canvas;
+            rec.delayCs = delayCs;
+            out.push_back(std::move(rec));
+            ++frameCount;
+            if (out.size() > 512) {
+                err = "gif: too many frames";
+                return false;
+            }
+            // GCE 只作用于单帧
+            transIdx = -1;
+            delayCs = 0;
+            disposal = 0;
+            continue;
+        }
+        char posbuf[32];
+        std::snprintf(posbuf, sizeof(posbuf), "%02x@%zu", block, pos - 1);
+        err = std::string("gif: unknown block ") + posbuf;
+        return false;
+    }
+    if (out.empty()) {
+        err = "gif: no image data";
+        return false;
+    }
+    return true;
+}
+
+bool gifEncodeFrames(const std::vector<const uint8_t*>& frames, uint32_t w, uint32_t h,
+                     const std::vector<uint16_t>& delaysCs, int maxColors, bool dither,
+                     std::vector<uint8_t>& out, std::string& err) {
+    if (frames.empty() || frames.size() != delaysCs.size()) {
+        err = "gif encode frames: empty or size mismatch";
+        return false;
+    }
+    if (w == 0 || h == 0 || static_cast<uint64_t>(w) * h > kLimit) {
+        err = "gif encode frames: bad canvas size";
+        return false;
+    }
+    if (maxColors < 2 || maxColors > 256) {
+        maxColors = 256;
+    }
+    out.clear();
+    out.insert(out.end(), {'G', 'I', 'F', '8', '9', 'a'});
+    wrU16(out, static_cast<uint16_t>(w));
+    wrU16(out, static_cast<uint16_t>(h));
+    out.push_back(0x70);  // 无 GCT（逐帧 LCT；bit7=0 防解码器误读 6B 伪表）
+    out.push_back(0);     // bg
+    out.push_back(0);     // aspect
+    // NETSCAPE2.0 循环扩展（无限循环）
+    out.insert(out.end(), {0x21, 0xFF, 0x0B});
+    const char ns[] = "NETSCAPE2.0";
+    out.insert(out.end(), ns, ns + 11);
+    out.insert(out.end(), {0x03, 0x01, 0x00, 0x00, 0x00});  // 子块：循环 u16=0 + 终止
+    for (size_t f = 0; f < frames.size(); ++f) {
+        const uint8_t* rgba = frames[f];
+        if (rgba == nullptr) {
+            err = "gif encode frames: null frame";
+            return false;
+        }
+        std::vector<uint8_t> palette;
+        std::vector<uint8_t> indices;
+        const int transIdx = quantizeImage(rgba, w, h, maxColors, dither, palette, indices);
+        const int nColors = static_cast<int>(palette.size() / 3);
+        if (nColors < 1) {
+            err = "gif encode frames: empty palette";
+            return false;
+        }
+        int gctBits = 1;
+        while ((1 << (gctBits + 1)) < nColors) {
+            ++gctBits;
+        }
+        const int lctSize = 1 << (gctBits + 1);
+        const int minCodeSize = gctBits + 1 < 2 ? 2 : gctBits + 1;
+        // GCE（delay + 透明）
+        out.push_back(0x21);
+        out.push_back(0xF9);
+        out.push_back(4);
+        out.push_back(static_cast<uint8_t>(transIdx >= 0 ? 0x01 : 0x00));
+        wrU16(out, delaysCs[f]);
+        out.push_back(static_cast<uint8_t>(transIdx >= 0 ? transIdx : 0));
+        out.push_back(0);
+        // 图像描述符（LCT）
+        out.push_back(0x2C);
+        wrU16(out, 0);
+        wrU16(out, 0);
+        wrU16(out, static_cast<uint16_t>(w));
+        wrU16(out, static_cast<uint16_t>(h));
+        out.push_back(static_cast<uint8_t>(0x80 | gctBits));
+        for (int i = 0; i < lctSize; ++i) {
+            if (i < nColors) {
+                out.push_back(palette[i * 3 + 0]);
+                out.push_back(palette[i * 3 + 1]);
+                out.push_back(palette[i * 3 + 2]);
+            } else {
+                out.insert(out.end(), 3, 0);
+            }
+        }
+        out.push_back(static_cast<uint8_t>(minCodeSize));
+        std::vector<uint8_t> lzw;
+        lzwEncode(indices, minCodeSize, lzw);
+        size_t off = 0;
+        while (off < lzw.size()) {
+            const size_t n = std::min<size_t>(255, lzw.size() - off);
+            out.push_back(static_cast<uint8_t>(n));
+            out.insert(out.end(), lzw.begin() + off, lzw.begin() + off + n);
+            off += n;
+        }
+        out.push_back(0);  // 数据块终止
+    }
+    out.push_back(0x3B);
     return true;
 }
 

@@ -677,6 +677,24 @@ bool decodeChannel(int compression, int width, int height, const std::vector<uin
         }
         return true;
     }
+    if (compression == 2 || compression == 3) {
+        // P7：ZIP（2）/ ZIP+预测（3）——单 zlib 流整解后同 raw 裁剪。
+        std::vector<uint8_t> full;
+        if (!zipToBytes(payload.data(), payload.size(), static_cast<size_t>(width),
+                        static_cast<size_t>(height), compression == 3, full, err)) {
+            return false;
+        }
+        if (crop == nullptr) {
+            out = std::move(full);
+            return true;
+        }
+        out.assign(static_cast<size_t>(cw) * ch, 0);
+        for (int row = 0; row < ch; ++row) {
+            const uint8_t* src = full.data() + static_cast<size_t>(crop->y + row) * width + crop->x;
+            std::memcpy(out.data() + static_cast<size_t>(row) * cw, src, static_cast<size_t>(cw));
+        }
+        return true;
+    }
     if (compression == 1) {
         out.assign(static_cast<size_t>(cw) * ch, 0);
         size_t offset = 0;
@@ -768,6 +786,22 @@ void decodeFlatComposite(const uint8_t* data, Cursor& c, bool isPSB, int width, 
             }
             planesRaw[k] = std::move(payload);
         }
+    } else if (compression == 2 || compression == 3) {
+        // P7：ZIP（2）/ ZIP+预测（3）——单 zlib 流覆盖全通道平面序（PSD 规范同 RLE
+        // 布局去行计数表）。预测按行（每平面 h 行 × rb 字节）逐行累加还原。
+        const size_t remaining = c.size() - c.offset;
+        std::vector<uint8_t> all;
+        std::string zerr;
+        if (!zipToBytes(data + c.offset, remaining, rb,
+                        static_cast<size_t>(height) * channels, compression == 3, all, zerr)) {
+            return;
+        }
+        const size_t planeSize = rb * static_cast<size_t>(height);
+        for (size_t k = 0; k < channels; ++k) {
+            planesRaw[k].assign(all.begin() + static_cast<std::ptrdiff_t>(k * planeSize),
+                                all.begin() + static_cast<std::ptrdiff_t>((k + 1) * planeSize));
+        }
+        c.offset = c.size();
     } else {
         return;
     }
@@ -1060,6 +1094,10 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
     if (layerSection < 4) {
         // 无图层段（扁平 PSD）：M22 起解码合成图（ImageData）段为单背景层——
         // 16/32/CMYK/Lab/Gray 的扁平文件在互换场景常见；截断/失败保持空文档旧行为。
+        // P7 修复：合成图恒在 Layer&Mask 段之后——先跳到段尾再解码（layerSection
+        // 为 1/2 等非零小值时旧代码会把段内残余字节当 compression 读，M22 扁平档
+        // 真文件 layerSection=0 侥幸不触发）。
+        c.offset = layerSectionEnd;
         decodeFlatComposite(data, c, isPSB, static_cast<int>(w), static_cast<int>(h), depth, mode, out);
         return true;
     }
@@ -1078,9 +1116,12 @@ bool readPsd(const uint8_t* data, size_t length, PsdDocument& out, std::string& 
     const int count = std::abs(static_cast<int>(rawCount));
     if (count > 10000) { err = "image too large"; return false; }
     if (count == 0) {
-        // layerSection 存在但 0 层 = 扁平文件（PS 保存的合并 PSD 常见）：解码合成图为背景层。
-        decodeFlatComposite(data, c, isPSB, static_cast<int>(w), static_cast<int>(h), depth, mode, out);
+        // layerSection 存在但 0 层 = 扁平文件（PS 保存的合并 PSD 常见）：解码合成图为
+        // 背景层。P7 修复：先跳到 Layer&Mask 段尾（合成图在 global mask info/additional
+        // blocks 之后）——旧代码在 count 后原地解码，读到的是段内后续字节（自有 0 层
+        // 导出/部分 PS 扁平档 → 静默空文档）。
         c.offset = layerSectionEnd;
+        decodeFlatComposite(data, c, isPSB, static_cast<int>(w), static_cast<int>(h), depth, mode, out);
         return true;
     }
 

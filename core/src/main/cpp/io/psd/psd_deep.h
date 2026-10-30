@@ -33,11 +33,17 @@ std::optional<std::vector<float>> planeToF32(const uint8_t* data, size_t len, ui
                                              size_t height, std::string& err);
 
 // 通道压缩段 → 原始字节平面（宽 × 高 × bps/8）。compression 0 = raw、1 = RLE
-//（行计数 u16，PSB u32；行距 = deepRowBytes）。crop 为空 = 整面；
-// 否则 {x, y, w, h}（采样粒度）——RLE 仍整面解后裁剪列带。
+//（行计数 u16，PSB u32；行距 = deepRowBytes）、2 = ZIP、3 = ZIP+预测。crop 为空 = 整面；
+// 否则 {x, y, w, h}（采样粒度）——RLE/ZIP 仍整面解后裁剪列带。
 std::optional<std::vector<uint8_t>> decodeDeepChannel(int compression, size_t width, size_t height,
                                                       uint16_t depth, bool largeDoc, const uint8_t* payload,
                                                       size_t len, const int* crop, std::string& err);
+
+// P7：PSD ZIP 通道解码（compression 2/3 公共核）——单 zlib 流整解 → rows × rowBytes
+// 行字节平面；prediction = true 时逐行字节级累加还原（PSD「ZIP with prediction」，
+// psd-tools decode_prediction 同式：每行首字节原样，后续累加）。
+bool zipToBytes(const uint8_t* data, size_t len, size_t rowBytes, size_t rows, bool prediction,
+                std::vector<uint8_t>& out, std::string& err);
 
 // 8-bit 平面裁剪（采样粒度 {x,y,w,h}）。
 std::vector<uint8_t> cropPlane8(const std::vector<uint8_t>& plane, size_t width, size_t height, int x, int y,

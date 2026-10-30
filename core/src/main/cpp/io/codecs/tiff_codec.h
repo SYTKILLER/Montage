@@ -13,6 +13,7 @@
 
 #include "io/codecs/codec_util.h"
 #include "io/psd/psd_reader.h"
+#include "io/psd_export.h"
 
 namespace montage {
 namespace io {
@@ -23,6 +24,12 @@ bool tiffDecode(const uint8_t* data, size_t len, CodecImage& out, std::string& e
 // bitDepth: 8 | 16；compression: "none" | "deflate" | "lzw"；alpha 存在且 <255 任一 → RGBA
 bool tiffEncode(const uint8_t* rgba, uint32_t w, uint32_t h, int bitDepth, bool withAlpha,
                 const std::string& compression, std::vector<uint8_t>& out, std::string& err);
+
+// P7：分层 TIFF 写出——8-bit RGBA 合成图 + tag 37724 ImageSourceData（8BIM/Layr 块，
+// 载荷 = PSD v1 层信息段提取自 exportPsdToMemory；本 reader tiffDecodeLayers 同构回读，
+// PS 5.5+ 兼容）。>30000px 拒绝（v1 矩形域/经典 TIFF 4GB 同因）；compression 同 tiffEncode。
+bool tiffEncodeLayers(const PsdDocSnap& snap, const std::string& compression,
+                      std::vector<uint8_t>& out, std::string& err);
 
 // 是否携带 Photoshop 分层 tag（37724 含 Layr/Lr16/Lr32 块）
 bool tiffHasLayerData(const uint8_t* data, size_t len);
